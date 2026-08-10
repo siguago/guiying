@@ -11,11 +11,22 @@
 - 把硬链接从独立副本估算中剔除；容量只显示逻辑重复上限，clone、稀疏文件和快照仍会影响实际释放。
 - 输出版本化重复组报告；当前没有移动、改时、重命名或删除 API。
 
-仓库已新增一个尚未接入桌面运行时的有界只读元数据提取层：它保留 EXIF / QuickTime 原始字段与精确位置，但明确标记为“未验证”，不会直接生成可信时间或自动修复建议。sidecar 关系、时间规范化与冲突策略仍属于 M1；M2 才会实现隔离事务。设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、[扫描任务协议](docs/engineering/SCAN_JOBS.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、[M0 复核记录](docs/engineering/M0_REVIEW.md) 和 [路线图](docs/ROADMAP.md)。
+仓库还包含尚未接入桌面主链的四个安全基础层：有界 EXIF / QuickTime 原始证据提取、
+显式 floating/offset 时间规范化与冲突策略、macOS descriptor-bound 卷/路径证据，以及
+fail-closed SQLite 持久化。它们都没有照片写入 API，也不会把缓存、未二次提取的时间或
+旧挂载会话提升为行动授权。下一阶段会按[持久化只读运行时方案](docs/engineering/PHASE1_RUNTIME.md)
+把这些基础层接成可分页、可暂停、可恢复的真实扫描主链；M2 才会另行实现并故障注入
+验证同卷隔离与恢复事务。
+
+设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、
+[扫描任务协议](docs/engineering/SCAN_JOBS.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、
+[M0 复核记录](docs/engineering/M0_REVIEW.md) 和 [路线图](docs/ROADMAP.md)。
 
 ## 开发
 
-前置环境：Node.js 22+、pnpm 10+、Rust 1.77.2+、SQLite 3.37+，以及 Tauri 2 在 macOS 上需要的 Xcode Command Line Tools。仓库当前自动化证据使用 Rust 1.92.0 复跑。
+前置环境：Node.js 22+、pnpm 10+、Rust 1.77.2、SQLite 3.37+，以及 Tauri 2 在 macOS
+上需要的 Xcode Command Line Tools。Rust 1.77.2 是当前 MSRV 与 CI 门禁版本；stable
+工具链只作为补充复验，不能替代 MSRV。
 
 ```bash
 pnpm install
@@ -37,22 +48,28 @@ pnpm lint
 pnpm test:ui
 bash tests/sqlite_migration.sh
 
-cargo fmt --manifest-path crates/guiying-core/Cargo.toml -- --check
-cargo clippy --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings
-cargo test --manifest-path crates/guiying-core/Cargo.toml --all-features
-
-cargo clippy --manifest-path crates/guiying-metadata/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path crates/guiying-metadata/Cargo.toml --all-targets
-
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
+for manifest in \
+  crates/guiying-core/Cargo.toml \
+  crates/guiying-metadata/Cargo.toml \
+  crates/guiying-store/Cargo.toml \
+  crates/guiying-time/Cargo.toml \
+  crates/guiying-volume/Cargo.toml \
+  src-tauri/Cargo.toml
+do
+  cargo +1.77.2 fmt --manifest-path "$manifest" -- --check
+  cargo +1.77.2 clippy --locked --manifest-path "$manifest" --all-targets --all-features -- -D warnings
+  cargo +1.77.2 test --locked --manifest-path "$manifest" --all-targets --all-features
+done
 ```
 
 ## 仓库结构
 
 - `crates/guiying-core/`：不提供变更 API 的扫描与逐字节复核核心。读取在部分卷上可能更新文件系统管理的 atime。
 - `crates/guiying-metadata/`：有硬预算的原始 EXIF / QuickTime 时间字段提取；不负责日期可信度、时区推断或写回。
-- `src-tauri/`：最小权限桌面壳与 SQLite 迁移。
+- `crates/guiying-time/`：时间语义、冲突与证据资格策略；资格结果不构成照片写入授权。
+- `crates/guiying-volume/`：macOS descriptor-bound 卷会话和无损路径证据；其他平台绑定目前 fail closed。
+- `crates/guiying-store/`：应用数据目录内的 SQLite 证据持久化、迁移、分页与备份；不打开用户媒体。
+- `src-tauri/`：最小权限桌面壳、可取消扫描任务与轻量进度事件；尚未接入持久化运行时。
 - `src/`：React 证据复核界面。
 - `design-system/`：DTCG 设计令牌及生成的 CSS 消费关系。
 - `docs/`：产品、工程安全、数据模型、UI 交付与测试证据。

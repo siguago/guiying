@@ -11,8 +11,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tokens:build": "python3 /Users/sigua/.codex/skills/craft-ui-design/scripts/export_tokens_css.py design-system/tokens.tokens.json src/styles/tokens.css",
-    "tokens:check": "python3 /Users/sigua/.codex/skills/craft-ui-design/scripts/export_tokens_css.py --check design-system/tokens.tokens.json src/styles/tokens.css",
+    "tokens:build": "node scripts/export-design-tokens.mjs design-system/tokens.tokens.json src/styles/tokens.css",
+    "tokens:check": "node scripts/export-design-tokens.mjs --check design-system/tokens.tokens.json src/styles/tokens.css",
     "test:ui": "playwright test"
   },
   "dependencies": {
