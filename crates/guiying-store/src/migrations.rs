@@ -5,13 +5,15 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::error::{Result, StoreError};
 
 pub(crate) const APPLICATION_ID: i32 = 0x4755_5949; // ASCII "GUYI"
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 4;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 5;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_init.sql");
 
 const STORE_MIGRATION: &str = include_str!("migrations/0002_store_runtime.sql");
 const STORE_HARDENING_MIGRATION: &str = include_str!("migrations/0003_store_hardening.sql");
 const EVIDENCE_BINDING_MIGRATION: &str = include_str!("migrations/0004_evidence_binding.sql");
+const SESSION_BOUND_EVIDENCE_MIGRATION: &str =
+    include_str!("migrations/0005_session_bound_evidence.sql");
 
 const REGISTRY_SQL: &str = r#"
 CREATE TABLE guiying_schema_migrations (
@@ -34,7 +36,7 @@ struct Migration {
     strips_embedded_transaction: bool,
 }
 
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     Migration {
         version: 1,
         name: "initial_data_model",
@@ -57,6 +59,12 @@ const MIGRATIONS: [Migration; 4] = [
         version: 4,
         name: "evidence_binding",
         sql: EVIDENCE_BINDING_MIGRATION,
+        strips_embedded_transaction: false,
+    },
+    Migration {
+        version: 5,
+        name: "session_bound_evidence",
+        sql: SESSION_BOUND_EVIDENCE_MIGRATION,
         strips_embedded_transaction: false,
     },
 ];
@@ -114,6 +122,109 @@ pub(crate) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<()> {
     validate_registry(&read_registry(connection)?)?;
     validate_runtime_invariants(connection, final_version)?;
     crate::repository::validate_capability_profile_hashes(connection, final_version)
+}
+
+/// Invalidates process-local scan sessions whenever an existing database is
+/// opened by a new `Store`. File descriptors and mount bindings never survive
+/// a process/connection lifetime, so persisted non-terminal state is evidence
+/// to recover from, not authority to resume in place.
+pub(crate) fn reconcile_stale_scan_sessions(
+    connection: &mut Connection,
+    now_ms: i64,
+) -> Result<u64> {
+    if now_ms < 0 {
+        return Err(StoreError::invalid_input(
+            "now_ms",
+            "recovery timestamp must be non-negative",
+        ));
+    }
+    if read_user_version(connection)? < 5 {
+        return Ok(0);
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let interrupted = transaction.execute(
+        "UPDATE scan_runs \
+         SET state = 'interrupted', \
+             state_version = state_version + 1, \
+             started_at_ms = COALESCE(started_at_ms, created_at_ms), \
+             finished_at_ms = MAX(created_at_ms, updated_at_ms, ?1), \
+             updated_at_ms = MAX(updated_at_ms, ?1), \
+             last_error_code = 'PROCESS_RESTARTED_WITH_STALE_SESSION', \
+             last_error_message = \
+                 'The process-local volume binding ended; start a fresh bound attempt.' \
+         WHERE state IN ('queued', 'running', 'paused') \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_run_sessions AS session \
+               WHERE session.scan_run_id = scan_runs.id \
+                 AND session.volume_id = scan_runs.volume_id \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE exact_group_builds \
+         SET state = 'abandoned', \
+             finalized_at_ms = MAX(created_at_ms, ?1), \
+             abandon_reason_code = 'PROCESS_RESTARTED', \
+             abandon_reason_message = \
+                 'Draft evidence cannot cross a process-local volume session.' \
+         WHERE state = 'draft' \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runs AS run \
+               JOIN scan_run_sessions AS session \
+                 ON session.scan_run_id = run.id \
+                AND session.volume_id = run.volume_id \
+               WHERE run.id = exact_group_builds.scan_run_id \
+                 AND run.volume_id = exact_group_builds.volume_id \
+                 AND run.state = 'interrupted' \
+                 AND run.last_error_code = 'PROCESS_RESTARTED_WITH_STALE_SESSION' \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE scan_jobs \
+         SET state = 'failed', \
+             state_version = state_version + 1, \
+             updated_at_ms = MAX(updated_at_ms, ?1) \
+         WHERE state IN ('queued', 'running', 'paused') \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runs AS run \
+               JOIN scan_run_sessions AS session \
+                 ON session.scan_run_id = run.id \
+                AND session.volume_id = run.volume_id \
+               WHERE run.id = scan_jobs.active_scan_run_id \
+                 AND run.volume_id = scan_jobs.volume_id \
+                 AND run.state = 'interrupted' \
+                 AND run.last_error_code = 'PROCESS_RESTARTED_WITH_STALE_SESSION' \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE scan_jobs \
+         SET state = 'failed', \
+             state_version = state_version + 1, \
+             updated_at_ms = MAX(updated_at_ms, ?1) \
+         WHERE state = 'queued' \
+           AND active_scan_run_id IS NULL \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_job_scopes AS scope \
+               WHERE scope.scan_job_id = scan_jobs.id \
+                 AND scope.volume_id = scan_jobs.volume_id \
+                 AND scope.origin = 'observed_v5' \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE capability_profiles \
+         SET is_current = 0 \
+         WHERE is_current = 1 \
+           AND profile_hash_version = 2 \
+           AND mount_session_key IS NOT NULL",
+        [],
+    )?;
+    transaction.commit()?;
+    u64::try_from(interrupted)
+        .map_err(|_| StoreError::invalid_input("interrupted_scan_count", "row count overflow"))
 }
 
 /// Validates ownership markers, migration history, and the actual safety
@@ -216,17 +327,19 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
          )",
         "scan job/run binding has mismatched root evidence",
     )?;
-    reject_if_exists(
-        connection,
-        "SELECT EXISTS( \
-             SELECT 1 \
-             FROM scan_job_runs AS binding \
-             JOIN scan_runs AS run ON run.id = binding.scan_run_id \
-             GROUP BY binding.scan_job_id \
-             HAVING MIN(run.capability_profile_id) <> MAX(run.capability_profile_id) \
-         )",
-        "scan job history mixes capability profiles",
-    )?;
+    if version < 5 {
+        reject_if_exists(
+            connection,
+            "SELECT EXISTS( \
+                 SELECT 1 \
+                 FROM scan_job_runs AS binding \
+                 JOIN scan_runs AS run ON run.id = binding.scan_run_id \
+                 GROUP BY binding.scan_job_id \
+                 HAVING MIN(run.capability_profile_id) <> MAX(run.capability_profile_id) \
+             )",
+            "scan job history mixes capability profiles",
+        )?;
+    }
     reject_if_exists(
         connection,
         "SELECT EXISTS( \
@@ -241,9 +354,26 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
          )",
         "active scan run is not bound to its job",
     )?;
+    let terminal_retry_adjacency = if version >= 5 {
+        "OR (job.state = 'completed' AND run.state IN ('completed', 'queued')) \
+         OR (job.state = 'cancelled' AND (run.id IS NULL OR run.state IN ( \
+             'cancelled', 'failed', 'interrupted', 'queued' \
+         )))"
+    } else {
+        "OR (job.state = 'completed' AND run.state = 'completed') \
+         OR (job.state = 'cancelled' AND (run.id IS NULL OR run.state = 'cancelled'))"
+    };
+    let failed_adjacency = if version >= 5 {
+        "(job.state = 'failed' AND (run.id IS NULL OR run.state IN ( \
+             'failed', 'interrupted', 'queued' \
+         )))"
+    } else {
+        "(job.state = 'failed' AND run.state IN ('failed', 'interrupted', 'queued'))"
+    };
     reject_if_exists(
         connection,
-        "SELECT EXISTS( \
+        &format!(
+            "SELECT EXISTS( \
              SELECT 1 \
              FROM scan_jobs AS job \
              LEFT JOIN scan_runs AS run \
@@ -252,11 +382,11 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
                  (job.state = 'queued' AND (run.id IS NULL OR run.state = 'queued')) \
                  OR (job.state = 'running' AND run.state = 'running') \
                  OR (job.state = 'paused' AND run.state = 'paused') \
-                 OR (job.state = 'completed' AND run.state = 'completed') \
-                 OR (job.state = 'failed' AND run.state IN ('failed', 'interrupted', 'queued')) \
-                 OR (job.state = 'cancelled' AND (run.id IS NULL OR run.state = 'cancelled')) \
+                 OR {failed_adjacency} \
+                 {terminal_retry_adjacency} \
              ) \
-         )",
+         )"
+        ),
         "scan job and active run states are inconsistent",
     )?;
     reject_if_exists(
@@ -311,38 +441,443 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
              )",
             "scan run is missing bound raw root evidence",
         )?;
-        reject_if_exists(
-            connection,
-            "SELECT EXISTS( \
-                 SELECT 1 \
-                 FROM scan_job_runs AS binding \
-                 JOIN scan_job_roots AS job_root \
-                   ON job_root.scan_job_id = binding.scan_job_id \
-                  AND job_root.volume_id = binding.volume_id \
-                 JOIN scan_run_roots AS run_root \
-                   ON run_root.scan_run_id = binding.scan_run_id \
-                  AND run_root.volume_id = binding.volume_id \
-                 WHERE job_root.capability_profile_id IS NULL \
-                    OR job_root.capability_profile_id <> run_root.capability_profile_id \
-                    OR job_root.path_semantics_version <> run_root.path_semantics_version \
-                    OR job_root.relative_path_raw <> run_root.relative_path_raw \
-                    OR job_root.path_encoding <> run_root.path_encoding \
-                    OR job_root.semantic_path_key <> run_root.semantic_path_key \
-             )",
-            "scan job/run binding has mismatched raw path-semantics evidence",
-        )?;
-        reject_if_exists(
-            connection,
-            "SELECT EXISTS( \
-                 SELECT 1 FROM media_files AS media \
-                 LEFT JOIN media_path_keys AS path \
-                   ON path.volume_id = media.volume_id AND path.media_file_id = media.id \
-                 WHERE path.media_file_id IS NULL \
-             )",
-            "media file is missing a path-semantics binding",
-        )?;
+        if version == 4 {
+            reject_if_exists(
+                connection,
+                "SELECT EXISTS( \
+                     SELECT 1 \
+                     FROM scan_job_runs AS binding \
+                     JOIN scan_job_roots AS job_root \
+                       ON job_root.scan_job_id = binding.scan_job_id \
+                      AND job_root.volume_id = binding.volume_id \
+                     JOIN scan_run_roots AS run_root \
+                       ON run_root.scan_run_id = binding.scan_run_id \
+                      AND run_root.volume_id = binding.volume_id \
+                     WHERE job_root.capability_profile_id IS NULL \
+                        OR job_root.capability_profile_id <> run_root.capability_profile_id \
+                        OR job_root.path_semantics_version <> run_root.path_semantics_version \
+                        OR job_root.relative_path_raw <> run_root.relative_path_raw \
+                        OR job_root.path_encoding <> run_root.path_encoding \
+                        OR job_root.semantic_path_key <> run_root.semantic_path_key \
+                 )",
+                "scan job/run binding has mismatched raw path-semantics evidence",
+            )?;
+        }
+        if version == 4 {
+            reject_if_exists(
+                connection,
+                "SELECT EXISTS( \
+                     SELECT 1 FROM media_files AS media \
+                     LEFT JOIN media_path_keys AS path \
+                       ON path.volume_id = media.volume_id AND path.media_file_id = media.id \
+                     WHERE path.media_file_id IS NULL \
+                 )",
+                "media file is missing a v4 path-semantics binding",
+            )?;
+        } else {
+            reject_if_exists(
+                connection,
+                "SELECT EXISTS( \
+                     SELECT 1 FROM media_files AS media \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM media_path_keys AS legacy_path \
+                         WHERE legacy_path.volume_id = media.volume_id \
+                           AND legacy_path.media_file_id = media.id \
+                     ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 \
+                         FROM media_namespace_paths AS namespace_path \
+                         JOIN namespace_profiles AS namespace \
+                           ON namespace.id = namespace_path.namespace_profile_id \
+                          AND namespace.volume_id = namespace_path.volume_id \
+                         WHERE namespace_path.volume_id = media.volume_id \
+                           AND namespace_path.media_file_id = media.id \
+                           AND namespace.origin = 'observed_v5' \
+                           AND namespace.reuse_scope <> 'history_only' \
+                     ) \
+                 )",
+                "media file is missing a trusted v4 or v5 path binding",
+            )?;
+        }
+    }
+    if version >= 5 {
+        validate_session_bound_evidence(connection)?;
     }
     validate_stored_path_evidence(connection, version)?;
+    Ok(())
+}
+
+fn validate_session_bound_evidence(connection: &Connection) -> Result<()> {
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM namespace_profiles AS namespace \
+             JOIN volumes AS volume ON volume.id = namespace.volume_id \
+             WHERE (namespace.origin = 'legacy_session_v4' AND ( \
+                       namespace.profile_key IS NOT NULL \
+                       OR namespace.reuse_scope <> 'history_only' \
+                       OR namespace.bound_mount_session_key IS NOT NULL \
+                   )) \
+                OR (namespace.origin = 'observed_v5' AND ( \
+                       namespace.profile_key IS NULL \
+                       OR namespace.native_path_encoding IS NULL \
+                       OR namespace.case_behavior IS NULL \
+                       OR namespace.unicode_behavior IS NULL \
+                       OR namespace.key_strategy <> 'exact_native_v1' \
+                       OR namespace.key_algorithm_version IS NULL \
+                       OR namespace.reuse_scope = 'history_only' \
+                       OR namespace.legacy_capability_profile_id IS NOT NULL \
+                       OR (namespace.reuse_scope = 'cross_session' \
+                           AND namespace.bound_mount_session_key IS NOT NULL) \
+                       OR (namespace.reuse_scope = 'current_session_only' AND ( \
+                           namespace.bound_mount_session_key IS NULL \
+                           OR length(namespace.bound_mount_session_key) <> 64 \
+                           OR namespace.bound_mount_session_key \
+                               <> lower(namespace.bound_mount_session_key) \
+                           OR namespace.bound_mount_session_key GLOB '*[^0-9a-f]*' \
+                       )) \
+                   )) \
+                OR (namespace.reuse_scope = 'cross_session' AND ( \
+                       volume.identity_strength <> 'strong' \
+                       OR namespace.case_behavior = 'unknown' \
+                       OR namespace.unicode_behavior = 'unknown' \
+                   )) \
+         )",
+        "namespace profile has incomplete or over-privileged reuse evidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_jobs AS job \
+             LEFT JOIN scan_job_scopes AS scope ON scope.scan_job_id = job.id \
+             LEFT JOIN namespace_profiles AS namespace \
+               ON namespace.id = scope.namespace_profile_id \
+              AND namespace.volume_id = scope.volume_id \
+             LEFT JOIN volumes AS volume ON volume.id = scope.volume_id \
+             WHERE scope.scan_job_id IS NULL \
+                OR scope.volume_id <> job.volume_id \
+                OR scope.root_display <> job.root_relative_path \
+                OR namespace.id IS NULL \
+                OR scope.origin <> namespace.origin \
+                OR (scope.origin = 'legacy_session_v4' AND ( \
+                       scope.recoverable <> 0 \
+                       OR scope.stable_root_path_key IS NOT NULL \
+                       OR scope.root_scope_key IS NOT NULL \
+                       OR scope.legacy_semantic_path_key <> job.root_path_key \
+                   )) \
+                OR (scope.origin = 'observed_v5' AND ( \
+                       scope.stable_root_path_key <> job.root_path_key \
+                       OR scope.root_scope_key IS NULL \
+                       OR scope.legacy_semantic_path_key IS NOT NULL \
+                       OR (scope.recoverable = 1 AND ( \
+                           namespace.reuse_scope <> 'cross_session' \
+                           OR volume.identity_strength <> 'strong' \
+                       )) \
+                   )) \
+         )",
+        "scan job scope does not match its stable namespace evidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_job_runs AS binding \
+             JOIN scan_job_scopes AS scope \
+               ON scope.scan_job_id = binding.scan_job_id \
+              AND scope.volume_id = binding.volume_id \
+             LEFT JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = binding.scan_run_id \
+              AND session.scan_job_id = binding.scan_job_id \
+              AND session.volume_id = binding.volume_id \
+             WHERE scope.origin = 'observed_v5' \
+               AND session.scan_run_id IS NULL \
+         )",
+        "v5 scan attempt is missing its immutable session provenance",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_run_sessions AS session \
+             JOIN scan_runs AS run \
+               ON run.id = session.scan_run_id \
+              AND run.volume_id = session.volume_id \
+             JOIN scan_job_runs AS binding \
+               ON binding.scan_job_id = session.scan_job_id \
+              AND binding.scan_run_id = session.scan_run_id \
+              AND binding.volume_id = session.volume_id \
+             JOIN scan_job_scopes AS scope \
+               ON scope.scan_job_id = session.scan_job_id \
+              AND scope.volume_id = session.volume_id \
+             JOIN namespace_profiles AS namespace \
+               ON namespace.id = session.namespace_profile_id \
+              AND namespace.volume_id = session.volume_id \
+             JOIN capability_profiles AS profile \
+               ON profile.id = session.capability_profile_id \
+              AND profile.volume_id = session.volume_id \
+             JOIN volumes AS volume ON volume.id = session.volume_id \
+             WHERE run.capability_profile_id <> session.capability_profile_id \
+                OR scope.origin <> 'observed_v5' \
+                OR namespace.origin <> 'observed_v5' \
+                OR (namespace.reuse_scope = 'cross_session' \
+                    AND namespace.bound_mount_session_key IS NOT NULL) \
+                OR (namespace.reuse_scope = 'current_session_only' \
+                    AND namespace.bound_mount_session_key \
+                        <> session.mount_session_key COLLATE BINARY) \
+                OR scope.namespace_profile_id <> session.namespace_profile_id \
+                OR scope.mount_relative_root_raw <> session.mount_relative_root_raw \
+                OR scope.path_encoding <> session.path_encoding \
+                OR scope.stable_root_path_key <> session.stable_root_path_key \
+                OR scope.root_scope_key <> session.root_scope_key \
+                OR profile.profile_hash_version <> 2 \
+                OR profile.probe_status <> 'complete' \
+                OR profile.can_read <> 1 \
+                OR profile.mount_session_key <> session.mount_session_key COLLATE BINARY \
+                OR length(session.mount_session_key) <> 64 \
+                OR session.mount_session_key GLOB '*[^0-9a-f]*' \
+                OR (binding.attempt_number > 1 AND ( \
+                     scope.recoverable <> 1 \
+                     OR namespace.reuse_scope <> 'cross_session' \
+                     OR volume.identity_strength <> 'strong' \
+                )) \
+         )",
+        "scan run session is not bound to its stable scope and capability",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_job_runs AS binding \
+             JOIN scan_runs AS run \
+               ON run.id = binding.scan_run_id \
+              AND run.volume_id = binding.volume_id \
+             JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = binding.scan_run_id \
+              AND session.scan_job_id = binding.scan_job_id \
+              AND session.volume_id = binding.volume_id \
+             LEFT JOIN scan_job_runs AS previous_binding \
+               ON previous_binding.scan_job_id = binding.scan_job_id \
+              AND previous_binding.attempt_number = binding.attempt_number - 1 \
+             WHERE (binding.attempt_number = 1 \
+                    AND run.parent_scan_run_id IS NOT NULL) \
+                OR (binding.attempt_number > 1 AND ( \
+                    previous_binding.scan_run_id IS NULL \
+                    OR run.parent_scan_run_id <> previous_binding.scan_run_id \
+                )) \
+         )",
+        "scan attempt lineage does not point to the immediately preceding run",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_runs AS run \
+             LEFT JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = run.id \
+              AND session.volume_id = run.volume_id \
+             LEFT JOIN capability_profiles AS profile \
+               ON profile.id = session.capability_profile_id \
+              AND profile.volume_id = session.volume_id \
+             WHERE run.state IN ('queued', 'running', 'paused') \
+               AND (session.scan_run_id IS NULL \
+                    OR profile.is_current <> 1 \
+                    OR profile.mount_session_key <> session.mount_session_key COLLATE BINARY) \
+         )",
+        "non-terminal scan lacks its current mount session",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_runs AS run \
+             JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = run.id \
+              AND session.volume_id = run.volume_id \
+             WHERE run.state = 'completed' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM scan_stage_seals AS seal \
+                   WHERE seal.scan_run_id = run.id \
+                     AND seal.volume_id = run.volume_id \
+                     AND seal.stage = 'exact_verification' \
+               ) \
+         )",
+        "completed v5 scan is missing its exact-verification seal",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_stage_seals AS seal \
+             WHERE (seal.stage = 'enumeration' AND ( \
+                       seal.item_count <> ( \
+                           SELECT count(*) \
+                           FROM media_observation_snapshots AS observation \
+                           WHERE observation.scan_run_id = seal.scan_run_id \
+                       ) \
+                       OR seal.logical_bytes <> COALESCE(( \
+                           SELECT sum(observation.size_bytes) \
+                           FROM media_observation_snapshots AS observation \
+                           WHERE observation.scan_run_id = seal.scan_run_id \
+                       ), 0) \
+                   )) \
+                OR (seal.stage = 'sampling' AND ( \
+                       NOT EXISTS ( \
+                           SELECT 1 FROM scan_stage_seals AS prerequisite \
+                           WHERE prerequisite.scan_run_id = seal.scan_run_id \
+                             AND prerequisite.stage = 'enumeration' \
+                             AND prerequisite.sealed_at_ms <= seal.sealed_at_ms \
+                       ) \
+                       OR seal.item_count <> ( \
+                           SELECT count(*) FROM observation_fingerprints AS fingerprint \
+                           WHERE fingerprint.scan_run_id = seal.scan_run_id \
+                             AND fingerprint.fingerprint_kind = 'sample' \
+                       ) \
+                       OR seal.logical_bytes <> COALESCE(( \
+                           SELECT sum(fingerprint.bytes_read) \
+                           FROM observation_fingerprints AS fingerprint \
+                           WHERE fingerprint.scan_run_id = seal.scan_run_id \
+                             AND fingerprint.fingerprint_kind = 'sample' \
+                       ), 0) \
+                   )) \
+                OR (seal.stage = 'full_hash' AND ( \
+                       NOT EXISTS ( \
+                           SELECT 1 FROM scan_stage_seals AS prerequisite \
+                           WHERE prerequisite.scan_run_id = seal.scan_run_id \
+                             AND prerequisite.stage = 'sampling' \
+                             AND prerequisite.sealed_at_ms <= seal.sealed_at_ms \
+                       ) \
+                       OR seal.item_count <> ( \
+                           SELECT count(*) FROM observation_fingerprints AS fingerprint \
+                           WHERE fingerprint.scan_run_id = seal.scan_run_id \
+                             AND fingerprint.fingerprint_kind = 'exact_bytes' \
+                             AND fingerprint.read_origin = 'full_hash_read' \
+                       ) \
+                       OR seal.logical_bytes <> COALESCE(( \
+                           SELECT sum(fingerprint.bytes_read) \
+                           FROM observation_fingerprints AS fingerprint \
+                           WHERE fingerprint.scan_run_id = seal.scan_run_id \
+                             AND fingerprint.fingerprint_kind = 'exact_bytes' \
+                             AND fingerprint.read_origin = 'full_hash_read' \
+                       ), 0) \
+                   )) \
+                OR (seal.stage = 'exact_verification' AND ( \
+                       NOT EXISTS ( \
+                           SELECT 1 FROM scan_stage_seals AS prerequisite \
+                           WHERE prerequisite.scan_run_id = seal.scan_run_id \
+                             AND prerequisite.stage = 'full_hash' \
+                             AND prerequisite.sealed_at_ms <= seal.sealed_at_ms \
+                       ) \
+                       OR EXISTS ( \
+                           SELECT 1 FROM exact_group_builds AS draft \
+                           WHERE draft.scan_run_id = seal.scan_run_id \
+                             AND draft.state = 'draft' \
+                       ) \
+                       OR seal.item_count <> ( \
+                           SELECT count(*) FROM exact_verification_edges AS edge \
+                           WHERE edge.scan_run_id = seal.scan_run_id \
+                       ) \
+                       OR seal.logical_bytes <> COALESCE(( \
+                           SELECT sum(edge.compared_bytes) \
+                           FROM exact_verification_edges AS edge \
+                           WHERE edge.scan_run_id = seal.scan_run_id \
+                       ), 0) \
+                   )) \
+         )",
+        "scan stage seal is out of order or has stale totals",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM observation_fingerprints AS fingerprint \
+             JOIN media_observation_snapshots AS observation \
+               ON observation.id = fingerprint.media_observation_snapshot_id \
+              AND observation.scan_run_id = fingerprint.scan_run_id \
+              AND observation.volume_id = fingerprint.volume_id \
+             WHERE fingerprint.source_signature_before <> observation.source_signature \
+                OR fingerprint.source_signature_after <> observation.source_signature \
+                OR fingerprint.observed_size_bytes <> observation.size_bytes \
+                OR (fingerprint.fingerprint_kind = 'exact_bytes' AND ( \
+                     fingerprint.bytes_read <> observation.size_bytes \
+                     OR fingerprint.reached_expected_eof <> 1 \
+                )) \
+         )",
+        "fingerprint does not match its immutable observation",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM exact_group_builds AS build \
+             WHERE build.state = 'verified' \
+               AND ( \
+                   (SELECT count(*) FROM exact_group_build_members AS member \
+                    WHERE member.exact_group_build_id = build.id) \
+                       <> build.expected_member_count \
+                   OR (SELECT count(*) FROM exact_verification_edges AS edge \
+                       WHERE edge.exact_group_build_id = build.id) \
+                       <> build.expected_edge_count \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM exact_group_build_members AS representative \
+                       WHERE representative.exact_group_build_id = build.id \
+                         AND representative.ordinal = 0 \
+                         AND representative.media_observation_snapshot_id = \
+                             build.representative_observation_id \
+                         AND representative.observation_fingerprint_id = \
+                             build.representative_fingerprint_id \
+                   ) \
+                   OR EXISTS ( \
+                       SELECT 1 FROM exact_group_build_members AS member \
+                       WHERE member.exact_group_build_id = build.id \
+                         AND member.media_observation_snapshot_id <> \
+                             build.representative_observation_id \
+                         AND NOT EXISTS ( \
+                             SELECT 1 FROM exact_verification_edges AS edge \
+                             WHERE edge.exact_group_build_id = build.id \
+                               AND edge.member_observation_id = \
+                                   member.media_observation_snapshot_id \
+                         ) \
+                   ) \
+               ) \
+         )",
+        "verified exact group is missing members or verification edges",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM exact_group_builds AS build \
+             JOIN exact_group_build_members AS member \
+               ON member.exact_group_build_id = build.id \
+              AND member.scan_run_id = build.scan_run_id \
+             WHERE build.state = 'verified' \
+             GROUP BY member.scan_run_id, member.media_observation_snapshot_id \
+             HAVING count(DISTINCT build.id) > 1 \
+         )",
+        "verified exact groups overlap by observation identity",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM exact_group_builds AS build \
+             JOIN exact_group_build_members AS member \
+               ON member.exact_group_build_id = build.id \
+              AND member.scan_run_id = build.scan_run_id \
+             JOIN media_observation_snapshots AS observation \
+               ON observation.id = member.media_observation_snapshot_id \
+              AND observation.scan_run_id = member.scan_run_id \
+              AND observation.volume_id = member.volume_id \
+             WHERE build.state = 'verified' \
+               AND observation.file_object_key IS NOT NULL \
+             GROUP BY member.scan_run_id, observation.file_object_key \
+             HAVING count(DISTINCT build.id) > 1 \
+         )",
+        "verified exact groups overlap by physical file identity",
+    )?;
+    crate::repository::verify_all_verified_exact_groups(connection)?;
     Ok(())
 }
 
@@ -504,6 +1039,77 @@ fn validate_stored_value_bounds(connection: &Connection, version: i64) -> Result
             "stored media observation exceeds a repository value bound",
         )?;
     }
+    if version >= 5 {
+        for (table, predicate) in [
+            (
+                "namespace_profiles",
+                String::from(
+                    "(profile_key IS NOT NULL AND length(profile_key) <> 32) \
+                     OR (bound_mount_session_key IS NOT NULL \
+                         AND length(CAST(bound_mount_session_key AS BLOB)) <> 64)",
+                ),
+            ),
+            (
+                "scan_job_scopes",
+                format!(
+                    "length(CAST(root_display AS BLOB)) > {path} \
+                     OR length(mount_relative_root_raw) > {path} \
+                     OR (legacy_semantic_path_key IS NOT NULL \
+                         AND length(legacy_semantic_path_key) NOT BETWEEN 1 AND {path_key})"
+                ),
+            ),
+            (
+                "scan_run_sessions",
+                format!(
+                    "length(CAST(mount_session_key AS BLOB)) <> 64 \
+                     OR length(mount_relative_root_raw) > {path}"
+                ),
+            ),
+            (
+                "media_namespace_paths",
+                format!(
+                    "length(CAST(display_path AS BLOB)) NOT BETWEEN 1 AND {path} \
+                     OR length(mount_relative_path_raw) NOT BETWEEN 1 AND {path}"
+                ),
+            ),
+            (
+                "media_observation_snapshots",
+                format!(
+                    "length(CAST(display_path AS BLOB)) NOT BETWEEN 1 AND {path} \
+                     OR length(root_relative_path_raw) NOT BETWEEN 1 AND {path} \
+                     OR (native_file_id IS NOT NULL \
+                         AND length(native_file_id) NOT BETWEEN 1 AND {identifier})"
+                ),
+            ),
+            (
+                "observation_fingerprints",
+                format!(
+                    "length(CAST(algorithm AS BLOB)) NOT BETWEEN 1 AND {identifier} \
+                     OR length(digest) NOT BETWEEN 1 AND {identifier}"
+                ),
+            ),
+            (
+                "exact_group_builds",
+                format!(
+                    "length(build_key) <> 32 \
+                     OR length(expected_manifest_digest) <> 32 \
+                     OR (group_key IS NOT NULL AND length(group_key) <> 32) \
+                     OR (abandon_reason_code IS NOT NULL \
+                         AND length(CAST(abandon_reason_code AS BLOB)) \
+                             NOT BETWEEN 1 AND {identifier}) \
+                     OR (abandon_reason_message IS NOT NULL \
+                         AND length(CAST(abandon_reason_message AS BLOB)) \
+                             NOT BETWEEN 1 AND {text})"
+                ),
+            ),
+        ] {
+            reject_if_exists(
+                connection,
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate})"),
+                "stored v5 evidence exceeds a repository value bound",
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -616,6 +1222,110 @@ fn validate_stored_path_evidence(connection: &Connection, version: i64) -> Resul
             &row.get::<_, String>(3)?,
             false,
         )?;
+    }
+    if version >= 5 {
+        let mut statement = connection.prepare(
+            "SELECT scan_job_id, root_display, mount_relative_root_raw, path_encoding \
+             FROM scan_job_scopes ORDER BY scan_job_id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            validate_path_row(
+                "scan_job_scopes",
+                row.get(0)?,
+                &row.get::<_, String>(1)?,
+                &row.get::<_, Vec<u8>>(2)?,
+                &row.get::<_, String>(3)?,
+                true,
+            )?;
+        }
+
+        let mut statement = connection.prepare(
+            "SELECT session.scan_run_id, run.root_relative_path, \
+                    session.mount_relative_root_raw, session.path_encoding \
+             FROM scan_run_sessions AS session \
+             JOIN scan_runs AS run ON run.id = session.scan_run_id \
+             ORDER BY session.scan_run_id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            validate_path_row(
+                "scan_run_sessions",
+                row.get(0)?,
+                &row.get::<_, String>(1)?,
+                &row.get::<_, Vec<u8>>(2)?,
+                &row.get::<_, String>(3)?,
+                true,
+            )?;
+        }
+
+        for (table, id_column, display_column, raw_column) in [
+            (
+                "media_namespace_paths",
+                "id",
+                "display_path",
+                "mount_relative_path_raw",
+            ),
+            (
+                "media_observation_snapshots",
+                "id",
+                "display_path",
+                "root_relative_path_raw",
+            ),
+        ] {
+            let sql = format!(
+                "SELECT {id_column}, {display_column}, {raw_column}, path_encoding \
+                 FROM {table} ORDER BY {id_column}"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                validate_path_row(
+                    table,
+                    row.get(0)?,
+                    &row.get::<_, String>(1)?,
+                    &row.get::<_, Vec<u8>>(2)?,
+                    &row.get::<_, String>(3)?,
+                    false,
+                )?;
+            }
+        }
+
+        let mut statement = connection.prepare(
+            "SELECT observation.id, session.mount_relative_root_raw, \
+                    session.path_encoding, namespace_path.mount_relative_path_raw, \
+                    namespace_path.path_encoding, observation.root_relative_path_raw, \
+                    observation.path_encoding \
+             FROM media_observation_snapshots AS observation \
+             JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = observation.scan_run_id \
+              AND session.volume_id = observation.volume_id \
+              AND session.capability_profile_id = observation.capability_profile_id \
+              AND session.namespace_profile_id = observation.namespace_profile_id \
+             JOIN media_namespace_paths AS namespace_path \
+               ON namespace_path.id = observation.media_namespace_path_id \
+              AND namespace_path.volume_id = observation.volume_id \
+              AND namespace_path.media_file_id = observation.media_file_id \
+              AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+             ORDER BY observation.id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let observation_id = row.get::<_, i64>(0)?;
+            crate::repository::validate_v5_path_relation(
+                &row.get::<_, Vec<u8>>(1)?,
+                &row.get::<_, String>(2)?,
+                &row.get::<_, Vec<u8>>(3)?,
+                &row.get::<_, String>(4)?,
+                &row.get::<_, Vec<u8>>(5)?,
+                &row.get::<_, String>(6)?,
+            )
+            .map_err(|error| {
+                StoreError::MigrationHistoryMismatch(format!(
+                    "media observation id {observation_id} escapes its bound scan root: {error}"
+                ))
+            })?;
+        }
     }
     Ok(())
 }
@@ -736,23 +1446,57 @@ fn apply_migration(
 }
 
 fn strip_transaction(sql: &'static str) -> Result<&'static str> {
-    let (_, after_begin) =
-        sql.split_once("\nBEGIN IMMEDIATE;\n")
+    let mut begin_body_start = None;
+    let mut commit_start = None;
+    let mut offset = 0_usize;
+
+    for segment in sql.split_inclusive('\n') {
+        let without_lf = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+        match line {
+            "BEGIN IMMEDIATE;" => {
+                if begin_body_start.replace(offset + segment.len()).is_some() {
+                    return Err(StoreError::MalformedMigration(
+                        "initial migration must contain exactly one BEGIN IMMEDIATE boundary",
+                    ));
+                }
+            }
+            "COMMIT;" => {
+                if commit_start.replace(offset).is_some() {
+                    return Err(StoreError::MalformedMigration(
+                        "initial migration must contain exactly one COMMIT boundary",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        offset = offset
+            .checked_add(segment.len())
             .ok_or(StoreError::MalformedMigration(
-                "initial migration must contain one BEGIN IMMEDIATE boundary",
+                "initial migration line offset overflowed",
             ))?;
-    let (body, trailing) =
-        after_begin
-            .rsplit_once("\nCOMMIT;")
-            .ok_or(StoreError::MalformedMigration(
-                "initial migration must end with COMMIT",
-            ))?;
-    if !trailing.trim().is_empty() {
+    }
+
+    let begin_body_start = begin_body_start.ok_or(StoreError::MalformedMigration(
+        "initial migration must contain one BEGIN IMMEDIATE boundary",
+    ))?;
+    let commit_start = commit_start.ok_or(StoreError::MalformedMigration(
+        "initial migration must end with COMMIT",
+    ))?;
+    if commit_start < begin_body_start {
+        return Err(StoreError::MalformedMigration(
+            "initial migration COMMIT precedes BEGIN IMMEDIATE",
+        ));
+    }
+    let commit_line_end = sql[commit_start..]
+        .find('\n')
+        .map_or(sql.len(), |relative| commit_start + relative + 1);
+    if !sql[commit_line_end..].trim().is_empty() {
         return Err(StoreError::MalformedMigration(
             "unexpected content follows initial migration COMMIT",
         ));
     }
-    Ok(body)
+    Ok(&sql[begin_body_start..commit_start])
 }
 
 fn migration_checksum(sql: &str) -> [u8; 32] {
@@ -998,7 +1742,8 @@ fn schema_key((kind, name): &(String, String)) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_migration, migrate, preflight_existing, validate_current_schema, MIGRATIONS,
+        apply_migration, migrate, preflight_existing, strip_transaction, validate_current_schema,
+        MIGRATIONS,
     };
     use crate::model::{CapabilityProfileInput, NewScanJob, PathKey};
     use crate::repository::{
@@ -1036,6 +1781,7 @@ mod tests {
         assert_eq!(preflight_existing(&connection)?, 2);
         apply_migration(&mut connection, &MIGRATIONS[2], 1_002, false)?;
         apply_migration(&mut connection, &MIGRATIONS[3], 1_003, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[4], 1_004, false)?;
         validate_current_schema(&connection)?;
         let (encoding, raw): (String, Vec<u8>) = connection.query_row(
             "SELECT path_encoding, relative_path_raw FROM media_file_paths WHERE media_file_id = 1",
@@ -1044,6 +1790,263 @@ mod tests {
         )?;
         assert_eq!(encoding, "windows_utf16_le");
         assert_eq!(raw, hex_bytes("700068006F0074006F002E006A0070006700"));
+        Ok(())
+    }
+
+    #[test]
+    fn initial_transaction_parser_accepts_crlf_without_relaxing_boundaries() -> crate::Result<()> {
+        const CRLF: &str =
+            "-- initial\r\nBEGIN IMMEDIATE;\r\nCREATE TABLE item(id INTEGER);\r\nCOMMIT;\r\n";
+        assert_eq!(
+            strip_transaction(CRLF)?,
+            "CREATE TABLE item(id INTEGER);\r\n"
+        );
+
+        const DUPLICATE_BEGIN: &str =
+            "BEGIN IMMEDIATE;\r\nBEGIN IMMEDIATE;\r\nSELECT 1;\r\nCOMMIT;\r\n";
+        assert!(strip_transaction(DUPLICATE_BEGIN).is_err());
+        const DUPLICATE_COMMIT: &str = "BEGIN IMMEDIATE;\r\nSELECT 1;\r\nCOMMIT;\r\nCOMMIT;\r\n";
+        assert!(strip_transaction(DUPLICATE_COMMIT).is_err());
+        const TRAILING_SQL: &str = "BEGIN IMMEDIATE;\r\nSELECT 1;\r\nCOMMIT;\r\nSELECT 2;\r\n";
+        assert!(strip_transaction(TRAILING_SQL).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn version_four_active_attempt_becomes_nonrecoverable_history() -> crate::Result<()> {
+        let mut connection = seeded_version_four_connection()?;
+        apply_migration(&mut connection, &MIGRATIONS[4], 1_004, false)?;
+
+        let (job_state, job_version): (String, i64) = connection.query_row(
+            "SELECT state, state_version FROM scan_jobs WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((job_state.as_str(), job_version), ("failed", 1));
+        let (run_state, run_version, error_code): (String, i64, String) = connection.query_row(
+            "SELECT state, state_version, last_error_code FROM scan_runs WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!((run_state.as_str(), run_version), ("interrupted", 1));
+        assert_eq!(error_code, "PROCESS_UPGRADED_WITH_ACTIVE_RUN");
+
+        let legacy_scope: (String, i64, Option<Vec<u8>>, Option<Vec<u8>>) = connection.query_row(
+            "SELECT origin, recoverable, stable_root_path_key, root_scope_key \
+                 FROM scan_job_scopes WHERE scan_job_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(legacy_scope.0, "legacy_session_v4");
+        assert_eq!(legacy_scope.1, 0);
+        assert!(legacy_scope.2.is_none());
+        assert!(legacy_scope.3.is_none());
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM scan_run_sessions", [], |row| row
+                .get::<_, i64>(0),)?,
+            0
+        );
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM observation_fingerprints", [], |row| {
+                row.get::<_, i64>(0)
+            },)?,
+            0
+        );
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM exact_group_builds", [], |row| row
+                .get::<_, i64>(0),)?,
+            0
+        );
+        {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "INSERT INTO scan_runs ( \
+                     id, run_key, volume_id, capability_profile_id, root_relative_path, \
+                     root_path_key, scan_mode, state, created_at_ms, updated_at_ms \
+                 ) VALUES (2, 'legacy-retry', 1, 1, '', x'01', 'resume', 'queued', 2, 2);",
+            )?;
+            let error = transaction
+                .execute(
+                    "INSERT INTO scan_job_runs ( \
+                         scan_job_id, scan_run_id, volume_id, attempt_number, created_at_ms \
+                     ) VALUES (1, 2, 1, 2, 2)",
+                    [],
+                )
+                .expect_err("legacy v4 scope accepted a new attempt");
+            assert!(error.to_string().contains("legacy or unscoped"));
+            transaction.rollback()?;
+        }
+        validate_current_schema(&connection)?;
+        Ok(())
+    }
+
+    #[test]
+    fn version_four_unbound_queued_job_is_failed_not_stranded() -> crate::Result<()> {
+        let mut connection = seeded_version_four_connection()?;
+        connection.execute_batch(
+            "INSERT INTO scan_jobs ( \
+                 id, job_key, volume_id, root_relative_path, root_path_key, \
+                 state, created_at_ms, updated_at_ms \
+             ) VALUES (2, 'unbound-job', 1, 'Pictures', x'02', 'queued', 2, 2); \
+             INSERT INTO scan_job_roots ( \
+                 scan_job_id, volume_id, capability_profile_id, path_semantics_version, \
+                 relative_path_raw, path_encoding, semantic_path_key, created_at_ms \
+             ) VALUES (2, 1, NULL, 1, CAST('Pictures' AS BLOB), 'utf8', x'02', 2);",
+        )?;
+
+        apply_migration(&mut connection, &MIGRATIONS[4], 1_004, false)?;
+        let state: (String, i64, Option<i64>) = connection.query_row(
+            "SELECT state, state_version, active_scan_run_id FROM scan_jobs WHERE id = 2",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!((state.0.as_str(), state.1, state.2), ("failed", 1, None));
+        let scope: (String, i64) = connection.query_row(
+            "SELECT namespace.origin, scope.recoverable \
+             FROM scan_job_scopes AS scope \
+             JOIN namespace_profiles AS namespace \
+               ON namespace.id = scope.namespace_profile_id \
+             WHERE scope.scan_job_id = 2",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((scope.0.as_str(), scope.1), ("legacy_session_v4", 0));
+        validate_current_schema(&connection)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_version_four_upgrade_rolls_back_every_v5_object() -> crate::Result<()> {
+        let mut connection = seeded_version_four_connection()?;
+        connection.execute_batch(
+            "DROP TRIGGER trg_scan_job_roots_no_delete_v4; \
+             DELETE FROM scan_job_roots WHERE scan_job_id = 1;",
+        )?;
+
+        assert!(apply_migration(&mut connection, &MIGRATIONS[4], 1_004, false).is_err());
+        assert_eq!(read_test_user_version(&connection)?, 4);
+        let registered: i64 = connection.query_row(
+            "SELECT count(*) FROM guiying_schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(registered, 4);
+        let v5_objects: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_schema \
+             WHERE name IN ('namespace_profiles', 'scan_run_sessions', \
+                            'observation_fingerprints')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(v5_objects, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_group_finalize_rejects_reclaimable_integer_overflow() -> crate::Result<()> {
+        let connection = empty_version_five_connection()?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.execute_batch(
+            "DROP TRIGGER trg_scan_runs_initial_state_v5; \
+             DROP TRIGGER trg_scan_run_sessions_insert_guard_v5; \
+             DROP TRIGGER trg_media_observation_snapshots_insert_guard_v5; \
+             DROP TRIGGER trg_exact_group_builds_insert_guard_v5; \
+             DROP TRIGGER trg_exact_group_build_members_insert_guard_v5; \
+             DROP TRIGGER trg_exact_verification_edges_insert_guard_v5; \
+             INSERT INTO volumes ( \
+                 id, identity_key, identity_strength, marker_uuid, filesystem_type, \
+                 is_network, is_read_only, first_seen_at_ms, last_seen_at_ms, \
+                 created_at_ms, updated_at_ms \
+             ) VALUES (1, 'volume', 'strong', 'marker', 'apfs', 0, 1, 1, 1, 1, 1); \
+             INSERT INTO capability_profiles ( \
+                 id, volume_id, profile_hash, profile_hash_version, probe_mode, probe_status, \
+                 observed_at_ms, os_build, mount_session_key, probe_protocol_version, \
+                 path_encoding_family, path_semantics_version, can_read, is_current, created_at_ms \
+             ) VALUES ( \
+                 1, 1, zeroblob(32), 2, 'passive', 'complete', 1, 'test', \
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+                 1, 'unix', 1, 1, 1, 1 \
+             ); \
+             INSERT INTO scan_runs ( \
+                 id, run_key, volume_id, capability_profile_id, root_relative_path, \
+                 root_path_key, scan_mode, state, started_at_ms, created_at_ms, updated_at_ms \
+             ) VALUES (1, 'run', 1, 1, '', zeroblob(32), 'full', 'running', 1, 1, 1); \
+             INSERT INTO scan_run_sessions ( \
+                 scan_run_id, scan_job_id, volume_id, capability_profile_id, \
+                 namespace_profile_id, mount_session_key, mount_relative_root_raw, \
+                 path_encoding, stable_root_path_key, root_scope_key, \
+                 root_object_signature, created_at_ms \
+             ) VALUES ( \
+                 1, 1, 1, 1, 1, \
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+                 x'', 'utf8', zeroblob(32), \
+                 x'0101010101010101010101010101010101010101010101010101010101010101', \
+                 zeroblob(32), 1 \
+             ); \
+             INSERT INTO media_observation_snapshots ( \
+                 id, volume_id, scan_run_id, media_namespace_path_id, media_file_id, \
+                 namespace_profile_id, capability_profile_id, root_relative_path_raw, \
+                 path_encoding, display_path, source_signature, stat_signature_version, \
+                 file_object_key, file_mode, entry_type, size_bytes, modified_time_seconds, \
+                 modified_time_nanoseconds, changed_time_seconds, changed_time_nanoseconds, \
+                 timestamp_granularity_ns, observed_at_ms \
+             ) VALUES \
+                 (1, 1, 1, 1, 1, 1, 1, x'61', 'utf8', 'a', \
+                  x'1111111111111111111111111111111111111111111111111111111111111111', \
+                  1, x'2121212121212121212121212121212121212121212121212121212121212121', \
+                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1), \
+                 (2, 1, 1, 2, 2, 1, 1, x'62', 'utf8', 'b', \
+                  x'1212121212121212121212121212121212121212121212121212121212121212', \
+                  1, x'2222222222222222222222222222222222222222222222222222222222222222', \
+                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1), \
+                 (3, 1, 1, 3, 3, 1, 1, x'63', 'utf8', 'c', \
+                  x'1313131313131313131313131313131313131313131313131313131313131313', \
+                  1, x'2323232323232323232323232323232323232323232323232323232323232323', \
+                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1); \
+             INSERT INTO exact_group_builds ( \
+                 id, build_key, volume_id, scan_run_id, representative_observation_id, \
+                 representative_fingerprint_id, expected_member_count, expected_edge_count, \
+                 expected_manifest_digest, state, created_at_ms \
+             ) VALUES (1, zeroblob(32), 1, 1, 1, 1, 3, 2, zeroblob(32), 'draft', 1); \
+             INSERT INTO exact_group_build_members ( \
+                 exact_group_build_id, volume_id, scan_run_id, ordinal, \
+                 media_observation_snapshot_id, observation_fingerprint_id, sort_rank, \
+                 manifest_leaf, created_at_ms \
+             ) VALUES \
+                 (1, 1, 1, 0, 1, 1, 0, \
+                  x'3131313131313131313131313131313131313131313131313131313131313131', 1), \
+                 (1, 1, 1, 1, 2, 2, 1, \
+                  x'3232323232323232323232323232323232323232323232323232323232323232', 1), \
+                 (1, 1, 1, 2, 3, 3, 2, \
+                  x'3333333333333333333333333333333333333333333333333333333333333333', 1); \
+             INSERT INTO exact_verification_edges ( \
+                 exact_group_build_id, volume_id, scan_run_id, representative_observation_id, \
+                 representative_fingerprint_id, member_observation_id, member_fingerprint_id, \
+                 representative_source_signature, member_source_signature, compared_bytes, \
+                 verified_at_ms \
+             ) VALUES \
+                 (1, 1, 1, 1, 1, 2, 2, \
+                  x'1111111111111111111111111111111111111111111111111111111111111111', \
+                  x'1212121212121212121212121212121212121212121212121212121212121212', \
+                  9223372036854775807, 2), \
+                 (1, 1, 1, 1, 1, 3, 3, \
+                  x'1111111111111111111111111111111111111111111111111111111111111111', \
+                  x'1313131313131313131313131313131313131313131313131313131313131313', \
+                  9223372036854775807, 2);",
+        )?;
+
+        let error = connection
+            .execute(
+                "UPDATE exact_group_builds \
+                    SET state = 'verified', group_key = zeroblob(32), \
+                        independent_file_count = 3, \
+                        logical_reclaimable_bytes = 9223372036854775807, \
+                        finalized_at_ms = 2 \
+                  WHERE id = 1",
+                [],
+            )
+            .expect_err("overflowing reclaimable byte calculation was accepted");
+        assert!(error.to_string().contains("complete manifest and edge set"));
         Ok(())
     }
 
@@ -1284,7 +2287,9 @@ mod tests {
                 .expect_err("legacy profile started a scan");
             assert!(matches!(
                 start_error,
-                crate::StoreError::ConcurrencyConflict { .. }
+                crate::StoreError::LegacyEvidenceApiDisabled {
+                    api: "transition_scan_job_and_run"
+                }
             ));
         }
 
@@ -1306,7 +2311,9 @@ mod tests {
             .expect_err("legacy profile accepted a new root");
         assert!(matches!(
             root_error,
-            crate::StoreError::IdempotencyConflict { .. }
+            crate::StoreError::LegacyEvidenceApiDisabled {
+                api: "create_scan_job"
+            }
         ));
         Ok(())
     }
@@ -1358,6 +2365,27 @@ mod tests {
              ) VALUES (1, 1, 1, 1, 1); \
              UPDATE scan_jobs SET active_scan_run_id = 1 WHERE id = 1;",
         )?;
+        Ok(connection)
+    }
+
+    fn seeded_version_four_connection() -> crate::Result<Connection> {
+        let mut connection = seeded_version_two_connection()?;
+        apply_migration(&mut connection, &MIGRATIONS[2], 1_002, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[3], 1_003, false)?;
+        Ok(connection)
+    }
+
+    fn empty_version_five_connection() -> crate::Result<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        for (index, migration) in MIGRATIONS.iter().enumerate() {
+            apply_migration(
+                &mut connection,
+                migration,
+                1_000 + i64::try_from(index).expect("five migrations fit i64"),
+                index == 0,
+            )?;
+        }
         Ok(connection)
     }
 

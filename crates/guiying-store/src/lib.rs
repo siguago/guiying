@@ -13,10 +13,22 @@ mod store;
 
 pub use error::{Result, StoreError};
 pub use model::{
-    CapabilityProfileInput, IntegrityCheckKind, IntegrityReport, MediaFileInput, MediaFileRecord,
-    NewScanIssue, NewScanJob, NewScanReport, NewScanRun, Page, PathKey, ScanCheckpointInput,
-    ScanCheckpointRecord, ScanIssueRecord, ScanJobRecord, ScanReportRecord, ScanRunRecord,
-    StoreSettings, VolumeInput, MAX_PAGE_SIZE, MAX_SCAN_REPORT_JSON_BYTES,
+    BeginExactGroupInput, BuildKey, CandidateBucketRecord, CapabilityProfileInput,
+    DuplicateGroupCursor, DuplicateGroupMemberCursor, DuplicateGroupMemberRecord,
+    ExactDigestBucketCursor, ExactGroupKey, ExactGroupManifestMember, ExactGroupMemberInput,
+    ExactVerificationEdgeInput, FileObjectKey, FileTimestampParts, FingerprintBucketRecord,
+    FingerprintHintRecord, FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind,
+    IntegrityCheckKind, IntegrityReport, KeysetPage, ManifestDigest, MediaFileInput,
+    MediaFileRecord, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun,
+    NewScanIssue, NewScanJob, NewScanReport, NewScanRun, NewScopedScanJob, ObservationCursor,
+    ObservationInput, ObservationRecord, Page, ParametersHash, PathKey, RootObjectSignature,
+    RootScopeKey, RunEvidenceGuard, SampleBucketCursor, ScanCheckpointInput, ScanCheckpointRecord,
+    ScanIssueCursor, ScanIssueRecord, ScanJobRecord, ScanReportRecord, ScanRunRecord, ScanStage,
+    SizeBucketCursor, SizeMemberCursor, SourceSignature, StablePathKey, StoreSettings,
+    VerifiedExactGroup, VolumeInput, MAX_PAGE_SIZE, MAX_SCAN_REPORT_JSON_BYTES,
 };
-pub use repository::{compute_capability_profile_hash, RepositoryTx};
+pub use repository::{
+    compute_capability_profile_hash, compute_exact_group_manifest, compute_exact_group_member_leaf,
+    RepositoryTx,
+};
 pub use store::Store;

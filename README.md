@@ -13,10 +13,12 @@
 
 仓库还包含尚未接入桌面主链的四个安全基础层：有界 EXIF / QuickTime 原始证据提取、
 显式 floating/offset 时间规范化与冲突策略、macOS descriptor-bound 卷/路径证据，以及
-fail-closed SQLite 持久化。它们都没有照片写入 API，也不会把缓存、未二次提取的时间或
-旧挂载会话提升为行动授权。下一阶段会按[持久化只读运行时方案](docs/engineering/PHASE1_RUNTIME.md)
-把这些基础层接成可分页、可暂停、可恢复的真实扫描主链；M2 才会另行实现并故障注入
-验证同卷隔离与恢复事务。
+session-bound v5 SQLite 持久化证据。持久化层已经具备不可变观察、阶段封印、精确组
+草稿/定案、有界分页和重启失效恢复，但调用方上报的读取字段在接入 descriptor-bound
+扫描适配器前仍不是可信 I/O 证明。上述基础层都没有照片写入 API，也不会把缓存、未二次
+提取的时间或旧挂载会话提升为行动授权。下一阶段会按
+[持久化只读运行时方案](docs/engineering/PHASE1_RUNTIME.md)把它们接成可分页、可暂停、可恢复的
+真实扫描主链；M2 才会另行实现并故障注入验证同卷隔离与恢复事务。
 
 设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、
 [扫描任务协议](docs/engineering/SCAN_JOBS.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、

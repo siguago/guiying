@@ -20,9 +20,14 @@ use tempfile::NamedTempFile;
 use crate::error::{Result, StoreError};
 use crate::migrations;
 use crate::model::{
-    ForeignKeyViolation, IntegrityCheckKind, IntegrityReport, MediaFileRecord, Page,
-    ScanCheckpointRecord, ScanIssueRecord, ScanJobRecord, ScanReportRecord, ScanRunRecord,
-    StoreSettings, MAX_PAGE_SIZE,
+    CandidateBucketRecord, DuplicateGroupCursor, DuplicateGroupMemberCursor,
+    DuplicateGroupMemberRecord, ExactDigestBucketCursor, ExactGroupKey, FileTimestampParts,
+    FingerprintBucketRecord, FingerprintHintRecord, ForeignKeyViolation, FreshFingerprintKind,
+    IntegrityCheckKind, IntegrityReport, KeysetPage, ManifestDigest, MediaFileRecord,
+    ObservationCursor, ObservationRecord, Page, ParametersHash, SampleBucketCursor,
+    ScanCheckpointRecord, ScanIssueCursor, ScanIssueRecord, ScanJobRecord, ScanReportRecord,
+    ScanRunRecord, SizeBucketCursor, SizeMemberCursor, StoreSettings, VerifiedExactGroup,
+    MAX_PAGE_SIZE,
 };
 use crate::repository::RepositoryTx;
 
@@ -35,6 +40,7 @@ const SQLITE_MAX_COLUMNS: i32 = 512;
 const SQLITE_MAX_VARIABLES: i32 = 2_048;
 const SQLITE_MAX_TRIGGER_DEPTH: i32 = 64;
 const MAX_INTEGRITY_MESSAGES: usize = 1_024;
+const KEYSET_CURSOR_VERSION: i64 = 1;
 
 /// A single configured connection to Guiying's local application database.
 ///
@@ -72,6 +78,15 @@ impl Store {
 
     pub fn settings(&self) -> &StoreSettings {
         &self.settings
+    }
+
+    fn consistent_read<T>(&self, callback: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.verify_bound_database()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let value = callback(&transaction)?;
+        transaction.commit()?;
+        self.verify_bound_database()?;
+        Ok(value)
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -273,12 +288,666 @@ impl Store {
         after_id: Option<i64>,
         limit: u32,
     ) -> Result<Page<ScanIssueRecord>> {
+        let cursor = after_id.map(|last_issue_id| ScanIssueCursor {
+            cursor_version: KEYSET_CURSOR_VERSION,
+            scan_run_id,
+            last_issue_id,
+        });
+        let page = self.list_scan_issues_page(scan_run_id, cursor.as_ref(), limit)?;
+        Ok(Page {
+            items: page.items,
+            next_cursor: page.next_cursor.map(|cursor| cursor.last_issue_id),
+        })
+    }
+
+    /// Lists immutable v5 observations for one run using a run-bound cursor.
+    pub fn list_observations_page(
+        &self,
+        scan_run_id: i64,
+        cursor: Option<&ObservationCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<ObservationRecord, ObservationCursor>> {
         validate_positive_read_id("scan_run_id", scan_run_id)?;
-        self.verify_bound_database()?;
-        let (after_id, fetch_limit) = validated_page(after_id, limit)?;
-        let page_bytes = self.connection.query_row(
-            "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
-                 SELECT length(CAST(issue_key AS BLOB)) \
+        let after_id = validate_observation_cursor(scan_run_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            let items = query_observations_page(
+                connection,
+                scan_run_id,
+                None,
+                after_id,
+                fetch_limit,
+                "observation page",
+            )?;
+            keyset_page_from_items(items, limit, |record| ObservationCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                last_observation_id: record.id,
+            })
+        })
+    }
+
+    /// Lists sizes having at least two current-run observations.
+    ///
+    /// Enumeration must be sealed first so an incomplete walk cannot be
+    /// mistaken for a complete candidate set.
+    pub fn list_size_candidate_buckets_page(
+        &self,
+        scan_run_id: i64,
+        cursor: Option<&SizeBucketCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<CandidateBucketRecord, SizeBucketCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        let after_size = validate_size_bucket_cursor(scan_run_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_stage_sealed(connection, scan_run_id, "enumeration")?;
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+                     SELECT 256 AS row_bytes \
+                     FROM media_observation_snapshots \
+                     WHERE scan_run_id = ?1 AND (?2 IS NULL OR size_bytes > ?2) \
+                     GROUP BY size_bytes HAVING count(*) >= 2 \
+                     ORDER BY size_bytes LIMIT ?3 \
+                 )",
+                rusqlite::params![scan_run_id, after_size, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "size candidate bucket page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT size_bytes, count(*) \
+                 FROM media_observation_snapshots \
+                 WHERE scan_run_id = ?1 AND (?2 IS NULL OR size_bytes > ?2) \
+                 GROUP BY size_bytes HAVING count(*) >= 2 \
+                 ORDER BY size_bytes LIMIT ?3",
+            )?;
+            let items = statement
+                .query_map(
+                    rusqlite::params![scan_run_id, after_size, fetch_limit],
+                    |row| {
+                        Ok(CandidateBucketRecord {
+                            observed_size_bytes: row.get(0)?,
+                            member_count: row.get(1)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            keyset_page_from_items(items, limit, |record| SizeBucketCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                last_size_bytes: record.observed_size_bytes,
+            })
+        })
+    }
+
+    /// Lists the immutable observations in one sealed size bucket.
+    pub fn list_observations_for_size_page(
+        &self,
+        scan_run_id: i64,
+        size_bytes: i64,
+        cursor: Option<&SizeMemberCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<ObservationRecord, SizeMemberCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        if size_bytes < 0 {
+            return Err(StoreError::invalid_input(
+                "size_bytes",
+                "candidate size must be non-negative",
+            ));
+        }
+        let after_id = validate_size_member_cursor(scan_run_id, size_bytes, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_stage_sealed(connection, scan_run_id, "enumeration")?;
+            let items = query_observations_page(
+                connection,
+                scan_run_id,
+                Some(size_bytes),
+                after_id,
+                fetch_limit,
+                "size candidate member page",
+            )?;
+            keyset_page_from_items(items, limit, |record| SizeMemberCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                size_bytes,
+                last_observation_id: record.id,
+            })
+        })
+    }
+
+    /// Lists sealed sampling buckets without mixing algorithms or parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_sample_candidate_buckets_page(
+        &self,
+        scan_run_id: i64,
+        algorithm: &str,
+        algorithm_version: i64,
+        parameters_hash: &ParametersHash,
+        cursor: Option<&SampleBucketCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<FingerprintBucketRecord, SampleBucketCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_fingerprint_query(algorithm, algorithm_version)?;
+        let after = validate_sample_bucket_cursor(
+            scan_run_id,
+            algorithm,
+            algorithm_version,
+            parameters_hash,
+            cursor,
+        )?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_stage_sealed(connection, scan_run_id, "sampling")?;
+            let items = query_fingerprint_buckets_page(
+                connection,
+                scan_run_id,
+                FreshFingerprintKind::Sample,
+                algorithm,
+                algorithm_version,
+                parameters_hash,
+                after.as_ref().map(|value| (value.0, value.1.as_slice())),
+                fetch_limit,
+                "sample candidate bucket page",
+            )?;
+            keyset_page_from_items(items, limit, |record| SampleBucketCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                fingerprint_kind: FreshFingerprintKind::Sample,
+                algorithm: algorithm.to_owned(),
+                algorithm_version,
+                parameters_hash: *parameters_hash,
+                last_digest: record.digest.clone(),
+                last_observed_size_bytes: record.observed_size_bytes,
+            })
+        })
+    }
+
+    /// Lists sealed full-hash buckets without treating a cached hint as fresh.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_exact_digest_buckets_page(
+        &self,
+        scan_run_id: i64,
+        algorithm: &str,
+        algorithm_version: i64,
+        parameters_hash: &ParametersHash,
+        cursor: Option<&ExactDigestBucketCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<FingerprintBucketRecord, ExactDigestBucketCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_fingerprint_query(algorithm, algorithm_version)?;
+        let after = validate_exact_digest_bucket_cursor(
+            scan_run_id,
+            algorithm,
+            algorithm_version,
+            parameters_hash,
+            cursor,
+        )?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_stage_sealed(connection, scan_run_id, "full_hash")?;
+            let items = query_fingerprint_buckets_page(
+                connection,
+                scan_run_id,
+                FreshFingerprintKind::ExactBytes,
+                algorithm,
+                algorithm_version,
+                parameters_hash,
+                after.as_ref().map(|value| (value.0, value.1.as_slice())),
+                fetch_limit,
+                "exact digest bucket page",
+            )?;
+            keyset_page_from_items(items, limit, |record| ExactDigestBucketCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                fingerprint_kind: FreshFingerprintKind::ExactBytes,
+                algorithm: algorithm.to_owned(),
+                algorithm_version,
+                parameters_hash: *parameters_hash,
+                last_digest: record.digest.clone(),
+                last_observed_size_bytes: record.observed_size_bytes,
+            })
+        })
+    }
+
+    /// Returns a historical v5 exact fingerprint only as a provisional hint.
+    ///
+    /// Missing or mismatched reuse evidence is deliberately indistinguishable
+    /// from a cache miss. This method never copies evidence into the current
+    /// run and never consults the legacy v4 `fingerprints` table.
+    pub fn find_fingerprint_hint(
+        &self,
+        scan_run_id: i64,
+        current_observation_id: i64,
+        algorithm: &str,
+        algorithm_version: i64,
+        parameters_hash: &ParametersHash,
+    ) -> Result<Option<FingerprintHintRecord>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("current_observation_id", current_observation_id)?;
+        validate_fingerprint_query(algorithm, algorithm_version)?;
+        self.consistent_read(|connection| {
+            let raw = connection
+                .query_row(
+                    "SELECT fingerprint.id, fingerprint.scan_run_id, \
+                            fingerprint.media_observation_snapshot_id, \
+                            fingerprint.algorithm, fingerprint.algorithm_version, \
+                            fingerprint.parameters_hash, fingerprint.digest, \
+                            fingerprint.observed_size_bytes, historical.source_signature, \
+                            fingerprint.completed_at_ms \
+                     FROM media_observation_snapshots AS current \
+                     JOIN media_namespace_paths AS current_path \
+                       ON current_path.volume_id = current.volume_id \
+                      AND current_path.id = current.media_namespace_path_id \
+                      AND current_path.media_file_id = current.media_file_id \
+                      AND current_path.namespace_profile_id = current.namespace_profile_id \
+                     JOIN scan_run_sessions AS current_session \
+                       ON current_session.volume_id = current.volume_id \
+                      AND current_session.scan_run_id = current.scan_run_id \
+                      AND current_session.capability_profile_id = current.capability_profile_id \
+                      AND current_session.namespace_profile_id = current.namespace_profile_id \
+                     JOIN namespace_profiles AS namespace \
+                       ON namespace.volume_id = current.volume_id \
+                      AND namespace.id = current.namespace_profile_id \
+                     JOIN volumes AS volume ON volume.id = current.volume_id \
+                     JOIN capability_profiles AS current_capability \
+                       ON current_capability.volume_id = current.volume_id \
+                      AND current_capability.id = current.capability_profile_id \
+                     JOIN media_namespace_paths AS historical_path \
+                       ON historical_path.volume_id = current.volume_id \
+                      AND historical_path.namespace_profile_id = current.namespace_profile_id \
+                      AND historical_path.stable_path_key = current_path.stable_path_key \
+                      AND historical_path.mount_relative_path_raw = \
+                          current_path.mount_relative_path_raw \
+                      AND historical_path.path_encoding = current_path.path_encoding \
+                     JOIN media_observation_snapshots AS historical \
+                       ON historical.volume_id = current.volume_id \
+                      AND historical.namespace_profile_id = current.namespace_profile_id \
+                      AND historical.media_namespace_path_id = historical_path.id \
+                      AND historical.scan_run_id <> current.scan_run_id \
+                     JOIN scan_run_sessions AS historical_session \
+                       ON historical_session.volume_id = historical.volume_id \
+                      AND historical_session.scan_run_id = historical.scan_run_id \
+                      AND historical_session.capability_profile_id = \
+                          historical.capability_profile_id \
+                      AND historical_session.namespace_profile_id = \
+                          historical.namespace_profile_id \
+                     JOIN capability_profiles AS historical_capability \
+                       ON historical_capability.volume_id = historical.volume_id \
+                      AND historical_capability.id = historical.capability_profile_id \
+                     JOIN observation_fingerprints AS fingerprint \
+                       ON fingerprint.volume_id = historical.volume_id \
+                      AND fingerprint.scan_run_id = historical.scan_run_id \
+                      AND fingerprint.media_observation_snapshot_id = historical.id \
+                     WHERE current.scan_run_id = ?1 AND current.id = ?2 \
+                       AND volume.identity_strength = 'strong' \
+                       AND namespace.origin = 'observed_v5' \
+                       AND namespace.reuse_scope = 'cross_session' \
+                       AND current_capability.profile_hash_version = 2 \
+                       AND current_capability.is_current = 1 \
+                       AND current_capability.probe_status = 'complete' \
+                       AND current_capability.can_read = 1 \
+                       AND current_capability.has_persistent_file_ids = 1 \
+                       AND current_capability.timestamp_granularity_ns IS NOT NULL \
+                       AND current_capability.timestamp_granularity_ns = \
+                           current.timestamp_granularity_ns \
+                       AND current_capability.mount_session_key = \
+                           current_session.mount_session_key \
+                       AND historical_capability.profile_hash_version = 2 \
+                       AND historical_capability.probe_status = 'complete' \
+                       AND historical_capability.can_read = 1 \
+                       AND historical_capability.has_persistent_file_ids = 1 \
+                       AND historical_capability.timestamp_granularity_ns IS NOT NULL \
+                       AND historical_capability.timestamp_granularity_ns = \
+                           historical.timestamp_granularity_ns \
+                       AND historical_capability.mount_session_key = \
+                           historical_session.mount_session_key \
+                       AND historical_session.stable_root_path_key = \
+                           current_session.stable_root_path_key \
+                       AND historical_session.root_scope_key = current_session.root_scope_key \
+                       AND historical_session.mount_relative_root_raw = \
+                           current_session.mount_relative_root_raw \
+                       AND historical_session.path_encoding = current_session.path_encoding \
+                       AND historical.root_relative_path_raw = current.root_relative_path_raw \
+                       AND historical.path_encoding = current.path_encoding \
+                       AND current.native_file_id IS NOT NULL \
+                       AND current.native_file_generation IS NOT NULL \
+                       AND historical.native_file_id = current.native_file_id \
+                       AND historical.native_file_generation = current.native_file_generation \
+                       AND historical.file_mode = current.file_mode \
+                       AND historical.size_bytes = current.size_bytes \
+                       AND historical.modified_time_seconds = current.modified_time_seconds \
+                       AND historical.modified_time_nanoseconds = \
+                           current.modified_time_nanoseconds \
+                       AND historical.changed_time_seconds = current.changed_time_seconds \
+                       AND historical.changed_time_nanoseconds = \
+                           current.changed_time_nanoseconds \
+                       AND historical.timestamp_granularity_ns = \
+                           current.timestamp_granularity_ns \
+                       AND fingerprint.fingerprint_kind = 'exact_bytes' \
+                       AND fingerprint.algorithm = ?3 \
+                       AND fingerprint.algorithm_version = ?4 \
+                       AND fingerprint.parameters_hash = ?5 \
+                       AND fingerprint.source_signature_before = \
+                           historical.source_signature \
+                       AND fingerprint.source_signature_after = historical.source_signature \
+                       AND fingerprint.observed_size_bytes = historical.size_bytes \
+                       AND fingerprint.bytes_read = historical.size_bytes \
+                       AND fingerprint.reached_expected_eof = 1 \
+                     ORDER BY fingerprint.completed_at_ms DESC, fingerprint.id DESC LIMIT 1",
+                    rusqlite::params![
+                        scan_run_id,
+                        current_observation_id,
+                        algorithm,
+                        algorithm_version,
+                        parameters_hash.as_bytes().as_slice(),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                            row.get::<_, i64>(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            raw.map(
+                |(
+                    fingerprint_id,
+                    historical_run_id,
+                    observation_id,
+                    algorithm,
+                    algorithm_version,
+                    stored_parameters_hash,
+                    digest,
+                    observed_size_bytes,
+                    source_signature,
+                    completed_at_ms,
+                )| {
+                    Ok(FingerprintHintRecord {
+                        fingerprint_id,
+                        scan_run_id: historical_run_id,
+                        observation_id,
+                        algorithm,
+                        algorithm_version,
+                        parameters_hash: ParametersHash::from_runtime_evidence(fixed_32_bytes(
+                            "parameters_hash",
+                            stored_parameters_hash,
+                        )?),
+                        digest,
+                        observed_size_bytes,
+                        source_signature,
+                        completed_at_ms,
+                    })
+                },
+            )
+            .transpose()
+        })
+    }
+
+    /// Lists only fully verified exact-byte groups.
+    pub fn list_duplicate_groups_page(
+        &self,
+        scan_run_id: i64,
+        cursor: Option<&DuplicateGroupCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<VerifiedExactGroup, DuplicateGroupCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        let after = validate_duplicate_group_cursor(scan_run_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_stage_sealed(connection, scan_run_id, "exact_verification")?;
+            let (after_reclaimable, after_id) = after.unzip();
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+                     SELECT 1024 + length(group_key) \
+                                 + length(expected_manifest_digest) AS row_bytes \
+                     FROM exact_group_builds \
+                     WHERE scan_run_id = ?1 AND state = 'verified' \
+                       AND ( \
+                           ?2 IS NULL \
+                           OR logical_reclaimable_bytes < ?2 \
+                           OR (logical_reclaimable_bytes = ?2 AND id > ?3) \
+                       ) \
+                     ORDER BY logical_reclaimable_bytes DESC, id LIMIT ?4 \
+                 )",
+                rusqlite::params![scan_run_id, after_reclaimable, after_id, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "verified duplicate group page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT id, group_key, expected_member_count, expected_edge_count, \
+                        independent_file_count, logical_reclaimable_bytes, \
+                        expected_manifest_digest, finalized_at_ms \
+                 FROM exact_group_builds \
+                 WHERE scan_run_id = ?1 AND state = 'verified' \
+                   AND ( \
+                       ?2 IS NULL \
+                       OR logical_reclaimable_bytes < ?2 \
+                       OR (logical_reclaimable_bytes = ?2 AND id > ?3) \
+                   ) \
+                 ORDER BY logical_reclaimable_bytes DESC, id LIMIT ?4",
+            )?;
+            let raw_items = statement
+                .query_map(
+                    rusqlite::params![scan_run_id, after_reclaimable, after_id, fetch_limit],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, i64>(7)?,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let items = raw_items
+                .into_iter()
+                .map(
+                    |(
+                        build_id,
+                        group_key,
+                        member_count,
+                        edge_count,
+                        independent_file_count,
+                        logical_reclaimable_bytes,
+                        manifest_digest,
+                        finalized_at_ms,
+                    )| {
+                        Ok(VerifiedExactGroup {
+                            build_id,
+                            group_key: ExactGroupKey::from_runtime_evidence(fixed_32_bytes(
+                                "group_key",
+                                group_key,
+                            )?),
+                            member_count,
+                            edge_count,
+                            independent_file_count,
+                            logical_reclaimable_bytes,
+                            manifest_digest: ManifestDigest::from_runtime_evidence(fixed_32_bytes(
+                                "expected_manifest_digest",
+                                manifest_digest,
+                            )?),
+                            finalized_at_ms,
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?;
+            keyset_page_from_items(items, limit, |record| DuplicateGroupCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                last_logical_reclaimable_bytes: record.logical_reclaimable_bytes,
+                last_group_build_id: record.build_id,
+            })
+        })
+    }
+
+    /// Lists members only when their group build reached `verified`.
+    pub fn list_duplicate_group_members_page(
+        &self,
+        scan_run_id: i64,
+        group_build_id: i64,
+        cursor: Option<&DuplicateGroupMemberCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<DuplicateGroupMemberRecord, DuplicateGroupMemberCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("group_build_id", group_build_id)?;
+        let after = validate_duplicate_group_member_cursor(scan_run_id, group_build_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_stage_sealed(connection, scan_run_id, "exact_verification")?;
+            let (after_rank, after_ordinal) = after.unzip();
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+                     SELECT 2048 + length(namespace_path.stable_path_key) \
+                                 + length(namespace_path.mount_relative_path_raw) \
+                                 + length(observation.root_relative_path_raw) \
+                                 + length(CAST(observation.path_encoding AS BLOB)) \
+                                 + length(CAST(observation.display_path AS BLOB)) \
+                                 + length(observation.source_signature) \
+                                 + COALESCE(length(observation.file_object_key), 0) AS row_bytes \
+                     FROM exact_group_build_members AS member \
+                     JOIN exact_group_builds AS build \
+                       ON build.volume_id = member.volume_id \
+                      AND build.scan_run_id = member.scan_run_id \
+                      AND build.id = member.exact_group_build_id \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.volume_id = member.volume_id \
+                      AND observation.scan_run_id = member.scan_run_id \
+                      AND observation.id = member.media_observation_snapshot_id \
+                     JOIN media_namespace_paths AS namespace_path \
+                       ON namespace_path.volume_id = observation.volume_id \
+                      AND namespace_path.id = observation.media_namespace_path_id \
+                      AND namespace_path.media_file_id = observation.media_file_id \
+                      AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+                     WHERE member.scan_run_id = ?1 \
+                       AND member.exact_group_build_id = ?2 \
+                       AND build.state = 'verified' \
+                       AND ( \
+                           ?3 IS NULL \
+                           OR member.sort_rank > ?3 \
+                           OR (member.sort_rank = ?3 AND member.ordinal > ?4) \
+                       ) \
+                     ORDER BY member.sort_rank, member.ordinal LIMIT ?5 \
+                 )",
+                rusqlite::params![
+                    scan_run_id,
+                    group_build_id,
+                    after_rank,
+                    after_ordinal,
+                    fetch_limit,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "verified duplicate group member page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT member.exact_group_build_id, member.ordinal, \
+                        member.media_observation_snapshot_id, \
+                        member.observation_fingerprint_id, member.sort_rank, \
+                        namespace_path.stable_path_key, \
+                        namespace_path.mount_relative_path_raw, \
+                        observation.root_relative_path_raw, observation.path_encoding, \
+                        observation.display_path, observation.source_signature, \
+                        observation.size_bytes, observation.file_object_key \
+                 FROM exact_group_build_members AS member \
+                 JOIN exact_group_builds AS build \
+                   ON build.volume_id = member.volume_id \
+                  AND build.scan_run_id = member.scan_run_id \
+                  AND build.id = member.exact_group_build_id \
+                 JOIN media_observation_snapshots AS observation \
+                   ON observation.volume_id = member.volume_id \
+                  AND observation.scan_run_id = member.scan_run_id \
+                  AND observation.id = member.media_observation_snapshot_id \
+                 JOIN media_namespace_paths AS namespace_path \
+                   ON namespace_path.volume_id = observation.volume_id \
+                  AND namespace_path.id = observation.media_namespace_path_id \
+                  AND namespace_path.media_file_id = observation.media_file_id \
+                  AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+                 WHERE member.scan_run_id = ?1 \
+                   AND member.exact_group_build_id = ?2 \
+                   AND build.state = 'verified' \
+                   AND ( \
+                       ?3 IS NULL \
+                       OR member.sort_rank > ?3 \
+                       OR (member.sort_rank = ?3 AND member.ordinal > ?4) \
+                   ) \
+                 ORDER BY member.sort_rank, member.ordinal LIMIT ?5",
+            )?;
+            let items = statement
+                .query_map(
+                    rusqlite::params![
+                        scan_run_id,
+                        group_build_id,
+                        after_rank,
+                        after_ordinal,
+                        fetch_limit,
+                    ],
+                    |row| {
+                        Ok(DuplicateGroupMemberRecord {
+                            group_build_id: row.get(0)?,
+                            ordinal: row.get(1)?,
+                            observation_id: row.get(2)?,
+                            fingerprint_id: row.get(3)?,
+                            sort_rank: row.get(4)?,
+                            stable_path_key: row.get(5)?,
+                            mount_relative_path_raw: row.get(6)?,
+                            root_relative_path_raw: row.get(7)?,
+                            path_encoding: row.get(8)?,
+                            display_path: row.get(9)?,
+                            source_signature: row.get(10)?,
+                            size_bytes: row.get(11)?,
+                            file_object_key: row.get(12)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            keyset_page_from_items(items, limit, |record| DuplicateGroupMemberCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                group_build_id,
+                last_sort_rank: record.sort_rank,
+                last_ordinal: record.ordinal,
+            })
+        })
+    }
+
+    /// Lists issues using a cursor that cannot be reused for another run.
+    pub fn list_scan_issues_page(
+        &self,
+        scan_run_id: i64,
+        cursor: Option<&ScanIssueCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<ScanIssueRecord, ScanIssueCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        let after_id = validate_issue_cursor(scan_run_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+                 SELECT 512 + length(CAST(issue_key AS BLOB)) \
                       + length(CAST(severity AS BLOB)) \
                       + length(CAST(stage AS BLOB)) \
                       + length(CAST(code AS BLOB)) \
@@ -287,42 +956,43 @@ impl Store {
                  WHERE scan_run_id = ?1 AND id > ?2 \
                  ORDER BY id LIMIT ?3 \
              )",
-            rusqlite::params![scan_run_id, after_id, fetch_limit],
-            |row| row.get::<_, i64>(0),
-        )?;
-        enforce_read_budget("issue page", page_bytes, MAX_PAGE_RESULT_BYTES)?;
-        let mut statement = self.connection.prepare(
-            "SELECT id, issue_key, volume_id, scan_run_id, media_file_id, severity, stage, \
-                    code, message, occurred_at_ms, resolved_at_ms \
-             FROM scan_issues \
-             WHERE scan_run_id = ?1 AND id > ?2 \
-             ORDER BY id \
-             LIMIT ?3",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![scan_run_id, after_id, fetch_limit],
-            |row| {
-                Ok(ScanIssueRecord {
-                    id: row.get(0)?,
-                    issue_key: row.get(1)?,
-                    volume_id: row.get(2)?,
-                    scan_run_id: row.get(3)?,
-                    media_file_id: row.get(4)?,
-                    severity: row.get(5)?,
-                    stage: row.get(6)?,
-                    code: row.get(7)?,
-                    message: row.get(8)?,
-                    occurred_at_ms: row.get(9)?,
-                    resolved_at_ms: row.get(10)?,
-                })
-            },
-        )?;
-        let items = rows
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(StoreError::from)?;
-        let page = page_from_items(items, limit, |record| record.id)?;
-        self.verify_bound_database()?;
-        Ok(page)
+                rusqlite::params![scan_run_id, after_id, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget("issue page", page_bytes, MAX_PAGE_RESULT_BYTES)?;
+            let mut statement = connection.prepare(
+                "SELECT id, issue_key, volume_id, scan_run_id, media_file_id, severity, stage, \
+                        code, message, occurred_at_ms, resolved_at_ms \
+                 FROM scan_issues \
+                 WHERE scan_run_id = ?1 AND id > ?2 \
+                 ORDER BY id LIMIT ?3",
+            )?;
+            let items = statement
+                .query_map(
+                    rusqlite::params![scan_run_id, after_id, fetch_limit],
+                    |row| {
+                        Ok(ScanIssueRecord {
+                            id: row.get(0)?,
+                            issue_key: row.get(1)?,
+                            volume_id: row.get(2)?,
+                            scan_run_id: row.get(3)?,
+                            media_file_id: row.get(4)?,
+                            severity: row.get(5)?,
+                            stage: row.get(6)?,
+                            code: row.get(7)?,
+                            message: row.get(8)?,
+                            occurred_at_ms: row.get(9)?,
+                            resolved_at_ms: row.get(10)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            keyset_page_from_items(items, limit, |record| ScanIssueCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                last_issue_id: record.id,
+            })
+        })
     }
 
     pub fn list_active_scan_jobs_page(
@@ -556,6 +1226,7 @@ impl Store {
         verify_database_security(&resolved_path, &read_write_snapshot)?;
         let now_ms = current_time_ms()?;
         migrations::migrate(&mut connection, now_ms)?;
+        migrations::reconcile_stale_scan_sessions(&mut connection, now_ms)?;
         migrations::validate_current_schema(&connection)?;
         let verified_settings = read_and_verify_settings(&connection)?;
         if settings != verified_settings {
@@ -1475,6 +2146,576 @@ fn current_time_ms() -> Result<i64> {
     })
 }
 
+fn query_observations_page(
+    connection: &Connection,
+    scan_run_id: i64,
+    size_bytes: Option<i64>,
+    after_id: i64,
+    fetch_limit: i64,
+    budget_kind: &'static str,
+) -> Result<Vec<ObservationRecord>> {
+    let page_bytes = connection.query_row(
+        "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+             SELECT 2048 \
+                  + length(namespace_path.stable_path_key) \
+                  + length(namespace_path.mount_relative_path_raw) \
+                  + length(observation.root_relative_path_raw) \
+                  + length(CAST(observation.path_encoding AS BLOB)) \
+                  + length(CAST(observation.display_path AS BLOB)) \
+                  + length(observation.source_signature) \
+                  + COALESCE(length(observation.file_object_key), 0) \
+                  + COALESCE(length(observation.native_file_id), 0) AS row_bytes \
+             FROM media_observation_snapshots AS observation \
+             JOIN media_namespace_paths AS namespace_path \
+               ON namespace_path.volume_id = observation.volume_id \
+              AND namespace_path.id = observation.media_namespace_path_id \
+              AND namespace_path.media_file_id = observation.media_file_id \
+              AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+             WHERE observation.scan_run_id = ?1 \
+               AND observation.id > ?2 \
+               AND ( \
+                   ?3 IS NULL \
+                   OR ( \
+                       observation.size_bytes = ?3 \
+                       AND EXISTS ( \
+                           SELECT 1 FROM media_observation_snapshots AS candidate \
+                           WHERE candidate.scan_run_id = ?1 \
+                             AND candidate.size_bytes = ?3 \
+                           GROUP BY candidate.size_bytes HAVING count(*) >= 2 \
+                       ) \
+                   ) \
+               ) \
+             ORDER BY observation.id LIMIT ?4 \
+         )",
+        rusqlite::params![scan_run_id, after_id, size_bytes, fetch_limit],
+        |row| row.get::<_, i64>(0),
+    )?;
+    enforce_read_budget(budget_kind, page_bytes, MAX_PAGE_RESULT_BYTES)?;
+
+    let mut statement = connection.prepare(
+        "SELECT observation.id, observation.volume_id, observation.scan_run_id, \
+                observation.media_namespace_path_id, observation.media_file_id, \
+                observation.namespace_profile_id, observation.capability_profile_id, \
+                namespace_path.stable_path_key, namespace_path.mount_relative_path_raw, \
+                observation.root_relative_path_raw, observation.path_encoding, \
+                observation.display_path, observation.source_signature, \
+                observation.stat_signature_version, observation.file_object_key, \
+                observation.native_file_id, observation.native_file_generation, \
+                observation.file_mode, observation.size_bytes, observation.allocated_bytes, \
+                observation.link_count, observation.is_sparse, observation.may_share_content, \
+                observation.birth_time_seconds, observation.birth_time_nanoseconds, \
+                observation.modified_time_seconds, observation.modified_time_nanoseconds, \
+                observation.changed_time_seconds, observation.changed_time_nanoseconds, \
+                observation.accessed_time_seconds, observation.accessed_time_nanoseconds, \
+                observation.timestamp_granularity_ns, observation.observed_at_ms \
+         FROM media_observation_snapshots AS observation \
+         JOIN media_namespace_paths AS namespace_path \
+           ON namespace_path.volume_id = observation.volume_id \
+          AND namespace_path.id = observation.media_namespace_path_id \
+          AND namespace_path.media_file_id = observation.media_file_id \
+          AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+         WHERE observation.scan_run_id = ?1 \
+           AND observation.id > ?2 \
+           AND ( \
+               ?3 IS NULL \
+               OR ( \
+                   observation.size_bytes = ?3 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM media_observation_snapshots AS candidate \
+                       WHERE candidate.scan_run_id = ?1 \
+                         AND candidate.size_bytes = ?3 \
+                       GROUP BY candidate.size_bytes HAVING count(*) >= 2 \
+                   ) \
+               ) \
+           ) \
+         ORDER BY observation.id LIMIT ?4",
+    )?;
+    let items = statement
+        .query_map(
+            rusqlite::params![scan_run_id, after_id, size_bytes, fetch_limit],
+            observation_from_row,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StoreError::from)?;
+    Ok(items)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_fingerprint_buckets_page(
+    connection: &Connection,
+    scan_run_id: i64,
+    fingerprint_kind: FreshFingerprintKind,
+    algorithm: &str,
+    algorithm_version: i64,
+    parameters_hash: &ParametersHash,
+    after: Option<(i64, &[u8])>,
+    fetch_limit: i64,
+    budget_kind: &'static str,
+) -> Result<Vec<FingerprintBucketRecord>> {
+    let (after_size, after_digest) = after
+        .map(|(size, digest)| (Some(size), Some(digest)))
+        .unwrap_or((None, None));
+    let kind = fingerprint_kind.as_storage_str();
+    let page_bytes = connection.query_row(
+        "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+             SELECT 1024 + length(CAST(algorithm AS BLOB)) \
+                         + length(parameters_hash) + length(digest) AS row_bytes \
+             FROM observation_fingerprints \
+             WHERE scan_run_id = ?1 \
+               AND fingerprint_kind = ?2 \
+               AND (?2 <> 'exact_bytes' OR read_origin = 'full_hash_read') \
+               AND algorithm = ?3 \
+               AND algorithm_version = ?4 \
+               AND parameters_hash = ?5 \
+               AND ( \
+                   ?6 IS NULL \
+                   OR observed_size_bytes > ?6 \
+                   OR (observed_size_bytes = ?6 AND digest > ?7) \
+               ) \
+             GROUP BY observed_size_bytes, digest \
+             HAVING count(DISTINCT media_observation_snapshot_id) >= 2 \
+             ORDER BY observed_size_bytes, digest LIMIT ?8 \
+         )",
+        rusqlite::params![
+            scan_run_id,
+            kind,
+            algorithm,
+            algorithm_version,
+            parameters_hash.as_bytes().as_slice(),
+            after_size,
+            after_digest,
+            fetch_limit,
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    enforce_read_budget(budget_kind, page_bytes, MAX_PAGE_RESULT_BYTES)?;
+    let mut statement = connection.prepare(
+        "SELECT observed_size_bytes, digest, \
+                count(DISTINCT media_observation_snapshot_id) \
+         FROM observation_fingerprints \
+         WHERE scan_run_id = ?1 \
+           AND fingerprint_kind = ?2 \
+           AND (?2 <> 'exact_bytes' OR read_origin = 'full_hash_read') \
+           AND algorithm = ?3 \
+           AND algorithm_version = ?4 \
+           AND parameters_hash = ?5 \
+           AND ( \
+               ?6 IS NULL \
+               OR observed_size_bytes > ?6 \
+               OR (observed_size_bytes = ?6 AND digest > ?7) \
+           ) \
+         GROUP BY observed_size_bytes, digest \
+         HAVING count(DISTINCT media_observation_snapshot_id) >= 2 \
+         ORDER BY observed_size_bytes, digest LIMIT ?8",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            scan_run_id,
+            kind,
+            algorithm,
+            algorithm_version,
+            parameters_hash.as_bytes().as_slice(),
+            after_size,
+            after_digest,
+            fetch_limit,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(observed_size_bytes, digest, member_count)| {
+            Ok(FingerprintBucketRecord {
+                fingerprint_kind,
+                algorithm: algorithm.to_owned(),
+                algorithm_version,
+                parameters_hash: *parameters_hash,
+                observed_size_bytes,
+                digest,
+                member_count,
+            })
+        })
+        .collect()
+}
+
+fn observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservationRecord> {
+    Ok(ObservationRecord {
+        id: row.get(0)?,
+        volume_id: row.get(1)?,
+        scan_run_id: row.get(2)?,
+        media_namespace_path_id: row.get(3)?,
+        media_file_id: row.get(4)?,
+        namespace_profile_id: row.get(5)?,
+        capability_profile_id: row.get(6)?,
+        stable_path_key: row.get(7)?,
+        mount_relative_path_raw: row.get(8)?,
+        root_relative_path_raw: row.get(9)?,
+        path_encoding: row.get(10)?,
+        display_path: row.get(11)?,
+        source_signature: row.get(12)?,
+        stat_signature_version: row.get(13)?,
+        file_object_key: row.get(14)?,
+        native_file_id: row.get(15)?,
+        native_file_generation: row.get(16)?,
+        file_mode: row.get(17)?,
+        size_bytes: row.get(18)?,
+        allocated_bytes: row.get(19)?,
+        link_count: row.get(20)?,
+        is_sparse: optional_bool_from_row(row, 21)?,
+        may_share_content: optional_bool_from_row(row, 22)?,
+        birth_time: optional_timestamp_from_row(row, 23, 24)?,
+        modified_time: required_timestamp_from_row(row, 25, 26)?,
+        changed_time: required_timestamp_from_row(row, 27, 28)?,
+        accessed_time: optional_timestamp_from_row(row, 29, 30)?,
+        timestamp_granularity_ns: row.get(31)?,
+        observed_at_ms: row.get(32)?,
+    })
+}
+
+fn optional_bool_from_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<bool>> {
+    let value = row.get::<_, Option<i64>>(index)?;
+    match value {
+        None => Ok(None),
+        Some(0) => Ok(Some(false)),
+        Some(1) => Ok(Some(true)),
+        Some(value) => Err(rusqlite::Error::IntegralValueOutOfRange(index, value)),
+    }
+}
+
+fn optional_timestamp_from_row(
+    row: &rusqlite::Row<'_>,
+    seconds_index: usize,
+    nanoseconds_index: usize,
+) -> rusqlite::Result<Option<FileTimestampParts>> {
+    let seconds = row.get::<_, Option<i64>>(seconds_index)?;
+    let nanoseconds = row.get::<_, Option<i64>>(nanoseconds_index)?;
+    match (seconds, nanoseconds) {
+        (None, None) => Ok(None),
+        (Some(seconds), Some(nanoseconds)) => {
+            let nanoseconds = u32::try_from(nanoseconds).map_err(|_| {
+                rusqlite::Error::IntegralValueOutOfRange(nanoseconds_index, nanoseconds)
+            })?;
+            Ok(Some(FileTimestampParts {
+                seconds,
+                nanoseconds,
+            }))
+        }
+        (Some(_), None) | (None, Some(_)) => Err(rusqlite::Error::InvalidColumnType(
+            nanoseconds_index,
+            "timestamp_parts".to_owned(),
+            rusqlite::types::Type::Null,
+        )),
+    }
+}
+
+fn required_timestamp_from_row(
+    row: &rusqlite::Row<'_>,
+    seconds_index: usize,
+    nanoseconds_index: usize,
+) -> rusqlite::Result<FileTimestampParts> {
+    optional_timestamp_from_row(row, seconds_index, nanoseconds_index)?.ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
+            seconds_index,
+            "timestamp_parts".to_owned(),
+            rusqlite::types::Type::Null,
+        )
+    })
+}
+
+fn require_stage_sealed(
+    connection: &Connection,
+    scan_run_id: i64,
+    stage: &'static str,
+) -> Result<()> {
+    let sealed = connection.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_stage_seals \
+             WHERE scan_run_id = ?1 AND stage = ?2 \
+         )",
+        rusqlite::params![scan_run_id, stage],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !sealed {
+        return Err(StoreError::invalid_input(
+            "scan_stage",
+            format!("{stage} stage must be sealed before this candidate query"),
+        ));
+    }
+    Ok(())
+}
+
+fn validated_keyset_limit(limit: u32) -> Result<i64> {
+    validated_page(None, limit).map(|(_, fetch_limit)| fetch_limit)
+}
+
+fn validate_observation_cursor(
+    scan_run_id: i64,
+    cursor: Option<&ObservationCursor>,
+) -> Result<i64> {
+    match cursor {
+        None => Ok(0),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id => Err(StoreError::invalid_input(
+            "cursor",
+            "observation cursor belongs to a different scan run",
+        )),
+        Some(cursor) if cursor.last_observation_id <= 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "observation cursor id must be positive",
+        )),
+        Some(cursor) => Ok(cursor.last_observation_id),
+    }
+}
+
+fn validate_size_bucket_cursor(
+    scan_run_id: i64,
+    cursor: Option<&SizeBucketCursor>,
+) -> Result<Option<i64>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id => Err(StoreError::invalid_input(
+            "cursor",
+            "size-bucket cursor belongs to a different scan run",
+        )),
+        Some(cursor) if cursor.last_size_bytes < 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "size-bucket cursor size must be non-negative",
+        )),
+        Some(cursor) => Ok(Some(cursor.last_size_bytes)),
+    }
+}
+
+fn validate_size_member_cursor(
+    scan_run_id: i64,
+    size_bytes: i64,
+    cursor: Option<&SizeMemberCursor>,
+) -> Result<i64> {
+    match cursor {
+        None => Ok(0),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id || cursor.size_bytes != size_bytes => {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "size-member cursor belongs to a different run or size bucket",
+            ))
+        }
+        Some(cursor) if cursor.last_observation_id <= 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "size-member cursor id must be positive",
+        )),
+        Some(cursor) => Ok(cursor.last_observation_id),
+    }
+}
+
+fn validate_issue_cursor(scan_run_id: i64, cursor: Option<&ScanIssueCursor>) -> Result<i64> {
+    match cursor {
+        None => Ok(0),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id => Err(StoreError::invalid_input(
+            "cursor",
+            "issue cursor belongs to a different scan run",
+        )),
+        Some(cursor) if cursor.last_issue_id < 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "issue cursor id must be non-negative",
+        )),
+        Some(cursor) => Ok(cursor.last_issue_id),
+    }
+}
+
+fn validate_fingerprint_query(algorithm: &str, algorithm_version: i64) -> Result<()> {
+    validate_lookup_key("algorithm", algorithm)?;
+    if algorithm_version <= 0 {
+        return Err(StoreError::invalid_input(
+            "algorithm_version",
+            "fingerprint algorithm version must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sample_bucket_cursor(
+    scan_run_id: i64,
+    algorithm: &str,
+    algorithm_version: i64,
+    parameters_hash: &ParametersHash,
+    cursor: Option<&SampleBucketCursor>,
+) -> Result<Option<(i64, Vec<u8>)>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor)
+            if cursor.cursor_version != KEYSET_CURSOR_VERSION
+                || cursor.scan_run_id != scan_run_id
+                || cursor.fingerprint_kind != FreshFingerprintKind::Sample
+                || cursor.algorithm != algorithm
+                || cursor.algorithm_version != algorithm_version
+                || cursor.parameters_hash != *parameters_hash =>
+        {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "sample-bucket cursor belongs to a different fingerprint query",
+            ))
+        }
+        Some(cursor) => {
+            validate_fingerprint_cursor_key(cursor.last_observed_size_bytes, &cursor.last_digest)?;
+            Ok(Some((
+                cursor.last_observed_size_bytes,
+                cursor.last_digest.clone(),
+            )))
+        }
+    }
+}
+
+fn validate_exact_digest_bucket_cursor(
+    scan_run_id: i64,
+    algorithm: &str,
+    algorithm_version: i64,
+    parameters_hash: &ParametersHash,
+    cursor: Option<&ExactDigestBucketCursor>,
+) -> Result<Option<(i64, Vec<u8>)>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor)
+            if cursor.cursor_version != KEYSET_CURSOR_VERSION
+                || cursor.scan_run_id != scan_run_id
+                || cursor.fingerprint_kind != FreshFingerprintKind::ExactBytes
+                || cursor.algorithm != algorithm
+                || cursor.algorithm_version != algorithm_version
+                || cursor.parameters_hash != *parameters_hash =>
+        {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "exact-digest cursor belongs to a different fingerprint query",
+            ))
+        }
+        Some(cursor) => {
+            validate_fingerprint_cursor_key(cursor.last_observed_size_bytes, &cursor.last_digest)?;
+            Ok(Some((
+                cursor.last_observed_size_bytes,
+                cursor.last_digest.clone(),
+            )))
+        }
+    }
+}
+
+fn validate_fingerprint_cursor_key(size_bytes: i64, digest: &[u8]) -> Result<()> {
+    if size_bytes < 0 {
+        return Err(StoreError::invalid_input(
+            "cursor",
+            "fingerprint bucket size must be non-negative",
+        ));
+    }
+    if digest.is_empty() || digest.len() > 1_024 {
+        return Err(StoreError::invalid_input(
+            "cursor",
+            "fingerprint bucket digest must contain 1..=1024 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_duplicate_group_cursor(
+    scan_run_id: i64,
+    cursor: Option<&DuplicateGroupCursor>,
+) -> Result<Option<(i64, i64)>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id => Err(StoreError::invalid_input(
+            "cursor",
+            "duplicate-group cursor belongs to a different scan run",
+        )),
+        Some(cursor)
+            if cursor.last_logical_reclaimable_bytes < 0 || cursor.last_group_build_id <= 0 =>
+        {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "duplicate-group cursor contains an invalid key",
+            ))
+        }
+        Some(cursor) => Ok(Some((
+            cursor.last_logical_reclaimable_bytes,
+            cursor.last_group_build_id,
+        ))),
+    }
+}
+
+fn validate_duplicate_group_member_cursor(
+    scan_run_id: i64,
+    group_build_id: i64,
+    cursor: Option<&DuplicateGroupMemberCursor>,
+) -> Result<Option<(i64, i64)>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor)
+            if cursor.scan_run_id != scan_run_id || cursor.group_build_id != group_build_id =>
+        {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "group-member cursor belongs to a different run or group",
+            ))
+        }
+        Some(cursor) if cursor.last_sort_rank < 0 || cursor.last_ordinal < 0 => Err(
+            StoreError::invalid_input("cursor", "group-member cursor contains an invalid key"),
+        ),
+        Some(cursor) => Ok(Some((cursor.last_sort_rank, cursor.last_ordinal))),
+    }
+}
+
+fn unsupported_cursor_version(observed: i64) -> StoreError {
+    StoreError::invalid_input(
+        "cursor",
+        format!("unsupported cursor version {observed}; expected {KEYSET_CURSOR_VERSION}"),
+    )
+}
+
+fn fixed_32_bytes(field: &'static str, bytes: Vec<u8>) -> Result<[u8; 32]> {
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        StoreError::invalid_input(
+            field,
+            format!("stored evidence has {} bytes instead of 32", bytes.len()),
+        )
+    })
+}
+
+fn keyset_page_from_items<T, C>(
+    mut items: Vec<T>,
+    limit: u32,
+    cursor: impl Fn(&T) -> C,
+) -> Result<KeysetPage<T, C>> {
+    let limit = usize::try_from(limit)
+        .map_err(|_| StoreError::invalid_input("limit", "page size does not fit usize"))?;
+    let has_more = items.len() > limit;
+    if has_more {
+        items.truncate(limit);
+    }
+    let next_cursor = if has_more {
+        items.last().map(cursor)
+    } else {
+        None
+    };
+    Ok(KeysetPage { items, next_cursor })
+}
+
 fn scan_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRunRecord> {
     Ok(ScanRunRecord {
         id: row.get(0)?,
@@ -1561,10 +2802,14 @@ fn validate_positive_read_id(field: &'static str, value: i64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::{
-        capture_database_security, ensure_initialization_sidecars_absent,
-        initialize_database_with_hook, verify_database_security,
-        verify_initialization_temporary_identity, InitializationStage, Store,
+        capture_database_security, verify_database_security,
+        verify_initialization_temporary_identity,
+    };
+    use super::{
+        ensure_initialization_sidecars_absent, initialize_database_with_hook, InitializationStage,
+        Store,
     };
     use crate::StoreError;
     use tempfile::TempDir;

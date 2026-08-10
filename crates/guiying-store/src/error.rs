@@ -140,6 +140,11 @@ pub enum StoreError {
     #[error("write transaction was poisoned by a caught repository mutation error")]
     WriteTransactionPoisoned,
 
+    #[error(
+        "legacy evidence API {api} is disabled after schema v5; use the session-bound v5 repository API"
+    )]
+    LegacyEvidenceApiDisabled { api: &'static str },
+
     #[error("backup destination already exists: {0:?}")]
     BackupDestinationExists(PathBuf),
 

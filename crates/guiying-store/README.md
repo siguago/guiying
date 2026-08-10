@@ -76,27 +76,39 @@ Safety properties:
 - exact path bytes plus canonical `utf8`, `unix_bytes`, or
   `windows_utf16_le` encoding are persisted separately from display text, so
   non-UTF-8 Unix and WTF-16 Windows names are not lossy. Version 3 migrates the
-  earlier `windows_wtf16le` label without changing bytes. Version 4 also binds
-  job/run root bytes and every media-path observation to the exact capability
-  profile and path-semantics version that produced its semantic key. UTF-8 raw
-  bytes must exactly equal the display path;
+  earlier `windows_wtf16le` label without changing bytes. Version 5 separates
+  the stable volume namespace and job scope from each mount session. Every run
+  is bound to a current capability profile, a canonical 32-byte mount-session
+  key, the exact root bytes, and a root-object signature. Namespaces whose
+  behavior is safe only for the current session persist that same authenticated
+  mount key and cannot be reused by a later mount; cross-session namespaces
+  must not carry one. Each observation must
+  prove component-wise that its mount-relative path is the bound root followed
+  by its root-relative path. UTF-8 raw bytes must exactly equal display text;
 - `PathKey` is an opaque, bounded key accepted only through the filesystem
   adapter constructor. The store deliberately does not invent filesystem
   case/Unicode behavior: APFS, exFAT, NTFS, and SMB semantic key derivation is
-  the probed volume adapter's responsibility;
+  the probed volume adapter's responsibility. Version 5 evidence uses distinct
+  fixed-size types for namespace, stable-path, root-scope, source-signature,
+  parameter, build, manifest, and mount-session keys, preventing one key domain
+  from being substituted for another;
 - file, issue, and active-job reads use bounded keyset pages (`id > cursor`),
   never caller-controlled offsets or unbounded vectors. Page size is 1–256 and
   each returned page also has a 16 MiB aggregate byte budget. Checkpoint and
-  report reads inspect SQLite lengths before materializing their JSON payloads;
+  report reads inspect SQLite lengths before materializing their JSON payloads.
+  Version 5 observations, candidate buckets, exact fingerprints, verified
+  duplicate groups, and group members have endpoint-specific versioned keyset
+  cursors so a cursor cannot be silently reused with another query;
 - progress advances only for a `running` run, is monotonic, and always keeps
   `fingerprinted_count <= discovered_count`. Checkpoints use optimistic
   versions, a versioned/bounded cursor, the same volume/run binding, and must
   exactly match already-persisted progress counts;
-- job/run bindings require identical volume-relative root text, raw bytes,
-  encoding, semantic key, capability profile, and semantics version. Root and
-  binding evidence is immutable, active-run replacement is limited to a
-  failed/interrupted attempt, and impossible active job/run state combinations
-  are rejected by both the repository and schema triggers;
+- version 5 jobs are stable, capability-independent namespace/root scopes. Each
+  run adds immutable session evidence for its current capability and mount.
+  A later attempt is allowed only for a recoverable, strong, cross-session
+  namespace after the prior attempt is terminal; paused or running jobs cannot
+  be replaced. Impossible active job/run state combinations are rejected by
+  both the repository and schema triggers;
 - job and run state changes are one coordinated repository operation. Both
   rows use optimistic `state_version` compare-and-swap counters, the ordering
   is chosen to satisfy immediate SQLite guards, and an internal savepoint
@@ -104,13 +116,34 @@ Safety properties:
   evidence is required exactly for `failed` and `interrupted` runs. Every edge
   into `running` additionally compares the expected current capability profile
   and mount-session key and requires a complete, readable, canonical v2 probe;
-- version 4 creates immutable per-run media observations. A semantic path key
-  from one capability profile or semantics version can never overwrite the
-  current record created under another profile/version; the legacy
-  `media_files.path_key` slot is now an internal domain-separated storage key.
-  New observations are accepted only while that run is `running` and its
-  capability profile is still current, so paused and terminal evidence is
-  sealed;
+- version 5 is the only API for creating new scan evidence. The legacy public
+  mutators for job/run/file evidence, unguarded progress/checkpoints/issues,
+  unguarded state transitions, and monolithic scan reports return
+  `LegacyEvidenceApiDisabled` before writing. Version 4 rows remain historical
+  migration input only and are never eligible as version 5 fingerprints or
+  duplicate-group evidence. Version 5 progress, checkpoints, issues, immutable
+  observation snapshots, and fresh per-run fingerprints require the typed
+  capability/mount guard; batches contain at most 128 observations or
+  fingerprints. Enumeration, sampling, full-hash, and exact-verification seals
+  are ordered and immutable, and a run cannot become completed before the final
+  seal exists;
+- exact duplicate groups begin as drafts. The repository derives every member
+  leaf from current database evidence, requires a full verification edge for
+  each non-representative member, streams and recomputes the canonical manifest,
+  uses checked reclaim arithmetic, and atomically changes the draft to
+  `verified`. Read APIs expose verified groups only; no file operation is
+  performed by this crate;
+- the version 5 fingerprint and comparison DTOs are claims supplied by the
+  trusted in-process runtime adapter, not opaque proof that this crate performed
+  file I/O. This crate never opens media. These dormant APIs must not be exposed
+  directly over IPC or used to authorize a file operation; a bad adapter could
+  copy a historical hint back as if it had reread the source. Hints are only a
+  fail-closed optimization, and pinned volume/root/file handles plus core-owned
+  read proof remain a blocker for the execution phase;
+- every writable reopen reconciles any old nonterminal scan session to an
+  interrupted terminal state before new runtime work can resume. A worker from
+  the previous process therefore cannot continue progress, checkpoints, issues,
+  fingerprints, groups, or state transitions under a stale session guard;
 - full report JSON is capped at 16 MiB. Large per-file or per-group result sets
   belong in normalized paginated tables rather than one report blob;
 - all crate tests use `tempfile::TempDir` and never point at user media.
@@ -124,11 +157,10 @@ batch's current volume identity, canonical capability profile, and mount
 session with an execution-time re-probe.
 
 Keyset cursors provide a bounded continuation point, not a snapshot-isolation
-token. `list_files_page` is currently the latest-file projection selected by
-`media_files.last_seen_scan_run_id`; it is not a historical terminal-run export.
-The immutable observation rows preserve the normalized evidence, but a public
-paginated observation/export API remains an M2 deliverable. Until then, callers
-must not represent the current-view page API as a complete historical report.
+token. Version 5's run-bound observation and verified-group pages are the
+immutable evidence read surface. `list_files_page` remains a legacy latest-file
+projection selected by `media_files.last_seen_scan_run_id`; callers must not
+represent that projection as a complete historical terminal-run report.
 
 The pathname checks bind the database to the same regular-file identity across
 ordinary calls, but no portable `std`/SQLite API proves that an already-open

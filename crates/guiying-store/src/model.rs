@@ -46,6 +46,273 @@ impl PathKey {
     }
 }
 
+macro_rules! fixed_evidence_type {
+    ($name:ident, $constructor:ident, $description:literal) => {
+        #[doc = $description]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub struct $name([u8; 32]);
+
+        impl $name {
+            pub fn $constructor(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+
+            pub fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+
+            pub fn into_bytes(self) -> [u8; 32] {
+                self.0
+            }
+        }
+    };
+}
+
+fixed_evidence_type!(
+    NamespaceProfileKey,
+    from_volume_adapter,
+    "Stable identity of one probed filesystem namespace policy."
+);
+fixed_evidence_type!(
+    StablePathKey,
+    from_volume_adapter,
+    "Stable, filesystem-adapter-derived key for a mount-relative path."
+);
+fixed_evidence_type!(
+    RootScopeKey,
+    from_volume_adapter,
+    "Stable identity of a selected logical scan root."
+);
+fixed_evidence_type!(
+    RootObjectSignature,
+    from_volume_adapter,
+    "Current-session descriptor identity for the selected scan root."
+);
+fixed_evidence_type!(
+    SourceSignature,
+    from_runtime_evidence,
+    "Immutable signature of one current-session file observation."
+);
+fixed_evidence_type!(
+    ParametersHash,
+    from_runtime_evidence,
+    "Canonical hash of fingerprint algorithm parameters."
+);
+fixed_evidence_type!(
+    BuildKey,
+    from_runtime_evidence,
+    "Idempotency key for one exact duplicate-group build."
+);
+fixed_evidence_type!(
+    ExactGroupKey,
+    from_runtime_evidence,
+    "Canonical identity of one verified exact duplicate group."
+);
+fixed_evidence_type!(
+    ManifestDigest,
+    from_runtime_evidence,
+    "Canonical digest of an exact duplicate-group member manifest."
+);
+fixed_evidence_type!(
+    FileObjectKey,
+    from_runtime_evidence,
+    "Current observation's independently derived physical-file identity."
+);
+
+/// Authenticated mount generation emitted by the volume runtime.
+///
+/// SQLite stores this value as exactly 64 lowercase hexadecimal characters so
+/// it can be compared byte-for-byte with the value covered by the current
+/// capability-profile hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MountSessionKey([u8; 32]);
+
+impl MountSessionKey {
+    pub fn from_runtime_evidence(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_storage_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(64);
+        for byte in self.0 {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+}
+
+/// Capability/session proof required by every v5 run-scoped write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunEvidenceGuard {
+    pub scan_run_id: i64,
+    pub capability_profile_id: i64,
+    pub mount_session_key: MountSessionKey,
+}
+
+/// A page whose cursor is bound to one specific v5 endpoint and query scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeysetPage<T, C> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<C>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub last_observation_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeBucketCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub last_size_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeMemberCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub size_bytes: i64,
+    pub last_observation_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SampleBucketCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub fingerprint_kind: FreshFingerprintKind,
+    pub algorithm: String,
+    pub algorithm_version: i64,
+    pub parameters_hash: ParametersHash,
+    pub last_digest: Vec<u8>,
+    pub last_observed_size_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactDigestBucketCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub fingerprint_kind: FreshFingerprintKind,
+    pub algorithm: String,
+    pub algorithm_version: i64,
+    pub parameters_hash: ParametersHash,
+    pub last_digest: Vec<u8>,
+    pub last_observed_size_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateGroupCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub last_logical_reclaimable_bytes: i64,
+    pub last_group_build_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateGroupMemberCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub group_build_id: i64,
+    pub last_sort_rank: i64,
+    pub last_ordinal: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanIssueCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub last_issue_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationRecord {
+    pub id: i64,
+    pub volume_id: i64,
+    pub scan_run_id: i64,
+    pub media_namespace_path_id: i64,
+    pub media_file_id: i64,
+    pub namespace_profile_id: i64,
+    pub capability_profile_id: i64,
+    pub stable_path_key: Vec<u8>,
+    pub mount_relative_path_raw: Vec<u8>,
+    pub root_relative_path_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub display_path: String,
+    pub source_signature: Vec<u8>,
+    pub stat_signature_version: i64,
+    pub file_object_key: Option<Vec<u8>>,
+    pub native_file_id: Option<Vec<u8>>,
+    pub native_file_generation: Option<i64>,
+    pub file_mode: i64,
+    pub size_bytes: i64,
+    pub allocated_bytes: Option<i64>,
+    pub link_count: Option<i64>,
+    pub is_sparse: Option<bool>,
+    pub may_share_content: Option<bool>,
+    pub birth_time: Option<FileTimestampParts>,
+    pub modified_time: FileTimestampParts,
+    pub changed_time: FileTimestampParts,
+    pub accessed_time: Option<FileTimestampParts>,
+    pub timestamp_granularity_ns: i64,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateBucketRecord {
+    pub observed_size_bytes: i64,
+    pub member_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FingerprintBucketRecord {
+    pub fingerprint_kind: FreshFingerprintKind,
+    pub algorithm: String,
+    pub algorithm_version: i64,
+    pub parameters_hash: ParametersHash,
+    pub observed_size_bytes: i64,
+    pub digest: Vec<u8>,
+    pub member_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateGroupMemberRecord {
+    pub group_build_id: i64,
+    pub ordinal: i64,
+    pub observation_id: i64,
+    pub fingerprint_id: i64,
+    pub sort_rank: i64,
+    pub stable_path_key: Vec<u8>,
+    pub mount_relative_path_raw: Vec<u8>,
+    pub root_relative_path_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub display_path: String,
+    pub source_signature: Vec<u8>,
+    pub size_bytes: i64,
+    pub file_object_key: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FingerprintHintRecord {
+    pub fingerprint_id: i64,
+    pub scan_run_id: i64,
+    pub observation_id: i64,
+    pub algorithm: String,
+    pub algorithm_version: i64,
+    pub parameters_hash: ParametersHash,
+    pub digest: Vec<u8>,
+    pub observed_size_bytes: i64,
+    pub source_signature: Vec<u8>,
+    pub completed_at_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -161,6 +428,223 @@ pub struct CapabilityProfileInput {
     pub maximum_name_bytes: Option<i64>,
     pub maximum_file_bytes: Option<i64>,
     pub raw_capabilities: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NamespaceProfileInput {
+    pub volume_id: i64,
+    pub profile_key: NamespaceProfileKey,
+    pub profile_version: i64,
+    pub native_path_encoding: String,
+    pub case_behavior: String,
+    pub unicode_behavior: String,
+    pub key_strategy: String,
+    pub key_algorithm_version: i64,
+    pub reuse_scope: String,
+    pub bound_mount_session_key: Option<MountSessionKey>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewScopedScanJob {
+    pub job_key: String,
+    pub volume_id: i64,
+    pub namespace_profile_id: i64,
+    pub root_display: String,
+    pub mount_relative_root_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub stable_root_path_key: StablePathKey,
+    pub root_scope_key: RootScopeKey,
+    pub config: Option<Value>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewBoundScanRun {
+    pub run_key: String,
+    pub scan_job_id: i64,
+    pub volume_id: i64,
+    pub capability_profile_id: i64,
+    pub parent_scan_run_id: Option<i64>,
+    pub mount_session_key: MountSessionKey,
+    pub mount_relative_root_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub stable_root_path_key: StablePathKey,
+    pub root_scope_key: RootScopeKey,
+    pub root_object_signature: RootObjectSignature,
+    pub scan_mode: String,
+    pub config: Option<Value>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTimestampParts {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservationInput {
+    pub stable_path_key: StablePathKey,
+    pub mount_relative_path_raw: Vec<u8>,
+    pub root_relative_path_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub display_path: String,
+    pub entry_type: String,
+    pub media_kind: String,
+    pub mime_type: Option<String>,
+    pub file_extension: Option<String>,
+    pub source_signature: SourceSignature,
+    pub stat_signature_version: i64,
+    pub file_object_key: Option<FileObjectKey>,
+    pub native_file_id: Option<Vec<u8>>,
+    pub native_file_generation: Option<i64>,
+    pub file_mode: i64,
+    pub size_bytes: i64,
+    pub allocated_bytes: Option<i64>,
+    pub link_count: Option<i64>,
+    pub is_sparse: Option<bool>,
+    pub may_share_content: Option<bool>,
+    pub birth_time: Option<FileTimestampParts>,
+    pub modified_time: FileTimestampParts,
+    pub changed_time: FileTimestampParts,
+    pub accessed_time: Option<FileTimestampParts>,
+    pub timestamp_granularity_ns: i64,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScanStage {
+    Enumeration,
+    Sampling,
+    FullHash,
+    ExactVerification,
+}
+
+impl ScanStage {
+    pub(crate) fn as_storage_str(self) -> &'static str {
+        match self {
+            Self::Enumeration => "enumeration",
+            Self::Sampling => "sampling",
+            Self::FullHash => "full_hash",
+            Self::ExactVerification => "exact_verification",
+        }
+    }
+
+    pub(crate) fn prerequisite(self) -> Option<Self> {
+        match self {
+            Self::Enumeration => None,
+            Self::Sampling => Some(Self::Enumeration),
+            Self::FullHash => Some(Self::Sampling),
+            Self::ExactVerification => Some(Self::FullHash),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FreshFingerprintKind {
+    Sample,
+    ExactBytes,
+}
+
+impl FreshFingerprintKind {
+    pub(crate) fn as_storage_str(self) -> &'static str {
+        match self {
+            Self::Sample => "sample",
+            Self::ExactBytes => "exact_bytes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FingerprintReadOrigin {
+    SampleRead,
+    FullHashRead,
+    ExactCompareRead,
+}
+
+impl FingerprintReadOrigin {
+    pub(crate) fn as_storage_str(self) -> &'static str {
+        match self {
+            Self::SampleRead => "sample_read",
+            Self::FullHashRead => "full_hash_read",
+            Self::ExactCompareRead => "exact_compare_read",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FreshFingerprintInput {
+    pub observation_id: i64,
+    pub fingerprint_kind: FreshFingerprintKind,
+    pub algorithm: String,
+    pub algorithm_version: i64,
+    pub parameters_hash: ParametersHash,
+    pub read_origin: FingerprintReadOrigin,
+    pub source_signature_before: SourceSignature,
+    pub source_signature_after: SourceSignature,
+    pub digest: Vec<u8>,
+    pub observed_size_bytes: i64,
+    pub bytes_read: i64,
+    pub reached_expected_eof: bool,
+    pub completed_at_ms: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BeginExactGroupInput {
+    pub build_key: BuildKey,
+    pub representative_observation_id: i64,
+    pub representative_fingerprint_id: i64,
+    pub expected_member_count: i64,
+    pub expected_manifest_digest: ManifestDigest,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExactGroupMemberInput {
+    pub ordinal: i64,
+    pub observation_id: i64,
+    pub fingerprint_id: i64,
+    pub sort_rank: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExactVerificationEdgeInput {
+    pub member_observation_id: i64,
+    pub member_fingerprint_id: i64,
+    pub representative_source_signature: SourceSignature,
+    pub member_source_signature: SourceSignature,
+    pub compared_bytes: i64,
+    pub verified_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactGroupManifestMember {
+    pub ordinal: u64,
+    pub observation_id: u64,
+    pub fingerprint_id: u64,
+    pub sort_rank: u64,
+    pub stable_path_key: StablePathKey,
+    pub source_signature: SourceSignature,
+    pub size_bytes: u64,
+    pub algorithm: String,
+    pub algorithm_version: u32,
+    pub parameters_hash: ParametersHash,
+    pub digest: Vec<u8>,
+    pub file_object_key: Option<FileObjectKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedExactGroup {
+    pub build_id: i64,
+    pub group_key: ExactGroupKey,
+    pub member_count: i64,
+    pub edge_count: i64,
+    pub independent_file_count: i64,
+    pub logical_reclaimable_bytes: i64,
+    pub manifest_digest: ManifestDigest,
+    pub finalized_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
