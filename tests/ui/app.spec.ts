@@ -33,8 +33,12 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
 
   await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /IMG_4821\.HEIC/ })).toHaveAttribute('aria-pressed', 'true')
-  await expect(page.getByText('扫描逐字节一致')).toBeVisible()
+  await expect(page.getByText('D1 · 逐字节确认').first()).toBeVisible()
+  await expect(page.getByText('时间：高可信').first()).toBeVisible()
   await expect(page.getByText('不参与重复判定')).toBeVisible()
+  await expect(page.locator('code').filter({ hasText: '/Volumes/影像归档/已整理/2021/05/IMG_4821.HEIC' })).toBeVisible()
+  await expect(page.locator('code').filter({ hasText: '/Volumes/影像归档/iPhone 全量备份 2024/IMG_4821.HEIC' })).toBeVisible()
+  await expect(page.locator('code').filter({ hasText: '/Volumes/影像归档/手机照片 2025/IMG_4821 2.HEIC' })).toBeVisible()
   await expect(page.getByText(/这是合成数据演示/)).toBeVisible()
 
   const accessibility = await new AxeBuilder({ page }).analyze()

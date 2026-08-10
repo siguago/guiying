@@ -1020,6 +1020,27 @@
   text-align: right;
 }
 
+.group-row__proofs {
+  display: grid;
+  gap: 5px;
+  justify-items: start;
+}
+
+.content-proof {
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px;
+  color: var(--semantic-text-positive);
+  background: var(--semantic-surface-selected);
+  border: 1px solid color-mix(in srgb, var(--semantic-action-primary) 26%, transparent);
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
 .group-row__saving strong {
   font-family: var(--semantic-font-numeric);
   font-size: 11px;
@@ -1227,6 +1248,96 @@
   margin: 0;
 }
 
+.group-members {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.group-member {
+  min-width: 0;
+  padding: 10px;
+  background: var(--semantic-surface-canvas);
+  border: 1px solid var(--semantic-border-default);
+  border-radius: var(--semantic-radius-control);
+}
+
+.group-member--keeper {
+  background: var(--semantic-surface-selected);
+  border-color: color-mix(in srgb, var(--semantic-action-primary) 28%, var(--semantic-border-default));
+}
+
+.group-member__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.group-member__heading strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-member__heading span {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  color: var(--semantic-text-secondary);
+  font-size: 7px;
+  font-weight: 700;
+}
+
+.group-member--keeper .group-member__heading span {
+  color: var(--semantic-text-positive);
+}
+
+.group-member > code {
+  display: block;
+  margin-top: 5px;
+  overflow: hidden;
+  color: var(--semantic-text-secondary);
+  font-family: var(--semantic-font-numeric);
+  font-size: 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-member dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 10px;
+  margin: 9px 0 0;
+}
+
+.group-member dl div {
+  min-width: 0;
+}
+
+.group-member dt,
+.group-member dd {
+  overflow: hidden;
+  margin: 0;
+  font-size: 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-member dt {
+  color: var(--semantic-text-secondary);
+}
+
+.group-member dd {
+  margin-top: 2px;
+  font-family: var(--semantic-font-numeric);
+}
+
 .keeper-block strong {
   font-size: 10px;
 }
@@ -1397,7 +1508,7 @@
     grid-template-columns: 38px minmax(150px, 1fr) 76px 16px;
   }
 
-  .group-row > .confidence {
+  .group-row__proofs {
     display: none;
   }
 }

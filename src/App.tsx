@@ -317,7 +317,7 @@ function GroupRow({
   onSelect: () => void
 }) {
   const MediaIcon = group.mediaKind === 'video' ? Video : group.mediaKind === 'asset' ? Layers3 : ImageIcon
-  const highestConfidence = group.evidence[0]?.confidence ?? 'low'
+  const timeConfidence = group.evidence[0]?.confidence ?? 'low'
 
   return (
     <button
@@ -331,8 +331,11 @@ function GroupRow({
         <strong>{group.files[0]?.name ?? '未命名媒体'}</strong>
         <small>{group.format} · {group.dimensions ?? '尺寸未知'} · {group.files.length} 份</small>
       </span>
-      <span className={`confidence confidence--${highestConfidence}`}>
-        {confidenceLabel(highestConfidence)}
+      <span className="group-row__proofs">
+        <span className="content-proof"><CheckCircle2 aria-hidden="true" size={12} /> D1 · 逐字节确认</span>
+        <span className={`confidence confidence--${timeConfidence}`}>
+          时间：{confidenceLabel(timeConfidence)}
+        </span>
       </span>
       <span className="group-row__saving">
         <strong>{formatBytes(group.reclaimableBytes)}</strong>
@@ -356,13 +359,34 @@ function GroupInspector({ group }: { group: DuplicateGroup }) {
       <section className="inspector-section">
         <div className="inspector-section__title">
           <span>内容验证</span>
-          <span className="verified-label"><CheckCircle2 size={13} /> 扫描逐字节一致</span>
+          <span className="verified-label"><CheckCircle2 size={13} /> D1 · 逐字节确认</span>
         </div>
         <EvidenceRail group={group} />
       </section>
 
       <section className="inspector-section">
-        <div className="inspector-section__title"><span>建议保留</span><span>{group.files.length} 份内容相同</span></div>
+        <div className="inspector-section__title"><span>组内全部文件</span><span>{group.files.length} 份内容相同</span></div>
+        <ol className="group-members">
+          {group.files.map((file) => (
+            <li className={file.isRecommendedKeeper ? 'group-member group-member--keeper' : 'group-member'} key={file.id}>
+              <div className="group-member__heading">
+                <strong>{file.name}</strong>
+                {file.isRecommendedKeeper ? <span><Archive aria-hidden="true" size={11} /> 暂定保留</span> : <span>重复成员</span>}
+              </div>
+              <code title={file.path}>{file.path}</code>
+              <dl>
+                <div><dt>大小</dt><dd>{formatBytes(file.sizeBytes)}</dd></div>
+                <div><dt>文件创建</dt><dd>{file.createdAt ?? '未知'}</dd></div>
+                <div><dt>文件修改</dt><dd>{file.modifiedAt ?? '未知'}</dd></div>
+                <div><dt>拍摄时间</dt><dd>{file.captureTime ?? '尚无内嵌证据'}</dd></div>
+              </dl>
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      <section className="inspector-section">
+        <div className="inspector-section__title"><span>暂定保留建议</span><span>未形成执行计划</span></div>
         <div className="keeper-block">
           <span className="keeper-block__icon"><Archive size={18} /></span>
           <div>
@@ -411,15 +435,15 @@ function IssueDisclosure({ report }: { report: ScanReport }) {
     <details className="issue-disclosure">
       <summary>查看 {report.issues.length.toLocaleString('zh-CN')} 条扫描问题记录</summary>
       <ul>
-        {report.issues.slice(0, 50).map((issue) => (
-          <li key={`${issue.code}-${issue.path}`}>
+        {report.issues.slice(0, 50).map((issue, index) => (
+          <li key={`${issue.code}-${issue.path}-${issue.detail}-${index}`}>
             <code>{issue.code}</code>
             <span title={issue.path}>{issue.path}</span>
             <small>{issue.detail}</small>
           </li>
         ))}
       </ul>
-      {report.issues.length > 50 ? <p>仅显示前 50 条；完整记录将由后续本地审计账本保存。</p> : null}
+      {report.issues.length > 50 ? <p>当前界面仅显示前 50 条；在本地审计账本接入前，请勿把这份视图当作完整问题导出。</p> : null}
     </details>
   )
 }
