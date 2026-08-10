@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">归影应用图标</title>
+  <desc id="desc">两张叠放的照片与安全确认标记，象征可复核的照片去重。</desc>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="#F2F0E7"/>
+
+  <rect x="268" y="164" width="596" height="596" rx="132" fill="#9BB9AA" stroke="#14211B" stroke-width="28"/>
+  <rect x="148" y="264" width="604" height="604" rx="136" fill="#14211B"/>
+
+  <circle cx="566" cy="438" r="64" fill="#F2F0E7"/>
+  <path d="M236 718 390 546l112 116 70-70 92 106" fill="none" stroke="#F2F0E7" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <circle cx="752" cy="754" r="158" fill="#2A7759" stroke="#F2F0E7" stroke-width="34"/>
+  <path d="m674 754 55 55 108-122" fill="none" stroke="#F2F0E7" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
