@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0",
+  "pairs": [
+    {
+      "name": "Primary ink on paper",
+      "role": "body-text",
+      "foreground": "#17231f",
+      "background": "#f5f2e9",
+      "minimum": 4.5
+    },
+    {
+      "name": "Evidence green control on paper",
+      "role": "non-text-ui",
+      "foreground": "#1f7257",
+      "background": "#f5f2e9",
+      "minimum": 3.0
+    },
+    {
+      "name": "Focus indicator on white surface",
+      "role": "focus-indicator",
+      "foreground": "#1f7257",
+      "background": "#ffffff",
+      "minimum": 3.0
+    },
+    {
+      "name": "Review amber text on paper",
+      "role": "small-text",
+      "foreground": "#8a5012",
+      "background": "#f5f2e9",
+      "minimum": 4.5
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+归影原生运行验证
+时间：2026-08-11T00:03:52+08:00
+环境：Tauri 2.11.x; macOS 26.5.2 arm64
+
+命令：pnpm tauri:dev
+退出码：0（验证后使用 Ctrl-C 正常终止开发会话）
+
+结果：Vite 在 127.0.0.1:1420 启动；Cargo 构建完成；target/debug/guiying-desktop 启动；系统窗口列表确认标题“归影”、逻辑窗口 1280x820；只捕获该窗口作为 native-landing-1280x820.png。
+
+独立代码审计确认唯一 command 为 scan_directory，当前实现没有移动、改时、删除或其他主动变更调用；webview capabilities 仅 core:default 与 dialog:allow-open，未注册 fs、shell 或 HTTP 插件。capability 不是 Rust command 的 OS 沙箱保证。读取在部分卷上仍可能更新 atime。

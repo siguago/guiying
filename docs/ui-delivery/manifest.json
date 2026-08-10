@@ -1,0 +1,203 @@
+{
+  "schema_version": "2.0",
+  "project": "归影 Guiying",
+  "scope": "M0 desktop interface for no-mutation exact-byte duplicate evidence scanning and honest timestamp-boundary disclosure",
+  "delivery_tier": "complete",
+  "delivery_mode": "implementation",
+  "integration_mode": "existing_repository",
+  "platforms": [
+    "desktop"
+  ],
+  "platform_matrix": [
+    {
+      "id": "desktop",
+      "platform": "desktop",
+      "target_versions": [
+        "macOS 13+ target",
+        "macOS 26.5.2 arm64 verified"
+      ],
+      "implementation_stack": "Tauri + React + TypeScript + Rust",
+      "implementation_stack_version": "Tauri 2.11.x; React 19.2.8; TypeScript 6.0.2; Rust 1.92.0",
+      "design_guidance": "Repository desktop safety model, platform-app guidance, and native macOS interaction conventions",
+      "design_guidance_version": "reviewed 2026-08-10",
+      "guidance_checked_at": "2026-08-10",
+      "source_urls": [],
+      "fallback_notes": "Unknown filesystem capability, incomplete scan, path ambiguity, mount identity change, or content conflict remains report-only and cannot authorize a mutation. Reading may update filesystem-managed atime."
+    }
+  ],
+  "direction": {
+    "name": "档案纸上的校验台账",
+    "north_star": "让每个整理结论像一份可检查的档案记录，而不是要求用户盲信的清理按钮。",
+    "signature_device": "纵向证据脊柱串联大小、抽样指纹、完整 BLAKE3、扫描逐字节确认与未来执行前复核。"
+  },
+  "themes": [
+    "default"
+  ],
+  "locales": [
+    {
+      "tag": "zh-CN",
+      "direction": "ltr"
+    }
+  ],
+  "entrypoints": [
+    {
+      "id": "desktop-product-entrypoint",
+      "type": "native_app",
+      "purpose": "product",
+      "platforms": [
+        "desktop"
+      ],
+      "locales": [
+        "zh-CN"
+      ],
+      "target": "src-tauri/target/debug/bundle/macos/归影.app",
+      "open_instructions": "From the repository root run pnpm install, then pnpm tauri:dev. Build the debug app and DMG with pnpm exec tauri build --debug.",
+      "qa_target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-core-flow",
+        "desktop-product-entrypoint-desktop-zh-cn-contrast",
+        "desktop-product-entrypoint-desktop-zh-cn-visual",
+        "desktop-product-entrypoint-desktop-zh-cn-privacy",
+        "desktop-product-entrypoint-desktop-zh-cn-responsive",
+        "desktop-product-entrypoint-desktop-zh-cn-screen-reader",
+        "desktop-product-entrypoint-desktop-zh-cn-assets",
+        "desktop-product-entrypoint-desktop-zh-cn-keyboard",
+        "desktop-product-entrypoint-desktop-zh-cn-build",
+        "desktop-product-entrypoint-desktop-zh-cn-runtime",
+        "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large",
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ]
+    },
+    {
+      "id": "desktop-system-entrypoint",
+      "type": "design_artifact",
+      "purpose": "system",
+      "platforms": [
+        "desktop"
+      ],
+      "locales": [
+        "zh-CN"
+      ],
+      "target": "design-direction.md",
+      "open_instructions": "Open design-direction.md together with the repository design-system/tokens.tokens.json and src/App.css implementation.",
+      "qa_target_ids": [
+        "desktop-system-entrypoint-desktop-zh-cn-visual"
+      ]
+    }
+  ],
+  "required_qa_targets": [
+    "desktop-product-entrypoint-desktop-zh-cn-core-flow",
+    "desktop-product-entrypoint-desktop-zh-cn-contrast",
+    "desktop-product-entrypoint-desktop-zh-cn-visual",
+    "desktop-product-entrypoint-desktop-zh-cn-privacy",
+    "desktop-product-entrypoint-desktop-zh-cn-responsive",
+    "desktop-product-entrypoint-desktop-zh-cn-screen-reader",
+    "desktop-product-entrypoint-desktop-zh-cn-assets",
+    "desktop-product-entrypoint-desktop-zh-cn-keyboard",
+    "desktop-product-entrypoint-desktop-zh-cn-build",
+    "desktop-product-entrypoint-desktop-zh-cn-runtime",
+    "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
+  ],
+  "viewports": [
+    {
+      "id": "desktop-compact",
+      "width": 1024,
+      "height": 768,
+      "unit": "px"
+    },
+    {
+      "id": "desktop-large",
+      "width": 1280,
+      "height": 820,
+      "unit": "px"
+    }
+  ],
+  "artifacts": {
+    "design_direction": {
+      "status": "created",
+      "kind": "documentation",
+      "notes": "Scoped M0 direction, grammar, signature evidence spine, anti-goals, states, and safety language are documented.",
+      "path": "design-direction.md"
+    },
+    "token_source": {
+      "status": "inherited",
+      "kind": "dtcg_tokens",
+      "notes": "Canonical repository source is design-system/tokens.tokens.json and is owned with the production UI."
+    },
+    "token_export": {
+      "status": "inherited",
+      "kind": "css_tokens",
+      "notes": "Canonical generated target export is src/styles/tokens.css; pnpm tokens:check verifies synchronization."
+    },
+    "contrast_evidence": {
+      "status": "created",
+      "kind": "contrast_report",
+      "notes": "Representative opaque role pairs cover body text, controls, focus, and warning text.",
+      "path": "design-system/contrast-pairs.json"
+    },
+    "component_source": {
+      "status": "inherited",
+      "kind": "component_source",
+      "notes": "Production component and state source is src/App.tsx with styling in src/App.css and src/index.css."
+    },
+    "accessibility": {
+      "status": "inherited",
+      "kind": "accessibility_report",
+      "notes": "Repository tests/ui/app.spec.ts owns axe and keyboard checks; VoiceOver manual coverage is explicitly limited."
+    },
+    "icon_source": {
+      "status": "inherited",
+      "kind": "source",
+      "notes": "Functional icons use lucide-react under ISC and the in-product brand mark is original; packaged app icons remain scaffold defaults and are a declared limitation."
+    },
+    "implementation_source": {
+      "status": "inherited",
+      "kind": "implementation_source",
+      "notes": "Production sources are src, src-tauri, and crates/guiying-core; this package records the handoff without copying those sources."
+    }
+  },
+  "capabilities": {
+    "image_generation": {
+      "status": "not_needed",
+      "ui_screen_references": "not_needed",
+      "notes": "The interface is implemented directly from the product safety model; no generated UI raster reference is used."
+    },
+    "browser_rendering": {
+      "status": "used",
+      "notes": "Playwright renders explicitly labelled synthetic-data states for responsive, keyboard, contrast, and accessibility checks."
+    },
+    "figma": {
+      "status": "not_needed",
+      "notes": "No Figma artifact was requested; the canonical implementation and design system live in the repository."
+    },
+    "native_runner": {
+      "status": "used",
+      "notes": "The Tauri app was launched, captured in a native macOS window, and bundled as an app and DMG."
+    },
+    "image_inspection": {
+      "status": "used",
+      "notes": "All four browser captures and the native-window capture were decoded and inspected at full size."
+    }
+  },
+  "evidence": {
+    "qa": {
+      "status": "partial",
+      "path": "qa-evidence.json",
+      "notes": "Automated and native evidence passed where mapped; real external-volume dialog flow, VoiceOver, and final branded app icon remain explicit limitations."
+    },
+    "sources": {
+      "path": "handoff/sources.md",
+      "notes": "Repository provenance, dependency licenses, non-copy boundaries, and synthetic-data hygiene are recorded."
+    },
+    "handoff": {
+      "path": "handoff/implementation-notes.md",
+      "notes": "Stack mapping, source ownership, commands, capability boundaries, and milestone constraints are recorded."
+    }
+  },
+  "status": "ready_with_limitations",
+  "limitations": [
+    "limitation-native-core-flow",
+    "limitation-screen-reader",
+    "limitation-brand-assets"
+  ],
+  "created_at": "2026-08-10T23:20:04+08:00"
+}

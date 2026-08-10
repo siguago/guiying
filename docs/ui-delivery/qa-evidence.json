@@ -1,0 +1,425 @@
+{
+  "schema_version": "2.0",
+  "targets": [
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-core-flow",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "external-volume-scan",
+      "theme": "default",
+      "viewport": "desktop-compact",
+      "check": "core-flow",
+      "method": "assisted",
+      "capability": "native_runner",
+      "result": "unavailable",
+      "evidence_ids": [],
+      "limitation_id": "limitation-native-core-flow",
+      "notes": "Native launch and the read-only core are verified independently, but the system directory dialog through a real external-volume scan was not automated or manually completed in this run."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-contrast",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "landing-and-results",
+      "theme": "default",
+      "viewport": "desktop-compact",
+      "check": "contrast",
+      "method": "automated",
+      "capability": "manual",
+      "result": "passed",
+      "evidence_ids": [
+        "contrast-role-report",
+        "frontend-qa-log"
+      ],
+      "limitation_id": null,
+      "notes": "Representative token pairs pass their role thresholds and axe reports zero violations on landing and results states."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-visual",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "native-landing",
+      "theme": "default",
+      "viewport": "desktop-large",
+      "check": "visual",
+      "method": "assisted",
+      "capability": "native_runner",
+      "result": "passed",
+      "evidence_ids": [
+        "native-landing-capture"
+      ],
+      "limitation_id": null,
+      "notes": "The actual Tauri macOS window was captured in isolation and inspected at full decoded resolution."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-privacy",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "m0-command-boundary",
+      "theme": "default",
+      "viewport": null,
+      "check": "privacy",
+      "method": "manual",
+      "capability": "manual",
+      "result": "passed",
+      "evidence_ids": [
+        "core-rust-test-log",
+        "manual-safety-review"
+      ],
+      "limitation_id": null,
+      "notes": "Code review found no network, move, rename, timestamp, or delete operation in the M0 command. UI text discloses possible filesystem-managed atime updates."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-responsive",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "synthetic-results-compact",
+      "theme": "default",
+      "viewport": "desktop-compact",
+      "check": "responsive",
+      "method": "assisted",
+      "capability": "native_runner",
+      "result": "passed",
+      "evidence_ids": [
+        "frontend-qa-log",
+        "responsive-compact-capture"
+      ],
+      "limitation_id": null,
+      "notes": "The Tauri webview implementation was exercised at the declared 1024x768 compact desktop boundary without lost evidence or overlap."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-screen-reader",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "voiceover-zh-cn",
+      "theme": "default",
+      "viewport": "desktop-compact",
+      "check": "screen-reader",
+      "method": "manual",
+      "capability": "manual",
+      "result": "unavailable",
+      "evidence_ids": [],
+      "limitation_id": "limitation-screen-reader",
+      "notes": "Semantic and axe checks passed, but VoiceOver reading order, live status announcements, and the native directory dialog were not manually evaluated."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-assets",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "production-assets",
+      "theme": "default",
+      "viewport": null,
+      "check": "assets",
+      "method": "manual",
+      "capability": "manual",
+      "result": "unavailable",
+      "evidence_ids": [],
+      "limitation_id": "limitation-brand-assets",
+      "notes": "In-product Lucide icons and the original brand mark render correctly, but the bundled app icon remains the Tauri scaffold asset and is not release-ready."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-keyboard",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "synthetic-core-flow",
+      "theme": "default",
+      "viewport": "desktop-compact",
+      "check": "keyboard",
+      "method": "automated",
+      "capability": "browser_rendering",
+      "result": "passed",
+      "evidence_ids": [
+        "frontend-qa-log"
+      ],
+      "limitation_id": null,
+      "notes": "A keyboard-only Playwright test reaches the explicitly labelled synthetic scan and results; focus indicators and focus restoration are covered."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-build",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "debug-bundle",
+      "theme": "default",
+      "viewport": null,
+      "check": "build",
+      "method": "automated",
+      "capability": "build_toolchain",
+      "result": "passed",
+      "evidence_ids": [
+        "tauri-build-log"
+      ],
+      "limitation_id": null,
+      "notes": "The corrected Tauri debug build command produces both the macOS application bundle and arm64 DMG."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-runtime",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "native-launch",
+      "theme": "default",
+      "viewport": "desktop-large",
+      "check": "runtime",
+      "method": "assisted",
+      "capability": "native_runner",
+      "result": "passed",
+      "evidence_ids": [
+        "native-run-log"
+      ],
+      "limitation_id": null,
+      "notes": "The native development binary launches a titled 1280x820 macOS window and exits cleanly after inspection."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large",
+      "required": true,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "synthetic-results-large",
+      "theme": "default",
+      "viewport": "desktop-large",
+      "check": "responsive",
+      "method": "assisted",
+      "capability": "native_runner",
+      "result": "passed",
+      "evidence_ids": [
+        "frontend-qa-log",
+        "responsive-large-capture"
+      ],
+      "limitation_id": null,
+      "notes": "At 1280x820 the master-detail evidence layout, persistent synthetic-data notice, metrics, and inspector remain legible."
+    },
+    {
+      "id": "desktop-product-entrypoint-desktop-zh-cn-image-inspection",
+      "required": false,
+      "entrypoint_id": "desktop-product-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "full-resolution-native-review",
+      "theme": "default",
+      "viewport": "desktop-large",
+      "check": "visual",
+      "method": "manual",
+      "capability": "image_inspection",
+      "result": "passed",
+      "evidence_ids": [
+        "native-landing-capture"
+      ],
+      "limitation_id": null,
+      "notes": "The native raster was decoded and inspected at original Retina resolution; browser captures were also reviewed at original size."
+    },
+    {
+      "id": "desktop-system-entrypoint-desktop-zh-cn-visual",
+      "required": false,
+      "entrypoint_id": "desktop-system-entrypoint",
+      "platform": "desktop",
+      "locale": "zh-CN",
+      "state": "design-system-contract",
+      "theme": "default",
+      "viewport": "desktop-large",
+      "check": "visual",
+      "method": "manual",
+      "capability": "manual",
+      "result": "passed",
+      "evidence_ids": [
+        "system-direction-artifact"
+      ],
+      "limitation_id": null,
+      "notes": "The direction contract maps signature evidence grammar, components, states, layout, accessibility, anti-goals, and repository ownership."
+    }
+  ],
+  "evidence": [
+    {
+      "id": "contrast-role-report",
+      "kind": "contrast-report",
+      "path": "design-system/contrast-pairs.json",
+      "captured_at": "2026-08-11T00:18:03+08:00",
+      "tool": "craft-ui-design delivery validator",
+      "version": "v2 contract",
+      "command": "python3 /Users/sigua/.codex/skills/craft-ui-design/scripts/validate_delivery.py docs/ui-delivery",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-contrast"
+      ],
+      "notes": "Opaque representative colors use the same semantic roles as the repository DTCG token source."
+    },
+    {
+      "id": "frontend-qa-log",
+      "kind": "test-output",
+      "path": "evidence/frontend-qa.txt",
+      "captured_at": "2026-08-11T00:15:28+08:00",
+      "tool": "Playwright, axe-core, Vite, Oxlint",
+      "version": "Playwright 1.62.1; axe-core 4.12.1; Vite 8.2.1; Oxlint 1.75.0",
+      "command": "pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-contrast",
+        "desktop-product-entrypoint-desktop-zh-cn-responsive",
+        "desktop-product-entrypoint-desktop-zh-cn-keyboard",
+        "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
+      ],
+      "notes": "Four tests pass after correcting contrast, scroll focus, dialog-return focus, synthetic-data disclosure, and metric wording."
+    },
+    {
+      "id": "core-rust-test-log",
+      "kind": "test-output",
+      "path": "evidence/core-rust-tests.txt",
+      "captured_at": "2026-08-11T00:15:22+08:00",
+      "tool": "Cargo",
+      "version": "1.92.0",
+      "command": "cargo fmt --manifest-path crates/guiying-core/Cargo.toml -- --check && cargo clippy --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings && cargo test --manifest-path crates/guiying-core/Cargo.toml --all-features",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-privacy"
+      ],
+      "notes": "The core exposes no mutation API and fail-closed edge behavior is covered by the recorded Rust suite."
+    },
+    {
+      "id": "manual-safety-review",
+      "kind": "manual-review",
+      "path": "handoff/qa-report.md",
+      "captured_at": "2026-08-11T00:14:30+08:00",
+      "tool": "independent code and documentation review",
+      "version": "M0 review 2",
+      "command": "Review src-tauri capabilities, Rust command calls, UI claims, synthetic fixtures, and captured window contents.",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-privacy"
+      ],
+      "notes": "The review corrected atime, partial-report, synthetic-data, metric, path, mount-session, and capability-language overclaims."
+    },
+    {
+      "id": "tauri-build-log",
+      "kind": "build-log",
+      "path": "evidence/tauri-build.txt",
+      "captured_at": "2026-08-11T00:16:19+08:00",
+      "tool": "Tauri CLI",
+      "version": "2.11.4",
+      "command": "pnpm exec tauri build --debug",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-build"
+      ],
+      "notes": "The successful corrected command and the earlier argument-forwarding mistake are both disclosed in the log."
+    },
+    {
+      "id": "native-run-log",
+      "kind": "run-log",
+      "path": "evidence/native-run.txt",
+      "captured_at": "2026-08-11T00:03:52+08:00",
+      "tool": "Tauri CLI and macOS CoreGraphics window listing",
+      "version": "Tauri 2.11.x; macOS 26.5.2",
+      "command": "pnpm tauri:dev",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-runtime"
+      ],
+      "notes": "The app process and titled native window were observed before a clean developer-session termination."
+    },
+    {
+      "id": "native-landing-capture",
+      "kind": "screenshot",
+      "path": "evidence/native-landing-1280x820.png",
+      "captured_at": "2026-08-11T00:03:52+08:00",
+      "tool": "macOS screencapture and full-size image inspection",
+      "version": "macOS 26.5.2",
+      "command": "Resolve the Guiying CoreGraphics window id, then screencapture -x -l WINDOW_ID evidence/native-landing-1280x820.png.",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-visual",
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "Only the Guiying native window is present; the capture contains no other desktop windows or user media."
+    },
+    {
+      "id": "responsive-compact-capture",
+      "kind": "screenshot",
+      "path": "evidence/results-1024x768.png",
+      "captured_at": "2026-08-11T00:15:28+08:00",
+      "tool": "Playwright Chromium",
+      "version": "1.62.1",
+      "command": "pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-responsive"
+      ],
+      "notes": "Synthetic data is persistently labelled; the 1024x768 master-detail view retains the safety footer and evidence rail."
+    },
+    {
+      "id": "responsive-large-capture",
+      "kind": "screenshot",
+      "path": "evidence/results-1280x820.png",
+      "captured_at": "2026-08-11T00:15:24+08:00",
+      "tool": "Playwright Chromium",
+      "version": "1.62.1",
+      "command": "pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
+      ],
+      "notes": "The 1280x820 evidence workspace shows group ordering, synthetic notice, exact-byte proof, and weak time evidence without overlap."
+    },
+    {
+      "id": "system-direction-artifact",
+      "kind": "design-artifact",
+      "path": "design-direction.md",
+      "captured_at": "2026-08-11T00:15:30+08:00",
+      "tool": "repository design review",
+      "version": "M0 direction 1",
+      "command": "Review design-direction.md against src/App.tsx, src/App.css, and the product safety documents.",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-system-entrypoint-desktop-zh-cn-visual"
+      ],
+      "notes": "The system artifact documents the implemented visual thesis and the boundaries that remain intentionally locked."
+    }
+  ],
+  "limitations": [
+    {
+      "id": "limitation-native-core-flow",
+      "capability": "native_runner",
+      "affected_target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-core-flow"
+      ],
+      "impact": "The evidence does not prove a complete macOS directory-dialog to real external-volume scan through the Tauri IPC bridge.",
+      "mitigation": "Run the P0 external-volume matrix on disposable APFS and exFAT fixtures, exercise dialog selection and interruption cases, and attach the native run recording before changing this target to passed."
+    },
+    {
+      "id": "limitation-screen-reader",
+      "capability": "manual",
+      "affected_target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-screen-reader"
+      ],
+      "impact": "Automated semantics cannot establish VoiceOver reading order, Chinese pronunciation, live progress behavior, or native dialog usability.",
+      "mitigation": "Complete a VoiceOver-only walkthrough of idle, dialog return, scanning, partial report, result selection, issue disclosure, and error recovery on macOS."
+    },
+    {
+      "id": "limitation-brand-assets",
+      "capability": "manual",
+      "affected_target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-assets"
+      ],
+      "impact": "The debug application and DMG still use scaffold packaging icons and must not be treated as release-branded artifacts.",
+      "mitigation": "Design the canonical application icon, export all macOS sizes, replace src-tauri/icons, and inspect the Dock, Finder, DMG, and 16px rendering before release."
+    }
+  ]
+}

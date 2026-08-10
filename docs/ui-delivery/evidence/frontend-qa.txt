@@ -1,0 +1,17 @@
+归影 M0 前端与可访问性验证
+时间：2026-08-11T00:15:28+08:00
+环境：macOS 26.5.2 arm64; Node.js v26.5.0; pnpm 10.12.1
+
+命令：pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui
+退出码：0
+
+结果：
+- DTCG CSS export is current.
+- TypeScript + Vite production build passed; 1803 modules transformed.
+- Oxlint passed with no diagnostics.
+- Playwright desktop-chromium: 4 passed, 0 failed.
+- axe-core scanned landing and results states: 0 violations.
+- Keyboard-only test reached directory selection, scan action and results.
+- Rendered evidence captured at 1280x820 and 1024x768 CSS pixels.
+
+首轮曾发现对比度、可滚动详情焦点和目录对话框返回焦点问题；安全复核还发现真实扫描进度不应由定时器推进。上述问题已修复，本记录对应仅由后端事件驱动真实进度后的全量复跑。

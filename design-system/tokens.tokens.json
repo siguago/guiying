@@ -1,0 +1,149 @@
+{
+  "$description": "归影桌面端设计令牌。色彩取自档案纸、暗房工作台和校验印章，服务于证据、警告与可逆操作的清晰表达。",
+  "reference": {
+    "color": {
+      "paper": {
+        "canvas": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.952941, 0.945098, 0.913725], "alpha": 1, "hex": "#f3f1e9" }
+        },
+        "surface": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.984314, 0.980392, 0.960784], "alpha": 1, "hex": "#fbfaf5" }
+        },
+        "muted": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.917647, 0.905882, 0.866667], "alpha": 1, "hex": "#eae7dd" }
+        }
+      },
+      "ink": {
+        "strong": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.094118, 0.12549, 0.113725], "alpha": 1, "hex": "#18201d" }
+        },
+        "muted": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.356863, 0.4, 0.376471], "alpha": 1, "hex": "#5b6660" }
+        }
+      },
+      "line": {
+        "$type": "color",
+        "$value": { "colorSpace": "srgb", "components": [0.811765, 0.823529, 0.788235], "alpha": 1, "hex": "#cfd2c9" }
+      },
+      "green": {
+        "600": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.145098, 0.407843, 0.309804], "alpha": 1, "hex": "#25684f" }
+        },
+        "800": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.090196, 0.294118, 0.219608], "alpha": 1, "hex": "#174b38" }
+        },
+        "100": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.866667, 0.917647, 0.890196], "alpha": 1, "hex": "#ddeae3" }
+        }
+      },
+      "amber": {
+        "600": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.541176, 0.313725, 0.070588], "alpha": 1, "hex": "#8a5012" }
+        },
+        "100": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.945098, 0.890196, 0.807843], "alpha": 1, "hex": "#f1e3ce" }
+        }
+      },
+      "red": {
+        "600": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.627451, 0.266667, 0.219608], "alpha": 1, "hex": "#a04438" }
+        },
+        "100": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.94902, 0.870588, 0.854902], "alpha": 1, "hex": "#f2deda" }
+        }
+      },
+      "white": {
+        "$type": "color",
+        "$value": { "colorSpace": "srgb", "components": [1, 1, 1], "alpha": 1, "hex": "#ffffff" }
+      }
+    },
+    "font": {
+      "interface": {
+        "$type": "fontFamily",
+        "$value": ["-apple-system", "BlinkMacSystemFont", "PingFang SC", "Noto Sans CJK SC", "Segoe UI", "sans-serif"]
+      },
+      "numeric": {
+        "$type": "fontFamily",
+        "$value": ["SFMono-Regular", "Cascadia Mono", "Roboto Mono", "monospace"]
+      }
+    },
+    "space": {
+      "$type": "dimension",
+      "1": { "$value": { "value": 4, "unit": "px" } },
+      "2": { "$value": { "value": 8, "unit": "px" } },
+      "3": { "$value": { "value": 12, "unit": "px" } },
+      "4": { "$value": { "value": 16, "unit": "px" } },
+      "5": { "$value": { "value": 20, "unit": "px" } },
+      "6": { "$value": { "value": 24, "unit": "px" } },
+      "8": { "$value": { "value": 32, "unit": "px" } },
+      "10": { "$value": { "value": 40, "unit": "px" } }
+    },
+    "radius": {
+      "$type": "dimension",
+      "small": { "$value": { "value": 6, "unit": "px" } },
+      "medium": { "$value": { "value": 10, "unit": "px" } },
+      "large": { "$value": { "value": 14, "unit": "px" } }
+    },
+    "motion": {
+      "fast": { "$type": "duration", "$value": { "value": 120, "unit": "ms" } },
+      "standard": { "$type": "duration", "$value": { "value": 220, "unit": "ms" } },
+      "deliberate": { "$type": "duration", "$value": { "value": 420, "unit": "ms" } },
+      "ease": { "$type": "cubicBezier", "$value": [0.2, 0, 0, 1] }
+    }
+  },
+  "semantic": {
+    "surface": {
+      "canvas": { "$type": "color", "$value": "{reference.color.paper.canvas}" },
+      "primary": { "$type": "color", "$value": "{reference.color.paper.surface}" },
+      "secondary": { "$type": "color", "$value": "{reference.color.paper.muted}" },
+      "selected": { "$type": "color", "$value": "{reference.color.green.100}" },
+      "warning": { "$type": "color", "$value": "{reference.color.amber.100}" },
+      "danger": { "$type": "color", "$value": "{reference.color.red.100}" }
+    },
+    "text": {
+      "primary": { "$type": "color", "$value": "{reference.color.ink.strong}" },
+      "secondary": { "$type": "color", "$value": "{reference.color.ink.muted}" },
+      "inverse": { "$type": "color", "$value": "{reference.color.white}" },
+      "positive": { "$type": "color", "$value": "{reference.color.green.800}" },
+      "warning": { "$type": "color", "$value": "{reference.color.amber.600}" },
+      "danger": { "$type": "color", "$value": "{reference.color.red.600}" }
+    },
+    "border": {
+      "default": { "$type": "color", "$value": "{reference.color.line}" },
+      "strong": { "$type": "color", "$value": "{reference.color.ink.muted}" },
+      "focus": { "$type": "color", "$value": "{reference.color.green.600}" }
+    },
+    "action": {
+      "primary": { "$type": "color", "$value": "{reference.color.green.600}" },
+      "primaryHover": { "$type": "color", "$value": "{reference.color.green.800}" },
+      "danger": { "$type": "color", "$value": "{reference.color.red.600}" }
+    },
+    "font": {
+      "interface": { "$type": "fontFamily", "$value": "{reference.font.interface}" },
+      "numeric": { "$type": "fontFamily", "$value": "{reference.font.numeric}" }
+    },
+    "radius": {
+      "control": { "$type": "dimension", "$value": "{reference.radius.small}" },
+      "surface": { "$type": "dimension", "$value": "{reference.radius.medium}" },
+      "overlay": { "$type": "dimension", "$value": "{reference.radius.large}" }
+    },
+    "motion": {
+      "fast": { "$type": "duration", "$value": "{reference.motion.fast}" },
+      "standard": { "$type": "duration", "$value": "{reference.motion.standard}" },
+      "deliberate": { "$type": "duration", "$value": "{reference.motion.deliberate}" },
+      "ease": { "$type": "cubicBezier", "$value": "{reference.motion.ease}" }
+    }
+  }
+}
