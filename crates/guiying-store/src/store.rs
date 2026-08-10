@@ -2886,6 +2886,7 @@ mod tests {
     fn initialization_publishes_one_self_contained_database_file() -> crate::Result<()> {
         let temporary = TempDir::new()
             .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
+        let public_database = temporary.path().join("initialized.sqlite3");
         let canonical_parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
             StoreError::io("canonicalizing test directory", temporary.path(), error)
         })?;
@@ -2895,7 +2896,10 @@ mod tests {
 
         assert!(database.is_file());
         ensure_initialization_sidecars_absent(&database)?;
-        Store::open_existing(&database)?.close()?;
+        // Windows canonicalization intentionally returns a verbatim path. The
+        // public API rejects verbatim/device namespaces, so reopen through the
+        // caller's ordinary disk path while checking the same published file.
+        Store::open_existing(public_database)?.close()?;
         Ok(())
     }
 
