@@ -16,7 +16,7 @@
 - 14 张 STRICT 表的 SQLite 迁移和可重复安全约束测试；
 - 前端、原生窗口、Rust 与构建证据归档。
 
-M0 的唯一原生 command 是 `scan_directory`。当前没有移动、重命名、改时、隔离、恢复或删除 API，也没有把 SQLite 操作模型接入运行时。读取可能由文件系统更新 atime，因此 M0 的准确边界是“无主动变更”，不是 OS 级零写入保证。
+M0 的原生命令仅负责启动、查询、取消、确认释放只读扫描及兼容 `scan_directory`。同一时间只允许一个任务，事件按 owner 窗口定向发送，终态报告在界面明确确认接收前不会被新任务淘汰。当前没有移动、重命名、改时、隔离、恢复或删除 API，也没有把 SQLite 操作模型接入运行时。读取可能由文件系统更新 atime，因此 M0 的准确边界是“无主动变更”，不是 OS 级零写入保证。
 
 ## 2. D1 判定门槛
 
@@ -52,15 +52,17 @@ M0 的唯一原生 command 是 `scan_directory`。当前没有移动、重命名
 - SQLite 裸 id 曾可能跨卷/跨文件错绑，且 donor 与双日志顺序缺少硬门：现已用复合外键、触发器、不可变依赖和卷端 manifest outbox 阻断。
 - 后续故障模型审计发现完整哈希与逐字节比较对异常提前 EOF 的校验不够：现已要求精确声明长度并额外验证 EOF，短读与超长流均有回归测试。
 - 操作模型曾允许 keeper 自身成为 source、`../` 路径和 batch/item 类型错配：现已增加原始路径字节、角色/同一性、目标路径、dry-run 与动作类型硬约束。
+- 任务状态查询曾可能因一次瞬时 IPC 失败丢失取消控制，终态报告也可能被下一任务提前淘汰：现已用自动退避重试、状态未确认警告、显式 acknowledge 和未确认报告门禁修复，并增加 Tauri 模拟恢复测试。
+- 取消无法抢占阻塞中的内核 I/O：最终目录/根复核已增加取消点，界面明确说明需等待当前读取返回；真正硬超时仍要求后续隔离工作进程。
 
 ## 5. 验证结果
 
 | 门禁 | 结果 |
 | --- | --- |
-| Core `fmt + clippy -D warnings + test` | 9 unit + 24 integration，全通过 |
-| Tauri `fmt + clippy -D warnings + test` | 通过 |
+| Core `fmt + clippy -D warnings + test` | 10 unit + 24 integration，全通过 |
+| Tauri `fmt + clippy -D warnings + test` | 7/7，全通过 |
 | 前端 tokens / TypeScript / Vite / Oxlint | 通过 |
-| Playwright + axe | 4/4 通过；首屏与结果态 0 violation |
+| Playwright + axe | 5/5 通过；含瞬时 IPC 失败恢复，首屏与结果态 0 violation |
 | SQLite 迁移安全脚本 | 14 张 STRICT 表；合法链与非法用例全部通过 |
 | Tauri debug bundle | `.app` 与 arm64 `.dmg` 均生成成功 |
 | 独立 M0 代码/文案复核 | 无 P0 blocker；提出项均已修复或明确降级 |

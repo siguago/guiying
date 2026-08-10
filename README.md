@@ -7,14 +7,15 @@
 - 枚举常见图片、RAW 与视频；拒绝扫描根末组件为符号链接，绑定根后不跟随树内符号链接，并默认跳过嵌套卷。
 - 以文件大小 → 首/中/尾抽样 BLAKE3 → 完整 BLAKE3 分层缩小候选，再逐字节确认后才生成确定重复组。
 - 在扫描前后校验文件身份、长度、mtime 与 ctime，变化中的文件不参与定案。
+- 桌面端同一时间只运行一个扫描任务；支持合作式安全停止、任务隔离和轻量进度事件。取消报告会清空尚未完成最终目录复核的 D1 定案组，只保留观察记录、统计与问题。
 - 把硬链接从独立副本估算中剔除；容量只显示逻辑重复上限，clone、稀疏文件和快照仍会影响实际释放。
 - 输出版本化重复组报告；当前没有移动、改时、重命名或删除 API。
 
-后续 M1 才会加入 EXIF / QuickTime / sidecar 拍摄时间证据；M2 才会实现隔离事务。设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、[M0 复核记录](docs/engineering/M0_REVIEW.md) 和 [路线图](docs/ROADMAP.md)。
+后续 M1 才会加入 EXIF / QuickTime / sidecar 拍摄时间证据；M2 才会实现隔离事务。设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、[扫描任务协议](docs/engineering/SCAN_JOBS.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、[M0 复核记录](docs/engineering/M0_REVIEW.md) 和 [路线图](docs/ROADMAP.md)。
 
 ## 开发
 
-前置环境：Node.js 22+、pnpm 10+、Rust 1.92+、SQLite 3.37+，以及 Tauri 2 在 macOS 上需要的 Xcode Command Line Tools。
+前置环境：Node.js 22+、pnpm 10+、Rust 1.77.2+、SQLite 3.37+，以及 Tauri 2 在 macOS 上需要的 Xcode Command Line Tools。仓库当前自动化证据使用 Rust 1.92.0 复跑。
 
 ```bash
 pnpm install

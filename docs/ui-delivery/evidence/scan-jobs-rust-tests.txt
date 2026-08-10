@@ -1,0 +1,15 @@
+归影桌面扫描任务控制验证
+时间：2026-08-11T01:02:04+08:00
+环境：rustc/cargo 1.92.0; macOS arm64
+
+按 Tauri 工程门禁顺序执行：
+1. cargo clippy --fix --allow-dirty --allow-staged
+2. cargo clippy --all-targets -- -D warnings
+3. cargo fmt
+4. cargo test
+
+退出码：全部为 0。
+
+结果：7/7 lib tests passed，main 与 doc tests passed，0 failed。
+
+覆盖：单活动任务互斥、合作式取消与重复取消幂等、取消报告终态、失败状态结构化序列化、未确认终态阻断新任务、显式确认与幂等释放、owner 窗口关闭清理、阶段/时间/计数进度节流、旧任务进度隔离，以及大型报告通过 Arc 共享同一实例。

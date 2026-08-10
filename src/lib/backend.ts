@@ -8,10 +8,32 @@ import type { DuplicateGroup, NativePathRef, ScanReport } from '../domain'
 const DEMO_ROOT = '/Volumes/影像归档/手机照片'
 
 export interface ScanProgress {
+  jobId?: string
   stage: 'enumerating' | 'sampling' | 'full_hashing' | 'verifying' | 'complete'
   completed: number
-  total?: number
-  currentPath?: string
+  total?: number | null
+  currentPath?: string | null
+}
+
+interface CoreAppError {
+  code?: string
+  message: string
+  jobId?: string
+}
+
+interface CoreScanJobStatus {
+  jobId: string
+  phase: 'running' | 'cancelling' | 'completed' | 'cancelled' | 'failed'
+  startedAtUnixMs: number
+  finishedAtUnixMs: number | null
+  progress: ScanProgress | null
+  report: CoreScanReport | null
+  error: CoreAppError | null
+}
+
+export interface ReadOnlyScanSession {
+  jobId: string
+  result: Promise<ScanReport>
 }
 
 interface CoreTimestamp {
@@ -192,18 +214,140 @@ export async function scanDirectoryReadOnly(
   root: string,
   onProgress?: (progress: ScanProgress) => void,
 ): Promise<ScanReport> {
+  const session = await startDirectoryScanReadOnly(root, onProgress)
+  return session.result
+}
+
+export async function startDirectoryScanReadOnly(
+  root: string,
+  onProgress?: (progress: ScanProgress) => void,
+  onStatusWarning?: (warning: string | null) => void,
+): Promise<ReadOnlyScanSession> {
   if (!isTauri()) {
     throw new Error('浏览器预览不能读取本地目录；请运行桌面应用，或使用明确标注的合成数据演示。')
   }
 
   const startedAt = performance.now()
-  const unlisten = await listen<ScanProgress>('scan-progress', (event) => onProgress?.(event.payload))
+  let expectedJobId: string | undefined
+  let progressBeforeStartResponse: ScanProgress | undefined
+  const unlisten = await listen<ScanProgress>('scan-progress', (event) => {
+    if (!expectedJobId) {
+      progressBeforeStartResponse = event.payload
+    } else if (event.payload.jobId === expectedJobId) {
+      onProgress?.(event.payload)
+    }
+  })
   try {
-    const report = await invoke<CoreScanReport>('scan_directory', { root })
-    return adaptReport(report, Math.round(performance.now() - startedAt))
+    const response = await invoke<{ jobId: string }>('start_scan', { root })
+    expectedJobId = response.jobId
+    if (progressBeforeStartResponse?.jobId === expectedJobId) {
+      onProgress?.(progressBeforeStartResponse)
+    }
+    const result = waitForScanResult(response.jobId, startedAt, unlisten, onStatusWarning)
+    return { jobId: response.jobId, result }
+  } catch (error) {
+    const existingJobId = recoverableExistingJobId(error)
+    if (existingJobId) {
+      expectedJobId = existingJobId
+      const result = waitForScanResult(existingJobId, startedAt, unlisten, onStatusWarning)
+      return { jobId: existingJobId, result }
+    }
+    unlisten()
+    throw error
+  }
+}
+
+export async function cancelDirectoryScanReadOnly(jobId: string): Promise<void> {
+  if (!isTauri()) {
+    throw new Error('浏览器预览中没有可取消的本地扫描任务。')
+  }
+  await invoke('cancel_scan', { jobId })
+}
+
+async function waitForScanResult(
+  jobId: string,
+  startedAt: number,
+  unlisten: () => void,
+  onStatusWarning?: (warning: string | null) => void,
+): Promise<ScanReport> {
+  let consecutiveStatusFailures = 0
+  try {
+    for (;;) {
+      let status: CoreScanJobStatus
+      try {
+        status = await invoke<CoreScanJobStatus>('get_scan_status', { jobId })
+      } catch (error) {
+        if (errorCode(error) === 'SCAN_JOB_NOT_FOUND') throw error
+        consecutiveStatusFailures += 1
+        onStatusWarning?.(
+          `暂时无法确认扫描状态，正在自动重试（${consecutiveStatusFailures}）；任务仍可能运行，停止按钮继续有效。`,
+        )
+        await wait(Math.min(2_000, 200 * 2 ** Math.min(consecutiveStatusFailures - 1, 4)))
+        continue
+      }
+
+      if (consecutiveStatusFailures > 0) {
+        consecutiveStatusFailures = 0
+        onStatusWarning?.(null)
+      }
+
+      if (status.phase === 'completed' || status.phase === 'cancelled') {
+        if (!status.report) {
+          throw new Error('扫描任务已结束，但没有返回可验证的报告。')
+        }
+        const measuredDuration = status.finishedAtUnixMs === null
+          ? Math.round(performance.now() - startedAt)
+          : Math.max(0, status.finishedAtUnixMs - status.startedAtUnixMs)
+        const report = adaptReport(status.report, measuredDuration)
+        await acknowledgeScanWithRetry(jobId, onStatusWarning)
+        return report
+      }
+      if (status.phase === 'failed') {
+        const failure = status.error ?? new Error('扫描任务失败，且没有返回结构化错误。')
+        await acknowledgeScanWithRetry(jobId, onStatusWarning)
+        throw failure
+      }
+      await wait(200)
+    }
   } finally {
     unlisten()
   }
+}
+
+function recoverableExistingJobId(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const value = error as { code?: unknown; jobId?: unknown }
+  const recoverable = value.code === 'SCAN_ALREADY_RUNNING' || value.code === 'SCAN_RESULT_PENDING'
+  return recoverable && typeof value.jobId === 'string' ? value.jobId : undefined
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' ? code : undefined
+}
+
+async function acknowledgeScanWithRetry(
+  jobId: string,
+  onStatusWarning?: (warning: string | null) => void,
+): Promise<void> {
+  let attempt = 0
+  for (;;) {
+    try {
+      await invoke('acknowledge_scan', { jobId })
+      onStatusWarning?.(null)
+      return
+    } catch (error) {
+      if (errorCode(error) === 'SCAN_JOB_NOT_FOUND') return
+      attempt += 1
+      onStatusWarning?.(`报告已生成，正在确认本地接收（重试 ${attempt}）；原文件未发生主动变更。`)
+      await wait(Math.min(2_000, 200 * 2 ** Math.min(attempt - 1, 4)))
+    }
+  }
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
 }
 
 export async function runSyntheticScan(

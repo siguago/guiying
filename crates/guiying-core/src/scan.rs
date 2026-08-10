@@ -561,8 +561,38 @@ impl Scanner {
                 }
             };
 
-        let directories_stable = revalidate_directories(&directory_audits, &mut issues);
-        let roots_stable = revalidate_roots(&root_sessions, &mut issues);
+        let Some(directories_stable) =
+            revalidate_directories(&directory_audits, &mut issues, control)
+        else {
+            return Ok(finish_report(
+                roots,
+                scanned,
+                Vec::new(),
+                issues,
+                stats,
+                ScanStatus::Cancelled,
+            ));
+        };
+        let Some(roots_stable) = revalidate_roots(&root_sessions, &mut issues, control) else {
+            return Ok(finish_report(
+                roots,
+                scanned,
+                Vec::new(),
+                issues,
+                stats,
+                ScanStatus::Cancelled,
+            ));
+        };
+        if control.is_cancelled() {
+            return Ok(finish_report(
+                roots,
+                scanned,
+                Vec::new(),
+                issues,
+                stats,
+                ScanStatus::Cancelled,
+            ));
+        }
         let status = if roots_stable && directories_stable {
             emit_progress(
                 control,
@@ -583,9 +613,13 @@ impl Scanner {
 fn revalidate_directories(
     directories: &[BoundDirectoryAudit],
     issues: &mut Vec<ScanIssue>,
-) -> bool {
+    control: &dyn ScanControl,
+) -> Option<bool> {
     let mut stable = true;
     for directory in directories {
+        if control.is_cancelled() {
+            return None;
+        }
         if let Err(error) = directory.revalidate() {
             stable = false;
             push_issue(
@@ -596,7 +630,7 @@ fn revalidate_directories(
             );
         }
     }
-    stable
+    (!control.is_cancelled()).then_some(stable)
 }
 
 fn normalize_values(values: BTreeSet<String>, trim_dot: bool) -> BTreeSet<String> {
@@ -644,9 +678,16 @@ fn validate_roots(roots: &[PathBuf]) -> Result<Vec<RootSession>, ScanError> {
     Ok(sessions)
 }
 
-fn revalidate_roots(root_sessions: &[RootSession], issues: &mut Vec<ScanIssue>) -> bool {
+fn revalidate_roots(
+    root_sessions: &[RootSession],
+    issues: &mut Vec<ScanIssue>,
+    control: &dyn ScanControl,
+) -> Option<bool> {
     let mut stable = true;
     for root in root_sessions {
+        if control.is_cancelled() {
+            return None;
+        }
         let result = snapshot_path(&root.path);
         match result {
             Ok((metadata, snapshot))
@@ -672,7 +713,7 @@ fn revalidate_roots(root_sessions: &[RootSession], issues: &mut Vec<ScanIssue>) 
             }
         }
     }
-    stable
+    (!control.is_cancelled()).then_some(stable)
 }
 
 fn child_device(directory: &BoundDirectory) -> Option<u64> {
@@ -1330,9 +1371,21 @@ mod tests {
     use crate::model::{FileRecord, MediaKind, PathRef};
 
     use super::{
-        hash_reader_exact, make_duplicate_group, partition_equivalence_classes, NoopScanControl,
-        PairRelation, ReadHashError,
+        hash_reader_exact, make_duplicate_group, partition_equivalence_classes,
+        revalidate_directories, revalidate_roots, CancellationToken, NoopScanControl, PairRelation,
+        ReadHashError,
     };
+
+    #[test]
+    fn final_revalidation_observes_cancellation_before_completion() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut issues = Vec::new();
+
+        assert_eq!(revalidate_directories(&[], &mut issues, &token), None);
+        assert_eq!(revalidate_roots(&[], &mut issues, &token), None);
+        assert!(issues.is_empty());
+    }
 
     #[test]
     fn full_hash_rejects_premature_eof() {

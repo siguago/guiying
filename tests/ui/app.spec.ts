@@ -69,3 +69,85 @@ test('results adapt at the compact desktop boundary', async ({ page }) => {
     fullPage: true,
   })
 })
+
+test('a transient native status failure keeps cancellation control and recovers', async ({ page }) => {
+  await page.addInitScript(() => {
+    let callbackId = 0
+    let statusQueries = 0
+    const callbacks = new Map<number, (...args: unknown[]) => void>()
+    const report = {
+      schema_version: 3,
+      roots: [{ display: '/Volumes/Test Photos', encoding: 'unix_bytes', raw_base64: 'L1ZvbHVtZXMvVGVzdCBQaG90b3M' }],
+      files: [],
+      duplicate_groups: [],
+      issues: [],
+      stats: {
+        entries_seen: 0,
+        media_files: 0,
+        files_sampled: 0,
+        duplicate_files: 0,
+        logical_reclaimable_bytes: 0,
+        directory_identity_revisits_skipped: 0,
+      },
+      status: 'complete',
+      cancelled: false,
+    }
+
+    Object.assign(window, {
+      isTauri: true,
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
+      __TAURI_INTERNALS__: {
+        transformCallback: (callback: (...args: unknown[]) => void) => {
+          callbackId += 1
+          callbacks.set(callbackId, callback)
+          return callbackId
+        },
+        unregisterCallback: (id: number) => callbacks.delete(id),
+        invoke: async (command: string) => {
+          if (command === 'plugin:event|listen') return 1
+          if (command === 'plugin:event|unlisten') return undefined
+          if (command === 'plugin:dialog|open') return '/Volumes/Test Photos'
+          if (command === 'start_scan') return { jobId: 'scan-fixture' }
+          if (command === 'cancel_scan') return undefined
+          if (command === 'acknowledge_scan') return { released: true }
+          if (command === 'get_scan_status') {
+            statusQueries += 1
+            if (statusQueries <= 2) {
+              throw { code: 'IPC_TEMPORARY', message: 'temporary fixture failure' }
+            }
+            if (statusQueries === 3) {
+              return {
+                jobId: 'scan-fixture',
+                phase: 'running',
+                startedAtUnixMs: 1_000,
+                finishedAtUnixMs: null,
+                progress: null,
+                report: null,
+                error: null,
+              }
+            }
+            return {
+              jobId: 'scan-fixture',
+              phase: 'completed',
+              startedAtUnixMs: 1_000,
+              finishedAtUnixMs: 1_400,
+              progress: null,
+              report,
+              error: null,
+            }
+          }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '选择照片目录' }).click()
+  await page.getByRole('button', { name: '开始只读扫描' }).click()
+
+  await expect(page.getByRole('button', { name: '停止扫描' })).toBeVisible()
+  await expect(page.getByText(/暂时无法确认扫描状态/)).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  await expect(page.getByText('/Volumes/Test Photos').first()).toBeVisible()
+})

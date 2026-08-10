@@ -17,6 +17,7 @@ import {
   RotateCcw,
   ScanSearch,
   ShieldCheck,
+  Square,
   TriangleAlert,
   Video,
 } from 'lucide-react'
@@ -34,9 +35,10 @@ import type {
 import { fileNameFromPath, formatBytes } from './domain'
 import {
   chooseScanDirectory,
+  cancelDirectoryScanReadOnly,
   isDesktopRuntime,
   runSyntheticScan,
-  scanDirectoryReadOnly,
+  startDirectoryScanReadOnly,
 } from './lib/backend'
 
 type AppPhase = 'idle' | 'ready-to-scan' | 'scanning' | 'results' | 'error'
@@ -264,7 +266,23 @@ function IdleWorkspace({
   )
 }
 
-function ScanningWorkspace({ source, stageIndex }: { source: string; stageIndex: number }) {
+function ScanningWorkspace({
+  source,
+  stageIndex,
+  canCancel,
+  isCancelling,
+  cancelError,
+  statusWarning,
+  onCancel,
+}: {
+  source: string
+  stageIndex: number
+  canCancel: boolean
+  isCancelling: boolean
+  cancelError: string | null
+  statusWarning: string | null
+  onCancel: () => Promise<void>
+}) {
   return (
     <main aria-busy="true" className="workspace workspace--scan">
       <header className="workspace-header">
@@ -273,9 +291,17 @@ function ScanningWorkspace({ source, stageIndex }: { source: string; stageIndex:
           <h1>正在建立内容证据</h1>
           <p title={source}>{source}</p>
         </div>
-        <div aria-live="polite" className="scan-live">
-          <LoaderCircle aria-hidden="true" className="spin" size={22} />
-          {scanStages[stageIndex]?.label}
+        <div className="scan-actions">
+          <div aria-live="polite" className="scan-live">
+            <LoaderCircle aria-hidden="true" className="spin" size={22} />
+            {isCancelling ? '等待当前读取返回并安全停止…' : scanStages[stageIndex]?.label}
+          </div>
+          {canCancel ? (
+            <button className="button button--quiet" disabled={isCancelling} onClick={() => void onCancel()} type="button">
+              <Square aria-hidden="true" size={13} fill="currentColor" />
+              {isCancelling ? '停止请求已发送' : '停止扫描'}
+            </button>
+          ) : null}
         </div>
       </header>
 
@@ -299,9 +325,9 @@ function ScanningWorkspace({ source, stageIndex }: { source: string; stageIndex:
         </ol>
       </section>
 
-      <div className="scan-note">
-        <LockKeyhole aria-hidden="true" size={16} />
-        退出不会触发移动、改名或改时；下次需要重新扫描，文件系统可能记录访问时间 atime。
+      <div className="scan-note" role={cancelError || statusWarning ? 'alert' : undefined}>
+        {cancelError || statusWarning ? <TriangleAlert aria-hidden="true" size={16} /> : <LockKeyhole aria-hidden="true" size={16} />}
+        {cancelError ?? statusWarning ?? '停止请求会在当前系统读取返回后的安全检查点生效；不会触发移动、改名或改时，文件系统仍可能记录 atime。'}
       </div>
     </main>
   )
@@ -541,7 +567,7 @@ function ErrorWorkspace({ error, onReset }: { error: ScanErrorShape; onReset: ()
     <main className="workspace workspace--centered">
       <section className="error-sheet" role="alert">
         <span className="error-sheet__icon"><TriangleAlert size={24} /></span>
-        <span className="section-kicker">扫描已安全停止</span>
+        <span className="section-kicker">扫描流程未完成</span>
         <h1>没有执行主动修改操作</h1>
         <p>{error.message}</p>
         {error.code ? <code>{error.code}</code> : null}
@@ -560,7 +586,12 @@ function App() {
   const [error, setError] = useState<ScanErrorShape | null>(null)
   const [stageIndex, setStageIndex] = useState(0)
   const [isChoosing, setIsChoosing] = useState(false)
+  const [activeScanJobId, setActiveScanJobId] = useState<string | null>(null)
+  const [isCancelling, setIsCancelling] = useState(false)
+  const [scanActionError, setScanActionError] = useState<string | null>(null)
+  const [scanStatusWarning, setScanStatusWarning] = useState<string | null>(null)
   const chooseButtonRef = useRef<HTMLButtonElement>(null)
+  const scanAttemptRef = useRef(false)
 
   async function handleChoose() {
     let shouldRestoreFocus = false
@@ -584,12 +615,69 @@ function App() {
   }
 
   async function handleScan() {
-    if (!source) return
+    if (!source || scanAttemptRef.current) return
+    scanAttemptRef.current = true
     setStageIndex(0)
     setError(null)
+    setScanActionError(null)
+    setScanStatusWarning(null)
     setPhase('scanning')
     try {
-      const nextReport = await scanDirectoryReadOnly(source, (progress) => {
+      const session = await startDirectoryScanReadOnly(
+        source,
+        (progress) => {
+          const nextStage = {
+            enumerating: 0,
+            sampling: 1,
+            full_hashing: 2,
+            verifying: 3,
+            complete: 4,
+          }[progress.stage]
+          setStageIndex(nextStage)
+        },
+        setScanStatusWarning,
+      )
+      setActiveScanJobId(session.jobId)
+      const nextReport = await session.result
+      setSource(nextReport.root)
+      setReport(nextReport)
+      setPhase('results')
+    } catch (scanError) {
+      setError(asScanError(scanError))
+      setPhase('error')
+    } finally {
+      scanAttemptRef.current = false
+      setActiveScanJobId(null)
+      setIsCancelling(false)
+      setScanStatusWarning(null)
+    }
+  }
+
+  async function handleCancelScan() {
+    if (!activeScanJobId || isCancelling) return
+    setIsCancelling(true)
+    setScanActionError(null)
+    setScanStatusWarning(null)
+    try {
+      await cancelDirectoryScanReadOnly(activeScanJobId)
+    } catch (cancelError) {
+      setIsCancelling(false)
+      setScanActionError(`停止请求未送达：${asScanError(cancelError).message}`)
+    }
+  }
+
+  async function handleDemo() {
+    if (scanAttemptRef.current) return
+    scanAttemptRef.current = true
+    const demoRoot = createDemoReport().root
+    setSource(demoRoot)
+    setStageIndex(0)
+    setError(null)
+    setScanActionError(null)
+    setScanStatusWarning(null)
+    setPhase('scanning')
+    try {
+      const demo = await runSyntheticScan((progress) => {
         const nextStage = {
           enumerating: 0,
           sampling: 1,
@@ -599,32 +687,11 @@ function App() {
         }[progress.stage]
         setStageIndex(nextStage)
       })
-      setReport(nextReport)
+      setReport(demo)
       setPhase('results')
-    } catch (scanError) {
-      setError(asScanError(scanError))
-      setPhase('error')
+    } finally {
+      scanAttemptRef.current = false
     }
-  }
-
-  async function handleDemo() {
-    const demoRoot = createDemoReport().root
-    setSource(demoRoot)
-    setStageIndex(0)
-    setError(null)
-    setPhase('scanning')
-    const demo = await runSyntheticScan((progress) => {
-      const nextStage = {
-        enumerating: 0,
-        sampling: 1,
-        full_hashing: 2,
-        verifying: 3,
-        complete: 4,
-      }[progress.stage]
-      setStageIndex(nextStage)
-    })
-    setReport(demo)
-    setPhase('results')
   }
 
   function reset() {
@@ -633,6 +700,11 @@ function App() {
     setReport(null)
     setError(null)
     setStageIndex(0)
+    setActiveScanJobId(null)
+    setIsCancelling(false)
+    setScanActionError(null)
+    setScanStatusWarning(null)
+    scanAttemptRef.current = false
   }
 
   const desktopRuntime = isDesktopRuntime()
@@ -675,7 +747,17 @@ function App() {
             source={source}
           />
         ) : null}
-        {phase === 'scanning' && source ? <ScanningWorkspace source={source} stageIndex={stageIndex} /> : null}
+        {phase === 'scanning' && source ? (
+          <ScanningWorkspace
+            canCancel={activeScanJobId !== null}
+            cancelError={scanActionError}
+            isCancelling={isCancelling}
+            onCancel={handleCancelScan}
+            source={source}
+            stageIndex={stageIndex}
+            statusWarning={scanStatusWarning}
+          />
+        ) : null}
         {phase === 'results' && report ? <ResultsWorkspace onReset={reset} report={report} /> : null}
         {phase === 'error' && error ? <ErrorWorkspace error={error} onReset={reset} /> : null}
       </div>

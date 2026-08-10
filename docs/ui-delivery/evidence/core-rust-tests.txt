@@ -1,10 +1,10 @@
 归影只读扫描核心验证
-时间：2026-08-11T00:15:22+08:00
+时间：2026-08-11T01:02:04+08:00
 环境：rustc/cargo 1.92.0; macOS arm64
 
 命令：cargo fmt --manifest-path crates/guiying-core/Cargo.toml -- --check && cargo clippy --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings && cargo test --manifest-path crates/guiying-core/Cargo.toml --all-features
 退出码：0
 
-结果：fmt 通过，clippy -D warnings 通过，24 tests passed（5 unit + 19 integration），0 failed；doc tests 通过。
+结果：fmt 通过，clippy -D warnings 通过，34 tests passed（10 unit + 24 integration），0 failed；doc tests 通过。
 
-覆盖：root-fd 相对打开、祖先 symlink 置换、根身份变化清空定案组、目录 `(device, inode)` 防循环并降级 partial、直接/子级默认排除、非 UTF-8 路径无损 JSON 往返、硬链接不虚报空间、抽样碰撞由完整哈希消解、同哈希桶逐字节等价类与唯一稳定 group id、扫描中替换排除、精确比较中的并发变化、不可读文件降级为 issue、取消返回安全部分报告、同内容不同名称和时间仍可成组。
+覆盖：root-fd 相对打开、祖先 symlink 置换、根/嵌套目录身份变化清空定案组、目录 `(device, inode)` 防循环并降级 partial、目录深度与宽目录句柄上限、直接/子级默认排除、非 UTF-8 路径无损 JSON 往返、硬链接不虚报空间、短读/超长读拒绝、抽样碰撞由完整哈希消解、同哈希桶逐字节等价类与唯一稳定 group id、扫描中替换排除、精确比较中的并发变化、不可读文件降级为 issue、取消与最终复核取消点返回不含 D1 组的安全部分报告、同内容不同名称和时间仍可成组。

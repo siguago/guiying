@@ -72,6 +72,7 @@
       "result": "passed",
       "evidence_ids": [
         "core-rust-test-log",
+        "scan-jobs-rust-test-log",
         "manual-safety-review"
       ],
       "limitation_id": null,
@@ -266,7 +267,7 @@
       "id": "frontend-qa-log",
       "kind": "test-output",
       "path": "evidence/frontend-qa.txt",
-      "captured_at": "2026-08-11T00:15:28+08:00",
+      "captured_at": "2026-08-11T01:02:04+08:00",
       "tool": "Playwright, axe-core, Vite, Oxlint",
       "version": "Playwright 1.62.1; axe-core 4.12.1; Vite 8.2.1; Oxlint 1.75.0",
       "command": "pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui",
@@ -277,13 +278,13 @@
         "desktop-product-entrypoint-desktop-zh-cn-keyboard",
         "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
       ],
-      "notes": "Four tests pass after correcting contrast, scroll focus, dialog-return focus, synthetic-data disclosure, and metric wording."
+      "notes": "Five tests pass, including a mocked native scenario with two transient status-query failures that retains cancellation control, shows an uncertain-state warning, and recovers. Native cancellation semantics are covered separately by Rust tests."
     },
     {
       "id": "core-rust-test-log",
       "kind": "test-output",
       "path": "evidence/core-rust-tests.txt",
-      "captured_at": "2026-08-11T00:15:22+08:00",
+      "captured_at": "2026-08-11T01:02:04+08:00",
       "tool": "Cargo",
       "version": "1.92.0",
       "command": "cargo fmt --manifest-path crates/guiying-core/Cargo.toml -- --check && cargo clippy --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings && cargo test --manifest-path crates/guiying-core/Cargo.toml --all-features",
@@ -292,6 +293,20 @@
         "desktop-product-entrypoint-desktop-zh-cn-privacy"
       ],
       "notes": "The core exposes no mutation API and fail-closed edge behavior is covered by the recorded Rust suite."
+    },
+    {
+      "id": "scan-jobs-rust-test-log",
+      "kind": "test-output",
+      "path": "evidence/scan-jobs-rust-tests.txt",
+      "captured_at": "2026-08-11T01:02:04+08:00",
+      "tool": "Cargo",
+      "version": "1.92.0",
+      "command": "cargo clippy --fix --allow-dirty --allow-staged && cargo clippy --all-targets -- -D warnings && cargo fmt && cargo test",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-privacy"
+      ],
+      "notes": "Seven task-runtime tests cover single-job exclusion, cooperative cancellation, terminal acknowledgement, owner cleanup, progress isolation and throttling, structured failure, and shared report storage."
     },
     {
       "id": "manual-safety-review",
@@ -311,7 +326,7 @@
       "id": "tauri-build-log",
       "kind": "build-log",
       "path": "evidence/tauri-build.txt",
-      "captured_at": "2026-08-11T00:16:19+08:00",
+      "captured_at": "2026-08-11T01:06:38+08:00",
       "tool": "Tauri CLI",
       "version": "2.11.4",
       "command": "pnpm exec tauri build --debug",
@@ -319,7 +334,7 @@
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-build"
       ],
-      "notes": "The successful corrected command and the earlier argument-forwarding mistake are both disclosed in the log."
+      "notes": "The native debug app and DMG bundle link the cancellable scan commands while retaining the no-write capability boundary."
     },
     {
       "id": "native-run-log",
