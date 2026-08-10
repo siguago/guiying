@@ -171,10 +171,12 @@ fn ensure_reader_eof(reader: &mut impl Read) -> io::Result<()> {
     loop {
         match reader.read(&mut extra) {
             Ok(0) => return Ok(()),
-            Ok(_) => {
+            Ok(bytes_read) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "file contains data beyond its declared length",
+                    format!(
+                        "file contains data beyond its declared length (read {bytes_read} extra byte)"
+                    ),
                 ));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,

@@ -31,9 +31,9 @@ fn same_contents_with_different_names_and_times_are_grouped() {
     let contents = vec![0x5a; 200_000];
     let first = write_media(temporary.path(), "IMG_0001.HEIC", &contents);
     let second = write_media(temporary.path(), "copied-on-vacation.heic", &contents);
-    filetime::set_file_mtime(&first, FileTime::from_unix_time(1_600_000_000, 123))
+    filetime::set_file_mtime(first, FileTime::from_unix_time(1_600_000_000, 123))
         .expect("set first mtime");
-    filetime::set_file_mtime(&second, FileTime::from_unix_time(1_700_000_000, 456))
+    filetime::set_file_mtime(second, FileTime::from_unix_time(1_700_000_000, 456))
         .expect("set second mtime");
 
     let report = Scanner::default()
@@ -294,7 +294,7 @@ fn cancellation_returns_a_safe_partial_report() {
 fn hard_link_aliases_do_not_claim_reclaimable_storage() {
     let temporary = TempDir::new().expect("tempdir");
     let first = write_media(temporary.path(), "a.jpg", b"one physical file");
-    fs::hard_link(&first, temporary.path().join("b.jpg")).expect("create hard link");
+    fs::hard_link(first, temporary.path().join("b.jpg")).expect("create hard link");
 
     let report = Scanner::default()
         .scan([temporary.path()])
@@ -687,9 +687,9 @@ fn exact_comparison_handles_equal_and_different_files() {
     let second = write_media(temporary.path(), "b.mov", b"abcdef");
     let third = write_media(temporary.path(), "c.mov", b"abcxef");
 
-    let equal = compare_files_exact(&first, &second, &guiying_core::NoopScanControl)
+    let equal = compare_files_exact(&first, second, &guiying_core::NoopScanControl)
         .expect("comparison succeeds");
-    let different = compare_files_exact(&first, &third, &guiying_core::NoopScanControl)
+    let different = compare_files_exact(&first, third, &guiying_core::NoopScanControl)
         .expect("comparison succeeds");
 
     assert!(equal.identical);
@@ -722,7 +722,7 @@ fn exact_comparison_never_returns_a_result_after_a_concurrent_change() {
         target: second.clone(),
     };
 
-    let result = compare_files_exact(&first, &second, &control);
+    let result = compare_files_exact(first, &second, &control);
     assert!(matches!(
         result,
         Err(VerificationError::ChangedDuringRead(path)) if path == second

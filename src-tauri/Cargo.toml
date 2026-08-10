@@ -5,7 +5,7 @@ description = "A local-first, evidence-led photo archive deduplication desktop a
 authors = ["siguago"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.92.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

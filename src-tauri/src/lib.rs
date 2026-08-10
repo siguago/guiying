@@ -359,7 +359,7 @@ impl ScanJobManager {
         if registry
             .active
             .as_ref()
-            .map_or(true, |active| active.status.job_id != job_id)
+            .is_none_or(|active| active.status.job_id != job_id)
         {
             return None;
         }
@@ -425,9 +425,9 @@ impl ProgressGate {
         let stage_changed = self.last_stage != Some(stage);
         let count_threshold_reached =
             completed.saturating_sub(self.last_completed) >= PROGRESS_MIN_COUNT_DELTA;
-        let time_threshold_reached = self.last_emitted_at.map_or(true, |previous| {
-            elapsed.saturating_sub(previous) >= PROGRESS_MIN_INTERVAL
-        });
+        let time_threshold_reached = self
+            .last_emitted_at
+            .is_none_or(|previous| elapsed.saturating_sub(previous) >= PROGRESS_MIN_INTERVAL);
         let terminal = stage == "complete";
         let should_emit =
             stage_changed || count_threshold_reached || time_threshold_reached || terminal;

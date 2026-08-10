@@ -24,9 +24,10 @@ fail-closed SQLite 持久化。它们都没有照片写入 API，也不会把缓
 
 ## 开发
 
-前置环境：Node.js 22+、pnpm 10+、Rust 1.77.2、SQLite 3.37+，以及 Tauri 2 在 macOS
-上需要的 Xcode Command Line Tools。Rust 1.77.2 是当前 MSRV 与 CI 门禁版本；stable
-工具链只作为补充复验，不能替代 MSRV。
+前置环境：Node.js 22+、pnpm 10+、Rust 1.92.0、SQLite 3.37+，以及 Tauri 2 在 macOS
+上需要的 Xcode Command Line Tools。五个独立安全基础 crate 另以 Rust 1.77.2 作为
+MSRV 门禁；桌面壳的上游 Tauri 依赖图由锁文件固定，并在 Rust 1.92.0 上构建。两个
+门禁必须分别通过，不能用较新的桌面工具链掩盖基础 crate 的 MSRV 回归。
 
 ```bash
 pnpm install
@@ -53,13 +54,16 @@ for manifest in \
   crates/guiying-metadata/Cargo.toml \
   crates/guiying-store/Cargo.toml \
   crates/guiying-time/Cargo.toml \
-  crates/guiying-volume/Cargo.toml \
-  src-tauri/Cargo.toml
+  crates/guiying-volume/Cargo.toml
 do
   cargo +1.77.2 fmt --manifest-path "$manifest" -- --check
   cargo +1.77.2 clippy --locked --manifest-path "$manifest" --all-targets --all-features -- -D warnings
   cargo +1.77.2 test --locked --manifest-path "$manifest" --all-targets --all-features
 done
+
+cargo +1.92.0 fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo +1.92.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ```
 
 ## 仓库结构

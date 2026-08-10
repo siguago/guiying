@@ -901,10 +901,10 @@ tests 和 rustdoc。
 pnpm lint
 pnpm test:ui
 pnpm build
-cargo +1.77.2 clippy --manifest-path src-tauri/Cargo.toml --fix --allow-dirty --allow-staged
-cargo +1.77.2 clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo +1.77.2 fmt --manifest-path src-tauri/Cargo.toml -- --check
-cargo +1.77.2 test --manifest-path src-tauri/Cargo.toml --all-targets
+cargo +1.92.0 clippy --manifest-path src-tauri/Cargo.toml --fix --allow-dirty --allow-staged
+cargo +1.92.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo +1.92.0 fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets
 pnpm tauri build
 ```
 
