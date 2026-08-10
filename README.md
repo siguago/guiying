@@ -11,7 +11,7 @@
 - 把硬链接从独立副本估算中剔除；容量只显示逻辑重复上限，clone、稀疏文件和快照仍会影响实际释放。
 - 输出版本化重复组报告；当前没有移动、改时、重命名或删除 API。
 
-后续 M1 才会加入 EXIF / QuickTime / sidecar 拍摄时间证据；M2 才会实现隔离事务。设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、[扫描任务协议](docs/engineering/SCAN_JOBS.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、[M0 复核记录](docs/engineering/M0_REVIEW.md) 和 [路线图](docs/ROADMAP.md)。
+仓库已新增一个尚未接入桌面运行时的有界只读元数据提取层：它保留 EXIF / QuickTime 原始字段与精确位置，但明确标记为“未验证”，不会直接生成可信时间或自动修复建议。sidecar 关系、时间规范化与冲突策略仍属于 M1；M2 才会实现隔离事务。设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、[扫描任务协议](docs/engineering/SCAN_JOBS.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、[M0 复核记录](docs/engineering/M0_REVIEW.md) 和 [路线图](docs/ROADMAP.md)。
 
 ## 开发
 
@@ -41,6 +41,9 @@ cargo fmt --manifest-path crates/guiying-core/Cargo.toml -- --check
 cargo clippy --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --manifest-path crates/guiying-core/Cargo.toml --all-features
 
+cargo clippy --manifest-path crates/guiying-metadata/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path crates/guiying-metadata/Cargo.toml --all-targets
+
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
@@ -48,6 +51,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ## 仓库结构
 
 - `crates/guiying-core/`：不提供变更 API 的扫描与逐字节复核核心。读取在部分卷上可能更新文件系统管理的 atime。
+- `crates/guiying-metadata/`：有硬预算的原始 EXIF / QuickTime 时间字段提取；不负责日期可信度、时区推断或写回。
 - `src-tauri/`：最小权限桌面壳与 SQLite 迁移。
 - `src/`：React 证据复核界面。
 - `design-system/`：DTCG 设计令牌及生成的 CSS 消费关系。

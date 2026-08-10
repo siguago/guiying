@@ -1,0 +1,28 @@
+Guiying metadata extraction gate
+Date: 2026-08-11
+
+Scope
+- crates/guiying-metadata
+- read-only, path-independent raw timestamp field extraction
+- JPEG APP1/TIFF and bounded ISO-BMFF/QuickTime structures
+
+Commands
+1. cargo clippy --fix --allow-dirty --allow-staged
+2. cargo clippy --all-targets -- -D warnings
+3. cargo fmt
+4. cargo test --all-targets
+5. RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
+6. cargo package --allow-dirty
+
+Result
+- strict Clippy: pass
+- tests: 25 passed, 0 failed
+- rustdoc warnings: 0
+- package verification: pass
+- malformed structure, overflow, short read, invalid UTF-8, noncanonical BMFF paths,
+  duplicate fields and hard resource limits have negative coverage
+
+Safety interpretation
+- ExtractedUnvalidated means only that raw fields were found in accepted structures.
+- Date syntax, plausibility, timezone, source independence and conflicts are not decided here.
+- This crate exposes no path mutation, rename, timestamp-write or delete API.
