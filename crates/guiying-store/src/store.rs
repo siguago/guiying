@@ -1645,6 +1645,9 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_NOT_SUPPORTED,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
@@ -1656,10 +1659,26 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
         .map_err(|error| StoreError::io("opening database parent for sync", path, error))?;
     let flushed = unsafe { FlushFileBuffers(directory.as_raw_handle().cast()) };
     if flushed == 0 {
+        let error = std::io::Error::last_os_error();
+        // Windows does not provide a portable directory-fsync contract. NTFS
+        // commonly rejects FlushFileBuffers on a directory handle even when
+        // the handle was opened successfully. The database file itself was
+        // already synced before publication, so these specific responses mean
+        // "directory flush unavailable", not that file sync failed. Keep all
+        // other errors fail-closed.
+        if matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32
+                    || code == ERROR_INVALID_HANDLE as i32
+                    || code == ERROR_NOT_SUPPORTED as i32
+        ) {
+            return Ok(());
+        }
         return Err(StoreError::io(
             "syncing database parent directory",
             path,
-            std::io::Error::last_os_error(),
+            error,
         ));
     }
     Ok(())
