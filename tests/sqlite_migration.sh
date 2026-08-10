@@ -193,11 +193,14 @@ INSERT INTO operation_items (
     id, operation_batch_id, volume_id, item_key, media_file_id,
     keeper_media_file_id, duplicate_group_member_id,
     precondition_fingerprint_id, operation_kind,
-    source_relative_path_snapshot, destination_relative_path,
+    source_relative_path_snapshot, source_relative_path_raw,
+    source_path_encoding, destination_relative_path,
+    destination_relative_path_raw, destination_path_encoding,
     expected_size_bytes, expected_digest, created_at_ms, updated_at_ms
 ) VALUES (
     1, 1, 1, 'item-1', 1, 2, 1, 1, 'quarantine', 'source.jpg',
-    '.guiying/q/source.jpg', 10, x'AA', 10, 10
+    CAST('source.jpg' AS BLOB), 'unix_bytes', '.guiying/q/source.jpg',
+    CAST('.guiying/q/source.jpg' AS BLOB), 'unix_bytes', 10, x'AA', 10, 10
 );
 
 UPDATE operation_batches
@@ -261,37 +264,119 @@ expect_fail wrong_sidecar_direction "$core_db" \
 expect_fail time_candidate_evidence_immutable "$core_db" \
     "UPDATE time_candidates SET utc_instant_ns=0 WHERE id=1;"
 
+expect_fail keeper_cannot_be_its_own_destructive_source "$core_db" \
+    "INSERT INTO operation_items (
+        id, operation_batch_id, volume_id, item_key, media_file_id,
+        keeper_media_file_id, duplicate_group_member_id,
+        precondition_fingerprint_id, operation_kind,
+        source_relative_path_snapshot, source_relative_path_raw,
+        source_path_encoding, destination_relative_path,
+        destination_relative_path_raw, destination_path_encoding,
+        expected_size_bytes, expected_digest, created_at_ms, updated_at_ms
+     ) VALUES (
+        93, 1, 1, 'self-keeper', 2, 2, 2, 2, 'quarantine', 'keeper.jpg',
+        CAST('keeper.jpg' AS BLOB), 'unix_bytes', '.guiying/q/keeper.jpg',
+        CAST('.guiying/q/keeper.jpg' AS BLOB), 'unix_bytes', 10, x'AA', 1, 1
+     );"
+
+expect_fail operation_kind_must_match_batch "$core_db" \
+    "INSERT INTO operation_items (
+        id, operation_batch_id, volume_id, item_key, media_file_id,
+        keeper_media_file_id, duplicate_group_member_id,
+        precondition_fingerprint_id, operation_kind,
+        source_relative_path_snapshot, source_relative_path_raw,
+        source_path_encoding, expected_size_bytes, expected_digest,
+        created_at_ms, updated_at_ms
+     ) VALUES (
+        94, 2, 1, 'wrong-batch-kind', 1, 2, 1, 1, 'purge', 'source.jpg',
+        CAST('source.jpg' AS BLOB), 'unix_bytes', 10, x'AA', 1, 1
+     );"
+
+expect_fail display_path_traversal_is_rejected "$core_db" \
+    "INSERT INTO operation_items (
+        id, operation_batch_id, volume_id, item_key, media_file_id,
+        precondition_fingerprint_id, operation_kind,
+        source_relative_path_snapshot, source_relative_path_raw,
+        source_path_encoding, destination_relative_path,
+        destination_relative_path_raw, destination_path_encoding,
+        expected_size_bytes, expected_digest, created_at_ms, updated_at_ms
+     ) VALUES (
+        95, 2, 1, 'display-traversal', 1, 1, 'restore', 'source.jpg',
+        CAST('source.jpg' AS BLOB), 'unix_bytes', '../escape.jpg',
+        CAST('../escape.jpg' AS BLOB), 'unix_bytes', 10, x'AA', 1, 1
+     );"
+
+expect_fail raw_path_traversal_is_rejected "$core_db" \
+    "INSERT INTO operation_items (
+        id, operation_batch_id, volume_id, item_key, media_file_id,
+        precondition_fingerprint_id, operation_kind,
+        source_relative_path_snapshot, source_relative_path_raw,
+        source_path_encoding, destination_relative_path,
+        destination_relative_path_raw, destination_path_encoding,
+        expected_size_bytes, expected_digest, created_at_ms, updated_at_ms
+     ) VALUES (
+        96, 2, 1, 'raw-traversal', 1, 1, 'restore', 'source.jpg',
+        CAST('source.jpg' AS BLOB), 'unix_bytes', 'safe/escape.jpg',
+        CAST('../escape.jpg' AS BLOB), 'unix_bytes', 10, x'AA', 1, 1
+     );"
+
+expect_fail quarantine_requires_destination "$core_db" \
+    "INSERT INTO operation_items (
+        id, operation_batch_id, volume_id, item_key, media_file_id,
+        keeper_media_file_id, duplicate_group_member_id,
+        precondition_fingerprint_id, operation_kind,
+        source_relative_path_snapshot, source_relative_path_raw,
+        source_path_encoding, expected_size_bytes, expected_digest,
+        created_at_ms, updated_at_ms
+     ) VALUES (
+        97, 1, 1, 'missing-destination', 1, 2, 1, 1, 'quarantine',
+        'source.jpg', CAST('source.jpg' AS BLOB), 'unix_bytes',
+        10, x'AA', 1, 1
+     );"
+
 expect_fail precondition_wrong_file "$core_db" \
     "INSERT INTO operation_items (
         id, operation_batch_id, volume_id, item_key, media_file_id,
         precondition_fingerprint_id, operation_kind,
-        source_relative_path_snapshot, expected_size_bytes, expected_digest,
+        source_relative_path_snapshot, source_relative_path_raw,
+        source_path_encoding, destination_relative_path,
+        destination_relative_path_raw, destination_path_encoding,
+        expected_size_bytes, expected_digest,
         created_at_ms, updated_at_ms
      ) VALUES (
-        90, 2, 1, 'wrong-file', 1, 2, 'restore', 'source.jpg', 10, x'AA',
-        1, 1
+        90, 2, 1, 'wrong-file', 1, 2, 'restore', 'source.jpg',
+        CAST('source.jpg' AS BLOB), 'unix_bytes', 'restored/source.jpg',
+        CAST('restored/source.jpg' AS BLOB), 'unix_bytes', 10, x'AA', 1, 1
      );"
 
 expect_fail precondition_not_exact "$core_db" \
     "INSERT INTO operation_items (
         id, operation_batch_id, volume_id, item_key, media_file_id,
         precondition_fingerprint_id, operation_kind,
-        source_relative_path_snapshot, expected_size_bytes, expected_digest,
+        source_relative_path_snapshot, source_relative_path_raw,
+        source_path_encoding, destination_relative_path,
+        destination_relative_path_raw, destination_path_encoding,
+        expected_size_bytes, expected_digest,
         created_at_ms, updated_at_ms
      ) VALUES (
-        91, 2, 1, 'not-exact', 1, 3, 'restore', 'source.jpg', 10, x'AB',
-        1, 1
+        91, 2, 1, 'not-exact', 1, 3, 'restore', 'source.jpg',
+        CAST('source.jpg' AS BLOB), 'unix_bytes', 'restored/source.jpg',
+        CAST('restored/source.jpg' AS BLOB), 'unix_bytes', 10, x'AB', 1, 1
      );"
 
 expect_fail precondition_snapshot_mismatch "$core_db" \
     "INSERT INTO operation_items (
         id, operation_batch_id, volume_id, item_key, media_file_id,
         precondition_fingerprint_id, operation_kind,
-        source_relative_path_snapshot, expected_size_bytes, expected_digest,
+        source_relative_path_snapshot, source_relative_path_raw,
+        source_path_encoding, destination_relative_path,
+        destination_relative_path_raw, destination_path_encoding,
+        expected_size_bytes, expected_digest,
         created_at_ms, updated_at_ms
      ) VALUES (
-        92, 2, 1, 'bad-digest', 1, 1, 'restore', 'source.jpg', 10, x'FF',
-        1, 1
+        92, 2, 1, 'bad-digest', 1, 1, 'restore', 'source.jpg',
+        CAST('source.jpg' AS BLOB), 'unix_bytes', 'restored/source.jpg',
+        CAST('restored/source.jpg' AS BLOB), 'unix_bytes', 10, x'FF', 1, 1
      );"
 
 expect_fail bind_pending_batch_manifest "$core_db" \
@@ -576,21 +661,25 @@ INSERT INTO operation_items (
     id, operation_batch_id, volume_id, item_key, media_file_id,
     keeper_media_file_id, duplicate_group_member_id,
     precondition_fingerprint_id, operation_kind,
-    source_relative_path_snapshot, destination_relative_path,
+    source_relative_path_snapshot, source_relative_path_raw,
+    source_path_encoding, destination_relative_path,
+    destination_relative_path_raw, destination_path_encoding,
     expected_size_bytes, expected_digest, created_at_ms, updated_at_ms
 ) VALUES (
     1, 1, 1, 'donor-quarantine', 1, 2, 1, 1, 'quarantine', 'donor.jpg',
-    '.guiying/q/donor.jpg', 10, x'AA', 1, 1
+    CAST('donor.jpg' AS BLOB), 'unix_bytes', '.guiying/q/donor.jpg',
+    CAST('.guiying/q/donor.jpg' AS BLOB), 'unix_bytes', 10, x'AA', 1, 1
 );
 
 INSERT INTO operation_items (
     id, operation_batch_id, volume_id, item_key, media_file_id,
     time_candidate_id, precondition_fingerprint_id, operation_kind,
-    source_relative_path_snapshot, expected_size_bytes, expected_digest,
+    source_relative_path_snapshot, source_relative_path_raw,
+    source_path_encoding, expected_size_bytes, expected_digest,
     created_at_ms, updated_at_ms
 ) VALUES (
     2, 2, 1, 'target-repair', 3, 1, 3, 'repair_time', 'target.jpg',
-    10, x'AA', 1, 1
+    CAST('target.jpg' AS BLOB), 'unix_bytes', 10, x'AA', 1, 1
 );
 SQL
 

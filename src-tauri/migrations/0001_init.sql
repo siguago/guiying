@@ -725,6 +725,7 @@ CREATE TABLE operation_batches (
     UNIQUE (id, volume_id),
     UNIQUE (volume_id, id),
     CHECK (length(batch_key) > 0),
+    CHECK (is_dry_run = 0 OR state IN ('planned', 'cancelled')),
     CHECK (
         requires_confirmation = 0
         OR state IN ('planned', 'cancelled')
@@ -813,7 +814,16 @@ CREATE TABLE operation_items (
     state_version INTEGER NOT NULL DEFAULT 0
         CHECK (state_version >= 0),
     source_relative_path_snapshot TEXT NOT NULL,
+    source_relative_path_raw BLOB NOT NULL,
+    source_path_encoding TEXT NOT NULL
+        CHECK (source_path_encoding IN ('unix_bytes', 'windows_utf16le')),
     destination_relative_path TEXT,
+    destination_relative_path_raw BLOB,
+    destination_path_encoding TEXT
+        CHECK (
+            destination_path_encoding IS NULL
+            OR destination_path_encoding IN ('unix_bytes', 'windows_utf16le')
+        ),
     expected_size_bytes INTEGER NOT NULL
         CHECK (expected_size_bytes >= 0),
     expected_modified_time_ns INTEGER,
@@ -842,8 +852,59 @@ CREATE TABLE operation_items (
     UNIQUE (volume_id, id),
     CHECK (length(item_key) > 0),
     CHECK (length(source_relative_path_snapshot) > 0),
+    CHECK (length(source_relative_path_raw) > 0),
     CHECK (source_relative_path_snapshot NOT LIKE '/%'),
-    CHECK (destination_relative_path IS NULL OR destination_relative_path NOT LIKE '/%'),
+    CHECK (instr(source_relative_path_snapshot, char(0)) = 0),
+    CHECK (instr('/' || source_relative_path_snapshot || '/', '/../') = 0),
+    CHECK (instr('/' || source_relative_path_snapshot || '/', '/./') = 0),
+    CHECK (instr('/' || source_relative_path_snapshot || '/', '//') = 0),
+    CHECK (
+        source_path_encoding <> 'unix_bytes'
+        OR (
+            substr(source_relative_path_raw, 1, 1) <> x'2F'
+            AND instr(source_relative_path_raw, x'00') = 0
+            AND source_relative_path_raw NOT IN (x'2E', x'2E2E')
+            AND substr(source_relative_path_raw, 1, 2) <> x'2E2F'
+            AND substr(source_relative_path_raw, 1, 3) <> x'2E2E2F'
+            AND substr(source_relative_path_raw, -2) <> x'2F2E'
+            AND substr(source_relative_path_raw, -3) <> x'2F2E2E'
+            AND substr(source_relative_path_raw, -1) <> x'2F'
+            AND instr(source_relative_path_raw, x'2F2E2F') = 0
+            AND instr(source_relative_path_raw, x'2F2E2E2F') = 0
+            AND instr(source_relative_path_raw, x'2F2F') = 0
+        )
+    ),
+    CHECK (
+        (destination_relative_path IS NULL
+            AND destination_relative_path_raw IS NULL
+            AND destination_path_encoding IS NULL)
+        OR (destination_relative_path IS NOT NULL
+            AND destination_relative_path_raw IS NOT NULL
+            AND destination_path_encoding IS NOT NULL
+            AND length(destination_relative_path) > 0
+            AND length(destination_relative_path_raw) > 0
+            AND destination_relative_path NOT LIKE '/%'
+            AND instr(destination_relative_path, char(0)) = 0
+            AND instr('/' || destination_relative_path || '/', '/../') = 0
+            AND instr('/' || destination_relative_path || '/', '/./') = 0
+            AND instr('/' || destination_relative_path || '/', '//') = 0
+            AND (
+                destination_path_encoding <> 'unix_bytes'
+                OR (
+                    substr(destination_relative_path_raw, 1, 1) <> x'2F'
+                    AND instr(destination_relative_path_raw, x'00') = 0
+                    AND destination_relative_path_raw NOT IN (x'2E', x'2E2E')
+                    AND substr(destination_relative_path_raw, 1, 2) <> x'2E2F'
+                    AND substr(destination_relative_path_raw, 1, 3) <> x'2E2E2F'
+                    AND substr(destination_relative_path_raw, -2) <> x'2F2E'
+                    AND substr(destination_relative_path_raw, -3) <> x'2F2E2E'
+                    AND substr(destination_relative_path_raw, -1) <> x'2F'
+                    AND instr(destination_relative_path_raw, x'2F2E2F') = 0
+                    AND instr(destination_relative_path_raw, x'2F2E2E2F') = 0
+                    AND instr(destination_relative_path_raw, x'2F2F') = 0
+                )
+            ))
+    ),
     CHECK (
         (operation_kind = 'repair_time' AND time_candidate_id IS NOT NULL)
         OR (operation_kind <> 'repair_time' AND time_candidate_id IS NULL)
@@ -854,7 +915,14 @@ CREATE TABLE operation_items (
         OR (
             duplicate_group_member_id IS NOT NULL
             AND keeper_media_file_id IS NOT NULL
+            AND media_file_id <> keeper_media_file_id
         )
+    ),
+    CHECK (
+        (operation_kind IN ('quarantine', 'restore')
+            AND destination_relative_path IS NOT NULL)
+        OR (operation_kind NOT IN ('quarantine', 'restore')
+            AND destination_relative_path IS NULL)
     ),
     CHECK (
         state IN ('planned', 'skipped', 'cancelled')
@@ -1509,7 +1577,8 @@ WHEN NEW.keeper_media_file_id IS NOT NULL
     WHERE source_member.volume_id = NEW.volume_id
       AND source_member.id = NEW.duplicate_group_member_id
       AND source_member.media_file_id = NEW.media_file_id
-      AND source_member.member_role <> 'excluded'
+      AND source_member.member_role = 'candidate'
+      AND NEW.media_file_id <> NEW.keeper_media_file_id
       AND (
           batch.scan_run_id IS NULL
           OR batch.scan_run_id = duplicate_group.scan_run_id
@@ -1546,7 +1615,8 @@ WHEN NEW.keeper_media_file_id IS NOT NULL
     WHERE source_member.volume_id = NEW.volume_id
       AND source_member.id = NEW.duplicate_group_member_id
       AND source_member.media_file_id = NEW.media_file_id
-      AND source_member.member_role <> 'excluded'
+      AND source_member.member_role = 'candidate'
+      AND NEW.media_file_id <> NEW.keeper_media_file_id
       AND (
           batch.scan_run_id IS NULL
           OR batch.scan_run_id = duplicate_group.scan_run_id
@@ -1922,6 +1992,16 @@ BEGIN
     SELECT RAISE(ABORT, 'operation batch must start planned, unbound, at version 0');
 END;
 
+CREATE TRIGGER trg_operation_batches_dry_run_cannot_start
+BEFORE UPDATE OF state ON operation_batches
+FOR EACH ROW
+WHEN NEW.state = 'running'
+ AND OLD.state <> NEW.state
+ AND NEW.is_dry_run = 1
+BEGIN
+    SELECT RAISE(ABORT, 'dry-run batches cannot enter an execution state');
+END;
+
 CREATE TRIGGER trg_operation_batches_sealed_plan
 BEFORE UPDATE ON operation_batches
 FOR EACH ROW
@@ -2189,7 +2269,11 @@ WHEN EXISTS (
     OR OLD.precondition_fingerprint_kind IS NOT NEW.precondition_fingerprint_kind
     OR OLD.operation_kind IS NOT NEW.operation_kind
     OR OLD.source_relative_path_snapshot IS NOT NEW.source_relative_path_snapshot
+    OR OLD.source_relative_path_raw IS NOT NEW.source_relative_path_raw
+    OR OLD.source_path_encoding IS NOT NEW.source_path_encoding
     OR OLD.destination_relative_path IS NOT NEW.destination_relative_path
+    OR OLD.destination_relative_path_raw IS NOT NEW.destination_relative_path_raw
+    OR OLD.destination_path_encoding IS NOT NEW.destination_path_encoding
     OR OLD.expected_size_bytes IS NOT NEW.expected_size_bytes
     OR OLD.expected_modified_time_ns IS NOT NEW.expected_modified_time_ns
     OR OLD.expected_digest IS NOT NEW.expected_digest
@@ -2198,6 +2282,40 @@ WHEN EXISTS (
  )
 BEGIN
     SELECT RAISE(ABORT, 'sealed operation item plan is immutable');
+END;
+
+CREATE TRIGGER trg_operation_items_batch_kind_insert
+BEFORE INSERT ON operation_items
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM operation_batches AS batch
+    WHERE batch.id = NEW.operation_batch_id
+      AND batch.volume_id = NEW.volume_id
+      AND (
+          batch.operation_kind = 'mixed'
+          OR batch.operation_kind = NEW.operation_kind
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'operation item kind does not match its batch');
+END;
+
+CREATE TRIGGER trg_operation_items_batch_kind_update
+BEFORE UPDATE OF operation_batch_id, volume_id, operation_kind ON operation_items
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM operation_batches AS batch
+    WHERE batch.id = NEW.operation_batch_id
+      AND batch.volume_id = NEW.volume_id
+      AND (
+          batch.operation_kind = 'mixed'
+          OR batch.operation_kind = NEW.operation_kind
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'operation item kind does not match its batch');
 END;
 
 CREATE TRIGGER trg_operation_items_intent_binding
@@ -2304,7 +2422,8 @@ WHEN NEW.state = 'in_progress'
     WHERE source_member.volume_id = NEW.volume_id
       AND source_member.id = NEW.duplicate_group_member_id
       AND source_member.media_file_id = NEW.media_file_id
-      AND source_member.member_role <> 'excluded'
+      AND source_member.member_role = 'candidate'
+      AND NEW.media_file_id <> NEW.keeper_media_file_id
       AND duplicate_group.match_kind = 'exact_bytes'
       AND duplicate_group.algorithm = 'blake3'
       AND duplicate_group.review_state = 'approved'
@@ -2442,7 +2561,7 @@ WHEN NEW.state = 'in_progress'
                         candidate.source_media_file_id
                     AND link.to_media_file_id = candidate.media_file_id
                     AND link.link_kind = 'sidecar_for'
-                    AND link.relation_state IN ('inferred', 'confirmed')
+                    AND link.relation_state = 'confirmed'
               )
           )
       )

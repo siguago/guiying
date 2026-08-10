@@ -1,5 +1,5 @@
 use std::cmp;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
 
 use crate::error::VerificationError;
@@ -86,30 +86,29 @@ fn compare_files_exact_inner(
     let mut bytes_compared = 0_u64;
     let mut identical = true;
 
-    loop {
+    while bytes_compared < left_before.len {
         if control.is_cancelled() {
             return Err(VerificationError::Cancelled);
         }
 
-        let left_read =
-            left_file
-                .read(&mut left_buffer)
-                .map_err(|source| VerificationError::Read {
-                    path: left.path().to_path_buf(),
-                    source,
-                })?;
-        let right_read =
-            right_file
-                .read(&mut right_buffer)
-                .map_err(|source| VerificationError::Read {
-                    path: right.path().to_path_buf(),
-                    source,
-                })?;
+        let remaining = left_before.len - bytes_compared;
+        let chunk = cmp::min(remaining, VERIFY_BUFFER_BYTES as u64) as usize;
+        read_exact_or_unexpected_eof(&mut left_file, &mut left_buffer[..chunk]).map_err(
+            |source| VerificationError::Read {
+                path: left.path().to_path_buf(),
+                source,
+            },
+        )?;
+        read_exact_or_unexpected_eof(&mut right_file, &mut right_buffer[..chunk]).map_err(
+            |source| VerificationError::Read {
+                path: right.path().to_path_buf(),
+                source,
+            },
+        )?;
 
-        let shared = cmp::min(left_read, right_read);
-        if let Some(position) = left_buffer[..shared]
+        if let Some(position) = left_buffer[..chunk]
             .iter()
-            .zip(&right_buffer[..shared])
+            .zip(&right_buffer[..chunk])
             .position(|(left_byte, right_byte)| left_byte != right_byte)
         {
             bytes_compared = bytes_compared.saturating_add(position as u64 + 1);
@@ -117,14 +116,18 @@ fn compare_files_exact_inner(
             break;
         }
 
-        bytes_compared = bytes_compared.saturating_add(shared as u64);
-        if left_read != right_read {
-            identical = false;
-            break;
-        }
-        if left_read == 0 {
-            break;
-        }
+        bytes_compared = bytes_compared.saturating_add(chunk as u64);
+    }
+
+    if identical {
+        ensure_reader_eof(&mut left_file).map_err(|source| VerificationError::Read {
+            path: left.path().to_path_buf(),
+            source,
+        })?;
+        ensure_reader_eof(&mut right_file).map_err(|source| VerificationError::Read {
+            path: right.path().to_path_buf(),
+            source,
+        })?;
     }
 
     ensure_unchanged(left, &left_file, &left_before)?;
@@ -134,6 +137,50 @@ fn compare_files_exact_inner(
         identical,
         bytes_compared,
     })
+}
+
+fn read_exact_or_unexpected_eof(
+    reader: &mut impl Read,
+    mut destination: &mut [u8],
+) -> io::Result<()> {
+    let expected = destination.len();
+    let mut actual = 0_usize;
+
+    while !destination.is_empty() {
+        match reader.read(destination) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("expected {expected} bytes, read {actual}"),
+                ));
+            }
+            Ok(read) => {
+                actual = actual.saturating_add(read);
+                destination = &mut destination[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_reader_eof(reader: &mut impl Read) -> io::Result<()> {
+    let mut extra = [0_u8; 1];
+    loop {
+        match reader.read(&mut extra) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file contains data beyond its declared length",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub fn files_are_identical(
@@ -230,5 +277,36 @@ fn ensure_unchanged(
             path: access.path().to_path_buf(),
             source,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, ErrorKind};
+
+    use super::{ensure_reader_eof, read_exact_or_unexpected_eof};
+
+    #[test]
+    fn exact_read_rejects_premature_eof() {
+        let mut reader = Cursor::new(b"abc");
+        let mut destination = [0_u8; 4];
+
+        let error = read_exact_or_unexpected_eof(&mut reader, &mut destination)
+            .expect_err("a short read must fail closed");
+
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn exact_read_rejects_data_beyond_the_declared_length() {
+        let mut reader = Cursor::new(b"abcd");
+        let mut destination = [0_u8; 3];
+        read_exact_or_unexpected_eof(&mut reader, &mut destination)
+            .expect("declared prefix is readable");
+
+        let error = ensure_reader_eof(&mut reader)
+            .expect_err("data beyond the declared length must fail closed");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 }

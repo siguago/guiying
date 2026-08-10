@@ -4,7 +4,7 @@
 | --- | --- |
 | 复核日期 | 2026-08-11 |
 | 复核范围 | 只读精确重复扫描核心、Tauri 桥接、React 证据界面、SQLite 安全模型 |
-| 结论 | 可提交为内部 M0；未发现会导致数据损坏或错误 D1 定案的 P0 blocker |
+| 结论 | 可提交为内部 M0；后续审计发现的短读与执行模型 P0 已封闭，写能力仍锁定 |
 
 ## 1. 本轮实际交付
 
@@ -50,12 +50,14 @@ M0 的唯一原生 command 是 `scan_directory`。当前没有移动、重命名
 - 真实扫描进度曾有定时器自动推进：现已仅由 Rust 事件驱动；合成演示使用独立且明确的合成事件。
 - 目录身份循环、根路径祖先 symlink 语义和 opaque path 在前端的保留曾不完整：现已补齐并测试。
 - SQLite 裸 id 曾可能跨卷/跨文件错绑，且 donor 与双日志顺序缺少硬门：现已用复合外键、触发器、不可变依赖和卷端 manifest outbox 阻断。
+- 后续故障模型审计发现完整哈希与逐字节比较对异常提前 EOF 的校验不够：现已要求精确声明长度并额外验证 EOF，短读与超长流均有回归测试。
+- 操作模型曾允许 keeper 自身成为 source、`../` 路径和 batch/item 类型错配：现已增加原始路径字节、角色/同一性、目标路径、dry-run 与动作类型硬约束。
 
 ## 5. 验证结果
 
 | 门禁 | 结果 |
 | --- | --- |
-| Core `fmt + clippy -D warnings + test` | 5 unit + 19 integration，全通过 |
+| Core `fmt + clippy -D warnings + test` | 9 unit + 19 integration，全通过 |
 | Tauri `fmt + clippy -D warnings + test` | 通过 |
 | 前端 tokens / TypeScript / Vite / Oxlint | 通过 |
 | Playwright + axe | 4/4 通过；首屏与结果态 0 violation |

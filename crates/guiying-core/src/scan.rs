@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -772,6 +772,22 @@ fn full_hash(
     let (mut file, before) = binding.open_stable(expected).map_err(map_stable_open)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| classify_read_error(binding, &file, &before, error))?;
+    let (digest, bytes_read) = hash_reader_exact(&mut file, before.len, buffer_bytes, control)
+        .map_err(|error| match error {
+            ReadHashError::Io(error) => classify_read_error(binding, &file, &before, error),
+            other => other,
+        })?;
+
+    verify_unchanged(binding, &file, &before)?;
+    Ok((digest, bytes_read))
+}
+
+fn hash_reader_exact(
+    reader: &mut impl Read,
+    expected_len: u64,
+    buffer_bytes: usize,
+    control: &dyn ScanControl,
+) -> Result<(String, u64), ReadHashError> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; buffer_bytes];
     let mut bytes_read = 0_u64;
@@ -780,9 +796,11 @@ fn full_hash(
         if control.is_cancelled() {
             return Err(ReadHashError::Cancelled);
         }
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| classify_read_error(binding, &file, &before, error))?;
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ReadHashError::Io(error)),
+        };
         if read == 0 {
             break;
         }
@@ -790,7 +808,18 @@ fn full_hash(
         bytes_read = bytes_read.saturating_add(read as u64);
     }
 
-    verify_unchanged(binding, &file, &before)?;
+    if bytes_read != expected_len {
+        let kind = if bytes_read < expected_len {
+            io::ErrorKind::UnexpectedEof
+        } else {
+            io::ErrorKind::InvalidData
+        };
+        return Err(ReadHashError::Io(io::Error::new(
+            kind,
+            format!("expected {expected_len} bytes, read {bytes_read}"),
+        )));
+    }
+
     Ok((hasher.finalize().to_hex().to_string(), bytes_read))
 }
 
@@ -1225,11 +1254,41 @@ fn finish_report(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, ErrorKind};
     use std::path::Path;
 
     use crate::model::{FileRecord, MediaKind, PathRef};
 
-    use super::{make_duplicate_group, partition_equivalence_classes, PairRelation};
+    use super::{
+        hash_reader_exact, make_duplicate_group, partition_equivalence_classes, NoopScanControl,
+        PairRelation, ReadHashError,
+    };
+
+    #[test]
+    fn full_hash_rejects_premature_eof() {
+        let mut reader = Cursor::new(b"abc");
+
+        let error = hash_reader_exact(&mut reader, 4, 2, &NoopScanControl)
+            .expect_err("a short hash input must fail closed");
+
+        assert!(matches!(
+            error,
+            ReadHashError::Io(error) if error.kind() == ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn full_hash_rejects_data_beyond_the_declared_length() {
+        let mut reader = Cursor::new(b"abcd");
+
+        let error = hash_reader_exact(&mut reader, 3, 2, &NoopScanControl)
+            .expect_err("an overlong hash input must fail closed");
+
+        assert!(matches!(
+            error,
+            ReadHashError::Io(error) if error.kind() == ErrorKind::InvalidData
+        ));
+    }
 
     #[test]
     fn a_single_hash_bucket_is_partitioned_by_byte_equality() {
