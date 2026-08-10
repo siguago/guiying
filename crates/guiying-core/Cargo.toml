@@ -1,0 +1,22 @@
+[package]
+name = "guiying-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+description = "Read-only duplicate media scanner for Guiying"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+base64 = "0.23.1"
+blake3 = "1.8.6"
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+
+[dev-dependencies]
+filetime = "0.2.29"
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+
+[target."cfg(unix)".dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
