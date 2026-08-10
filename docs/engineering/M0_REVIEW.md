@@ -44,7 +44,7 @@ M0 的唯一原生 command 是 `scan_directory`。当前没有移动、重命名
 
 - 完整哈希候选曾被 UI 过早称为“确定重复”：现已在组生成前强制逐字节比较，并以 `proof=byte_for_byte` 跨层校验。
 - 目录路径曾存在检查后再按 `PathBuf` 打开的 TOCTOU：现已改为根 fd 锚定的逐组件打开。
-- 报告曾丢失取消状态、issue 细节与非 UTF-8 路径：现已使用 schema v2 完整传递。
+- 报告曾丢失取消状态、issue 细节与非 UTF-8 路径：现已使用 schema v3 完整传递，并把可能超过 JavaScript 安全整数范围的文件身份编码为十进制字符串。
 - 浏览器预览曾可能让合成数据看起来像真实扫描：现在真实目录入口只在 Tauri 可用，合成模式全程固定提示。
 - “零写入”“可回收容量”“已读取字节”等文案曾过强：现已分别改为无主动变更、逻辑重复上限和媒体逻辑大小，并披露 atime。
 - 真实扫描进度曾有定时器自动推进：现已仅由 Rust 事件驱动；合成演示使用独立且明确的合成事件。
@@ -57,7 +57,7 @@ M0 的唯一原生 command 是 `scan_directory`。当前没有移动、重命名
 
 | 门禁 | 结果 |
 | --- | --- |
-| Core `fmt + clippy -D warnings + test` | 9 unit + 19 integration，全通过 |
+| Core `fmt + clippy -D warnings + test` | 9 unit + 24 integration，全通过 |
 | Tauri `fmt + clippy -D warnings + test` | 通过 |
 | 前端 tokens / TypeScript / Vite / Oxlint | 通过 |
 | Playwright + axe | 4/4 通过；首屏与结果态 0 violation |

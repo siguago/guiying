@@ -50,6 +50,14 @@ mod platform {
         relative_components: Vec<OsString>,
     }
 
+    #[derive(Clone)]
+    pub(crate) struct BoundDirectoryAudit {
+        path: PathBuf,
+        snapshot: FileSnapshot,
+        root_anchor: Arc<rustix::fd::OwnedFd>,
+        relative_components: Arc<[OsString]>,
+    }
+
     #[derive(Clone, Debug)]
     pub(crate) struct BoundFile {
         path: PathBuf,
@@ -153,6 +161,15 @@ mod platform {
 
         pub(crate) fn identity(&self) -> Option<crate::model::FileId> {
             self.snapshot.file_id
+        }
+
+        pub(crate) fn audit(&self) -> BoundDirectoryAudit {
+            BoundDirectoryAudit {
+                path: self.path.clone(),
+                snapshot: self.snapshot.clone(),
+                root_anchor: Arc::clone(&self.root_anchor),
+                relative_components: self.relative_components.clone().into(),
+            }
         }
 
         pub(crate) fn read_names(&mut self) -> Result<Vec<OsString>, io::Error> {
@@ -272,6 +289,49 @@ mod platform {
         }
     }
 
+    impl BoundDirectoryAudit {
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(crate) fn revalidate(&self) -> Result<(), BindDirectoryError> {
+            let descriptor = if self.relative_components.is_empty() {
+                rustix::io::dup(&self.root_anchor)
+                    .map_err(|error| BindDirectoryError::Io(error.into()))?
+            } else {
+                let mut opened_directories = Vec::<rustix::fd::OwnedFd>::new();
+                for component in self.relative_components.iter() {
+                    let descriptor = {
+                        let parent = opened_directories
+                            .last()
+                            .map_or_else(|| self.root_anchor.as_fd(), rustix::fd::AsFd::as_fd);
+                        rustix::fs::openat(
+                            parent,
+                            component,
+                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        )
+                    }
+                    .map_err(|error| BindDirectoryError::Io(error.into()))?;
+                    opened_directories.push(descriptor);
+                }
+                opened_directories
+                    .pop()
+                    .ok_or(BindDirectoryError::Changed)?
+            };
+            let metadata = File::from(descriptor)
+                .metadata()
+                .map_err(BindDirectoryError::Io)?;
+            if !metadata.file_type().is_dir() {
+                return Err(BindDirectoryError::NotDirectory);
+            }
+            if FileSnapshot::from_metadata(&metadata) != self.snapshot {
+                return Err(BindDirectoryError::Changed);
+            }
+            Ok(())
+        }
+    }
+
     fn open_root_relative(
         root_anchor: &rustix::fd::OwnedFd,
         relative_components: &[OsString],
@@ -342,12 +402,14 @@ mod platform {
             let (_, snapshot) = snapshot_path(&child).expect("snapshot child");
             let mut bound =
                 BoundDirectory::bind_root(child.clone(), &snapshot).expect("bind child");
+            let audit = bound.audit();
             fs::rename(&child, temporary.path().join("moved-child")).expect("rename child");
             symlink(&outside, &child).expect("replace with symlink");
 
             let names = bound.read_names().expect("read bound directory");
             assert!(names.iter().any(|name| name == "original.jpg"));
             assert!(!names.iter().any(|name| name == "outside.jpg"));
+            assert!(audit.revalidate().is_err());
         }
 
         #[test]
@@ -398,6 +460,11 @@ mod platform {
     /// Directory traversal fails closed on platforms where this crate does not
     /// yet have a handle-relative, no-follow implementation.
     pub(crate) struct BoundDirectory {
+        path: PathBuf,
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct BoundDirectoryAudit {
         path: PathBuf,
     }
 
@@ -471,6 +538,12 @@ mod platform {
             None
         }
 
+        pub(crate) fn audit(&self) -> BoundDirectoryAudit {
+            BoundDirectoryAudit {
+                path: self.path.clone(),
+            }
+        }
+
         pub(crate) fn read_names(&mut self) -> Result<Vec<OsString>, io::Error> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -507,6 +580,19 @@ mod platform {
             )))
         }
     }
+
+    impl BoundDirectoryAudit {
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(crate) fn revalidate(&self) -> Result<(), BindDirectoryError> {
+            Err(BindDirectoryError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure directory revalidation is unavailable on this platform",
+            )))
+        }
+    }
 }
 
-pub(crate) use platform::{BoundDirectory, BoundFile};
+pub(crate) use platform::{BoundDirectory, BoundDirectoryAudit, BoundFile};

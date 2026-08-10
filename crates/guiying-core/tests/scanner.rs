@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use filetime::FileTime;
 use guiying_core::{
     compare_files_exact, files_are_identical, DuplicateProof, PathRef, ProgressStage, ScanControl,
-    ScanIssue, ScanIssueCode, ScanOptions, ScanProgress, ScanStatus, Scanner, VerificationError,
+    ScanError, ScanIssueCode, ScanOptions, ScanProgress, ScanStatus, Scanner, VerificationError,
     REPORT_SCHEMA_VERSION,
 };
 use tempfile::TempDir;
@@ -380,6 +380,95 @@ fn a_changed_scan_root_interrupts_the_report_and_clears_groups() {
         .any(|issue| issue.code == ScanIssueCode::RootChangedDuringScan));
 }
 
+struct ChangeNestedDirectoryAtExactComparison {
+    directory: PathBuf,
+    done: AtomicBool,
+}
+
+impl ScanControl for ChangeNestedDirectoryAtExactComparison {
+    fn on_progress(&self, progress: &ScanProgress) {
+        if progress.stage == ProgressStage::ExactComparing
+            && !self.done.swap(true, Ordering::AcqRel)
+        {
+            write_media(
+                &self.directory,
+                "arrived-during-scan.jpg",
+                b"new nested file",
+            );
+        }
+    }
+}
+
+#[test]
+fn a_changed_nested_directory_interrupts_the_report_and_clears_groups() {
+    let temporary = TempDir::new().expect("tempdir");
+    let album = temporary.path().join("album");
+    fs::create_dir(&album).expect("create album");
+    write_media(&album, "a.jpg", b"duplicate");
+    write_media(&album, "b.jpg", b"duplicate");
+    let control = ChangeNestedDirectoryAtExactComparison {
+        directory: album,
+        done: AtomicBool::new(false),
+    };
+
+    let report = Scanner::default()
+        .scan_with_control([temporary.path()], &control)
+        .expect("scan returns an interrupted report");
+
+    assert_eq!(report.status, ScanStatus::Interrupted);
+    assert!(report.duplicate_groups.is_empty());
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.code == ScanIssueCode::DirectoryChangedDuringScan));
+}
+
+#[test]
+fn a_wide_directory_tree_is_traversed_without_holding_every_child_open() {
+    let temporary = TempDir::new().expect("tempdir");
+    const CHILDREN: usize = 512;
+    for index in 0..CHILDREN {
+        let child = temporary.path().join(format!("album-{index:04}"));
+        fs::create_dir(&child).expect("create child directory");
+        write_media(&child, "photo.jpg", format!("unique-{index}").as_bytes());
+    }
+
+    let report = Scanner::default()
+        .scan([temporary.path()])
+        .expect("wide scan succeeds");
+
+    assert_eq!(report.status, ScanStatus::Complete);
+    assert_eq!(report.files.len(), CHILDREN);
+    assert!(report.issues.is_empty());
+}
+
+#[test]
+fn directory_depth_is_bounded_and_reported_fail_closed() {
+    let temporary = TempDir::new().expect("tempdir");
+    let level_one = temporary.path().join("one");
+    let level_two = level_one.join("two");
+    let level_three = level_two.join("three");
+    fs::create_dir_all(&level_three).expect("create deep tree");
+    write_media(&level_three, "photo.jpg", b"deep fixture");
+    let scanner = Scanner::new(ScanOptions {
+        max_directory_depth: 2,
+        ..ScanOptions::default()
+    })
+    .expect("valid bounded scanner");
+
+    let report = scanner
+        .scan([temporary.path()])
+        .expect("bounded scan succeeds");
+
+    assert_eq!(report.status, ScanStatus::Partial);
+    assert!(report.files.is_empty());
+    assert_eq!(report.stats.directory_depth_limit_skipped, 1);
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.code == ScanIssueCode::DirectoryDepthLimitReached));
+}
+
 #[test]
 fn default_exclusions_skip_photo_libraries_quarantine_and_system_metadata() {
     let temporary = TempDir::new().expect("tempdir");
@@ -410,6 +499,24 @@ fn default_exclusions_skip_photo_libraries_quarantine_and_system_metadata() {
 }
 
 #[test]
+fn appledouble_resource_files_are_not_treated_as_photos() {
+    let temporary = TempDir::new().expect("tempdir");
+    write_media(temporary.path(), "IMG_0001.JPG", b"jpeg payload");
+    write_media(temporary.path(), "._IMG_0001.JPG", b"appledouble metadata");
+
+    let report = Scanner::default()
+        .scan([temporary.path()])
+        .expect("scan succeeds");
+
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(
+        report.files[0].path.display,
+        temporary.path().join("IMG_0001.JPG").to_string_lossy()
+    );
+    assert_eq!(report.stats.non_media_files_skipped, 1);
+}
+
+#[test]
 fn an_excluded_directory_selected_as_the_root_is_reported_without_descent() {
     let temporary = TempDir::new().expect("tempdir");
     for name in ["Family.photoslibrary", ".guiying"] {
@@ -418,17 +525,14 @@ fn an_excluded_directory_selected_as_the_root_is_reported_without_descent() {
         write_media(&excluded_root, "a.jpg", b"duplicate");
         write_media(&excluded_root, "b.jpg", b"duplicate");
 
-        let report = Scanner::default()
+        let error = Scanner::default()
             .scan([&excluded_root])
-            .expect("excluded root produces a report");
+            .expect_err("an excluded root must be refused");
 
-        assert!(report.files.is_empty());
-        assert!(report.duplicate_groups.is_empty());
-        assert_eq!(report.stats.excluded_directories_skipped, 1);
-        assert!(report
-            .issues
-            .iter()
-            .any(|issue| issue.code == ScanIssueCode::DirectoryExcluded));
+        assert!(matches!(
+            error,
+            ScanError::ExcludedRoot { path, .. } if path == excluded_root
+        ));
     }
 }
 
@@ -522,7 +626,7 @@ fn scanner_exact_comparison_fails_closed_on_an_ancestor_symlink_replacement() {
         .any(|issue| issue.code == ScanIssueCode::ExactVerificationFailed));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 #[test]
 fn non_utf8_paths_are_lossless_and_json_serializable() {
     use std::ffi::OsString;
@@ -532,23 +636,48 @@ fn non_utf8_paths_are_lossless_and_json_serializable() {
     let raw_name = OsString::from_vec(b"photo-\xff.jpg".to_vec());
     let raw_path = temporary.path().join(raw_name);
     let raw_ref = PathRef::from_path(&raw_path);
-    write_media(temporary.path(), "normal.jpg", b"fixture");
-    let mut report = Scanner::default()
+    fs::write(&raw_path, b"fixture").expect("write non-UTF-8 media fixture");
+    let report = Scanner::default()
         .scan([temporary.path()])
         .expect("scan succeeds");
-    report.roots[0] = raw_ref.clone();
-    report.files[0].path = raw_ref.clone();
-    report.issues.push(ScanIssue {
-        code: ScanIssueCode::MetadataUnreadable,
-        path: raw_ref.clone(),
-        detail: "synthetic non-UTF-8 path contract test".to_owned(),
-    });
 
     assert_eq!(raw_ref.to_path_buf().unwrap(), raw_path);
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(report.files[0].path, raw_ref);
     let json = serde_json::to_string(&report).expect("report serializes");
+    assert!(json.contains("\"device\":\""));
     let decoded: guiying_core::ScanReport =
         serde_json::from_str(&json).expect("report deserializes");
     assert_eq!(decoded, report);
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+#[test]
+fn non_utf8_path_references_are_lossless_even_when_the_volume_rejects_the_name() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let raw_path = PathBuf::from(OsString::from_vec(b"photo-\xff.jpg".to_vec()));
+    let path_ref = PathRef::from_path(&raw_path);
+    let json = serde_json::to_string(&path_ref).expect("path reference serializes");
+    let decoded: PathRef = serde_json::from_str(&json).expect("path reference deserializes");
+
+    assert_eq!(decoded, path_ref);
+    assert_eq!(decoded.to_path_buf().unwrap(), raw_path);
+}
+
+#[test]
+fn native_file_ids_are_serialized_as_decimal_strings() {
+    let temporary = TempDir::new().expect("tempdir");
+    write_media(temporary.path(), "photo.jpg", b"fixture");
+    let report = Scanner::default()
+        .scan([temporary.path()])
+        .expect("scan succeeds");
+
+    let json = serde_json::to_string(&report).expect("report serializes");
+
+    assert!(json.contains("\"device\":\""));
+    assert!(json.contains("\"inode\":\""));
 }
 
 #[test]

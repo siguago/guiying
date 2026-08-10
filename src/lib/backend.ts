@@ -31,7 +31,7 @@ interface CoreFileRecord {
   size: number
   modified?: CoreTimestamp
   created?: CoreTimestamp
-  file_id?: { device: number; inode: number }
+  file_id?: { device: string; inode: string }
   hard_link_count?: number
   sample_fingerprint?: string
   content_hash?: string
@@ -139,7 +139,7 @@ function adaptGroup(group: CoreDuplicateGroup): DuplicateGroup {
 }
 
 function adaptReport(report: CoreScanReport, durationMs: number): ScanReport {
-  if (report.schema_version !== 2) {
+  if (report.schema_version !== 3) {
     throw new Error(`不支持扫描报告版本 ${report.schema_version}；为避免误读证据，本次结果已拒绝显示。`)
   }
 

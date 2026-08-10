@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use std::sync::Arc;
 
 use crate::compare::compare_bound_files_exact;
 use crate::directory_io::{
-    BindDirectoryError, BindFileError, BoundDirectory, BoundFile, EntryKind,
+    BindDirectoryError, BindFileError, BoundDirectory, BoundDirectoryAudit, BoundFile, EntryKind,
 };
 use crate::error::{ScanError, VerificationError};
 use crate::file_io::{snapshot_path, FileSnapshot, StableOpenError};
@@ -19,6 +20,7 @@ use crate::model::{
 
 const MAX_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_READ_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DIRECTORY_DEPTH: u16 = 512;
 
 /// Observer and cancellation interface used by long-running scans and exact
 /// verification. Implementations must keep callbacks quick and non-blocking.
@@ -90,6 +92,11 @@ impl Scanner {
                 "read_buffer_bytes must be in 1..={MAX_READ_BUFFER_BYTES}"
             )));
         }
+        if options.max_directory_depth == 0 || options.max_directory_depth > MAX_DIRECTORY_DEPTH {
+            return Err(ScanError::InvalidOption(format!(
+                "max_directory_depth must be in 1..={MAX_DIRECTORY_DEPTH}"
+            )));
+        }
 
         options.media_extensions = normalize_values(options.media_extensions, true);
         options.excluded_directory_names =
@@ -147,6 +154,7 @@ impl Scanner {
         let mut stats = ScanStats::default();
         let mut seen_paths = BTreeSet::new();
         let mut visited_directory_ids = BTreeSet::<FileId>::new();
+        let mut directory_audits = Vec::<BoundDirectoryAudit>::new();
         let mut enumeration_completed = 0_u64;
 
         for root in &root_sessions {
@@ -163,15 +171,10 @@ impl Scanner {
 
             if root.is_directory {
                 if let Some(reason) = self.options.directory_exclusion(&root.path) {
-                    stats.excluded_directories_skipped =
-                        stats.excluded_directories_skipped.saturating_add(1);
-                    push_issue(
-                        &mut issues,
-                        ScanIssueCode::DirectoryExcluded,
-                        root.path.clone(),
+                    return Err(ScanError::ExcludedRoot {
+                        path: root.path.clone(),
                         reason,
-                    );
-                    continue;
+                    });
                 }
 
                 let bound_root = match BoundDirectory::bind_root(root.path.clone(), &root.snapshot)
@@ -198,9 +201,28 @@ impl Scanner {
                     continue;
                 }
                 let root_device = root.snapshot.device();
-                let mut directories = vec![bound_root];
+                directory_audits.push(bound_root.audit());
+                let mut bound_root = bound_root;
+                let mut root_names = match bound_root.read_names() {
+                    Ok(names) => names,
+                    Err(error) => {
+                        push_issue(
+                            &mut issues,
+                            ScanIssueCode::DirectoryUnreadable,
+                            bound_root.path().to_path_buf(),
+                            error.to_string(),
+                        );
+                        continue;
+                    }
+                };
+                root_names.sort();
+                let mut directories = vec![DirectoryFrame {
+                    directory: bound_root,
+                    names: root_names,
+                    depth: 0,
+                }];
 
-                while let Some(mut directory) = directories.pop() {
+                while let Some(mut frame) = directories.pop() {
                     if control.is_cancelled() {
                         return Ok(finish_report(
                             roots,
@@ -212,82 +234,84 @@ impl Scanner {
                         ));
                     }
 
-                    let mut names = match directory.read_names() {
-                        Ok(names) => names,
+                    let Some(name) = frame.names.pop() else {
+                        continue;
+                    };
+                    let path = frame.directory.path().join(&name);
+                    if !seen_paths.insert(path.clone()) {
+                        directories.push(frame);
+                        continue;
+                    }
+                    stats.entries_seen = stats.entries_seen.saturating_add(1);
+                    enumeration_completed = enumeration_completed.saturating_add(1);
+                    emit_progress(
+                        control,
+                        ProgressStage::Enumerating,
+                        enumeration_completed,
+                        None,
+                        Some(&path),
+                    );
+                    if control.is_cancelled() {
+                        return Ok(finish_report(
+                            roots,
+                            scanned,
+                            Vec::new(),
+                            issues,
+                            stats,
+                            ScanStatus::Cancelled,
+                        ));
+                    }
+
+                    let kind = match frame.directory.entry_kind(&name) {
+                        Ok(kind) => kind,
                         Err(error) => {
                             push_issue(
                                 &mut issues,
-                                ScanIssueCode::DirectoryUnreadable,
-                                directory.path().to_path_buf(),
+                                ScanIssueCode::MetadataUnreadable,
+                                path,
                                 error.to_string(),
                             );
+                            directories.push(frame);
                             continue;
                         }
                     };
-                    names.sort_by(|left, right| right.cmp(left));
+                    let mut child_to_visit = None;
+                    let child_depth = frame.depth.saturating_add(1);
 
-                    for name in names {
-                        let path = directory.path().join(&name);
-                        if !seen_paths.insert(path.clone()) {
-                            continue;
+                    match kind {
+                        EntryKind::Symlink => {
+                            stats.symlinks_skipped = stats.symlinks_skipped.saturating_add(1);
+                            push_issue(
+                                &mut issues,
+                                ScanIssueCode::SymlinkSkipped,
+                                path,
+                                "symbolic links are never followed".to_owned(),
+                            );
                         }
-                        stats.entries_seen = stats.entries_seen.saturating_add(1);
-                        enumeration_completed = enumeration_completed.saturating_add(1);
-                        emit_progress(
-                            control,
-                            ProgressStage::Enumerating,
-                            enumeration_completed,
-                            None,
-                            Some(&path),
-                        );
-                        if control.is_cancelled() {
-                            return Ok(finish_report(
-                                roots,
-                                scanned,
-                                Vec::new(),
-                                issues,
-                                stats,
-                                ScanStatus::Cancelled,
-                            ));
-                        }
-
-                        let kind = match directory.entry_kind(&name) {
-                            Ok(kind) => kind,
-                            Err(error) => {
+                        EntryKind::Directory => {
+                            if let Some(reason) = self.options.directory_exclusion(&path) {
+                                stats.excluded_directories_skipped =
+                                    stats.excluded_directories_skipped.saturating_add(1);
                                 push_issue(
                                     &mut issues,
-                                    ScanIssueCode::MetadataUnreadable,
+                                    ScanIssueCode::DirectoryExcluded,
                                     path,
-                                    error.to_string(),
+                                    reason,
                                 );
-                                continue;
-                            }
-                        };
-
-                        match kind {
-                            EntryKind::Symlink => {
-                                stats.symlinks_skipped = stats.symlinks_skipped.saturating_add(1);
+                            } else if child_depth > self.options.max_directory_depth {
+                                stats.directory_depth_limit_skipped =
+                                    stats.directory_depth_limit_skipped.saturating_add(1);
                                 push_issue(
                                     &mut issues,
-                                    ScanIssueCode::SymlinkSkipped,
+                                    ScanIssueCode::DirectoryDepthLimitReached,
                                     path,
-                                    "symbolic links are never followed".to_owned(),
+                                    format!(
+                                        "directory depth {child_depth} exceeds the configured safe limit {}",
+                                        self.options.max_directory_depth
+                                    ),
                                 );
-                            }
-                            EntryKind::Directory => {
-                                if let Some(reason) = self.options.directory_exclusion(&path) {
-                                    stats.excluded_directories_skipped =
-                                        stats.excluded_directories_skipped.saturating_add(1);
-                                    push_issue(
-                                        &mut issues,
-                                        ScanIssueCode::DirectoryExcluded,
-                                        path,
-                                        reason,
-                                    );
-                                    continue;
-                                }
-
-                                match directory.bind_child(&name, path.clone()) {
+                            } else {
+                                match frame.directory.bind_child(&name, path.clone()) {
                                     Ok(child) => {
                                         if self.options.stay_on_filesystem
                                             && root_device.is_some()
@@ -303,15 +327,13 @@ impl Scanner {
                                                 "nested filesystem is outside the scan root volume"
                                                     .to_owned(),
                                             );
-                                        } else if !accept_directory_identity(
+                                        } else if accept_directory_identity(
                                             &child,
                                             &mut visited_directory_ids,
                                             &mut issues,
                                             &mut stats,
                                         ) {
-                                            continue;
-                                        } else {
-                                            directories.push(child);
+                                            child_to_visit = Some(child);
                                         }
                                     }
                                     Err(error) => push_directory_binding_issue(
@@ -322,14 +344,10 @@ impl Scanner {
                                     ),
                                 }
                             }
-                            EntryKind::RegularFile => {
-                                let Some(media_kind) = self.options.media_kind(&path) else {
-                                    stats.non_media_files_skipped =
-                                        stats.non_media_files_skipped.saturating_add(1);
-                                    continue;
-                                };
-
-                                match directory.bind_regular_file(&name, path.clone()) {
+                        }
+                        EntryKind::RegularFile => {
+                            if let Some(media_kind) = self.options.media_kind(&path) {
+                                match frame.directory.bind_regular_file(&name, path.clone()) {
                                     Ok(bound_file) => {
                                         if self.options.stay_on_filesystem
                                             && root_device.is_some()
@@ -357,17 +375,41 @@ impl Scanner {
                                     }
                                     Err(error) => push_file_binding_issue(&mut issues, path, error),
                                 }
+                            } else {
+                                stats.non_media_files_skipped =
+                                    stats.non_media_files_skipped.saturating_add(1);
                             }
-                            EntryKind::Other => {
-                                stats.special_files_skipped =
-                                    stats.special_files_skipped.saturating_add(1);
-                                push_issue(
-                                    &mut issues,
-                                    ScanIssueCode::UnsupportedFileType,
-                                    path,
-                                    "only regular files are scanned".to_owned(),
-                                );
+                        }
+                        EntryKind::Other => {
+                            stats.special_files_skipped =
+                                stats.special_files_skipped.saturating_add(1);
+                            push_issue(
+                                &mut issues,
+                                ScanIssueCode::UnsupportedFileType,
+                                path,
+                                "only regular files are scanned".to_owned(),
+                            );
+                        }
+                    }
+
+                    directories.push(frame);
+                    if let Some(mut child) = child_to_visit {
+                        directory_audits.push(child.audit());
+                        match child.read_names() {
+                            Ok(mut names) => {
+                                names.sort();
+                                directories.push(DirectoryFrame {
+                                    directory: child,
+                                    names,
+                                    depth: child_depth,
+                                });
                             }
+                            Err(error) => push_issue(
+                                &mut issues,
+                                ScanIssueCode::DirectoryUnreadable,
+                                child.path().to_path_buf(),
+                                error.to_string(),
+                            ),
                         }
                     }
                 }
@@ -519,15 +561,16 @@ impl Scanner {
                 }
             };
 
-        emit_progress(
-            control,
-            ProgressStage::Complete,
-            scanned.len() as u64,
-            Some(scanned.len() as u64),
-            None,
-        );
+        let directories_stable = revalidate_directories(&directory_audits, &mut issues);
         let roots_stable = revalidate_roots(&root_sessions, &mut issues);
-        let status = if roots_stable {
+        let status = if roots_stable && directories_stable {
+            emit_progress(
+                control,
+                ProgressStage::Complete,
+                scanned.len() as u64,
+                Some(scanned.len() as u64),
+                None,
+            );
             ScanStatus::Complete
         } else {
             groups.clear();
@@ -535,6 +578,25 @@ impl Scanner {
         };
         Ok(finish_report(roots, scanned, groups, issues, stats, status))
     }
+}
+
+fn revalidate_directories(
+    directories: &[BoundDirectoryAudit],
+    issues: &mut Vec<ScanIssue>,
+) -> bool {
+    let mut stable = true;
+    for directory in directories {
+        if let Err(error) = directory.revalidate() {
+            stable = false;
+            push_issue(
+                issues,
+                ScanIssueCode::DirectoryChangedDuringScan,
+                directory.path().to_path_buf(),
+                format!("enumerated directory could not be revalidated: {error:?}"),
+            );
+        }
+    }
+    stable
 }
 
 fn normalize_values(values: BTreeSet<String>, trim_dot: bool) -> BTreeSet<String> {
@@ -683,6 +745,12 @@ struct ScannedFile {
     path: PathBuf,
     snapshot: FileSnapshot,
     binding: BoundFile,
+}
+
+struct DirectoryFrame {
+    directory: BoundDirectory,
+    names: Vec<OsString>,
+    depth: u16,
 }
 
 fn candidates_by_size(scanned: &[ScannedFile]) -> Vec<usize> {
@@ -1194,6 +1262,8 @@ fn issue_makes_report_partial(code: ScanIssueCode) -> bool {
         ScanIssueCode::DirectoryIdentityAlreadyVisited
             | ScanIssueCode::MetadataUnreadable
             | ScanIssueCode::DirectoryUnreadable
+            | ScanIssueCode::DirectoryChangedDuringScan
+            | ScanIssueCode::DirectoryDepthLimitReached
             | ScanIssueCode::FileUnreadable
             | ScanIssueCode::ChangedDuringScan
             | ScanIssueCode::ExactVerificationFailed

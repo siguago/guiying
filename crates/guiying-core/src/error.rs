@@ -19,6 +19,8 @@ pub enum ScanError {
     RootIsSymlink(PathBuf),
     #[error("scan root is neither a regular file nor a directory: {0}")]
     UnsupportedRoot(PathBuf),
+    #[error("scan root is excluded by the safety policy: {path} ({reason})")]
+    ExcludedRoot { path: PathBuf, reason: String },
 }
 
 #[derive(Debug, Error)]
