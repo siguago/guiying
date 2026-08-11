@@ -77,6 +77,7 @@ jobs:
           workspaces: |
             crates/guiying-core -> target
             crates/guiying-metadata -> target
+            crates/guiying-runtime -> target
             crates/guiying-store -> target
             crates/guiying-time -> target
             crates/guiying-volume -> target
@@ -86,6 +87,7 @@ jobs:
           for manifest in \
             crates/guiying-core/Cargo.toml \
             crates/guiying-metadata/Cargo.toml \
+            crates/guiying-runtime/Cargo.toml \
             crates/guiying-store/Cargo.toml \
             crates/guiying-time/Cargo.toml \
             crates/guiying-volume/Cargo.toml
@@ -98,6 +100,7 @@ jobs:
           for manifest in \
             crates/guiying-core/Cargo.toml \
             crates/guiying-metadata/Cargo.toml \
+            crates/guiying-runtime/Cargo.toml \
             crates/guiying-store/Cargo.toml \
             crates/guiying-time/Cargo.toml \
             crates/guiying-volume/Cargo.toml
@@ -110,6 +113,7 @@ jobs:
           for manifest in \
             crates/guiying-core/Cargo.toml \
             crates/guiying-metadata/Cargo.toml \
+            crates/guiying-runtime/Cargo.toml \
             crates/guiying-store/Cargo.toml \
             crates/guiying-time/Cargo.toml \
             crates/guiying-volume/Cargo.toml
@@ -185,4 +189,8 @@ jobs:
         run: |
           cargo fmt --manifest-path crates/guiying-store/Cargo.toml -- --check
           cargo clippy --locked --manifest-path crates/guiying-store/Cargo.toml --all-targets --all-features -- -D warnings
-          cargo test --locked --manifest-path crates/guiying-store/Cargo.toml --all-targets --all-features
+          # Existing-database open deliberately fails closed on Windows until
+          # descriptor-relative file-family staging has a native equivalent.
+          # The complete Store suite runs on Unix; Windows compiles every
+          # target above and executes the explicit platform contract below.
+          cargo test --locked --manifest-path crates/guiying-store/Cargo.toml --test store_integration windows_existing_database_open_fails_closed -- --exact
