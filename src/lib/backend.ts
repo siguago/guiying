@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { createDemoReport } from '../demo'
 import { fileNameFromPath } from '../domain'
-import type { DuplicateGroup, NativePathRef, ScanReport } from '../domain'
+import type { DuplicateGroup, ScanReport } from '../domain'
 
 const DEMO_ROOT = '/Volumes/影像归档/手机照片'
 
@@ -26,8 +26,9 @@ interface CoreScanJobStatus {
   phase: 'running' | 'cancelling' | 'completed' | 'cancelled' | 'failed'
   startedAtUnixMs: number
   finishedAtUnixMs: number | null
+  scanRunId: string | null
   progress: ScanProgress | null
-  report: CoreScanReport | null
+  result: CoreScanResultSummary | null
   error: CoreAppError | null
 }
 
@@ -36,162 +37,228 @@ export interface ReadOnlyScanSession {
   result: Promise<ScanReport>
 }
 
-interface CoreTimestamp {
-  seconds: number
-  nanoseconds: number
+interface CoreScanResultSummary {
+  schemaVersion: number
+  scanRunId: string
+  root: string
+  status: 'complete' | 'partial' | 'cancelled'
+  mediaFiles: string
+  logicalBytes: string
+  candidateSizeBuckets: string
+  sampledFiles: string
+  sampledBytesRead: string
+  fullHashedFiles: string
+  fullHashBytesRead: string
+  verifiedGroups: string
+  verifiedMembers: string
+  comparedPairs: string
+  comparedBytes: string
+  logicalReclaimableBytes: string
+  issues: string
 }
 
-interface CorePathRef {
-  display: string
-  encoding: 'unix_bytes' | 'windows_utf16_le' | 'utf8'
-  raw_base64: string
+interface CoreDuplicateGroupItem {
+  groupBuildId: string
+  groupKeyHex: string
+  memberCount: string
+  independentFileCount: string
+  logicalReclaimableBytes: string
+  finalizedAtUnixMs: string
 }
 
-interface CoreFileRecord {
-  path: CorePathRef
-  media_kind: 'image' | 'raw_image' | 'video'
-  size: number
-  modified?: CoreTimestamp
-  created?: CoreTimestamp
-  file_id?: { device: string; inode: string }
-  hard_link_count?: number
-  sample_fingerprint?: string
-  content_hash?: string
+interface CoreDuplicateGroupMemberItem {
+  groupBuildId: string
+  ordinal: string
+  observationId: string
+  displayPath: string
+  pathEncoding: 'unix_bytes' | 'windows_utf16_le' | 'utf8'
+  sizeBytes: string
+  hasStableFileIdentity: boolean
 }
 
-interface CoreDuplicateGroup {
-  id: string
-  content_hash: string
-  size: number
-  files: CoreFileRecord[]
-  proof: 'byte_for_byte'
-  independent_file_count: number
-  logical_reclaimable_bytes: number
+interface CoreScanIssueItem {
+  issueId: string
+  severity: string
+  stage: string
+  code: string
+  message: string
+  occurredAtUnixMs: string
+  resolved: boolean
 }
 
-interface CoreScanReport {
-  schema_version: number
-  roots: CorePathRef[]
-  files: CoreFileRecord[]
-  duplicate_groups: CoreDuplicateGroup[]
-  issues: Array<{ code: string; path: CorePathRef; detail: string }>
-  stats: {
-    entries_seen: number
-    media_files: number
-    files_sampled: number
-    duplicate_files: number
-    logical_reclaimable_bytes: number
-    directory_identity_revisits_skipped: number
-  }
-  status: 'complete' | 'partial' | 'cancelled' | 'interrupted'
-  cancelled: boolean
+interface CoreResultPage<T> {
+  items: T[]
+  nextCursor: string | null
 }
 
-function formatTimestamp(value?: CoreTimestamp): string | undefined {
-  if (!value) return undefined
-  const date = new Date(value.seconds * 1000 + value.nanoseconds / 1_000_000)
-  if (Number.isNaN(date.getTime())) return undefined
-  return new Intl.DateTimeFormat('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-    timeZoneName: 'short',
-  }).format(date)
-}
+const RESULT_PAGE_SIZE = 128
+const MEMBER_PAGE_SIZE = 256
+const MAX_UI_GROUPS = 2_000
+const MAX_UI_MEMBERS = 50_000
+const MAX_UI_ISSUES = 5_000
 
 function formatFromPath(path: string): string {
   const extension = fileNameFromPath(path).split('.').at(-1)
   return extension?.toUpperCase() ?? '媒体'
 }
 
-function preserveNativePath(path: CorePathRef): NativePathRef {
+function adaptGroup(
+  group: CoreDuplicateGroupItem,
+  members: CoreDuplicateGroupMemberItem[],
+): DuplicateGroup {
+  const sizeBytes = decimalToSafeNumber(members[0]?.sizeBytes ?? '0', '重复组文件大小')
+  const memberCount = decimalToSafeNumber(group.memberCount, '重复组成员数量')
   return {
-    encoding: path.encoding,
-    rawBase64: path.raw_base64,
-  }
-}
-
-function adaptGroup(group: CoreDuplicateGroup): DuplicateGroup {
-  const createdValues = group.files.map((file) => formatTimestamp(file.created)).filter(Boolean)
-  const timeValue = createdValues.length > 0
-    ? Array.from(new Set(createdValues)).slice(0, 3).join(' / ')
-    : '没有可用的文件创建时间'
-
-  return {
-    id: group.id,
-    hashPrefix: `b3:${group.content_hash.slice(0, 8)}…`,
-    mediaKind: group.files[0]?.media_kind === 'video' ? 'video' : 'image',
-    format: formatFromPath(group.files[0]?.path.display ?? ''),
-    sizeBytes: group.size,
-    reclaimableBytes: group.logical_reclaimable_bytes,
-    files: group.files.map((file, index) => ({
-      id: `${group.id}-${index}`,
-      name: fileNameFromPath(file.path.display),
-      path: file.path.display,
-      nativePath: preserveNativePath(file.path),
-      sizeBytes: file.size,
-      createdAt: formatTimestamp(file.created),
-      modifiedAt: formatTimestamp(file.modified),
+    id: group.groupBuildId,
+    hashPrefix: `组:${group.groupKeyHex.slice(0, 10)}…`,
+    mediaKind: members[0]?.displayPath.toLowerCase().match(/\.(mov|mp4|m4v|avi|mkv)$/)
+      ? 'video'
+      : 'image',
+    format: formatFromPath(members[0]?.displayPath ?? ''),
+    sizeBytes,
+    reclaimableBytes: decimalToSafeNumber(
+      group.logicalReclaimableBytes,
+      '重复组逻辑可回收大小',
+    ),
+    files: members.map((file, index) => ({
+      id: file.observationId,
+      name: fileNameFromPath(file.displayPath),
+      path: file.displayPath,
+      sizeBytes: decimalToSafeNumber(file.sizeBytes, '重复文件大小'),
       isRecommendedKeeper: index === 0,
       keeperReason: index === 0
-        ? '当前只按稳定路径顺序暂定；尚未解析内嵌拍摄时间与伴随资产'
+        ? '当前只按封印后的稳定顺序暂定；尚未解析内嵌拍摄时间与伴随资产'
         : undefined,
     })),
     evidence: [
       {
-        label: '文件创建时间',
-        value: timeValue,
-        source: '只读 birthtime（若卷提供）；不是拍摄时间',
+        label: '拍摄时间',
+        value: '尚未进入元数据时间分析阶段',
+        source: '当前 D1 结果只证明文件内容逐字节相同',
         confidence: 'low',
-        note: 'M0 尚未解析 EXIF / QuickTime，不会根据这些时间自动修复或选择主副本。',
+        note: '不会把文件系统时间当成拍摄时间，也不会据此自动选择主副本。',
       },
     ],
     verification: [
-      { label: '文件大小', detail: `${group.files.length} 份一致`, status: 'passed' },
-      { label: '抽样指纹', detail: '首 / 中 / 尾一致', status: 'passed' },
-      { label: '完整 BLAKE3', detail: `${group.content_hash.slice(0, 8)}…`, status: 'passed' },
-      { label: '扫描逐字节校验', detail: `${group.files.length} 份完全一致`, status: 'passed' },
-      { label: '执行前再次复核', detail: '隔离能力尚未实现', status: 'pending' },
+      { label: '文件大小', detail: `${memberCount} 份一致`, status: 'passed' },
+      { label: '抽样指纹', detail: '当前会话有界读取一致', status: 'passed' },
+      { label: '完整 BLAKE3', detail: '当前会话完整读取并封印', status: 'passed' },
+      { label: '逐字节校验', detail: `${memberCount} 份内容完全一致`, status: 'passed' },
+      { label: '目录覆盖复核', detail: '所有读取后重新验证', status: 'passed' },
+      { label: '执行前再次复核', detail: '隔离能力仍保持锁定', status: 'pending' },
     ],
   }
 }
 
-function adaptReport(report: CoreScanReport, durationMs: number): ScanReport {
-  if (report.schema_version !== 3) {
-    throw new Error(`不支持扫描报告版本 ${report.schema_version}；为避免误读证据，本次结果已拒绝显示。`)
+async function adaptPersistentReport(
+  jobId: string,
+  result: CoreScanResultSummary,
+  durationMs: number,
+  includeEvidencePages: boolean,
+): Promise<ScanReport> {
+  if (result.schemaVersion !== 1) {
+    throw new Error(`不支持持久化扫描结果版本 ${result.schemaVersion}；为避免误读证据，本次结果已拒绝显示。`)
   }
-
-  const verifiedGroups = report.duplicate_groups.filter((group) => group.proof === 'byte_for_byte')
+  const groupRecords = includeEvidencePages
+    ? await readAllPages<CoreDuplicateGroupItem>(
+      'list_duplicate_groups',
+      { jobId },
+      RESULT_PAGE_SIZE,
+      MAX_UI_GROUPS,
+      '确定重复组',
+    )
+    : []
+  let memberTotal = 0
+  const duplicateGroups: DuplicateGroup[] = []
+  for (const group of groupRecords) {
+    const members = await readAllPages<CoreDuplicateGroupMemberItem>(
+      'list_duplicate_group_members',
+      { jobId, groupBuildId: group.groupBuildId },
+      MEMBER_PAGE_SIZE,
+      MAX_UI_MEMBERS - memberTotal,
+      '重复组成员',
+    )
+    memberTotal += members.length
+    duplicateGroups.push(adaptGroup(group, members))
+  }
+  const issueRecords = includeEvidencePages
+    ? await readAllPages<CoreScanIssueItem>(
+      'list_scan_issues',
+      { jobId },
+      MEMBER_PAGE_SIZE,
+      MAX_UI_ISSUES,
+      '扫描问题',
+    )
+    : []
+  const duplicateFiles = groupRecords.reduce((total, group) => {
+    const independent = decimalToSafeNumber(group.independentFileCount, '独立文件数量')
+    return total + Math.max(0, independent - 1)
+  }, 0)
   return {
     dataMode: 'live',
-    status: report.status,
-    root: report.roots[0]?.display ?? '',
-    rootPath: report.roots[0] ? preserveNativePath(report.roots[0]) : undefined,
-    scannedFiles: report.stats.entries_seen,
-    mediaFiles: report.stats.media_files,
-    candidateFiles: report.stats.files_sampled,
-    scannedBytes: report.files.reduce((sum, file) => sum + file.size, 0),
-    duplicateFiles: verifiedGroups.reduce(
-      (total, group) => total + Math.max(0, group.independent_file_count - 1),
-      0,
+    status: result.status,
+    root: result.root,
+    scannedFiles: decimalToSafeNumber(result.mediaFiles, '媒体文件数量'),
+    mediaFiles: decimalToSafeNumber(result.mediaFiles, '媒体文件数量'),
+    candidateFiles: decimalToSafeNumber(result.sampledFiles, '候选文件数量'),
+    scannedBytes: decimalToSafeNumber(result.logicalBytes, '媒体逻辑大小'),
+    duplicateFiles,
+    reclaimableBytes: decimalToSafeNumber(
+      result.logicalReclaimableBytes,
+      '逻辑重复上限',
     ),
-    reclaimableBytes: report.stats.logical_reclaimable_bytes,
     durationMs,
-    skippedFiles: report.issues.length,
-    issues: report.issues.map((issue) => ({
+    skippedFiles: decimalToSafeNumber(result.issues, '问题数量'),
+    issues: issueRecords.map((issue) => ({
       code: issue.code,
-      path: issue.path.display,
-      nativePath: preserveNativePath(issue.path),
-      detail: issue.detail,
+      path: '',
+      detail: `${issue.stage}：${issue.message}`,
     })),
-    duplicateGroups: verifiedGroups
-      .map(adaptGroup)
+    duplicateGroups: duplicateGroups
       .sort((left, right) => right.reclaimableBytes - left.reclaimableBytes),
   }
+}
+
+async function readAllPages<T>(
+  command: string,
+  scope: Record<string, string>,
+  limit: number,
+  hardLimit: number,
+  label: string,
+): Promise<T[]> {
+  if (hardLimit <= 0) {
+    throw new Error(`${label}超过当前界面的有界加载上限；完整证据仍保存在本地数据库中。`)
+  }
+  const items: T[] = []
+  const seenCursors = new Set<string>()
+  let cursor: string | null = null
+  for (;;) {
+    const page: CoreResultPage<T> = await invoke<CoreResultPage<T>>(
+      command,
+      { ...scope, cursor, limit },
+    )
+    if (items.length + page.items.length > hardLimit) {
+      throw new Error(`${label}超过当前界面的有界加载上限（${hardLimit.toLocaleString('zh-CN')}）；完整证据仍保存在本地数据库中。`)
+    }
+    items.push(...page.items)
+    if (page.nextCursor === null) return items
+    if (seenCursors.has(page.nextCursor)) {
+      throw new Error(`${label}分页游标重复；为避免遗漏或重复展示，结果加载已停止。`)
+    }
+    seenCursors.add(page.nextCursor)
+    cursor = page.nextCursor
+  }
+}
+
+function decimalToSafeNumber(value: string, label: string): number {
+  if (!/^(0|[1-9]\d*)$/.test(value)) {
+    throw new Error(`${label}不是有效的非负十进制数。`)
+  }
+  const integer = BigInt(value)
+  if (integer > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`${label}超过当前界面的安全整数范围；为避免错误展示，本次结果已保留但不渲染。`)
+  }
+  return Number(integer)
 }
 
 export function isDesktopRuntime(): boolean {
@@ -292,13 +359,18 @@ async function waitForScanResult(
       }
 
       if (status.phase === 'completed' || status.phase === 'cancelled') {
-        if (!status.report) {
-          throw new Error('扫描任务已结束，但没有返回可验证的报告。')
+        if (!status.result) {
+          throw new Error('扫描任务已结束，但没有返回持久化结果摘要。')
         }
         const measuredDuration = status.finishedAtUnixMs === null
           ? Math.round(performance.now() - startedAt)
           : Math.max(0, status.finishedAtUnixMs - status.startedAtUnixMs)
-        const report = adaptReport(status.report, measuredDuration)
+        const report = await adaptPersistentReport(
+          jobId,
+          status.result,
+          measuredDuration,
+          status.phase === 'completed',
+        )
         await acknowledgeScanWithRetry(jobId, onStatusWarning)
         return report
       }
@@ -340,7 +412,7 @@ async function acknowledgeScanWithRetry(
     } catch (error) {
       if (errorCode(error) === 'SCAN_JOB_NOT_FOUND') return
       attempt += 1
-      onStatusWarning?.(`报告已生成，正在确认本地接收（重试 ${attempt}）；原文件未发生主动变更。`)
+      onStatusWarning?.(`结果已持久化，正在确认界面接收（重试 ${attempt}）；原文件未发生主动变更。`)
       await wait(Math.min(2_000, 200 * 2 ** Math.min(attempt - 1, 4)))
     }
   }

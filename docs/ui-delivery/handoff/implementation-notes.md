@@ -1,13 +1,15 @@
 # 实现交接
 
+> 本文件最初记录 M0。下列技术映射已同步到当前 Phase 1；其余 M0 视觉决策仍作为历史设计依据保留。
+
 ## 技术映射
 
-- `src/App.tsx`：M0 状态机、工作流轨道、扫描/结果/错误界面。
+- `src/App.tsx`：Phase 1 状态机、工作流轨道、扫描/结果/错误界面。
 - `src/App.css` 与 `src/index.css`：桌面布局、紧凑断点、焦点与减少动画设置。
-- `src/lib/backend.ts`：Tauri 目录选择、只读扫描 invoke、进度事件与浏览器合成数据适配。
-- `src-tauri/src/lib.rs`：唯一 command `scan_directory`；没有移动、重命名、改时、删除或任意路径写入 command。
-- `crates/guiying-core/`：分层 BLAKE3、并发变化检查、硬链接处理和执行前逐字节比较。
-- `src-tauri/migrations/0001_init.sql`：未来事务与审计账本的数据模型；当前 M0 尚未连接持久化运行时。
+- `src/lib/backend.ts`：Tauri 目录选择、只读扫描 invoke、轻量状态、结果分页与浏览器合成数据适配。
+- `src-tauri/src/lib.rs` / `scan_service.rs`：单任务调度、应用数据库初始化、合作式取消和只读分页 command；没有照片移动、重命名、改时或删除命令。
+- `crates/guiying-core/` / `guiying-volume/` / `guiying-runtime/`：分层 BLAKE3、descriptor/mount 夹持、逐字节比较和可信证据适配。
+- `crates/guiying-store/`：应用数据目录中的认证观察、阶段封印、D1 组和有界分页；不打开用户媒体。
 
 ## 令牌与组件
 
@@ -32,8 +34,8 @@ Rust 验证命令记录于仓库根 README。Tauri webview capability 只开放 
 
 ## 当前约束
 
-- M0 尚未解析 EXIF、QuickTime、XMP、AAE、Google Takeout JSON 或 Live Photo 配对关系。
+- 当前阶段尚未在桌面主链接入 EXIF、QuickTime、XMP、AAE、Google Takeout JSON 或 Live Photo 配对关系。
 - 结果中的 keeper 仅按稳定路径顺序暂定，并明确标注不能作为删除依据。
-- SQLite 迁移已经定义能力探测、密封计划、事务状态与审计事件，但未接入 UI。
+- SQLite 只读扫描证据已接入 UI；未来文件动作表仍 dormant，不构成执行授权。
 - 开发包仍使用 Tauri 脚手架应用图标；发布前必须完成品牌图标与小尺寸 QA。
 - 浏览器 E2E 覆盖合成数据流程；真实外置卷和系统目录对话框仍需人工验收矩阵。

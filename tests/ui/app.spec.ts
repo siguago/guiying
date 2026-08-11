@@ -75,22 +75,24 @@ test('a transient native status failure keeps cancellation control and recovers'
     let callbackId = 0
     let statusQueries = 0
     const callbacks = new Map<number, (...args: unknown[]) => void>()
-    const report = {
-      schema_version: 3,
-      roots: [{ display: '/Volumes/Test Photos', encoding: 'unix_bytes', raw_base64: 'L1ZvbHVtZXMvVGVzdCBQaG90b3M' }],
-      files: [],
-      duplicate_groups: [],
-      issues: [],
-      stats: {
-        entries_seen: 0,
-        media_files: 0,
-        files_sampled: 0,
-        duplicate_files: 0,
-        logical_reclaimable_bytes: 0,
-        directory_identity_revisits_skipped: 0,
-      },
+    const result = {
+      schemaVersion: 1,
+      scanRunId: '7',
+      root: '/Volumes/Test Photos',
       status: 'complete',
-      cancelled: false,
+      mediaFiles: '0',
+      logicalBytes: '0',
+      candidateSizeBuckets: '0',
+      sampledFiles: '0',
+      sampledBytesRead: '0',
+      fullHashedFiles: '0',
+      fullHashBytesRead: '0',
+      verifiedGroups: '0',
+      verifiedMembers: '0',
+      comparedPairs: '0',
+      comparedBytes: '0',
+      logicalReclaimableBytes: '0',
+      issues: '0',
     }
 
     Object.assign(window, {
@@ -110,6 +112,8 @@ test('a transient native status failure keeps cancellation control and recovers'
           if (command === 'start_scan') return { jobId: 'scan-fixture' }
           if (command === 'cancel_scan') return undefined
           if (command === 'acknowledge_scan') return { released: true }
+          if (command === 'list_duplicate_groups') return { items: [], nextCursor: null }
+          if (command === 'list_scan_issues') return { items: [], nextCursor: null }
           if (command === 'get_scan_status') {
             statusQueries += 1
             if (statusQueries <= 2) {
@@ -121,8 +125,9 @@ test('a transient native status failure keeps cancellation control and recovers'
                 phase: 'running',
                 startedAtUnixMs: 1_000,
                 finishedAtUnixMs: null,
+                scanRunId: null,
                 progress: null,
-                report: null,
+                result: null,
                 error: null,
               }
             }
@@ -131,8 +136,9 @@ test('a transient native status failure keeps cancellation control and recovers'
               phase: 'completed',
               startedAtUnixMs: 1_000,
               finishedAtUnixMs: 1_400,
+              scanRunId: '7',
               progress: null,
-              report,
+              result,
               error: null,
             }
           }

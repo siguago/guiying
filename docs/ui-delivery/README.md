@@ -2,6 +2,8 @@
 
 这是现有仓库的 complete / implementation / desktop / zh-CN 交付记录，范围限定为 M0 只读精确重复扫描。视觉方向为“档案纸上的校验台账”，签名装置是贯穿重复验证与时间来源的证据脊柱。
 
+> 这是 M0 的历史交付证据包；其中命令面、测试数量和实现映射不代表当前 Phase 1 代码。当前边界以仓库根 README、`docs/engineering/SCAN_JOBS.md` 和 `docs/engineering/PHASE1_RUNTIME.md` 为准。本目录截图会随现有 UI 回归测试刷新。
+
 ## 打开方式
 
 在仓库根目录安装依赖后运行原生应用：

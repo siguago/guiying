@@ -209,7 +209,7 @@ function IdleWorkspace({
           <h1>先看证据，<br />再决定要不要动文件。</h1>
           <p className="intro-lede">
             归影从内容本身识别重复，不相信文件名，也不把复制时间当作拍摄时间。
-            第一次扫描只生成可复核的证据报告；M0 尚不分析伴随资产，不能据此执行清理。
+            当前扫描只生成持久化、可复核的证据；尚不分析伴随资产，也不能据此执行清理。
           </p>
 
           <div className="intro-actions">
@@ -253,7 +253,7 @@ function IdleWorkspace({
             </li>
             <li>
               <span>03</span>
-              <div><strong>异常即保留</strong><small>不可读或扫描中变化的文件跳过；M0 不验证媒体可解码性</small></div>
+              <div><strong>异常即保留</strong><small>不可读或扫描中变化的文件跳过；当前阶段不验证媒体可解码性</small></div>
             </li>
           </ol>
           <div className="safety-sheet__footer">
@@ -448,7 +448,7 @@ function EmptyResults({ status }: { status: ScanReport['status'] }) {
     <div className="empty-results">
       <CheckCircle2 aria-hidden="true" size={30} />
       <h2>在已扫描范围内没有发现确定重复项</h2>
-      <p>本次只检查了逐字节完全相同的受支持媒体。相似照片与伴随资产不会被归入 M0 结果。</p>
+      <p>本次只检查了逐字节完全相同的受支持媒体。相似照片与伴随资产不会被归入当前结果。</p>
       {status !== 'complete' ? <small>扫描并未覆盖全部条目，请同时复核问题清单。</small> : null}
     </div>
   )
@@ -553,7 +553,7 @@ function ResultsWorkspace({
           ) : <EmptyResults status={report.status} />}
           <div className="group-panel__footer">
             <Info aria-hidden="true" size={15} />
-            本报告中的组已在扫描时逐字节确认；未来执行隔离前仍会再次复核。M0 尚不分析伴随资产，也不会执行清理。
+            本结果中的组已在当前挂载会话逐字节确认并持久化；未来执行隔离前仍会再次复核。当前阶段尚不分析伴随资产，也不会执行清理。
           </div>
         </section>
         {selectedGroup ? <GroupInspector group={selectedGroup} /> : null}
@@ -732,7 +732,7 @@ function App() {
           </div>
           <div className="app-bar__status">
             <span><span className="status-dot status-dot--ok" /> 无主动变更</span>
-            <span className="app-version">M0 · Evidence scan</span>
+            <span className="app-version">Phase 1 · Persistent evidence</span>
           </div>
         </header>
 

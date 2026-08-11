@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | 分阶段实施中；11.1 持久化证据层已完成，尚未接入桌面主链 |
+| 状态 | 分阶段实施中；持久化 D1 runtime 与 Tauri 分页主链已接通，时间与暂停恢复待完成 |
 | 最近更新 | 2026-08-11 |
 | 适用路线图 | [Phase 1：只读精确扫描 MVP](../ROADMAP.md#4-phase-1只读精确扫描-mvp) |
 | 写能力 | 无；本阶段不移动、不重命名、不改时、不隔离、不删除照片 |
@@ -32,7 +32,9 @@ mtime”，而不是 OS 级零写入保证。
 中与未来操作计划有关的表不构成本阶段的授权；Phase 1 不得暴露任何对应 Rust API、
 Tauri command 或 UI 入口。
 
-## 2. 当前实现判断
+## 2. 原始基线与当前进展
+
+本节 2.1–2.5 保留方案制定时的差距分析。当前代码已经完成 core 流式票据、volume 当前挂载夹持、Store v6 认证证据、runtime D1 封印，以及 Tauri 轻量状态/分页接入；仍未完成的部分以第 11 节和路线图为准。
 
 ### 2.1 `guiying-core`
 
@@ -98,11 +100,7 @@ job/run 乐观状态版本。
 
 ### 2.5 Tauri 与前端
 
-当前 Tauri 任务注册表只存在于进程内，且 `get_scan_status` 仍会返回
-`Arc<ScanReport>`。结果必须由前端 acknowledge 后才能释放，进程重启后状态全部丢失。
-
-Phase 1 必须改为 SQLite 是 durable truth，Tauri event 只发送轻量状态，结果按
-group/member/issue/time evidence 分页读取。
+原始 Tauri 任务注册表只存在于进程内，并返回 `Arc<ScanReport>`。当前已改为 SQLite 是证据真相源，事件和 `get_scan_status` 只发送轻量摘要，group/member/issue 通过有界分页读取。应用进程重启会令旧挂载会话失效并中断非终态 run；历史结果浏览与时间证据分页仍待接入。
 
 ## 3. 双键信任模型
 
@@ -711,7 +709,7 @@ list_time_evidence_fields
 
 - 返回完整报告的 `scan_directory`；
 - 带 `report` 字段的 `get_scan_status`；
-- 仅为释放内存报告而存在的 `acknowledge_scan`。
+- 仅为释放大型内存报告而存在的旧 `acknowledge_scan` 语义；当前同名命令只解除下一任务并发门，不删除持久化证据。
 
 状态事件只含 job/run key、state/version、stage、decimal-string counters 和有界 display
 path。事件丢失由 durable status 查询兜底。
