@@ -2402,14 +2402,7 @@ fn read_sample_fresh(
         .binding
         .open_stable(&opened.snapshot)
         .map_err(map_fresh_open_error)?;
-    let chunk = before.len.min(sample_bytes as u64) as usize;
-    let mut offsets = vec![0_u64];
-    if before.len > chunk as u64 {
-        offsets.push(before.len / 2 - chunk as u64 / 2);
-        offsets.push(before.len - chunk as u64);
-    }
-    offsets.sort_unstable();
-    offsets.dedup();
+    let (chunk, offsets) = crate::scan::sample_layout(before.len, sample_bytes);
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"guiying-sample-v1\0");

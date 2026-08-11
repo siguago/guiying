@@ -838,14 +838,7 @@ fn sample_fingerprint(
     control: &dyn ScanControl,
 ) -> Result<(String, u64), ReadHashError> {
     let (mut file, before) = binding.open_stable(expected).map_err(map_stable_open)?;
-    let chunk = (before.len.min(sample_bytes as u64)) as usize;
-    let mut offsets = vec![0_u64];
-    if before.len > chunk as u64 {
-        offsets.push(before.len / 2 - chunk as u64 / 2);
-        offsets.push(before.len - chunk as u64);
-    }
-    offsets.sort_unstable();
-    offsets.dedup();
+    let (chunk, offsets) = sample_layout(before.len, sample_bytes);
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"guiying-sample-v1\0");
@@ -870,6 +863,22 @@ fn sample_fingerprint(
 
     verify_unchanged(binding, &file, &before)?;
     Ok((hasher.finalize().to_hex().to_string(), bytes_read))
+}
+
+/// Select at most three non-overlapping sample windows. Keeping the windows
+/// disjoint guarantees that the reported physical bytes read never exceeds
+/// the immutable file length, even when a file is only slightly larger than
+/// the configured per-window target.
+pub(crate) fn sample_layout(length: u64, sample_bytes: usize) -> (usize, Vec<u64>) {
+    let target = sample_bytes as u64;
+    if length <= target {
+        return (length as usize, vec![0]);
+    }
+    let chunk = target.min((length / 3).max(1));
+    let mut offsets = vec![0, (length - chunk) / 2, length - chunk];
+    offsets.sort_unstable();
+    offsets.dedup();
+    (chunk as usize, offsets)
 }
 
 fn full_hash(
@@ -1372,9 +1381,21 @@ mod tests {
 
     use super::{
         hash_reader_exact, make_duplicate_group, partition_equivalence_classes,
-        revalidate_directories, revalidate_roots, CancellationToken, NoopScanControl, PairRelation,
-        ReadHashError,
+        revalidate_directories, revalidate_roots, sample_layout, CancellationToken,
+        NoopScanControl, PairRelation, ReadHashError,
     };
+
+    #[test]
+    fn sample_windows_never_overlap_or_exceed_the_file() {
+        for length in 0_u64..=300_000 {
+            let (chunk, offsets) = sample_layout(length, 64 * 1024);
+            let chunk = chunk as u64;
+            assert!(offsets.len() <= 3);
+            assert!(offsets.iter().all(|offset| offset + chunk <= length));
+            assert!(offsets.windows(2).all(|pair| pair[0] + chunk <= pair[1]));
+            assert!(chunk.saturating_mul(offsets.len() as u64) <= length);
+        }
+    }
 
     #[test]
     fn final_revalidation_observes_cancellation_before_completion() {
