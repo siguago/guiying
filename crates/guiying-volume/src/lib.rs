@@ -3,8 +3,9 @@
 //! This crate deliberately exposes no API for creating, renaming, timestamping,
 //! or removing filesystem objects. A [`BoundVolumeSession`] owns a directory
 //! descriptor for the selected root, binds observations to an independently
-//! generated mount-session key, and revalidates both the descriptor and its
-//! original path before a relative file is opened.
+//! generated mount-session key, and revalidates the descriptor through a fresh
+//! nofollow traversal from the current mount point before filesystem evidence
+//! is returned.
 //!
 //! macOS is the only volume-observation backend currently implemented. Other
 //! platforms fail closed with [`VolumeError::UnsupportedPlatform`]; path
@@ -23,15 +24,17 @@ mod volume;
 pub use error::{PathError, VolumeError};
 pub use model::{
     FileObjectIdentity, IdentityStrength, KeyDigest, MountObservation, NativePathEncoding,
-    NativeUuid, NativeValue, ReadOnlyFormatCapabilities, RootObjectIdentity, SpaceObservation,
-    VolumeIdentity, VolumeObservation, WriteCapabilities,
+    NativeUuid, NativeValue, ReadOnlyFormatCapabilities, RootObjectIdentity, RootScopeKey,
+    SpaceObservation, VolumeIdentity, VolumeObservation, WriteCapabilities,
 };
 pub use path::{
-    LosslessRelativePath, SerializedRelativePath, MAX_COMPONENT_BYTES, MAX_DISPLAY_PATH_BYTES,
-    MAX_PATH_COMPONENTS, MAX_RELATIVE_PATH_BYTES,
+    MountRelativePath, RootRelativePath, SerializedMountRelativePath, MAX_COMPONENT_BYTES,
+    MAX_DISPLAY_PATH_BYTES, MAX_PATH_COMPONENTS, MAX_RELATIVE_PATH_BYTES,
 };
 pub use profile::{
-    KeyStrategy, PathSemanticsProfile, ProfileOrigin, UnicodeNormalizationObservation,
-    PATH_KEY_ALGORITHM_VERSION, PATH_SEMANTICS_PROFILE_VERSION,
+    CaseBehaviorObservation, KeyStrategy, NamespaceReuseScope, PathSemanticsProfile, ProfileOrigin,
+    UnicodeNormalizationObservation, LEGACY_PATH_KEY_ALGORITHM_VERSION,
+    LEGACY_PATH_SEMANTICS_PROFILE_VERSION, PATH_KEY_ALGORITHM_VERSION,
+    PATH_SEMANTICS_PROFILE_VERSION,
 };
-pub use volume::{BoundVolumeSession, ReadOnlyFile, MAX_ROOT_PATH_BYTES};
+pub use volume::{BoundMediaPath, BoundVolumeSession, ReadOnlyFile, MAX_ROOT_PATH_BYTES};

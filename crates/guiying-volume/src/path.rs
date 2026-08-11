@@ -11,25 +11,28 @@ pub const MAX_DISPLAY_PATH_BYTES: usize = MAX_RELATIVE_PATH_BYTES * 3;
 const MAX_BASE64_PATH_BYTES: usize = MAX_RELATIVE_PATH_BYTES.div_ceil(3) * 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SerializedRelativePath {
+pub struct SerializedMountRelativePath {
     pub display: String,
     pub encoding: NativePathEncoding,
     pub raw_base64: String,
     pub profile_key: KeyDigest,
-    pub path_key: KeyDigest,
+    pub stable_path_key: KeyDigest,
 }
 
+/// A stable namespace address relative to the real filesystem mount root.
+///
+/// This type is evidence only and is never accepted as an open authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LosslessRelativePath {
+pub struct MountRelativePath {
     encoding: NativePathEncoding,
     raw: Vec<u8>,
     display: String,
     profile_key: KeyDigest,
-    path_key: KeyDigest,
+    stable_path_key: KeyDigest,
     component_count: usize,
 }
 
-impl LosslessRelativePath {
+impl MountRelativePath {
     pub fn from_raw(
         raw: Vec<u8>,
         encoding: NativePathEncoding,
@@ -50,19 +53,19 @@ impl LosslessRelativePath {
         };
         let display = display_raw(&raw, encoding);
         let profile_key = profile.profile_key();
-        let path_key = profile.calculate_path_key(&raw);
+        let stable_path_key = profile.calculate_path_key(&raw);
         Ok(Self {
             encoding,
             raw,
             display,
             profile_key,
-            path_key,
+            stable_path_key,
             component_count,
         })
     }
 
     pub fn from_serialized(
-        serialized: SerializedRelativePath,
+        serialized: SerializedMountRelativePath,
         profile: &PathSemanticsProfile,
     ) -> Result<Self, PathError> {
         if serialized.profile_key != profile.profile_key() {
@@ -90,19 +93,19 @@ impl LosslessRelativePath {
         if path.display != serialized.display {
             return Err(PathError::DisplayMismatch);
         }
-        if path.path_key != serialized.path_key {
+        if path.stable_path_key != serialized.stable_path_key {
             return Err(PathError::PathKeyMismatch);
         }
         Ok(path)
     }
 
-    pub fn to_serialized(&self) -> SerializedRelativePath {
-        SerializedRelativePath {
+    pub fn to_serialized(&self) -> SerializedMountRelativePath {
+        SerializedMountRelativePath {
             display: self.display.clone(),
             encoding: self.encoding,
             raw_base64: STANDARD_NO_PAD.encode(&self.raw),
             profile_key: self.profile_key,
-            path_key: self.path_key,
+            stable_path_key: self.stable_path_key,
         }
     }
 
@@ -122,8 +125,60 @@ impl LosslessRelativePath {
         self.profile_key
     }
 
-    pub const fn path_key(&self) -> KeyDigest {
-        self.path_key
+    pub const fn stable_path_key(&self) -> KeyDigest {
+        self.stable_path_key
+    }
+
+    pub const fn component_count(&self) -> usize {
+        self.component_count
+    }
+
+    pub const fn is_root(&self) -> bool {
+        self.component_count == 0
+    }
+}
+
+/// A lossless locator relative to the selected scan root.
+///
+/// It has deliberately no namespace key or serialization and carries a private
+/// exact-session binding. The volume session combines it with its descriptor-
+/// verified mount-relative root before producing stable path evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootRelativePath {
+    encoding: NativePathEncoding,
+    raw: Vec<u8>,
+    display: String,
+    component_count: usize,
+    mount_session_key: KeyDigest,
+}
+
+impl RootRelativePath {
+    pub(crate) fn from_raw(
+        raw: Vec<u8>,
+        encoding: NativePathEncoding,
+        mount_session_key: KeyDigest,
+    ) -> Result<Self, PathError> {
+        let component_count = validate_relative_raw(&raw, encoding)?;
+        let display = display_raw(&raw, encoding);
+        Ok(Self {
+            encoding,
+            raw,
+            display,
+            component_count,
+            mount_session_key,
+        })
+    }
+
+    pub const fn encoding(&self) -> NativePathEncoding {
+        self.encoding
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    pub fn display(&self) -> &str {
+        &self.display
     }
 
     pub const fn component_count(&self) -> usize {
@@ -134,6 +189,10 @@ impl LosslessRelativePath {
         self.component_count == 0
     }
 
+    pub(crate) fn is_bound_to_mount_session(&self, mount_session_key: KeyDigest) -> bool {
+        self.mount_session_key == mount_session_key
+    }
+
     pub(crate) fn unix_components(&self) -> Result<impl Iterator<Item = &[u8]>, PathError> {
         if self.encoding != NativePathEncoding::UnixBytes {
             return Err(PathError::UnsupportedEncoding);
@@ -142,6 +201,21 @@ impl LosslessRelativePath {
             .raw
             .split(|byte| *byte == b'/')
             .filter(|part| !part.is_empty()))
+    }
+}
+
+pub(crate) fn validate_relative_raw(
+    raw: &[u8],
+    encoding: NativePathEncoding,
+) -> Result<usize, PathError> {
+    if raw.len() > MAX_RELATIVE_PATH_BYTES {
+        return Err(PathError::PathTooLong {
+            limit: MAX_RELATIVE_PATH_BYTES,
+        });
+    }
+    match encoding {
+        NativePathEncoding::UnixBytes => validate_unix(raw),
+        NativePathEncoding::WindowsUtf16Le => validate_windows(raw),
     }
 }
 
@@ -296,7 +370,7 @@ fn numbered_windows_device(stem: &[u16], prefix: &[u8; 3]) -> bool {
     if stem.len() != 4 || !matches_ascii(&stem[..3], prefix) {
         return false;
     }
-    matches!(stem[3], value if (b'1' as u16..=b'9' as u16).contains(&value))
+    matches!(stem[3], value if (b'0' as u16..=b'9' as u16).contains(&value))
         || matches!(stem[3], 0x00b9 | 0x00b2 | 0x00b3)
 }
 
@@ -339,13 +413,13 @@ mod tests {
     fn unix_paths_are_lossless_and_profile_bound() {
         let profile = test_profile(NativePathEncoding::UnixBytes);
         let raw = b"photos/non-utf8-\xff.jpg".to_vec();
-        let path = LosslessRelativePath::from_raw(raw.clone(), profile.encoding(), &profile)
+        let path = MountRelativePath::from_raw(raw.clone(), profile.encoding(), &profile)
             .expect("valid path");
         assert_eq!(path.raw(), raw);
         assert_eq!(path.component_count(), 2);
         let serialized = path.to_serialized();
         assert_eq!(
-            LosslessRelativePath::from_serialized(serialized, &profile).expect("round trip"),
+            MountRelativePath::from_serialized(serialized, &profile).expect("round trip"),
             path
         );
     }
@@ -361,7 +435,7 @@ mod tests {
             b"a\0b".as_slice(),
         ] {
             assert!(
-                LosslessRelativePath::from_raw(raw.to_vec(), profile.encoding(), &profile).is_err()
+                MountRelativePath::from_raw(raw.to_vec(), profile.encoding(), &profile).is_err()
             );
         }
     }
@@ -378,47 +452,45 @@ mod tests {
             r"folder\com1",
             "folder\\trailing. ",
         ] {
-            assert!(LosslessRelativePath::from_raw(
-                windows_text(value),
-                profile.encoding(),
-                &profile
-            )
-            .is_err());
+            assert!(
+                MountRelativePath::from_raw(windows_text(value), profile.encoding(), &profile)
+                    .is_err()
+            );
         }
     }
 
     #[test]
     fn root_relative_empty_path_has_a_distinct_key() {
         let profile = test_profile(NativePathEncoding::UnixBytes);
-        let root = LosslessRelativePath::from_raw(Vec::new(), profile.encoding(), &profile)
+        let root = MountRelativePath::from_raw(Vec::new(), profile.encoding(), &profile)
             .expect("root path");
         assert!(root.is_root());
-        assert_ne!(root.path_key(), KeyDigest::new([0; 32]));
+        assert_ne!(root.stable_path_key(), KeyDigest::new([0; 32]));
     }
 
     #[test]
     fn tampered_serialization_is_rejected() {
         let profile = test_profile(NativePathEncoding::UnixBytes);
-        let path = LosslessRelativePath::from_raw(b"a.jpg".to_vec(), profile.encoding(), &profile)
+        let path = MountRelativePath::from_raw(b"a.jpg".to_vec(), profile.encoding(), &profile)
             .expect("valid path");
         let mut serialized = path.to_serialized();
         serialized.display = "b.jpg".to_owned();
         assert!(matches!(
-            LosslessRelativePath::from_serialized(serialized, &profile),
+            MountRelativePath::from_serialized(serialized, &profile),
             Err(PathError::DisplayMismatch)
         ));
 
         let mut serialized = path.to_serialized();
-        serialized.path_key = KeyDigest::from_bytes([0xff; 32]);
+        serialized.stable_path_key = KeyDigest::from_bytes([0xff; 32]);
         assert!(matches!(
-            LosslessRelativePath::from_serialized(serialized, &profile),
+            MountRelativePath::from_serialized(serialized, &profile),
             Err(PathError::PathKeyMismatch)
         ));
 
         let mut serialized = path.to_serialized();
         serialized.encoding = NativePathEncoding::WindowsUtf16Le;
         assert!(matches!(
-            LosslessRelativePath::from_serialized(serialized, &profile),
+            MountRelativePath::from_serialized(serialized, &profile),
             Err(PathError::EncodingProfileMismatch)
         ));
     }
@@ -426,12 +498,12 @@ mod tests {
     #[test]
     fn oversized_serialized_display_is_rejected() {
         let profile = test_profile(NativePathEncoding::UnixBytes);
-        let path = LosslessRelativePath::from_raw(b"a.jpg".to_vec(), profile.encoding(), &profile)
+        let path = MountRelativePath::from_raw(b"a.jpg".to_vec(), profile.encoding(), &profile)
             .expect("valid path");
         let mut serialized = path.to_serialized();
         serialized.display = "a".repeat(MAX_DISPLAY_PATH_BYTES + 1);
         assert!(matches!(
-            LosslessRelativePath::from_serialized(serialized, &profile),
+            MountRelativePath::from_serialized(serialized, &profile),
             Err(PathError::DisplayTooLong { .. })
         ));
     }
@@ -440,7 +512,7 @@ mod tests {
     fn malformed_utf16_is_rejected_without_allocation_growth() {
         let profile = test_profile(NativePathEncoding::WindowsUtf16Le);
         assert!(matches!(
-            LosslessRelativePath::from_raw(vec![1], profile.encoding(), &profile),
+            MountRelativePath::from_raw(vec![1], profile.encoding(), &profile),
             Err(PathError::InvalidUtf16Length)
         ));
         assert_eq!(windows_raw(&[0xd800]).len(), 2);
@@ -450,7 +522,7 @@ mod tests {
     fn hard_path_budgets_are_enforced() {
         let profile = test_profile(NativePathEncoding::UnixBytes);
         assert!(matches!(
-            LosslessRelativePath::from_raw(
+            MountRelativePath::from_raw(
                 vec![b'a'; MAX_RELATIVE_PATH_BYTES + 1],
                 profile.encoding(),
                 &profile
@@ -458,7 +530,7 @@ mod tests {
             Err(PathError::PathTooLong { .. })
         ));
         assert!(matches!(
-            LosslessRelativePath::from_raw(
+            MountRelativePath::from_raw(
                 vec![b'a'; MAX_COMPONENT_BYTES + 1],
                 profile.encoding(),
                 &profile
@@ -471,7 +543,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("/");
         assert!(matches!(
-            LosslessRelativePath::from_raw(too_many.into_bytes(), profile.encoding(), &profile),
+            MountRelativePath::from_raw(too_many.into_bytes(), profile.encoding(), &profile),
             Err(PathError::TooManyComponents { .. })
         ));
     }
@@ -479,22 +551,26 @@ mod tests {
     #[test]
     fn serialization_rejects_noncanonical_base64_and_wrong_profile() {
         let first = test_profile(NativePathEncoding::UnixBytes);
-        let second = PathSemanticsProfile::from_mount_observation(
+        let second_identity = crate::VolumeIdentity::new(
             KeyDigest::new([0x33; 32]),
-            KeyDigest::new([0x44; 32]),
+            crate::IdentityStrength::Strong,
+            None,
+        );
+        let second = PathSemanticsProfile::from_mount_observation(
+            &second_identity,
             NativePathEncoding::UnixBytes,
             crate::ReadOnlyFormatCapabilities::default(),
         );
-        let path = LosslessRelativePath::from_raw(b"a.jpg".to_vec(), first.encoding(), &first)
+        let path = MountRelativePath::from_raw(b"a.jpg".to_vec(), first.encoding(), &first)
             .expect("valid path");
         let mut serialized = path.to_serialized();
         serialized.raw_base64.push('=');
         assert!(matches!(
-            LosslessRelativePath::from_serialized(serialized, &first),
+            MountRelativePath::from_serialized(serialized, &first),
             Err(PathError::InvalidBase64(_))
         ));
         assert!(matches!(
-            LosslessRelativePath::from_serialized(path.to_serialized(), &second),
+            MountRelativePath::from_serialized(path.to_serialized(), &second),
             Err(PathError::ProfileMismatch)
         ));
     }
@@ -502,9 +578,15 @@ mod tests {
     #[test]
     fn windows_extended_device_names_are_rejected() {
         let profile = test_profile(NativePathEncoding::WindowsUtf16Le);
-        for value in [r"folder\CONIN$", r"folder\conout$.txt", "folder\\COM¹"] {
+        for value in [
+            r"folder\CONIN$",
+            r"folder\conout$.txt",
+            r"folder\COM0",
+            r"folder\lpt0.log",
+            "folder\\COM¹",
+        ] {
             assert!(matches!(
-                LosslessRelativePath::from_raw(windows_text(value), profile.encoding(), &profile),
+                MountRelativePath::from_raw(windows_text(value), profile.encoding(), &profile),
                 Err(PathError::WindowsReservedDevice { .. })
             ));
         }
@@ -526,11 +608,26 @@ mod tests {
         assert_ne!(first.profile_key(), second.profile_key());
 
         let raw = windows_text(r"photos\safe.jpg");
-        let path = LosslessRelativePath::from_raw(raw, first.encoding(), &first)
+        let path = MountRelativePath::from_raw(raw, first.encoding(), &first)
             .expect("safe offline Windows path");
         assert!(matches!(
-            LosslessRelativePath::from_serialized(path.to_serialized(), &second),
+            MountRelativePath::from_serialized(path.to_serialized(), &second),
             Err(PathError::ProfileMismatch)
         ));
+    }
+
+    #[test]
+    fn mount_relative_evidence_is_stable_and_contains_no_session_nonce() {
+        let profile = test_profile(NativePathEncoding::UnixBytes);
+        let path = MountRelativePath::from_raw(
+            b"photos/a.jpg".to_vec(),
+            NativePathEncoding::UnixBytes,
+            &profile,
+        )
+        .expect("valid path");
+
+        let reconstructed = MountRelativePath::from_serialized(path.to_serialized(), &profile)
+            .expect("stable path serialization");
+        assert_eq!(path.stable_path_key(), reconstructed.stable_path_key());
     }
 }

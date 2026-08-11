@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -37,7 +37,8 @@ struct MountSnapshot {
 
 pub(crate) struct PlatformSession {
     root_fd: OwnedFd,
-    root_path: PathBuf,
+    mount_point_raw: Vec<u8>,
+    mount_relative_root_raw: Vec<u8>,
     root_identity: RootObjectIdentity,
     mount_signature: MountSignature,
     native_uuid: Option<NativeUuid>,
@@ -56,12 +57,7 @@ pub(crate) fn bind(root: &Path) -> Result<(PlatformSession, BindParts), VolumeEr
     }
     let path_identity = root_identity_from_stat(&path_stat)?;
 
-    let root_fd = rustix::fs::open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| VolumeError::io("binding the selected root", error))?;
+    let root_fd = open_absolute_directory_nofollow(root.as_os_str().as_bytes())?;
     let before = snapshot_root(root_fd.as_fd())?;
     if before != path_identity {
         return Err(VolumeError::RootChangedDuringBind);
@@ -87,11 +83,31 @@ pub(crate) fn bind(root: &Path) -> Result<(PlatformSession, BindParts), VolumeEr
     {
         return Err(VolumeError::MountSessionChanged);
     }
-    verify_path_still_names_root(root, &after)?;
-
     let native_uuid = native_uuid_after;
     let format_capabilities = format_capabilities_after;
     let signature = mount_after.signature;
+    let descriptor_path = descriptor_path_without_firmlinks(root_fd.as_fd())?;
+    let mount_relative_root_raw = strip_mount_point(&descriptor_path, &signature.mount_point)?;
+    crate::path::validate_relative_raw(&mount_relative_root_raw, NativePathEncoding::UnixBytes)?;
+    let mount_root_fd = open_absolute_directory_nofollow(&signature.mount_point)?;
+    verify_directory_is_on_mount(
+        mount_root_fd.as_fd(),
+        after.device,
+        &signature,
+        VolumeError::UnprovenMountRelativeRoot,
+    )?;
+    verify_relative_directory_identity(
+        mount_root_fd.as_fd(),
+        &mount_relative_root_raw,
+        after,
+        &signature,
+    )?;
+    if query_native_uuid(mount_root_fd.as_fd())? != native_uuid
+        || query_format_capabilities(mount_root_fd.as_fd())?.unwrap_or_default()
+            != format_capabilities
+    {
+        return Err(VolumeError::MountSessionChanged);
+    }
     let mount_point = NativeValue::from_raw(&signature.mount_point, NativePathEncoding::UnixBytes);
     let mount_source =
         NativeValue::from_raw(&signature.mount_source, NativePathEncoding::UnixBytes);
@@ -112,12 +128,14 @@ pub(crate) fn bind(root: &Path) -> Result<(PlatformSession, BindParts), VolumeEr
         mount,
         mount_source_raw: signature.mount_source.clone(),
         filesystem_type_raw: signature.filesystem_type.clone(),
+        mount_relative_root_raw: mount_relative_root_raw.clone(),
         native_uuid,
         format_capabilities,
     };
     let session = PlatformSession {
         root_fd,
-        root_path: root.to_path_buf(),
+        mount_point_raw: signature.mount_point.clone(),
+        mount_relative_root_raw,
         root_identity: after,
         mount_signature: signature,
         native_uuid,
@@ -144,7 +162,42 @@ pub(crate) fn revalidate(session: &PlatformSession) -> Result<(), VolumeError> {
     if current_capabilities != session.format_capabilities {
         return Err(VolumeError::MountSessionChanged);
     }
-    verify_path_still_names_root(&session.root_path, &session.root_identity)?;
+    // Reopen the descriptor-observed mount point from `/` on every check. The
+    // pinned descriptors may continue naming a detached old mount after an
+    // unmount/replacement, so traversing only from either pinned descriptor is
+    // not sufficient evidence that the global mount point still names this
+    // session's filesystem.
+    let current_mount_root = open_absolute_directory_nofollow(&session.mount_point_raw)?;
+    verify_directory_is_on_mount(
+        current_mount_root.as_fd(),
+        session.root_identity.device,
+        &session.mount_signature,
+        VolumeError::MountSessionChanged,
+    )?;
+    let mount_root_uuid_before = query_native_uuid(current_mount_root.as_fd())?;
+    let mount_root_capabilities_before =
+        query_format_capabilities(current_mount_root.as_fd())?.unwrap_or_default();
+    if mount_root_uuid_before != session.native_uuid
+        || mount_root_capabilities_before != session.format_capabilities
+    {
+        return Err(VolumeError::MountSessionChanged);
+    }
+    verify_relative_directory_identity(
+        current_mount_root.as_fd(),
+        &session.mount_relative_root_raw,
+        session.root_identity,
+        &session.mount_signature,
+    )?;
+    let mount_root_after = mount_snapshot(current_mount_root.as_fd())?;
+    let mount_root_uuid_after = query_native_uuid(current_mount_root.as_fd())?;
+    let mount_root_capabilities_after =
+        query_format_capabilities(current_mount_root.as_fd())?.unwrap_or_default();
+    if mount_root_after.signature != session.mount_signature
+        || mount_root_uuid_after != mount_root_uuid_before
+        || mount_root_capabilities_after != mount_root_capabilities_before
+    {
+        return Err(VolumeError::MountSessionChanged);
+    }
     let capabilities_after =
         query_format_capabilities(session.root_fd.as_fd())?.unwrap_or_default();
     let uuid_after = query_native_uuid(session.root_fd.as_fd())?;
@@ -160,6 +213,69 @@ pub(crate) fn revalidate(session: &PlatformSession) -> Result<(), VolumeError> {
         return Err(VolumeError::MountSessionChanged);
     }
     Ok(())
+}
+
+pub(crate) fn verify_directory(
+    session: &PlatformSession,
+    components: &[&[u8]],
+) -> Result<RootObjectIdentity, VolumeError> {
+    revalidate(session)?;
+    if components.is_empty() {
+        let before = snapshot_root(session.root_fd.as_fd())?;
+        revalidate(session)?;
+        let after = snapshot_root(session.root_fd.as_fd())?;
+        return if before == session.root_identity && after == before {
+            Ok(before)
+        } else {
+            Err(VolumeError::RootBindingChanged)
+        };
+    }
+
+    let first = open_relative_directory(session, components)?;
+    let first_identity = snapshot_root(first.as_fd())?;
+    revalidate(session)?;
+    let second = open_relative_directory(session, components)?;
+    let second_identity = snapshot_root(second.as_fd())?;
+    let first_after = snapshot_root(first.as_fd())?;
+    revalidate(session)?;
+    if first_identity == first_after && first_identity == second_identity {
+        Ok(first_identity)
+    } else {
+        Err(VolumeError::RootBindingChanged)
+    }
+}
+
+fn open_relative_directory(
+    session: &PlatformSession,
+    components: &[&[u8]],
+) -> Result<OwnedFd, VolumeError> {
+    let mut current: Option<OwnedFd> = None;
+    for (index, component) in components.iter().enumerate() {
+        let parent = current
+            .as_ref()
+            .map_or_else(|| session.root_fd.as_fd(), AsFd::as_fd);
+        let opened = rustix::fs::openat(
+            parent,
+            OsStr::from_bytes(component),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| VolumeError::UnsafePathResolution {
+            component_index: index,
+            source: error.into(),
+        })?;
+        let stat = rustix::fs::fstat(&opened)
+            .map_err(|error| VolumeError::io("checking a relative directory", error))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(VolumeError::UnsafePathResolution {
+                component_index: index,
+                source: io::Error::new(io::ErrorKind::InvalidInput, "component is not a directory"),
+            });
+        }
+        verify_opened_mount_boundary(session, opened.as_fd(), device_to_u64(stat.st_dev)?)?;
+        current = Some(opened);
+    }
+    current.ok_or(VolumeError::RootBindingChanged)
 }
 
 pub(crate) fn open_regular_file(
@@ -304,6 +420,7 @@ fn validate_root_argument(root: &Path) -> Result<(), VolumeError> {
             return Err(VolumeError::UnsafeRootComponent);
         }
     }
+    crate::path::validate_relative_raw(&raw[1..], NativePathEncoding::UnixBytes)?;
     Ok(())
 }
 
@@ -315,18 +432,173 @@ fn ensure_directory(mode: u32) -> Result<(), VolumeError> {
     }
 }
 
-fn verify_path_still_names_root(
-    path: &Path,
-    expected: &RootObjectIdentity,
-) -> Result<(), VolumeError> {
-    let descriptor = rustix::fs::open(
-        path,
+fn open_absolute_directory_nofollow(raw: &[u8]) -> Result<OwnedFd, VolumeError> {
+    validate_absolute_root_bytes(raw)?;
+    let mut current = rustix::fs::open(
+        "/",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|_| VolumeError::RootBindingChanged)?;
-    let observed = snapshot_root(descriptor.as_fd())?;
-    if &observed == expected {
+    .map_err(|error| VolumeError::io("opening the filesystem root", error))?;
+    if raw == b"/" {
+        return Ok(current);
+    }
+    for (index, component) in raw[1..].split(|byte| *byte == b'/').enumerate() {
+        current = rustix::fs::openat(
+            current.as_fd(),
+            OsStr::from_bytes(component),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| VolumeError::UnsafeRootResolution {
+            component_index: index,
+            source: error.into(),
+        })?;
+    }
+    Ok(current)
+}
+
+fn validate_absolute_root_bytes(raw: &[u8]) -> Result<(), VolumeError> {
+    if raw.first() != Some(&b'/') {
+        return Err(VolumeError::RootNotAbsolute);
+    }
+    if raw.len() > crate::MAX_ROOT_PATH_BYTES {
+        return Err(VolumeError::RootPathTooLong {
+            limit: crate::MAX_ROOT_PATH_BYTES,
+        });
+    }
+    if raw.contains(&0) {
+        return Err(VolumeError::RootContainsNul);
+    }
+    if raw == b"/" {
+        return Ok(());
+    }
+    for component in raw[1..].split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            return Err(VolumeError::RootHasEmptyComponent);
+        }
+        if matches!(component, b"." | b"..") {
+            return Err(VolumeError::UnsafeRootComponent);
+        }
+    }
+    crate::path::validate_relative_raw(&raw[1..], NativePathEncoding::UnixBytes)?;
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn descriptor_path_without_firmlinks(fd: BorrowedFd<'_>) -> Result<Vec<u8>, VolumeError> {
+    let mut buffer = [0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: `buffer` is writable for PATH_MAX bytes for the duration of the
+    // call, `fd` remains borrowed, and the returned bytes are NUL-checked and
+    // independently rebound from the descriptor-observed mount root below.
+    let result = unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_GETPATH_NOFIRMLINK,
+            buffer.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(VolumeError::io(
+            "deriving a no-firmlink descriptor path",
+            io::Error::last_os_error(),
+        ));
+    }
+    let end =
+        buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(VolumeError::MalformedSystemMetadata {
+                field: "descriptor path",
+            })?;
+    if end == 0 {
+        return Err(VolumeError::MalformedSystemMetadata {
+            field: "descriptor path",
+        });
+    }
+    let raw = buffer[..end]
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    validate_absolute_root_bytes(&raw)?;
+    Ok(raw)
+}
+
+fn strip_mount_point(path: &[u8], mount_point: &[u8]) -> Result<Vec<u8>, VolumeError> {
+    validate_absolute_root_bytes(path)?;
+    validate_absolute_root_bytes(mount_point)?;
+    if mount_point == b"/" {
+        return Ok(path[1..].to_vec());
+    }
+    if path == mount_point {
+        return Ok(Vec::new());
+    }
+    let Some(suffix) = path.strip_prefix(mount_point) else {
+        return Err(VolumeError::UnprovenMountRelativeRoot);
+    };
+    let Some(relative) = suffix.strip_prefix(b"/") else {
+        return Err(VolumeError::UnprovenMountRelativeRoot);
+    };
+    if relative.is_empty() {
+        return Err(VolumeError::UnprovenMountRelativeRoot);
+    }
+    Ok(relative.to_vec())
+}
+
+fn verify_directory_is_on_mount(
+    fd: BorrowedFd<'_>,
+    expected_device: u64,
+    expected_mount: &MountSignature,
+    mismatch: VolumeError,
+) -> Result<(), VolumeError> {
+    let identity = snapshot_root(fd)?;
+    let observed = mount_snapshot(fd)?;
+    if same_mount_boundary(
+        expected_device,
+        expected_mount,
+        identity.device,
+        &observed.signature,
+    ) {
+        Ok(())
+    } else {
+        Err(mismatch)
+    }
+}
+
+fn verify_relative_directory_identity(
+    mount_root: BorrowedFd<'_>,
+    relative_raw: &[u8],
+    expected: RootObjectIdentity,
+    expected_mount: &MountSignature,
+) -> Result<(), VolumeError> {
+    crate::path::validate_relative_raw(relative_raw, NativePathEncoding::UnixBytes)?;
+    let mut current: Option<OwnedFd> = None;
+    for (index, component) in relative_raw
+        .split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        let parent = current.as_ref().map_or_else(|| mount_root, AsFd::as_fd);
+        let opened = rustix::fs::openat(
+            parent,
+            OsStr::from_bytes(component),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| VolumeError::UnsafeRootResolution {
+            component_index: index,
+            source: error.into(),
+        })?;
+        verify_directory_is_on_mount(
+            opened.as_fd(),
+            expected.device,
+            expected_mount,
+            VolumeError::CrossedMountBoundary,
+        )?;
+        current = Some(opened);
+    }
+    let observed = snapshot_root(current.as_ref().map_or_else(|| mount_root, AsFd::as_fd))?;
+    if observed == expected {
         Ok(())
     } else {
         Err(VolumeError::RootBindingChanged)
@@ -460,6 +732,7 @@ fn query_format_capabilities(
         persistent_object_ids: capability(values, valid, libc::VOL_CAP_FMT_PERSISTENTOBJECTIDS),
         symbolic_links: capability(values, valid, libc::VOL_CAP_FMT_SYMBOLICLINKS),
         hard_links: capability(values, valid, libc::VOL_CAP_FMT_HARDLINKS),
+        timestamp_granularity_ns: None,
     }))
 }
 
@@ -665,6 +938,60 @@ mod tests {
         assert!(matches!(
             nanoseconds(-1, "test"),
             Err(VolumeError::MalformedSystemMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn descriptor_paths_are_stripped_only_at_component_boundaries() {
+        assert_eq!(
+            strip_mount_point(
+                b"/System/Volumes/Data/Users/example",
+                b"/System/Volumes/Data"
+            )
+            .unwrap(),
+            b"Users/example"
+        );
+        assert_eq!(
+            strip_mount_point(b"/System/Volumes/Data", b"/System/Volumes/Data").unwrap(),
+            b""
+        );
+        assert_eq!(
+            strip_mount_point(b"/Users/example", b"/").unwrap(),
+            b"Users/example"
+        );
+        assert_eq!(
+            strip_mount_point(b"/Volumes/Photos/root-\xff", b"/Volumes/Photos").unwrap(),
+            b"root-\xff"
+        );
+        assert!(matches!(
+            strip_mount_point(b"/System/Volumes/Database/example", b"/System/Volumes/Data"),
+            Err(VolumeError::UnprovenMountRelativeRoot)
+        ));
+        assert!(matches!(
+            strip_mount_point(b"/private/tmp", b"/System/Volumes/Data"),
+            Err(VolumeError::UnprovenMountRelativeRoot)
+        ));
+    }
+
+    #[test]
+    fn descriptor_path_validation_has_component_budgets() {
+        let oversized_component = format!("/{}", "a".repeat(crate::MAX_COMPONENT_BYTES + 1));
+        assert!(matches!(
+            validate_absolute_root_bytes(oversized_component.as_bytes()),
+            Err(VolumeError::Path(crate::PathError::ComponentTooLong { .. }))
+        ));
+        let too_many = format!(
+            "/{}",
+            (0..=crate::MAX_PATH_COMPONENTS)
+                .map(|_| "a")
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert!(matches!(
+            validate_absolute_root_bytes(too_many.as_bytes()),
+            Err(VolumeError::Path(
+                crate::PathError::TooManyComponents { .. }
+            ))
         ));
     }
 }

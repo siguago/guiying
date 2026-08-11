@@ -12,6 +12,7 @@ pub(crate) struct BindParts {
     pub mount: MountObservation,
     pub mount_source_raw: Vec<u8>,
     pub filesystem_type_raw: Vec<u8>,
+    pub mount_relative_root_raw: Vec<u8>,
     pub native_uuid: Option<NativeUuid>,
     pub format_capabilities: ReadOnlyFormatCapabilities,
 }
@@ -20,7 +21,9 @@ pub(crate) struct BindParts {
 mod macos;
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{bind, open_regular_file, revalidate, snapshot_file, PlatformSession};
+pub(crate) use macos::{
+    bind, open_regular_file, revalidate, snapshot_file, verify_directory, PlatformSession,
+};
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct PlatformSession;
@@ -44,6 +47,16 @@ pub(crate) fn open_regular_file(
     _session: &PlatformSession,
     _components: &[&[u8]],
 ) -> Result<(File, FileObjectIdentity), VolumeError> {
+    Err(VolumeError::UnsupportedPlatform {
+        platform: std::env::consts::OS,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn verify_directory(
+    _session: &PlatformSession,
+    _components: &[&[u8]],
+) -> Result<crate::RootObjectIdentity, VolumeError> {
     Err(VolumeError::UnsupportedPlatform {
         platform: std::env::consts::OS,
     })

@@ -6,8 +6,7 @@ use serde::{Serialize, Serializer};
 
 use crate::profile::PathSemanticsProfile;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KeyDigest([u8; 32]);
 
 impl KeyDigest {
@@ -42,6 +41,42 @@ impl fmt::Display for KeyDigest {
     }
 }
 
+impl Serialize for KeyDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+/// Domain-separated scope of one selected root within a stable volume
+/// namespace. It is intentionally not interchangeable with a path or profile
+/// digest.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct RootScopeKey(KeyDigest);
+
+impl RootScopeKey {
+    pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+        Self(KeyDigest::new(bytes))
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.to_hex()
+    }
+}
+
+impl fmt::Display for RootScopeKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativePathEncoding {
@@ -67,7 +102,6 @@ pub struct NativeValue {
 }
 
 impl NativeValue {
-    #[cfg(target_os = "macos")]
     pub(crate) fn from_raw(raw: &[u8], encoding: NativePathEncoding) -> Self {
         let display = crate::path::display_raw(raw, encoding);
         Self {
@@ -202,6 +236,11 @@ pub struct ReadOnlyFormatCapabilities {
     pub persistent_object_ids: Option<bool>,
     pub symbolic_links: Option<bool>,
     pub hard_links: Option<bool>,
+    /// Actual filesystem timestamp precision when proven by a supported,
+    /// read-only platform observation. The reported nanosecond fields in file
+    /// identities do not imply one-nanosecond filesystem precision.
+    #[serde(serialize_with = "serialize_optional_u64_decimal")]
+    pub timestamp_granularity_ns: Option<u64>,
 }
 
 /// Write capabilities are intentionally all unknown in this read-only crate.
@@ -341,25 +380,43 @@ pub struct VolumeObservation {
     mount_session_key: KeyDigest,
     mount: MountObservation,
     root_identity: RootObjectIdentity,
+    mount_relative_root: NativeValue,
+    stable_root_path_key: KeyDigest,
+    root_scope_key: RootScopeKey,
     read_only_capabilities: ReadOnlyFormatCapabilities,
     write_capabilities: WriteCapabilities,
     path_semantics: PathSemanticsProfile,
 }
 
+pub(crate) struct BoundRootEvidence {
+    pub mount_relative_root: NativeValue,
+    pub stable_root_path_key: KeyDigest,
+    pub root_scope_key: RootScopeKey,
+}
+
 impl VolumeObservation {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         identity: VolumeIdentity,
         mount_session_key: KeyDigest,
         mount: MountObservation,
         root_identity: RootObjectIdentity,
+        root_evidence: BoundRootEvidence,
         read_only_capabilities: ReadOnlyFormatCapabilities,
         path_semantics: PathSemanticsProfile,
     ) -> Self {
+        let BoundRootEvidence {
+            mount_relative_root,
+            stable_root_path_key,
+            root_scope_key,
+        } = root_evidence;
         Self {
             identity,
             mount_session_key,
             mount,
             root_identity,
+            mount_relative_root,
+            stable_root_path_key,
+            root_scope_key,
             read_only_capabilities,
             write_capabilities: WriteCapabilities::unknown(),
             path_semantics,
@@ -380,6 +437,19 @@ impl VolumeObservation {
 
     pub const fn root_identity(&self) -> RootObjectIdentity {
         self.root_identity
+    }
+
+    /// Lossless selected-root address relative to the real mount root.
+    pub const fn mount_relative_root(&self) -> &NativeValue {
+        &self.mount_relative_root
+    }
+
+    pub const fn stable_root_path_key(&self) -> KeyDigest {
+        self.stable_root_path_key
+    }
+
+    pub const fn root_scope_key(&self) -> RootScopeKey {
+        self.root_scope_key
     }
 
     pub const fn read_only_capabilities(&self) -> ReadOnlyFormatCapabilities {
@@ -478,5 +548,27 @@ mod tests {
         };
         let mount_json = serde_json::to_value(mount).expect("serialize mount observation");
         assert_eq!(mount_json["raw_flags"], u64::MAX.to_string());
+
+        let capabilities = ReadOnlyFormatCapabilities {
+            timestamp_granularity_ns: Some(u64::MAX),
+            ..ReadOnlyFormatCapabilities::default()
+        };
+        let capabilities_json =
+            serde_json::to_value(capabilities).expect("serialize timestamp granularity");
+        assert_eq!(
+            capabilities_json["timestamp_granularity_ns"],
+            u64::MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn cryptographic_keys_serialize_as_fixed_lowercase_hex() {
+        let digest = KeyDigest::new([0xab; 32]);
+        let encoded = serde_json::to_value(digest).expect("serialize digest");
+        assert_eq!(encoded, "ab".repeat(32));
+
+        let scope = RootScopeKey::new([0xcd; 32]);
+        let encoded = serde_json::to_value(scope).expect("serialize root scope");
+        assert_eq!(encoded, "cd".repeat(32));
     }
 }

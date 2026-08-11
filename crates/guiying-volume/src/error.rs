@@ -62,6 +62,12 @@ pub enum VolumeError {
     RootHasEmptyComponent,
     #[error("the selected root contains '.' or '..' components")]
     UnsafeRootComponent,
+    #[error("selected-root component {component_index} could not be opened without following links: {source}")]
+    UnsafeRootResolution {
+        component_index: usize,
+        #[source]
+        source: io::Error,
+    },
     #[error("the selected root's final component is a symbolic link")]
     RootSymlink,
     #[error("the selected root is not a directory")]
@@ -72,6 +78,8 @@ pub enum VolumeError {
     RootBindingChanged,
     #[error("the mounted filesystem changed during the bound session")]
     MountSessionChanged,
+    #[error("the selected root cannot be proven relative to the descriptor-observed mount root")]
+    UnprovenMountRelativeRoot,
     #[error("the volume returned malformed system metadata for {field}")]
     MalformedSystemMetadata { field: &'static str },
     #[error("the operating system could not provide a mount-session nonce: {0}")]
@@ -92,6 +100,8 @@ pub enum VolumeError {
     FileChangedDuringOpen,
     #[error("the opened file belongs to a different bound mount session")]
     FileSessionMismatch,
+    #[error("the root-relative open locator is not bound to the current mount session")]
+    PathSessionMismatch,
     #[error("the opened file was resolved from a different relative path")]
     FilePathMismatch,
     #[error("I/O failure while {operation}: {source}")]
