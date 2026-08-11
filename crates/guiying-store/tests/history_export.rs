@@ -9,9 +9,9 @@ use guiying_store::{
     HistoryExportProjection, HistoryExportRecord, HistoryExportRequest, HistoryExportScope,
     LeasedScanTerminalOutcome, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey,
     NewBoundScanRun, NewScanIssue, NewScopedScanJob, ObservationInput, ParametersHash,
-    RootObjectSignature, RootScopeKey, RunEvidenceGuard, RuntimeLeaseKey, ScanStage,
-    SourceSignature, StablePathKey, Store, StoreError, TicketSortKey, VolumeCoverageManifest,
-    VolumeInput, MAX_HISTORY_EXPORT_BATCH_SIZE,
+    RootObjectSignature, RootScopeKey, RunEvidenceGuard, RuntimeLeaseKey, ScanAttemptStrategy,
+    ScanStage, SourceSignature, StablePathKey, Store, StoreError, TicketSortKey,
+    VolumeCoverageManifest, VolumeInput, MAX_HISTORY_EXPORT_BATCH_SIZE,
 };
 use tempfile::TempDir;
 
@@ -286,6 +286,7 @@ fn seed_history_export_fixture(store: &mut Store) -> Result<i64, Box<dyn std::er
             root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
             root_object_signature: RootObjectSignature::from_volume_adapter([14; 32]),
             scan_mode: "full".into(),
+            attempt_strategy: ScanAttemptStrategy::InitialFullV1,
             config: None,
             created_at_ms: 120,
         })?;

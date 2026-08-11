@@ -8,8 +8,8 @@ use guiying_store::{
     ManifestDigest, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun,
     NewScanIssue, NewScanJob, NewScanReport, NewScopedScanJob, ObservationInput, ParametersHash,
     PathKey, RepositoryTx, RootObjectSignature, RootScopeKey, RunEvidenceGuard, RuntimeLeaseKey,
-    ScanCheckpointInput, ScanStage, SourceSignature, StablePathKey, Store, StoreError,
-    TicketSortKey, VolumeCoverageManifest, VolumeInput,
+    ScanAttemptStrategy, ScanCheckpointInput, ScanStage, SourceSignature, StablePathKey, Store,
+    StoreError, TicketSortKey, VolumeCoverageManifest, VolumeInput,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -603,10 +603,10 @@ fn v5_write_pipeline_is_idempotent_and_finalizes_only_database_evidence(
             1,
             "running",
             1,
-            "completed",
-            "completed",
+            "failed",
+            "interrupted",
             800,
-            None,
+            Some(("TEST_RESTART", "prepare a fresh full child")),
         )?;
         let next_mount = MountSessionKey::from_runtime_evidence([9; 32]);
         let next_capability =
@@ -624,6 +624,7 @@ fn v5_write_pipeline_is_idempotent_and_finalizes_only_database_evidence(
             root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
             root_object_signature: RootObjectSignature::from_volume_adapter([15; 32]),
             scan_mode: "full".into(),
+            attempt_strategy: ScanAttemptStrategy::FreshFullChildV1,
             config: None,
             created_at_ms: 900,
         };
@@ -637,7 +638,7 @@ fn v5_write_pipeline_is_idempotent_and_finalizes_only_database_evidence(
         repository.transition_bound_scan_job_and_run(
             &next_guard,
             run.job_id,
-            "completed",
+            "failed",
             2,
             "queued",
             0,
@@ -682,7 +683,8 @@ fn v5_write_pipeline_is_idempotent_and_finalizes_only_database_evidence(
                 stable_root_path_key: StablePathKey::from_volume_adapter([12; 32]),
                 root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
                 root_object_signature: RootObjectSignature::from_volume_adapter([16; 32]),
-                scan_mode: "resume".into(),
+                scan_mode: "full".into(),
+                attempt_strategy: ScanAttemptStrategy::FreshFullChildV1,
                 config: None,
                 created_at_ms: 1_100,
             })
@@ -956,6 +958,7 @@ fn current_session_namespace_cannot_cross_mount_generations(
                 root_scope_key: RootScopeKey::from_volume_adapter([65; 32]),
                 root_object_signature: RootObjectSignature::from_volume_adapter([66; 32]),
                 scan_mode: "full".into(),
+                attempt_strategy: ScanAttemptStrategy::InitialFullV1,
                 config: None,
                 created_at_ms: 120,
             })?;
@@ -1008,7 +1011,8 @@ fn current_session_namespace_cannot_cross_mount_generations(
                 stable_root_path_key: StablePathKey::from_volume_adapter([64; 32]),
                 root_scope_key: RootScopeKey::from_volume_adapter([65; 32]),
                 root_object_signature: RootObjectSignature::from_volume_adapter([67; 32]),
-                scan_mode: "resume".into(),
+                scan_mode: "full".into(),
+                attempt_strategy: ScanAttemptStrategy::FreshFullChildV1,
                 config: None,
                 created_at_ms: 200,
             })
@@ -1386,6 +1390,7 @@ fn create_running_run(
             root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
             root_object_signature: RootObjectSignature::from_volume_adapter([14; 32]),
             scan_mode: "full".into(),
+            attempt_strategy: ScanAttemptStrategy::InitialFullV1,
             config: None,
             created_at_ms: 120,
         };

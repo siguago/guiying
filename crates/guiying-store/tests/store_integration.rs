@@ -6,8 +6,8 @@ use guiying_store::{
     FreshFingerprintKind, IntegrityCheckKind, ManifestDigest, MediaFileInput, MountSessionKey,
     NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue, NewScanJob,
     NewScanReport, NewScanRun, NewScopedScanJob, ObservationInput, ParametersHash, PathKey,
-    RootObjectSignature, RootScopeKey, RunEvidenceGuard, ScanCheckpointInput, ScanStage,
-    SourceSignature, StablePathKey, Store, StoreError, VolumeInput, MAX_PAGE_SIZE,
+    RootObjectSignature, RootScopeKey, RunEvidenceGuard, ScanAttemptStrategy, ScanCheckpointInput,
+    ScanStage, SourceSignature, StablePathKey, Store, StoreError, VolumeInput, MAX_PAGE_SIZE,
     MAX_SCAN_REPORT_JSON_BYTES,
 };
 use rusqlite::Connection;
@@ -20,7 +20,7 @@ fn open_enforces_settings_migrations_and_integrity() -> Result<(), Box<dyn std::
     let database = temporary.path().join("guiying.sqlite3");
     let store = Store::open_or_create(&database)?;
 
-    assert_eq!(store.schema_version()?, 8);
+    assert_eq!(store.schema_version()?, 9);
     assert!(store.settings().foreign_keys);
     assert_eq!(store.settings().busy_timeout_ms, 5_000);
     assert_eq!(store.settings().synchronous, "FULL");
@@ -41,14 +41,14 @@ fn open_enforces_settings_migrations_and_integrity() -> Result<(), Box<dyn std::
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(migration_count, 8);
+    assert_eq!(migration_count, 9);
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     assert_eq!(application_id, 0x4755_5949);
     connection.close().map_err(|(_, error)| error)?;
 
     let reopened = Store::open_existing(&database)?;
-    assert_eq!(reopened.schema_version()?, 8);
+    assert_eq!(reopened.schema_version()?, 9);
     Ok(())
 }
 
@@ -1254,7 +1254,8 @@ fn reopen_reconciles_stale_sessions_abandons_drafts_and_allows_fresh_strong_atte
             stable_root_path_key: StablePathKey::from_volume_adapter([12; 32]),
             root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
             root_object_signature: RootObjectSignature::from_volume_adapter([15; 32]),
-            scan_mode: "resume".into(),
+            scan_mode: "full".into(),
+            attempt_strategy: ScanAttemptStrategy::FreshFullChildV1,
             config: Some(json!({"exact": true})),
             created_at_ms: next_created_at_ms,
         })?;
@@ -1351,47 +1352,36 @@ fn reopen_fails_orphan_scope_and_clears_process_local_capabilities(
     inspection.close().map_err(|(_, error)| error)?;
 
     let new_mount = MountSessionKey::from_runtime_evidence([85; 32]);
-    reopened.write_transaction(|repository| {
-        let capability_profile_id = repository
-            .set_current_capability_profile(&capability_input(volume_id, new_mount, "unix"))?;
-        let run_id = repository.create_bound_scan_run(&NewBoundScanRun {
-            run_key: "orphan-scope-fresh-run".into(),
-            scan_job_id: job_id,
-            volume_id,
-            capability_profile_id,
-            parent_scan_run_id: None,
-            mount_session_key: new_mount,
-            mount_relative_root_raw: b"DCIM".to_vec(),
-            path_encoding: "utf8".into(),
-            stable_root_path_key: StablePathKey::from_volume_adapter([83; 32]),
-            root_scope_key: RootScopeKey::from_volume_adapter([84; 32]),
-            root_object_signature: RootObjectSignature::from_volume_adapter([86; 32]),
-            scan_mode: "full".into(),
-            config: None,
-            created_at_ms: 9_000_000_000_000,
-        })?;
-        let guard = RunEvidenceGuard {
-            scan_run_id: run_id,
-            capability_profile_id,
-            mount_session_key: new_mount,
-        };
-        assert_eq!(
-            repository.transition_bound_scan_job_and_run(
-                &guard,
-                job_id,
-                "failed",
-                1,
-                "queued",
-                0,
-                "running",
-                "running",
-                9_000_000_000_001,
-                None,
-            )?,
-            (2, 1)
-        );
-        Ok(())
-    })?;
+    let error = reopened
+        .write_transaction(|repository| {
+            let capability_profile_id = repository
+                .set_current_capability_profile(&capability_input(volume_id, new_mount, "unix"))?;
+            repository.create_bound_scan_run(&NewBoundScanRun {
+                run_key: "orphan-scope-fresh-run".into(),
+                scan_job_id: job_id,
+                volume_id,
+                capability_profile_id,
+                parent_scan_run_id: None,
+                mount_session_key: new_mount,
+                mount_relative_root_raw: b"DCIM".to_vec(),
+                path_encoding: "utf8".into(),
+                stable_root_path_key: StablePathKey::from_volume_adapter([83; 32]),
+                root_scope_key: RootScopeKey::from_volume_adapter([84; 32]),
+                root_object_signature: RootObjectSignature::from_volume_adapter([86; 32]),
+                scan_mode: "full".into(),
+                attempt_strategy: ScanAttemptStrategy::InitialFullV1,
+                config: None,
+                created_at_ms: 9_000_000_000_000,
+            })
+        })
+        .expect_err("a failed orphan job without an interrupted parent is not recoverable");
+    assert!(matches!(
+        error,
+        StoreError::ConcurrencyConflict {
+            entity: "scan_attempt_creation_state",
+            id
+        } if id == job_id
+    ));
     Ok(())
 }
 
@@ -1416,6 +1406,7 @@ fn v5_root_binding_is_checked_before_run_insert() -> Result<(), Box<dyn std::err
                 root_scope_key: RootScopeKey::from_volume_adapter([98; 32]),
                 root_object_signature: RootObjectSignature::from_volume_adapter([97; 32]),
                 scan_mode: "full".into(),
+                attempt_strategy: ScanAttemptStrategy::InitialFullV1,
                 config: None,
                 created_at_ms: 300,
             })
@@ -1821,6 +1812,7 @@ fn create_queued_scan_with_root(
             root_scope_key,
             root_object_signature: RootObjectSignature::from_volume_adapter([14; 32]),
             scan_mode: "full".into(),
+            attempt_strategy: ScanAttemptStrategy::InitialFullV1,
             config: Some(json!({"exact": true})),
             created_at_ms: 120,
         })?;

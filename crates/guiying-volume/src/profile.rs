@@ -52,18 +52,29 @@ pub enum KeyStrategy {
     ExactNativeV1,
 }
 
-/// The largest scope in which a namespace profile may be reused.
+/// The largest scope in which namespace evidence may be reused.
 ///
-/// This is evidence, not an authorization to open a path. Every access still
-/// requires a live [`crate::BoundVolumeSession`] and its full revalidation.
+/// This is evidence, not an authorization to open a path. Every filesystem
+/// access still requires a live [`crate::BoundVolumeSession`] and its full
+/// revalidation. Each variant documents its own non-open reuse boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NamespaceReuseScope {
-    /// Stable native volume identity permits matching the namespace after a
-    /// fresh bind. The new mount session must still be independently verified.
+    /// Strong logical-filesystem identity plus known case and Unicode semantics
+    /// permit cross-session namespace reuse. The new mount session must still
+    /// be independently verified.
     CrossSession,
+    /// Strong logical-filesystem identity and known case behavior permit only a
+    /// fresh, full child lineage when a caller independently matches the same
+    /// logical filesystem UUID and exact native selected-root bytes.
+    ///
+    /// Unknown Unicode normalization prevents broader reuse. This scope does
+    /// not prove the same physical medium or directory object and does not
+    /// authorize hint reuse, a file open, or cursor continuation.
+    FreshAttemptOnly,
     /// The identity evidence is too weak to associate observations made by a
-    /// different bind, even if its profile key happens to match.
+    /// different bind, or case behavior is unknown or contradictory, even if
+    /// its profile key happens to match.
     CurrentSessionOnly,
 }
 
@@ -137,9 +148,12 @@ impl PathSemanticsProfile {
             case_behavior(capabilities.case_sensitive, capabilities.case_preserving);
         let reuse_scope = if volume_identity.strength() == IdentityStrength::Strong
             && case_behavior != CaseBehaviorObservation::Unknown
-            && unicode_normalization != UnicodeNormalizationObservation::Unknown
         {
-            NamespaceReuseScope::CrossSession
+            if unicode_normalization == UnicodeNormalizationObservation::Unknown {
+                NamespaceReuseScope::FreshAttemptOnly
+            } else {
+                NamespaceReuseScope::CrossSession
+            }
         } else {
             NamespaceReuseScope::CurrentSessionOnly
         };
@@ -275,6 +289,20 @@ pub(crate) fn test_profile(encoding: NativePathEncoding) -> PathSemanticsProfile
 }
 
 #[cfg(test)]
+pub(crate) fn test_fresh_attempt_profile(encoding: NativePathEncoding) -> PathSemanticsProfile {
+    let identity = VolumeIdentity::new(KeyDigest::new([0x12; 32]), IdentityStrength::Strong, None);
+    PathSemanticsProfile::from_mount_observation(
+        &identity,
+        encoding,
+        ReadOnlyFormatCapabilities {
+            case_sensitive: Some(true),
+            case_preserving: Some(true),
+            ..ReadOnlyFormatCapabilities::default()
+        },
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -355,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn strong_identity_with_unknown_unicode_remains_session_scoped() {
+    fn strong_identity_with_known_case_and_unknown_unicode_is_fresh_attempt_only() {
         let capabilities = ReadOnlyFormatCapabilities {
             case_sensitive: Some(true),
             case_preserving: Some(true),
@@ -381,7 +409,11 @@ mod tests {
             first.unicode_normalization(),
             UnicodeNormalizationObservation::Unknown
         );
-        assert_eq!(first.reuse_scope(), NamespaceReuseScope::CurrentSessionOnly);
+        assert_eq!(first.reuse_scope(), NamespaceReuseScope::FreshAttemptOnly);
+        assert_eq!(
+            serde_json::to_string(&first.reuse_scope()).expect("serialize reuse scope"),
+            "\"fresh_attempt_only\""
+        );
 
         let weak = identity(0x22, IdentityStrength::Weak);
         let weak_profile = PathSemanticsProfile::from_mount_observation(
@@ -396,31 +428,43 @@ mod tests {
     }
 
     #[test]
-    fn only_fully_observed_strong_semantics_are_cross_session() {
+    fn known_unicode_on_strong_known_case_is_cross_session() {
         let capabilities = ReadOnlyFormatCapabilities {
             case_sensitive: Some(true),
             case_preserving: Some(true),
             ..ReadOnlyFormatCapabilities::default()
         };
         let strong = identity(0x23, IdentityStrength::Strong);
-        let known = PathSemanticsProfile::from_observed_semantics(
-            &strong,
-            NativePathEncoding::UnixBytes,
-            capabilities,
+        for unicode_normalization in [
             UnicodeNormalizationObservation::Exact,
-        );
-        assert_eq!(known.reuse_scope(), NamespaceReuseScope::CrossSession);
-        assert_eq!(known.case_behavior(), CaseBehaviorObservation::Sensitive);
-        assert_eq!(
-            known.unicode_normalization(),
-            UnicodeNormalizationObservation::Exact
-        );
+            UnicodeNormalizationObservation::Nfc,
+            UnicodeNormalizationObservation::Nfd,
+            UnicodeNormalizationObservation::NormalizingOther,
+        ] {
+            let known = PathSemanticsProfile::from_observed_semantics(
+                &strong,
+                NativePathEncoding::UnixBytes,
+                capabilities,
+                unicode_normalization,
+            );
+            assert_eq!(known.reuse_scope(), NamespaceReuseScope::CrossSession);
+            assert_eq!(known.case_behavior(), CaseBehaviorObservation::Sensitive);
+            assert_eq!(known.unicode_normalization(), unicode_normalization);
+        }
+    }
 
+    #[test]
+    fn weak_or_unknown_case_semantics_remain_session_scoped() {
+        let strong = identity(0x25, IdentityStrength::Strong);
         let weak = identity(0x24, IdentityStrength::Weak);
         let weak_known = PathSemanticsProfile::from_observed_semantics(
             &weak,
             NativePathEncoding::UnixBytes,
-            capabilities,
+            ReadOnlyFormatCapabilities {
+                case_sensitive: Some(true),
+                case_preserving: Some(true),
+                ..ReadOnlyFormatCapabilities::default()
+            },
             UnicodeNormalizationObservation::Exact,
         );
         assert_eq!(
@@ -444,6 +488,17 @@ mod tests {
         );
         assert_eq!(
             contradictory.reuse_scope(),
+            NamespaceReuseScope::CurrentSessionOnly
+        );
+
+        let unknown_case_and_unicode = PathSemanticsProfile::from_observed_semantics(
+            &strong,
+            NativePathEncoding::UnixBytes,
+            ReadOnlyFormatCapabilities::default(),
+            UnicodeNormalizationObservation::Unknown,
+        );
+        assert_eq!(
+            unknown_case_and_unicode.reuse_scope(),
             NamespaceReuseScope::CurrentSessionOnly
         );
     }

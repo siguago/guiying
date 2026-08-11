@@ -37,14 +37,15 @@ use guiying_store::{
     DirectoryTicketRecord, ExactDigestBucketCursor, ExactGroupManifestMember,
     ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey, FileTicketRecord,
     FileTimestampParts, FingerprintBucketRecord, FingerprintFileTicketRecord,
-    FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind, LeasedScanTerminalOutcome,
-    ManifestDigest, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun,
-    NewScanIssue, NewScopedScanJob, ObservationInput, ParametersHash, PauseCheckpointCursor,
-    PauseCheckpointInput, PauseCheckpointWriteKey, RootObjectSignature, RootScopeKey,
-    RunEvidenceGuard, RuntimeLeaseGuard, RuntimeLeaseKey, SampleBucketCursor, ScanControlKind,
-    ScanControlRequestInput, ScanControlRequestKey, ScanStage, SizeBucketCursor, SourceSignature,
-    StablePathKey, Store, StoreError, TicketSortKey, VerifiedExactGroup, VolumeCoverageManifest,
-    VolumeInput,
+    FingerprintReadOrigin, FreshAttemptRecoveryQuery, FreshAttemptRecoverySelection,
+    FreshAttemptRecoveryTarget, FreshFingerprintInput, FreshFingerprintKind,
+    LeasedScanTerminalOutcome, ManifestDigest, MountSessionKey, NamespaceProfileInput,
+    NamespaceProfileKey, NewBoundScanRun, NewScanIssue, NewScopedScanJob, ObservationInput,
+    ParametersHash, PauseCheckpointCursor, PauseCheckpointInput, PauseCheckpointWriteKey,
+    RootObjectSignature, RootScopeKey, RunEvidenceGuard, RuntimeLeaseGuard, RuntimeLeaseKey,
+    SampleBucketCursor, ScanAttemptStrategy, ScanControlKind, ScanControlRequestInput,
+    ScanControlRequestKey, ScanStage, SizeBucketCursor, SourceSignature, StablePathKey, Store,
+    StoreError, TicketSortKey, VerifiedExactGroup, VolumeCoverageManifest, VolumeInput,
 };
 use guiying_volume::{
     BoundMediaPath, BoundVolumeSession, CaseBehaviorObservation, FileObjectIdentity,
@@ -105,6 +106,27 @@ pub struct RuntimeScanIds {
     pub namespace_profile_id: i64,
     pub scan_job_id: i64,
     pub scan_run_id: i64,
+}
+
+/// User-visible classification of one freshly bound runtime attempt.
+///
+/// Both variants start a new core scanner from the selected root. A fresh
+/// child carries lineage only; it does not restore a cursor, descriptor,
+/// checkpoint, lease, or any evidence from its interrupted parent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeAttemptKind {
+    InitialFull,
+    FreshFullChild,
+}
+
+impl RuntimeAttemptKind {
+    /// Stable, read-only presentation value for desktop adapters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialFull => "initial_full",
+            Self::FreshFullChild => "fresh_full_child",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,6 +206,7 @@ pub struct ActiveReadOnlyScan {
     guard: RunEvidenceGuard,
     core_session_id: CoreSessionId,
     ids: RuntimeScanIds,
+    attempt_kind: RuntimeAttemptKind,
     job_state_version: i64,
     run_state_version: i64,
     runtime_lease_key: RuntimeLeaseKey,
@@ -198,8 +221,11 @@ pub struct ActiveReadOnlyScan {
 }
 
 impl ActiveReadOnlyScan {
-    /// Binds a directory through both read-only engines and creates a new
-    /// session-scoped Store attempt. The database parent must already exist.
+    /// Binds a directory through both read-only engines and creates a newly
+    /// session-bound Store attempt. An exact, unique interrupted scope may
+    /// supply lineage for a fresh full child; no process-local scan state or
+    /// historical evidence is restored. The database parent must already
+    /// exist.
     pub fn start(
         database_path: impl AsRef<Path>,
         root: impl AsRef<Path>,
@@ -207,21 +233,29 @@ impl ActiveReadOnlyScan {
     ) -> Result<Self, RuntimeError> {
         let root = root.as_ref();
         let volume = BoundVolumeSession::bind(root)?;
+        let config = runtime_scan_config(&options);
         let scanner = Scanner::new(options)?;
         let core = scanner.start_streaming([root.to_path_buf()], StreamLimits::default())?;
         let core_session_id = CoreSessionId::from_runtime_evidence(*core.session_id().as_bytes());
         let runtime_lease_key = RuntimeLeaseKey::from_runtime_evidence(random_key_material()?);
+        volume.revalidate()?;
         let mut store = Store::open_or_create(database_path)?;
         let now_ms = now_ms()?;
-        let setup =
-            create_store_attempt(&mut store, volume.observation(), core_session_id, now_ms)?;
-        Ok(Self {
+        let setup = create_store_attempt(
+            &mut store,
+            volume.observation(),
+            core_session_id,
+            &config,
+            now_ms,
+        )?;
+        let mut active = Self {
             store,
             volume,
             core,
             guard: setup.guard,
             core_session_id,
             ids: setup.ids,
+            attempt_kind: setup.attempt_kind,
             job_state_version: setup.job_state_version,
             run_state_version: setup.run_state_version,
             runtime_lease_key,
@@ -233,11 +267,30 @@ impl ActiveReadOnlyScan {
             exact_duplicates: None,
             issues_recorded: 0,
             files_fingerprinted: 0,
-        })
+        };
+        if let Err(error) = active.volume.revalidate() {
+            let primary = RuntimeError::Volume(error);
+            let message = primary.to_string();
+            return match active.transition_terminal(
+                "failed",
+                "interrupted",
+                Some(("VOLUME_CHANGED_DURING_ATTEMPT_BIND", &message)),
+            ) {
+                Ok(()) => Err(primary),
+                Err(transition) => Err(RuntimeError::Stream(format!(
+                    "{primary}; additionally failed to interrupt the newly bound attempt: {transition}"
+                ))),
+            };
+        }
+        Ok(active)
     }
 
     pub const fn ids(&self) -> RuntimeScanIds {
         self.ids
+    }
+
+    pub const fn attempt_kind(&self) -> RuntimeAttemptKind {
+        self.attempt_kind
     }
 
     pub const fn guard(&self) -> RunEvidenceGuard {
@@ -2704,6 +2757,7 @@ fn publish_after_transaction<T, E>(slot: &mut T, result: Result<T, E>) -> Result
 struct StoreAttempt {
     ids: RuntimeScanIds,
     guard: RunEvidenceGuard,
+    attempt_kind: RuntimeAttemptKind,
     job_state_version: i64,
     run_state_version: i64,
 }
@@ -2712,6 +2766,7 @@ fn create_store_attempt(
     store: &mut Store,
     volume: &VolumeObservation,
     core_session_id: CoreSessionId,
+    config: &serde_json::Value,
     now_ms: i64,
 ) -> Result<StoreAttempt, RuntimeError> {
     let mount_session_key =
@@ -2724,6 +2779,7 @@ fn create_store_attempt(
         volume.root_identity(),
         volume.mount_session_key().as_bytes(),
     );
+    let config = Some(config.clone());
     let setup = store.write_transaction(|repository| {
         let volume_id = repository.upsert_volume(&volume_input(volume, now_ms))?;
         let capability_profile_id = repository
@@ -2746,26 +2802,69 @@ fn create_store_attempt(
                     .then_some(mount_session_key),
                 created_at_ms: now_ms,
             })?;
-        let job_id = repository.create_scoped_scan_job(&NewScopedScanJob {
-            job_key: format!("runtime-job-{suffix}"),
-            volume_id,
-            namespace_profile_id,
-            root_display: volume.mount_relative_root().display().to_owned(),
-            mount_relative_root_raw: mount_root_raw.clone(),
-            path_encoding: path_encoding.to_owned(),
-            stable_root_path_key: StablePathKey::from_volume_adapter(
-                *volume.stable_root_path_key().as_bytes(),
-            ),
-            root_scope_key: RootScopeKey::from_volume_adapter(*volume.root_scope_key().as_bytes()),
-            config: Some(json!({"runtimeContractVersion": RUNTIME_CONTRACT_VERSION})),
-            created_at_ms: now_ms,
-        })?;
+        let recovery = unique_recovery_target(repository.select_fresh_attempt_recovery(
+            &FreshAttemptRecoveryQuery {
+                volume_id,
+                namespace_profile_id,
+                mount_relative_root_raw: mount_root_raw.clone(),
+                path_encoding: path_encoding.to_owned(),
+                stable_root_path_key: StablePathKey::from_volume_adapter(
+                    *volume.stable_root_path_key().as_bytes(),
+                ),
+                root_scope_key: RootScopeKey::from_volume_adapter(
+                    *volume.root_scope_key().as_bytes(),
+                ),
+                config: config.clone(),
+            },
+        )?);
+        let (
+            job_id,
+            parent_scan_run_id,
+            attempt_strategy,
+            attempt_kind,
+            expected_job_state,
+            expected_job_version,
+        ) = if let Some(target) = recovery {
+            (
+                target.job_id,
+                Some(target.parent_scan_run_id),
+                ScanAttemptStrategy::FreshFullChildV1,
+                RuntimeAttemptKind::FreshFullChild,
+                "failed",
+                target.job_state_version,
+            )
+        } else {
+            let job_id = repository.create_scoped_scan_job(&NewScopedScanJob {
+                job_key: format!("runtime-job-{suffix}"),
+                volume_id,
+                namespace_profile_id,
+                root_display: volume.mount_relative_root().display().to_owned(),
+                mount_relative_root_raw: mount_root_raw.clone(),
+                path_encoding: path_encoding.to_owned(),
+                stable_root_path_key: StablePathKey::from_volume_adapter(
+                    *volume.stable_root_path_key().as_bytes(),
+                ),
+                root_scope_key: RootScopeKey::from_volume_adapter(
+                    *volume.root_scope_key().as_bytes(),
+                ),
+                config: config.clone(),
+                created_at_ms: now_ms,
+            })?;
+            (
+                job_id,
+                None,
+                ScanAttemptStrategy::InitialFullV1,
+                RuntimeAttemptKind::InitialFull,
+                "queued",
+                0,
+            )
+        };
         let run_id = repository.create_bound_scan_run(&NewBoundScanRun {
             run_key: format!("runtime-run-{suffix}"),
             scan_job_id: job_id,
             volume_id,
             capability_profile_id,
-            parent_scan_run_id: None,
+            parent_scan_run_id,
             mount_session_key,
             mount_relative_root_raw: mount_root_raw.clone(),
             path_encoding: path_encoding.to_owned(),
@@ -2775,7 +2874,8 @@ fn create_store_attempt(
             root_scope_key: RootScopeKey::from_volume_adapter(*volume.root_scope_key().as_bytes()),
             root_object_signature: root_signature,
             scan_mode: "full".to_owned(),
-            config: Some(json!({"runtimeContractVersion": RUNTIME_CONTRACT_VERSION})),
+            attempt_strategy,
+            config: config.clone(),
             created_at_ms: now_ms,
         })?;
         let guard = RunEvidenceGuard {
@@ -2784,7 +2884,16 @@ fn create_store_attempt(
             mount_session_key,
         };
         let (job_state_version, run_state_version) = repository.transition_bound_scan_job_and_run(
-            &guard, job_id, "queued", 0, "queued", 0, "running", "running", now_ms, None,
+            &guard,
+            job_id,
+            expected_job_state,
+            expected_job_version,
+            "queued",
+            0,
+            "running",
+            "running",
+            now_ms,
+            None,
         )?;
         Ok(StoreAttempt {
             ids: RuntimeScanIds {
@@ -2795,11 +2904,30 @@ fn create_store_attempt(
                 scan_run_id: run_id,
             },
             guard,
+            attempt_kind,
             job_state_version,
             run_state_version,
         })
     })?;
     Ok(setup)
+}
+
+fn runtime_scan_config(options: &ScanOptions) -> serde_json::Value {
+    json!({
+        "runtimeContractVersion": RUNTIME_CONTRACT_VERSION,
+        "scanOptions": options,
+    })
+}
+
+fn unique_recovery_target(
+    selection: FreshAttemptRecoverySelection,
+) -> Option<FreshAttemptRecoveryTarget> {
+    match selection {
+        FreshAttemptRecoverySelection::Unique(target) => Some(target),
+        FreshAttemptRecoverySelection::None | FreshAttemptRecoverySelection::Ambiguous { .. } => {
+            None
+        }
+    }
 }
 
 struct EnumerationControl<'a> {
@@ -3485,7 +3613,9 @@ const fn key_strategy(value: KeyStrategy) -> &'static str {
 
 const fn reuse_scope(value: NamespaceReuseScope) -> &'static str {
     match value {
-        NamespaceReuseScope::CrossSession => "cross_session",
+        NamespaceReuseScope::CrossSession | NamespaceReuseScope::FreshAttemptOnly => {
+            "cross_session"
+        }
         NamespaceReuseScope::CurrentSessionOnly => "current_session_only",
     }
 }
@@ -3603,6 +3733,48 @@ mod tests {
         }
     }
 
+    fn run_attempt_audit(
+        database: &Path,
+        scan_run_id: i64,
+    ) -> rusqlite::Result<(Option<i64>, String, String, String, i64)> {
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.query_row(
+            "SELECT run.parent_scan_run_id, run.scan_mode, run.attempt_strategy, run.state, \
+                    binding.attempt_number \
+             FROM scan_runs AS run \
+             JOIN scan_job_runs AS binding ON binding.scan_run_id = run.id \
+             WHERE run.id = ?1",
+            [scan_run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+    }
+
+    fn run_evidence_counts(database: &Path, scan_run_id: i64) -> rusqlite::Result<(i64, i64, i64)> {
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.query_row(
+            "SELECT \
+                 (SELECT count(*) FROM media_observation_snapshots WHERE scan_run_id = ?1), \
+                 (SELECT count(*) FROM observation_fingerprints WHERE scan_run_id = ?1), \
+                 (SELECT count(*) FROM scan_stage_seals WHERE scan_run_id = ?1)",
+            [scan_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+    }
+
     fn control_request_audit(
         database: &Path,
         scan_run_id: i64,
@@ -3638,6 +3810,175 @@ mod tests {
                 Some("CANCEL_ACKNOWLEDGED".to_owned()),
             ),
         ]
+    }
+
+    #[test]
+    fn attempt_kind_values_and_ambiguous_selection_are_fail_closed() {
+        assert_eq!(RuntimeAttemptKind::InitialFull.as_str(), "initial_full");
+        assert_eq!(
+            RuntimeAttemptKind::FreshFullChild.as_str(),
+            "fresh_full_child"
+        );
+        assert_eq!(
+            unique_recovery_target(FreshAttemptRecoverySelection::None),
+            None
+        );
+        assert_eq!(
+            unique_recovery_target(FreshAttemptRecoverySelection::Ambiguous { candidate_count: 2 }),
+            None
+        );
+        let target = FreshAttemptRecoveryTarget {
+            job_id: 11,
+            parent_scan_run_id: 22,
+            job_state_version: 3,
+        };
+        assert_eq!(
+            unique_recovery_target(FreshAttemptRecoverySelection::Unique(target)),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn interrupted_exact_root_starts_a_fresh_full_child_without_copying_evidence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        fs::write(media.path().join("first.jpg"), b"same-photo")?;
+        fs::write(media.path().join("second.jpg"), b"same-photo")?;
+        let database = application.path().join("runtime.sqlite3");
+        let canonical_media = fs::canonicalize(media.path())?;
+
+        let mut first =
+            ActiveReadOnlyScan::start(&database, &canonical_media, ScanOptions::default())?;
+        assert_eq!(
+            first.volume.observation().path_semantics().reuse_scope(),
+            NamespaceReuseScope::FreshAttemptOnly,
+            "the macOS temporary volume must expose strong logical identity and known case behavior"
+        );
+        assert_eq!(first.attempt_kind(), RuntimeAttemptKind::InitialFull);
+        let first_ids = first.ids();
+        let first_core_session_id = first.core_session_id();
+        let first_mount_session_key = first.guard().mount_session_key;
+        assert_eq!(
+            run_attempt_audit(&database, first_ids.scan_run_id)?,
+            (
+                None,
+                "full".to_owned(),
+                "initial_full_v1".to_owned(),
+                "running".to_owned(),
+                1,
+            )
+        );
+
+        let first_enumeration = first.enumerate(&NoopScanControl, &mut ())?;
+        assert_eq!(first_enumeration.status, StreamBatchStatus::Completed);
+        assert_eq!(first_enumeration.media_files, 2);
+        let first_fingerprints = first.fingerprint_candidates(&NoopScanControl, &mut ())?;
+        assert!(first_fingerprints.sampled_files >= 2);
+        let parent_counts = run_evidence_counts(&database, first_ids.scan_run_id)?;
+        assert!(parent_counts.0 >= 2);
+        assert!(parent_counts.1 >= 2);
+        assert!(parent_counts.2 >= 2);
+        first.interrupt("TEST_RESELECT", "create an interrupted recovery parent")?;
+
+        let mut child =
+            ActiveReadOnlyScan::start(&database, &canonical_media, ScanOptions::default())?;
+        let child_ids = child.ids();
+        assert_eq!(child.attempt_kind(), RuntimeAttemptKind::FreshFullChild);
+        assert_eq!(child_ids.scan_job_id, first_ids.scan_job_id);
+        assert_ne!(child_ids.scan_run_id, first_ids.scan_run_id);
+        assert_ne!(child.core_session_id(), first_core_session_id);
+        assert_ne!(child.guard().mount_session_key, first_mount_session_key);
+        assert_eq!(
+            run_attempt_audit(&database, child_ids.scan_run_id)?,
+            (
+                Some(first_ids.scan_run_id),
+                "full".to_owned(),
+                "fresh_full_child_v1".to_owned(),
+                "running".to_owned(),
+                2,
+            )
+        );
+        assert!(child.enumeration_summary().is_none());
+        assert!(child.fingerprint_summary().is_none());
+        assert!(child.coverage_summary().is_none());
+        assert!(child.exact_duplicate_summary().is_none());
+        assert_eq!(
+            run_evidence_counts(&database, child_ids.scan_run_id)?,
+            (0, 0, 0)
+        );
+
+        let child_enumeration = child.enumerate(&NoopScanControl, &mut ())?;
+        assert_eq!(child_enumeration.status, StreamBatchStatus::Completed);
+        assert_eq!(child_enumeration.media_files, 2);
+        let child_counts = run_evidence_counts(&database, child_ids.scan_run_id)?;
+        assert!(child_counts.0 >= 2);
+        assert_eq!(child_counts.1, 0);
+        assert!(child_counts.2 >= 1);
+        child.interrupt("TEST_FINISHED", "fresh full child fixture completed")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_different_exact_root_starts_an_independent_initial_job(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let root_a = media.path().join("A");
+        let root_b = media.path().join("B");
+        fs::create_dir_all(&root_a)?;
+        fs::create_dir_all(&root_b)?;
+        let database = application.path().join("runtime.sqlite3");
+
+        let first = ActiveReadOnlyScan::start(
+            &database,
+            fs::canonicalize(&root_a)?,
+            ScanOptions::default(),
+        )?;
+        let first_job_id = first.ids().scan_job_id;
+        first.interrupt("TEST_DIFFERENT_ROOT", "leave root A interrupted")?;
+
+        let second = ActiveReadOnlyScan::start(
+            &database,
+            fs::canonicalize(&root_b)?,
+            ScanOptions::default(),
+        )?;
+        assert_eq!(second.attempt_kind(), RuntimeAttemptKind::InitialFull);
+        assert_ne!(second.ids().scan_job_id, first_job_id);
+        assert_eq!(
+            run_attempt_audit(&database, second.ids().scan_run_id)?,
+            (
+                None,
+                "full".to_owned(),
+                "initial_full_v1".to_owned(),
+                "running".to_owned(),
+                1,
+            )
+        );
+        second.interrupt("TEST_FINISHED", "different-root fixture completed")?;
+        Ok(())
+    }
+
+    #[test]
+    fn different_scan_options_never_reuse_an_interrupted_job(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        fs::write(media.path().join("photo.jpg"), b"photo")?;
+        let database = application.path().join("runtime.sqlite3");
+        let canonical_media = fs::canonicalize(media.path())?;
+
+        let first = ActiveReadOnlyScan::start(&database, &canonical_media, ScanOptions::default())?;
+        let first_job_id = first.ids().scan_job_id;
+        first.interrupt("TEST_OPTIONS_CHANGED", "leave the default scan interrupted")?;
+
+        let mut changed_options = ScanOptions::default();
+        changed_options.sample_bytes /= 2;
+        let second = ActiveReadOnlyScan::start(&database, &canonical_media, changed_options)?;
+        assert_eq!(second.attempt_kind(), RuntimeAttemptKind::InitialFull);
+        assert_ne!(second.ids().scan_job_id, first_job_id);
+        second.interrupt("TEST_FINISHED", "different-options fixture completed")?;
+        Ok(())
     }
 
     #[test]

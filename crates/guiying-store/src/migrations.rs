@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::error::{Result, StoreError};
 
 pub(crate) const APPLICATION_ID: i32 = 0x4755_5949; // ASCII "GUYI"
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 8;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 9;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_init.sql");
 
@@ -19,6 +19,8 @@ const RUNTIME_STREAM_EVIDENCE_MIGRATION: &str =
 const CAPTURE_TIME_EVIDENCE_MIGRATION: &str =
     include_str!("migrations/0007_capture_time_evidence.sql");
 const RUNTIME_CONTROL_MIGRATION: &str = include_str!("migrations/0008_runtime_control.sql");
+const FRESH_ATTEMPT_RECOVERY_MIGRATION: &str =
+    include_str!("migrations/0009_fresh_attempt_recovery.sql");
 
 const REGISTRY_SQL: &str = r#"
 CREATE TABLE guiying_schema_migrations (
@@ -41,7 +43,7 @@ struct Migration {
     strips_embedded_transaction: bool,
 }
 
-const MIGRATIONS: [Migration; 8] = [
+const MIGRATIONS: [Migration; 9] = [
     Migration {
         version: 1,
         name: "initial_data_model",
@@ -88,6 +90,12 @@ const MIGRATIONS: [Migration; 8] = [
         version: 8,
         name: "runtime_control",
         sql: RUNTIME_CONTROL_MIGRATION,
+        strips_embedded_transaction: false,
+    },
+    Migration {
+        version: 9,
+        name: "fresh_attempt_recovery",
+        sql: FRESH_ATTEMPT_RECOVERY_MIGRATION,
         strips_embedded_transaction: false,
     },
 ];
@@ -807,7 +815,7 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
         }
     }
     if version >= 5 {
-        validate_session_bound_evidence(connection)?;
+        validate_session_bound_evidence(connection, version)?;
     }
     if version >= 6 {
         validate_runtime_stream_evidence(connection)?;
@@ -817,6 +825,9 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
     }
     if version >= 8 {
         validate_runtime_control_evidence(connection)?;
+    }
+    if version >= 9 {
+        validate_fresh_attempt_recovery_evidence(connection)?;
     }
     validate_stored_path_evidence(connection, version)?;
     Ok(())
@@ -1205,10 +1216,16 @@ fn validate_runtime_control_evidence(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn validate_session_bound_evidence(connection: &Connection) -> Result<()> {
+fn validate_session_bound_evidence(connection: &Connection, version: i64) -> Result<()> {
+    let unicode_cross_session_rejection = if version >= 9 {
+        ""
+    } else {
+        "OR namespace.unicode_behavior = 'unknown'"
+    };
     reject_if_exists(
         connection,
-        "SELECT EXISTS( \
+        &format!(
+            "SELECT EXISTS( \
              SELECT 1 \
              FROM namespace_profiles AS namespace \
              JOIN volumes AS volume ON volume.id = namespace.volume_id \
@@ -1239,9 +1256,10 @@ fn validate_session_bound_evidence(connection: &Connection) -> Result<()> {
                 OR (namespace.reuse_scope = 'cross_session' AND ( \
                        volume.identity_strength <> 'strong' \
                        OR namespace.case_behavior = 'unknown' \
-                       OR namespace.unicode_behavior = 'unknown' \
+                       {unicode_cross_session_rejection} \
                    )) \
-         )",
+         )"
+        ),
         "namespace profile has incomplete or over-privileged reuse evidence",
     )?;
     reject_if_exists(
@@ -1576,6 +1594,157 @@ fn validate_session_bound_evidence(connection: &Connection) -> Result<()> {
         "verified exact groups overlap by physical file identity",
     )?;
     crate::repository::verify_all_verified_exact_groups(connection)?;
+    Ok(())
+}
+
+fn validate_fresh_attempt_recovery_evidence(connection: &Connection) -> Result<()> {
+    reject_if_exists(
+        connection,
+        "SELECT (SELECT count(*) FROM scan_attempt_strategy_epochs) <> 1 \
+             OR EXISTS( \
+                 SELECT 1 \
+                 FROM scan_runs AS run \
+                 CROSS JOIN scan_attempt_strategy_epochs AS epoch \
+                 WHERE epoch.id <> 1 \
+                    OR (run.id <= epoch.legacy_scan_run_id_cutoff \
+                        AND run.attempt_strategy <> 'legacy') \
+                    OR (run.id > epoch.legacy_scan_run_id_cutoff \
+                        AND run.attempt_strategy = 'legacy') \
+             )",
+        "scan attempt strategy violates the immutable v8-to-v9 epoch",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM namespace_reuse_policies AS policy \
+             LEFT JOIN namespace_profiles AS namespace \
+               ON namespace.id = policy.namespace_profile_id \
+              AND namespace.volume_id = policy.volume_id \
+             LEFT JOIN volumes AS volume ON volume.id = policy.volume_id \
+             WHERE namespace.id IS NULL OR volume.id IS NULL \
+                OR namespace.origin <> 'observed_v5' \
+                OR namespace.reuse_scope <> 'cross_session' \
+                OR namespace.bound_mount_session_key IS NOT NULL \
+                OR namespace.key_strategy <> 'exact_native_v1' \
+                OR namespace.case_behavior = 'unknown' \
+                OR volume.identity_strength <> 'strong' \
+                OR policy.policy_version <> 1 \
+                OR policy.created_at_ms < namespace.created_at_ms \
+                OR (policy.policy = 'evidence_reuse_eligible' \
+                    AND namespace.unicode_behavior = 'unknown') \
+         )",
+        "namespace reuse policy exceeds immutable namespace evidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_job_scopes AS scope \
+             LEFT JOIN namespace_reuse_policies AS policy \
+               ON policy.namespace_profile_id = scope.namespace_profile_id \
+              AND policy.volume_id = scope.volume_id \
+             WHERE scope.recoverable = 1 \
+               AND (policy.namespace_profile_id IS NULL \
+                    OR policy.policy NOT IN ( \
+                        'fresh_attempt_only', 'evidence_reuse_eligible' \
+                    )) \
+         )",
+        "recoverable scan scope lacks an explicit fresh-attempt policy",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_job_runs AS binding \
+             JOIN scan_runs AS run \
+               ON run.id = binding.scan_run_id AND run.volume_id = binding.volume_id \
+             JOIN scan_job_scopes AS scope \
+               ON scope.scan_job_id = binding.scan_job_id \
+              AND scope.volume_id = binding.volume_id \
+             LEFT JOIN scan_runs AS parent ON parent.id = run.parent_scan_run_id \
+             LEFT JOIN namespace_reuse_policies AS policy \
+               ON policy.namespace_profile_id = scope.namespace_profile_id \
+              AND policy.volume_id = scope.volume_id \
+             WHERE (run.attempt_strategy = 'initial_full_v1' AND ( \
+                       binding.attempt_number <> 1 \
+                       OR run.parent_scan_run_id IS NOT NULL \
+                       OR run.scan_mode <> 'full' \
+                   )) \
+                OR (run.attempt_strategy = 'fresh_full_child_v1' AND ( \
+                       binding.attempt_number <= 1 \
+                       OR run.parent_scan_run_id IS NULL \
+                       OR run.scan_mode <> 'full' \
+                       OR parent.attempt_strategy NOT IN ( \
+                           'initial_full_v1', 'fresh_full_child_v1' \
+                       ) \
+                       OR parent.state <> 'interrupted' \
+                       OR scope.recoverable <> 1 \
+                       OR policy.policy NOT IN ( \
+                           'fresh_attempt_only', 'evidence_reuse_eligible' \
+                       ) \
+                   )) \
+                OR (run.attempt_strategy <> 'legacy' \
+                    AND run.attempt_strategy NOT IN ( \
+                        'initial_full_v1', 'fresh_full_child_v1' \
+                    )) \
+                OR (run.attempt_strategy <> 'legacy' \
+                    AND binding.attempt_number = 1 \
+                    AND run.attempt_strategy <> 'initial_full_v1') \
+                OR (run.attempt_strategy <> 'legacy' \
+                    AND binding.attempt_number > 1 \
+                    AND run.attempt_strategy <> 'fresh_full_child_v1') \
+         )",
+        "explicit scan attempt strategy is inconsistent with lineage policy",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_runs AS run \
+             LEFT JOIN scan_job_runs AS binding \
+               ON binding.scan_run_id = run.id AND binding.volume_id = run.volume_id \
+             WHERE run.attempt_strategy <> 'legacy' \
+               AND binding.scan_run_id IS NULL \
+         )",
+        "explicit v9 scan attempt is missing its job binding",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_runs AS run \
+             JOIN scan_job_runs AS binding \
+               ON binding.scan_run_id = run.id AND binding.volume_id = run.volume_id \
+             JOIN scan_jobs AS job \
+               ON job.id = binding.scan_job_id AND job.volume_id = binding.volume_id \
+             LEFT JOIN scan_runs AS parent ON parent.id = run.parent_scan_run_id \
+             WHERE run.state = 'queued' \
+               AND run.attempt_strategy <> 'legacy' \
+               AND (job.active_scan_run_id IS NOT run.id \
+                    OR (run.attempt_strategy = 'initial_full_v1' AND ( \
+                        binding.attempt_number <> 1 \
+                        OR job.state <> 'queued' \
+                        OR run.parent_scan_run_id IS NOT NULL \
+                    )) \
+                    OR (run.attempt_strategy = 'fresh_full_child_v1' AND ( \
+                        binding.attempt_number <= 1 \
+                        OR job.state <> 'failed' \
+                        OR parent.state <> 'interrupted' \
+                    ))) \
+         )",
+        "queued v9 scan attempt is not in its atomic creation state",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_runs AS child \
+             JOIN scan_runs AS parent ON parent.id = child.parent_scan_run_id \
+             WHERE child.attempt_strategy = 'fresh_full_child_v1' \
+               AND parent.attempt_strategy = 'legacy' \
+         )",
+        "legacy scan run was promoted into a v9 fresh-attempt lineage",
+    )?;
     Ok(())
 }
 
@@ -4486,6 +4655,7 @@ mod tests {
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
         apply_migration(&mut connection, &MIGRATIONS[7], 1_007, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[8], 1_008, false)?;
         validate_current_schema(&connection)?;
         let (encoding, raw): (String, Vec<u8>) = connection.query_row(
             "SELECT path_encoding, relative_path_raw FROM media_file_paths WHERE media_file_id = 1",
@@ -4856,6 +5026,7 @@ mod tests {
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
         apply_migration(&mut connection, &MIGRATIONS[7], 1_007, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[8], 1_008, false)?;
         validate_current_schema(&connection)?;
         Ok(())
     }
@@ -4894,6 +5065,7 @@ mod tests {
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
         apply_migration(&mut connection, &MIGRATIONS[7], 1_007, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[8], 1_008, false)?;
         validate_current_schema(&connection)?;
         Ok(())
     }
@@ -4952,8 +5124,12 @@ mod tests {
              ); \
              INSERT INTO scan_runs ( \
                  id, run_key, volume_id, capability_profile_id, root_relative_path, \
-                 root_path_key, scan_mode, state, started_at_ms, created_at_ms, updated_at_ms \
-             ) VALUES (1, 'run', 1, 1, '', zeroblob(32), 'full', 'running', 1, 1, 1); \
+                 root_path_key, scan_mode, state, started_at_ms, created_at_ms, updated_at_ms, \
+                 attempt_strategy \
+             ) VALUES ( \
+                 1, 'run', 1, 1, '', zeroblob(32), 'full', 'running', 1, 1, 1, \
+                 'initial_full_v1' \
+             ); \
              INSERT INTO scan_run_sessions ( \
                  scan_run_id, scan_job_id, volume_id, capability_profile_id, \
                  namespace_profile_id, mount_session_key, mount_relative_root_raw, \

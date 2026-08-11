@@ -753,6 +753,59 @@ pub struct NewScopedScanJob {
     pub created_at_ms: i64,
 }
 
+/// Stable, freshly observed scope used to find a failed job that may receive
+/// one new bound attempt.
+///
+/// This query is only an association lookup. It never authorizes filesystem
+/// access and never opts the child run into historical fingerprint reuse.
+#[derive(Debug, Clone)]
+pub struct FreshAttemptRecoveryQuery {
+    pub volume_id: i64,
+    pub namespace_profile_id: i64,
+    pub mount_relative_root_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub stable_root_path_key: StablePathKey,
+    pub root_scope_key: RootScopeKey,
+    pub config: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreshAttemptRecoveryTarget {
+    pub job_id: i64,
+    pub parent_scan_run_id: i64,
+    pub job_state_version: i64,
+}
+
+/// Result of resolving recovery candidates for one exact scope.
+///
+/// More than one matching job is deliberately ambiguous. Callers must not
+/// pick one by recency, display path, or row id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshAttemptRecoverySelection {
+    None,
+    Unique(FreshAttemptRecoveryTarget),
+    Ambiguous { candidate_count: i64 },
+}
+
+/// Explicit v9 strategy for one newly bound scan attempt.
+///
+/// The storage schema also contains `legacy` for rows migrated from v8, but
+/// callers cannot create new legacy attempts through this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanAttemptStrategy {
+    InitialFullV1,
+    FreshFullChildV1,
+}
+
+impl ScanAttemptStrategy {
+    pub(crate) const fn as_storage_str(self) -> &'static str {
+        match self {
+            Self::InitialFullV1 => "initial_full_v1",
+            Self::FreshFullChildV1 => "fresh_full_child_v1",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewBoundScanRun {
     pub run_key: String,
@@ -767,6 +820,7 @@ pub struct NewBoundScanRun {
     pub root_scope_key: RootScopeKey,
     pub root_object_signature: RootObjectSignature,
     pub scan_mode: String,
+    pub attempt_strategy: ScanAttemptStrategy,
     pub config: Option<Value>,
     pub created_at_ms: i64,
 }

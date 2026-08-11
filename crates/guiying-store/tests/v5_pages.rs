@@ -4,8 +4,8 @@ use guiying_store::{
     ExactVerificationEdgeInput, FileObjectKey, FileTimestampParts, FingerprintReadOrigin,
     FreshFingerprintInput, FreshFingerprintKind, MountSessionKey, NamespaceProfileInput,
     NamespaceProfileKey, NewBoundScanRun, NewScanIssue, NewScopedScanJob, ObservationInput,
-    ParametersHash, RootObjectSignature, RootScopeKey, RunEvidenceGuard, ScanStage,
-    SourceSignature, StablePathKey, Store, StoreError, VolumeInput, MAX_PAGE_SIZE,
+    ParametersHash, RootObjectSignature, RootScopeKey, RunEvidenceGuard, ScanAttemptStrategy,
+    ScanStage, SourceSignature, StablePathKey, Store, StoreError, VolumeInput, MAX_PAGE_SIZE,
 };
 use tempfile::TempDir;
 
@@ -539,10 +539,11 @@ fn create_running_run(
             stable_root_path_key: StablePathKey::from_volume_adapter([12; 32]),
             root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
             root_object_signature: RootObjectSignature::from_volume_adapter([session_byte; 32]),
-            scan_mode: if parent_scan_run_id.is_some() {
-                "resume".into()
+            scan_mode: "full".into(),
+            attempt_strategy: if parent_scan_run_id.is_some() {
+                ScanAttemptStrategy::FreshFullChildV1
             } else {
-                "full".into()
+                ScanAttemptStrategy::InitialFullV1
             },
             config: None,
             created_at_ms: run_created_at_ms,

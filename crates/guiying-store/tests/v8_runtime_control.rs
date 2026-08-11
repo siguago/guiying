@@ -3,13 +3,50 @@ use guiying_store::{
     CoreSessionInput, DirectoryObjectSignature, LeasedScanTerminalOutcome, MountSessionKey,
     NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScopedScanJob,
     PauseCheckpointCursor, PauseCheckpointInput, PauseCheckpointWriteKey, RootObjectSignature,
-    RootScopeKey, RunEvidenceGuard, RuntimeLeaseGuard, RuntimeLeaseKey, ScanControlDisposition,
-    ScanControlKind, ScanControlRequestInput, ScanControlRequestKey, SourceSignature,
-    StablePathKey, Store, StoreError, TicketSortKey, VolumeInput,
+    RootScopeKey, RunEvidenceGuard, RuntimeLeaseGuard, RuntimeLeaseKey, ScanAttemptStrategy,
+    ScanControlDisposition, ScanControlKind, ScanControlRequestInput, ScanControlRequestKey,
+    SourceSignature, StablePathKey, Store, StoreError, TicketSortKey, VolumeInput,
 };
-use rusqlite::Connection;
+use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::Path;
 use tempfile::TempDir;
+
+const APPLICATION_ID: i32 = 0x4755_5949;
+
+const PRE_V9_MIGRATIONS: [(&str, &str); 8] = [
+    (
+        "initial_data_model",
+        include_str!("../src/migrations/0001_init.sql"),
+    ),
+    (
+        "store_runtime",
+        include_str!("../src/migrations/0002_store_runtime.sql"),
+    ),
+    (
+        "store_hardening",
+        include_str!("../src/migrations/0003_store_hardening.sql"),
+    ),
+    (
+        "evidence_binding",
+        include_str!("../src/migrations/0004_evidence_binding.sql"),
+    ),
+    (
+        "session_bound_evidence",
+        include_str!("../src/migrations/0005_session_bound_evidence.sql"),
+    ),
+    (
+        "runtime_stream_evidence",
+        include_str!("../src/migrations/0006_runtime_stream_evidence.sql"),
+    ),
+    (
+        "capture_time_evidence",
+        include_str!("../src/migrations/0007_capture_time_evidence.sql"),
+    ),
+    (
+        "runtime_control",
+        include_str!("../src/migrations/0008_runtime_control.sql"),
+    ),
+];
 
 #[derive(Clone, Copy)]
 struct RunningRuntime {
@@ -678,31 +715,9 @@ fn version_seven_database_migrates_to_runtime_control_schema(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let database = temporary.path().join("v7.sqlite3");
-    Store::open_or_create(&database)?.close()?;
-    let connection = Connection::open(&database)?;
-    connection.execute_batch(
-        "PRAGMA foreign_keys = OFF; \
-         DROP TRIGGER trg_scan_jobs_runtime_control_gate_v8; \
-         DROP TRIGGER trg_scan_runs_runtime_control_gate_v8; \
-         DROP TRIGGER trg_scan_pause_checkpoints_no_delete_v8; \
-         DROP TRIGGER trg_scan_pause_checkpoints_update_guard_v8; \
-         DROP TRIGGER trg_scan_pause_checkpoints_insert_guard_v8; \
-         DROP TRIGGER trg_scan_control_requests_no_delete_v8; \
-         DROP TRIGGER trg_scan_control_requests_update_guard_v8; \
-         DROP TRIGGER trg_scan_control_requests_insert_guard_v8; \
-         DROP TRIGGER trg_scan_runtime_leases_no_delete_v8; \
-         DROP TRIGGER trg_scan_runtime_leases_update_guard_v8; \
-         DROP TRIGGER trg_scan_runtime_leases_insert_guard_v8; \
-         DROP TABLE scan_pause_checkpoints; \
-         DROP TABLE scan_control_requests; \
-         DROP TABLE scan_runtime_leases; \
-         DROP INDEX ux_scan_run_sessions_mount_binding_v8; \
-         DELETE FROM guiying_schema_migrations WHERE version = 8; \
-         PRAGMA user_version = 7;",
-    )?;
-    drop(connection);
+    create_empty_managed_version(&database, 7)?;
     let store = Store::open_existing(&database)?;
-    assert_eq!(store.schema_version()?, 8);
+    assert_eq!(store.schema_version()?, 9);
     store.close()?;
     Ok(())
 }
@@ -919,6 +934,7 @@ fn create_running_run(
             root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
             root_object_signature: RootObjectSignature::from_volume_adapter([14; 32]),
             scan_mode: "full".into(),
+            attempt_strategy: ScanAttemptStrategy::InitialFullV1,
             config: None,
             created_at_ms: 120,
         })?;
@@ -993,4 +1009,69 @@ fn directory_ticket(
         ticket_sort_key: TicketSortKey::from_core_evidence(*ticket_hasher.finalize().as_bytes()),
         observed_at_ms: 170 + i64::from(signature_byte),
     }
+}
+
+fn create_empty_managed_version(
+    path: &Path,
+    target_version: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut connection = Connection::open(path)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    for (index, (name, sql)) in PRE_V9_MIGRATIONS.iter().enumerate() {
+        let version = i64::try_from(index)? + 1;
+        if version > target_version {
+            break;
+        }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if version == 1 {
+            transaction.execute_batch(
+                r#"CREATE TABLE guiying_schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    checksum BLOB NOT NULL CHECK (length(checksum) = 32),
+    applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0)
+) STRICT;"#,
+            )?;
+            transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+        }
+        let body = if version == 1 {
+            strip_initial_transaction(sql)?
+        } else {
+            sql
+        };
+        transaction.execute_batch(body)?;
+        let checksum = blake3::hash(sql.as_bytes());
+        transaction.execute(
+            "INSERT INTO guiying_schema_migrations (version, name, checksum, applied_at_ms) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                version,
+                name,
+                checksum.as_bytes().as_slice(),
+                1_000 + version,
+            ],
+        )?;
+        transaction.pragma_update(None, "user_version", version)?;
+        transaction.commit()?;
+    }
+    connection.close().map_err(|(_, error)| error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+fn strip_initial_transaction(sql: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    let begin = sql
+        .find("BEGIN IMMEDIATE;\n")
+        .ok_or("initial migration is missing BEGIN IMMEDIATE")?
+        + "BEGIN IMMEDIATE;\n".len();
+    let commit = sql
+        .rfind("COMMIT;")
+        .ok_or("initial migration is missing COMMIT")?;
+    Ok(&sql[begin..commit])
 }

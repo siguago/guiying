@@ -31,7 +31,7 @@ fn sealed_metadata_review_is_scoped_bounded_and_lossless() -> Result<(), Box<dyn
 
     assert_eq!(
         store.schema_version()?,
-        8,
+        9,
         "capture-time read APIs must remain available on the latest schema"
     );
 

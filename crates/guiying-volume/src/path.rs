@@ -21,7 +21,8 @@ pub struct SerializedMountRelativePath {
 
 /// A stable namespace address relative to the real filesystem mount root.
 ///
-/// This type is evidence only and is never accepted as an open authority.
+/// This type is exact-native evidence only and is never accepted as an open,
+/// hint-reuse, or cursor-continuation authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MountRelativePath {
     encoding: NativePathEncoding,
@@ -399,7 +400,7 @@ impl U16AsciiUppercase for u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::test_profile;
+    use crate::profile::{test_fresh_attempt_profile, test_profile};
 
     fn windows_raw(value: &[u16]) -> Vec<u8> {
         value.iter().flat_map(|unit| unit.to_le_bytes()).collect()
@@ -421,6 +422,44 @@ mod tests {
         assert_eq!(
             MountRelativePath::from_serialized(serialized, &profile).expect("round trip"),
             path
+        );
+    }
+
+    #[test]
+    fn fresh_attempt_paths_preserve_exact_native_distinctions() {
+        let profile = test_fresh_attempt_profile(NativePathEncoding::UnixBytes);
+        assert_eq!(
+            profile.reuse_scope(),
+            crate::NamespaceReuseScope::FreshAttemptOnly
+        );
+
+        let nfc = MountRelativePath::from_raw(
+            "photos/caf\u{e9}.jpg".as_bytes().to_vec(),
+            profile.encoding(),
+            &profile,
+        )
+        .expect("NFC path");
+        let nfd = MountRelativePath::from_raw(
+            "photos/cafe\u{301}.jpg".as_bytes().to_vec(),
+            profile.encoding(),
+            &profile,
+        )
+        .expect("NFD path");
+        let case_variant = MountRelativePath::from_raw(
+            b"photos/CAF\xC3\x89.JPG".to_vec(),
+            profile.encoding(),
+            &profile,
+        )
+        .expect("case-variant path");
+
+        assert_ne!(nfc.raw(), nfd.raw());
+        assert_ne!(nfc.stable_path_key(), nfd.stable_path_key());
+        assert_ne!(nfc.stable_path_key(), case_variant.stable_path_key());
+        assert_eq!(
+            MountRelativePath::from_serialized(nfc.to_serialized(), &profile)
+                .expect("exact-native round trip")
+                .raw(),
+            nfc.raw()
         );
     }
 
@@ -605,6 +644,10 @@ mod tests {
         assert_eq!(first.case_sensitive(), None);
         assert_eq!(first.case_preserving(), None);
         assert_eq!(first.origin(), crate::ProfileOrigin::ConservativeOffline);
+        assert_eq!(
+            first.reuse_scope(),
+            crate::NamespaceReuseScope::CurrentSessionOnly
+        );
         assert_ne!(first.profile_key(), second.profile_key());
 
         let raw = windows_text(r"photos\safe.jpg");

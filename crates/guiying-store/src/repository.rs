@@ -12,18 +12,20 @@ use crate::model::{
     CaptureTimeRecommendationInput, CoreDirectoryObservationInput, CoreFileObservationInput,
     CoreSessionId, CoreSessionInput, CoverageOutcomeInput, CoverageStatus, ExactGroupKey,
     ExactGroupManifestMember, ExactGroupMemberInput, ExactVerificationEdgeInput,
-    FileTimestampParts, FreshFingerprintInput, FreshFingerprintKind, LeasedScanTerminalOutcome,
-    ManifestDigest, MediaFileInput, MetadataContainerLocator, MetadataExtractionIssueInput,
-    MetadataFieldInput, MetadataReportManifestPlan, MetadataSourceRevalidationInput,
-    MountSessionKey, NamespaceProfileInput, NewBoundScanRun, NewScanIssue, NewScanJob,
-    NewScanReport, NewScanRun, NewScopedScanJob, ObservationInput, PauseCheckpointCursor,
-    PauseCheckpointInput, PauseCheckpointWriteKey, RecordTimeGroupOutcomeInput, RunEvidenceGuard,
-    RuntimeLeaseGuard, ScanCheckpointInput, ScanControlDisposition, ScanControlKind,
-    ScanControlRequestInput, ScanControlRequestKey, ScanControlRequestRecord, ScanStage,
-    SourceSignature, TimeEvidenceGuard, TimeEvidenceManifestDigest, TimeExactFingerprintMaterial,
-    TimeLineageKey, TimeSessionOutcome, TimeSourceKey, TimeSourceKeyMaterial, VerifiedExactGroup,
-    VolumeInput, MAX_IDENTIFIER_BYTES, MAX_JSON_BYTES, MAX_OPAQUE_BLOB_BYTES, MAX_PATH_BYTES,
-    MAX_TEXT_BYTES, MAX_TIME_EVIDENCE_BATCH, MAX_TIME_EVIDENCE_PAGE_BYTES,
+    FileTimestampParts, FreshAttemptRecoveryQuery, FreshAttemptRecoverySelection,
+    FreshAttemptRecoveryTarget, FreshFingerprintInput, FreshFingerprintKind,
+    LeasedScanTerminalOutcome, ManifestDigest, MediaFileInput, MetadataContainerLocator,
+    MetadataExtractionIssueInput, MetadataFieldInput, MetadataReportManifestPlan,
+    MetadataSourceRevalidationInput, MountSessionKey, NamespaceProfileInput, NewBoundScanRun,
+    NewScanIssue, NewScanJob, NewScanReport, NewScanRun, NewScopedScanJob, ObservationInput,
+    PauseCheckpointCursor, PauseCheckpointInput, PauseCheckpointWriteKey,
+    RecordTimeGroupOutcomeInput, RunEvidenceGuard, RuntimeLeaseGuard, ScanAttemptStrategy,
+    ScanCheckpointInput, ScanControlDisposition, ScanControlKind, ScanControlRequestInput,
+    ScanControlRequestKey, ScanControlRequestRecord, ScanStage, SourceSignature, TimeEvidenceGuard,
+    TimeEvidenceManifestDigest, TimeExactFingerprintMaterial, TimeLineageKey, TimeSessionOutcome,
+    TimeSourceKey, TimeSourceKeyMaterial, VerifiedExactGroup, VolumeInput, MAX_IDENTIFIER_BYTES,
+    MAX_JSON_BYTES, MAX_OPAQUE_BLOB_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES, MAX_TIME_EVIDENCE_BATCH,
+    MAX_TIME_EVIDENCE_PAGE_BYTES,
 };
 
 const MAX_V5_WRITE_BATCH: usize = 128;
@@ -221,6 +223,20 @@ impl<'transaction> RepositoryTx<'transaction> {
 
     pub fn create_scoped_scan_job(&mut self, input: &NewScopedScanJob) -> Result<i64> {
         self.run_mutator(|repository| repository.create_scoped_scan_job_impl(input))
+    }
+
+    /// Resolves an exact, recoverable failed-job scope inside the caller's
+    /// immediate transaction.
+    ///
+    /// Callers that create a child should invoke this method and
+    /// `create_bound_scan_run` in the same `Store::write_transaction` callback.
+    /// The returned ids are association evidence only; they grant no durable
+    /// filesystem authority and copy no evidence from the parent run.
+    pub fn select_fresh_attempt_recovery(
+        &self,
+        query: &FreshAttemptRecoveryQuery,
+    ) -> Result<FreshAttemptRecoverySelection> {
+        self.select_fresh_attempt_recovery_impl(query)
     }
 
     pub fn create_bound_scan_run(&mut self, input: &NewBoundScanRun) -> Result<i64> {
@@ -3189,13 +3205,15 @@ impl<'transaction> RepositoryTx<'transaction> {
                 && existing.reuse_scope == input.reuse_scope
                 && existing.bound_mount_session_key == bound_mount_session_key
                 && existing.legacy_capability_profile_id.is_none()
-                && existing.created_at_ms == input.created_at_ms;
+                && (input.reuse_scope == "cross_session"
+                    || existing.created_at_ms == input.created_at_ms);
             if !matches {
                 return Err(StoreError::IdempotencyConflict {
                     entity: "namespace_profile",
                     key: hex_hash(input.profile_key.as_bytes()),
                 });
             }
+            self.ensure_namespace_reuse_policy(existing.id, input, existing.created_at_ms)?;
             return Ok(existing.id);
         }
 
@@ -3219,18 +3237,97 @@ impl<'transaction> RepositoryTx<'transaction> {
                 input.created_at_ms,
             ],
         )?;
-        Ok(self.transaction.last_insert_rowid())
+        let namespace_profile_id = self.transaction.last_insert_rowid();
+        self.ensure_namespace_reuse_policy(namespace_profile_id, input, input.created_at_ms)?;
+        Ok(namespace_profile_id)
+    }
+
+    fn ensure_namespace_reuse_policy(
+        &self,
+        namespace_profile_id: i64,
+        input: &NamespaceProfileInput,
+        namespace_created_at_ms: i64,
+    ) -> Result<()> {
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT volume_id, policy, policy_version, created_at_ms \
+                 FROM namespace_reuse_policies WHERE namespace_profile_id = ?1",
+                [namespace_profile_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if input.reuse_scope != "cross_session" {
+            if existing.is_some() {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "namespace_reuse_policy",
+                    key: namespace_profile_id.to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        if let Some((volume_id, policy, version, created_at_ms)) = existing {
+            let policy_matches = matches!(
+                policy.as_str(),
+                "fresh_attempt_only" | "evidence_reuse_eligible"
+            ) && (policy != "evidence_reuse_eligible"
+                || input.unicode_behavior != "unknown");
+            if volume_id != input.volume_id
+                || version != 1
+                || created_at_ms < namespace_created_at_ms
+                || !policy_matches
+            {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "namespace_reuse_policy",
+                    key: namespace_profile_id.to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        let policy = if input.unicode_behavior == "unknown" {
+            "fresh_attempt_only"
+        } else {
+            "evidence_reuse_eligible"
+        };
+        self.transaction.execute(
+            "INSERT INTO namespace_reuse_policies ( \
+                 namespace_profile_id, volume_id, policy, policy_version, created_at_ms \
+             ) VALUES (?1, ?2, ?3, 1, ?4)",
+            params![
+                namespace_profile_id,
+                input.volume_id,
+                policy,
+                namespace_created_at_ms,
+            ],
+        )?;
+        Ok(())
     }
 
     fn create_scoped_scan_job_impl(&mut self, input: &NewScopedScanJob) -> Result<i64> {
         validate_scoped_scan_job(input)?;
         let config_json = serialize_optional_json("config", &input.config, MAX_JSON_BYTES)?;
-        let (reuse_scope, identity_strength, key_algorithm_version): (String, String, i64) =
-            self.transaction.query_row(
+        let (reuse_scope, identity_strength, key_algorithm_version, recovery_policy): (
+            String,
+            String,
+            i64,
+            Option<String>,
+        ) = self.transaction.query_row(
                 "SELECT namespace.reuse_scope, volume.identity_strength, \
-                        namespace.key_algorithm_version \
+                        namespace.key_algorithm_version, policy.policy \
                  FROM namespace_profiles AS namespace \
                  JOIN volumes AS volume ON volume.id = namespace.volume_id \
+                 LEFT JOIN namespace_reuse_policies AS policy \
+                   ON policy.namespace_profile_id = namespace.id \
+                  AND policy.volume_id = namespace.volume_id \
                  WHERE namespace.id = ?1 AND namespace.volume_id = ?2 \
                    AND namespace.origin = 'observed_v5' \
                    AND namespace.profile_key IS NOT NULL \
@@ -3244,9 +3341,20 @@ impl<'transaction> RepositoryTx<'transaction> {
                          AND namespace.bound_mount_session_key = lower(namespace.bound_mount_session_key) \
                          AND namespace.bound_mount_session_key NOT GLOB '*[^0-9a-f]*'))",
                 params![input.namespace_profile_id, input.volume_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
-        let recoverable = reuse_scope == "cross_session" && identity_strength == "strong";
+        let recoverable = reuse_scope == "cross_session"
+            && identity_strength == "strong"
+            && matches!(
+                recovery_policy.as_deref(),
+                Some("fresh_attempt_only" | "evidence_reuse_eligible")
+            );
+        if reuse_scope == "cross_session" && !recoverable {
+            return Err(StoreError::invalid_input(
+                "namespace_profile_id",
+                "cross-session scope lacks an explicit fresh-attempt policy",
+            ));
+        }
 
         let existing = self
             .transaction
@@ -3368,13 +3476,17 @@ impl<'transaction> RepositoryTx<'transaction> {
                     scope.namespace_profile_id, scope.mount_relative_root_raw, \
                     scope.path_encoding, scope.stable_root_path_key, scope.root_scope_key, \
                     scope.recoverable, namespace.reuse_scope, \
-                    namespace.bound_mount_session_key, volume.identity_strength \
+                    namespace.bound_mount_session_key, volume.identity_strength, policy.policy, \
+                    job.config_json \
              FROM scan_jobs AS job \
              JOIN scan_job_scopes AS scope ON scope.scan_job_id = job.id \
              JOIN namespace_profiles AS namespace \
                ON namespace.id = scope.namespace_profile_id \
               AND namespace.volume_id = scope.volume_id \
              JOIN volumes AS volume ON volume.id = job.volume_id \
+             LEFT JOIN namespace_reuse_policies AS policy \
+               ON policy.namespace_profile_id = namespace.id \
+              AND policy.volume_id = namespace.volume_id \
              WHERE job.id = ?1 AND scope.origin = 'observed_v5'",
             [input.scan_job_id],
             |row| {
@@ -3392,6 +3504,8 @@ impl<'transaction> RepositoryTx<'transaction> {
                     reuse_scope: row.get(10)?,
                     bound_mount_session_key: row.get(11)?,
                     identity_strength: row.get(12)?,
+                    recovery_policy: row.get(13)?,
+                    config_json: row.get(14)?,
                 })
             },
         )?;
@@ -3400,6 +3514,7 @@ impl<'transaction> RepositoryTx<'transaction> {
             || stored_scope.scope_encoding != input.path_encoding
             || stored_scope.scope_stable_key.as_slice() != input.stable_root_path_key.as_bytes()
             || stored_scope.scope_root_key.as_slice() != input.root_scope_key.as_bytes()
+            || stored_scope.config_json.as_deref() != config_json.as_deref()
         {
             return Err(StoreError::IdempotencyConflict {
                 entity: "bound_scan_run_scope",
@@ -3433,15 +3548,36 @@ impl<'transaction> RepositoryTx<'transaction> {
             [input.scan_job_id],
             |row| row.get(0),
         )?;
+        let fresh_policy_allows_lineage = matches!(
+            stored_scope.recovery_policy.as_deref(),
+            Some("fresh_attempt_only" | "evidence_reuse_eligible")
+        );
         if attempt_count > 0
             && (stored_scope.recoverable != 1
                 || stored_scope.reuse_scope != "cross_session"
-                || stored_scope.identity_strength != "strong")
+                || stored_scope.identity_strength != "strong"
+                || !fresh_policy_allows_lineage)
         {
             return Err(StoreError::invalid_input(
                 "scan_job_id",
-                "a subsequent run requires a recoverable strong cross-session scope",
+                "a subsequent run requires an explicit fresh-attempt policy",
             ));
+        }
+        match (attempt_count, input.attempt_strategy) {
+            (0, ScanAttemptStrategy::InitialFullV1) => {}
+            (0, ScanAttemptStrategy::FreshFullChildV1) => {
+                return Err(StoreError::invalid_input(
+                    "attempt_strategy",
+                    "the first run must use initial_full_v1",
+                ));
+            }
+            (_, ScanAttemptStrategy::FreshFullChildV1) => {}
+            (_, ScanAttemptStrategy::InitialFullV1) => {
+                return Err(StoreError::invalid_input(
+                    "attempt_strategy",
+                    "a subsequent run must use fresh_full_child_v1",
+                ));
+            }
         }
         if attempt_count > 0 && input.parent_scan_run_id.is_none() {
             return Err(StoreError::invalid_input(
@@ -3455,19 +3591,32 @@ impl<'transaction> RepositoryTx<'transaction> {
                 key: input.run_key.clone(),
             });
         }
-        if !matches!(
-            stored_scope.state.as_str(),
-            "queued" | "failed" | "completed" | "cancelled"
-        ) {
+        let creation_state_matches = match input.attempt_strategy {
+            ScanAttemptStrategy::InitialFullV1 => {
+                stored_scope.state == "queued" && stored_scope.active_scan_run_id.is_none()
+            }
+            ScanAttemptStrategy::FreshFullChildV1 => {
+                stored_scope.state == "failed"
+                    && stored_scope.active_scan_run_id == input.parent_scan_run_id
+            }
+        };
+        if !creation_state_matches {
             return Err(StoreError::ConcurrencyConflict {
-                entity: "scoped_scan_job_state",
+                entity: "scan_attempt_creation_state",
                 id: input.scan_job_id,
             });
         }
         if let Some(active_run_id) = stored_scope.active_scan_run_id {
             let replaceable = self.transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM scan_runs \
-                 WHERE id = ?1 AND state IN ('failed', 'interrupted', 'completed', 'cancelled'))",
+                 WHERE id = ?1 AND state = 'interrupted' \
+                   AND attempt_strategy IN ( \
+                       'initial_full_v1', 'fresh_full_child_v1' \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM scan_runtime_leases AS lease \
+                       WHERE lease.scan_run_id = scan_runs.id AND lease.state = 'active' \
+                   ))",
                 [active_run_id],
                 |row| row.get::<_, bool>(0),
             )?;
@@ -3519,8 +3668,9 @@ impl<'transaction> RepositoryTx<'transaction> {
                  run_key, volume_id, capability_profile_id, parent_scan_run_id, \
                  root_relative_path, root_path_key, scan_mode, state, config_json, \
                  discovered_count, fingerprinted_count, error_count, logical_bytes_seen, \
-                 created_at_ms, updated_at_ms, state_version \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, 0, 0, 0, 0, ?9, ?9, 0)",
+                 created_at_ms, updated_at_ms, state_version, attempt_strategy \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, \
+                       0, 0, 0, 0, ?9, ?9, 0, ?10)",
             params![
                 input.run_key,
                 input.volume_id,
@@ -3531,6 +3681,7 @@ impl<'transaction> RepositoryTx<'transaction> {
                 input.scan_mode,
                 config_json,
                 input.created_at_ms,
+                input.attempt_strategy.as_storage_str(),
             ],
         )?;
         let run_id = self.transaction.last_insert_rowid();
@@ -3589,8 +3740,18 @@ impl<'transaction> RepositoryTx<'transaction> {
         )?;
         let changed = self.transaction.execute(
             "UPDATE scan_jobs SET active_scan_run_id = ?2, updated_at_ms = MAX(updated_at_ms, ?3) \
-                 WHERE id = ?1 AND state IN ('queued', 'failed', 'completed', 'cancelled')",
-            params![input.scan_job_id, run_id, input.created_at_ms],
+                 WHERE id = ?1 \
+                   AND ((?4 = 'initial_full_v1' AND state = 'queued' \
+                         AND active_scan_run_id IS NULL) \
+                     OR (?4 = 'fresh_full_child_v1' AND state = 'failed' \
+                         AND active_scan_run_id = ?5))",
+            params![
+                input.scan_job_id,
+                run_id,
+                input.created_at_ms,
+                input.attempt_strategy.as_storage_str(),
+                input.parent_scan_run_id,
+            ],
         )?;
         if changed != 1 {
             return Err(StoreError::ConcurrencyConflict {
@@ -3599,6 +3760,108 @@ impl<'transaction> RepositoryTx<'transaction> {
             });
         }
         Ok(run_id)
+    }
+
+    fn select_fresh_attempt_recovery_impl(
+        &self,
+        query: &FreshAttemptRecoveryQuery,
+    ) -> Result<FreshAttemptRecoverySelection> {
+        validate_fresh_attempt_recovery_query(query)?;
+        let config_json = serialize_optional_json("config", &query.config, MAX_JSON_BYTES)?;
+        let (candidate_count, job_id, parent_scan_run_id, job_state_version) =
+            self.transaction.query_row(
+                "WITH eligible AS MATERIALIZED ( \
+                     SELECT job.id AS job_id, job.active_scan_run_id AS parent_scan_run_id, \
+                            job.state_version AS job_state_version \
+                     FROM scan_job_scopes AS scope \
+                     JOIN scan_jobs AS job \
+                       ON job.id = scope.scan_job_id AND job.volume_id = scope.volume_id \
+                     JOIN scan_runs AS parent \
+                       ON parent.id = job.active_scan_run_id \
+                      AND parent.volume_id = job.volume_id \
+                     JOIN namespace_profiles AS namespace \
+                       ON namespace.id = scope.namespace_profile_id \
+                      AND namespace.volume_id = scope.volume_id \
+                     JOIN namespace_reuse_policies AS policy \
+                       ON policy.namespace_profile_id = namespace.id \
+                      AND policy.volume_id = namespace.volume_id \
+                     JOIN volumes AS volume ON volume.id = scope.volume_id \
+                     WHERE scope.volume_id = ?1 \
+                       AND scope.namespace_profile_id = ?2 \
+                       AND scope.origin = 'observed_v5' \
+                       AND scope.recoverable = 1 \
+                       AND scope.mount_relative_root_raw = ?3 \
+                       AND scope.path_encoding = ?4 \
+                       AND scope.stable_root_path_key = ?5 \
+                       AND scope.root_scope_key = ?6 \
+                       AND job.root_path_key = ?5 \
+                       AND job.state = 'failed' \
+                       AND job.config_json IS ?7 \
+                       AND parent.state = 'interrupted' \
+                       AND parent.attempt_strategy IN ( \
+                           'initial_full_v1', 'fresh_full_child_v1' \
+                       ) \
+                       AND namespace.origin = 'observed_v5' \
+                       AND namespace.reuse_scope = 'cross_session' \
+                       AND namespace.bound_mount_session_key IS NULL \
+                       AND namespace.key_strategy = 'exact_native_v1' \
+                       AND namespace.case_behavior <> 'unknown' \
+                       AND policy.policy IN ( \
+                           'fresh_attempt_only', 'evidence_reuse_eligible' \
+                       ) \
+                       AND volume.identity_strength = 'strong' \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM scan_runtime_leases AS lease \
+                           WHERE lease.scan_run_id = parent.id \
+                             AND lease.state = 'active' \
+                       ) \
+                 ) \
+                 SELECT count(*), min(job_id), min(parent_scan_run_id), \
+                        min(job_state_version) \
+                 FROM eligible",
+                params![
+                    query.volume_id,
+                    query.namespace_profile_id,
+                    query.mount_relative_root_raw,
+                    query.path_encoding,
+                    query.stable_root_path_key.as_bytes().as_slice(),
+                    query.root_scope_key.as_bytes().as_slice(),
+                    config_json,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )?;
+        match candidate_count {
+            0 => Ok(FreshAttemptRecoverySelection::None),
+            1 => Ok(FreshAttemptRecoverySelection::Unique(
+                FreshAttemptRecoveryTarget {
+                    job_id: job_id.ok_or_else(|| {
+                        StoreError::MigrationHistoryMismatch(
+                            "unique recovery target is missing its job id".into(),
+                        )
+                    })?,
+                    parent_scan_run_id: parent_scan_run_id.ok_or_else(|| {
+                        StoreError::MigrationHistoryMismatch(
+                            "unique recovery target is missing its parent run id".into(),
+                        )
+                    })?,
+                    job_state_version: job_state_version.ok_or_else(|| {
+                        StoreError::MigrationHistoryMismatch(
+                            "unique recovery target is missing its job state version".into(),
+                        )
+                    })?,
+                },
+            )),
+            count => Ok(FreshAttemptRecoverySelection::Ambiguous {
+                candidate_count: count,
+            }),
+        }
     }
 
     fn find_existing_bound_scan_run(
@@ -3612,8 +3875,9 @@ impl<'transaction> RepositoryTx<'transaction> {
             .transaction
             .query_row(
                 "SELECT run.id, run.volume_id, run.capability_profile_id, run.parent_scan_run_id, \
-                        run.root_relative_path, run.root_path_key, run.scan_mode, run.config_json, \
-                        run.created_at_ms, session.scan_job_id, session.namespace_profile_id, \
+                        run.root_relative_path, run.root_path_key, run.scan_mode, \
+                        run.attempt_strategy, run.config_json, run.created_at_ms, \
+                        session.scan_job_id, session.namespace_profile_id, \
                         session.mount_session_key, session.mount_relative_root_raw, \
                         session.path_encoding, session.stable_root_path_key, \
                         session.root_scope_key, session.root_object_signature, session.created_at_ms \
@@ -3630,17 +3894,18 @@ impl<'transaction> RepositoryTx<'transaction> {
                         root_display: row.get(4)?,
                         stable_root_path_key: row.get(5)?,
                         scan_mode: row.get(6)?,
-                        config_json: row.get(7)?,
-                        created_at_ms: row.get(8)?,
-                        scan_job_id: row.get(9)?,
-                        namespace_profile_id: row.get(10)?,
-                        mount_session_key: row.get(11)?,
-                        mount_relative_root_raw: row.get(12)?,
-                        path_encoding: row.get(13)?,
-                        session_stable_root_path_key: row.get(14)?,
-                        root_scope_key: row.get(15)?,
-                        root_object_signature: row.get(16)?,
-                        session_created_at_ms: row.get(17)?,
+                        attempt_strategy: row.get(7)?,
+                        config_json: row.get(8)?,
+                        created_at_ms: row.get(9)?,
+                        scan_job_id: row.get(10)?,
+                        namespace_profile_id: row.get(11)?,
+                        mount_session_key: row.get(12)?,
+                        mount_relative_root_raw: row.get(13)?,
+                        path_encoding: row.get(14)?,
+                        session_stable_root_path_key: row.get(15)?,
+                        root_scope_key: row.get(16)?,
+                        root_object_signature: row.get(17)?,
+                        session_created_at_ms: row.get(18)?,
                     })
                 },
             )
@@ -3654,6 +3919,7 @@ impl<'transaction> RepositoryTx<'transaction> {
             && existing.root_display == scope.root_display
             && existing.stable_root_path_key.as_slice() == input.stable_root_path_key.as_bytes()
             && existing.scan_mode == input.scan_mode
+            && existing.attempt_strategy == input.attempt_strategy.as_storage_str()
             && existing.config_json.as_deref() == config_json
             && existing.created_at_ms == input.created_at_ms
             && existing.scan_job_id == Some(input.scan_job_id)
@@ -8602,6 +8868,8 @@ struct StoredScopedJob {
     reuse_scope: String,
     bound_mount_session_key: Option<String>,
     identity_strength: String,
+    recovery_policy: Option<String>,
+    config_json: Option<String>,
 }
 
 #[derive(Debug)]
@@ -8613,6 +8881,7 @@ struct StoredBoundScanRun {
     root_display: String,
     stable_root_path_key: Vec<u8>,
     scan_mode: String,
+    attempt_strategy: String,
     config_json: Option<String>,
     created_at_ms: i64,
     scan_job_id: Option<i64>,
@@ -12316,12 +12585,10 @@ fn validate_namespace_profile(input: &NamespaceProfileInput) -> Result<()> {
             "observed namespaces must be cross_session or current_session_only",
         ));
     }
-    if input.reuse_scope == "cross_session"
-        && (input.case_behavior == "unknown" || input.unicode_behavior == "unknown")
-    {
+    if input.reuse_scope == "cross_session" && input.case_behavior == "unknown" {
         return Err(StoreError::invalid_input(
             "reuse_scope",
-            "cross-session reuse requires known case and Unicode behavior",
+            "cross-session lineage requires known case behavior",
         ));
     }
     match input.reuse_scope.as_str() {
@@ -12359,6 +12626,20 @@ fn validate_scoped_scan_job(input: &NewScopedScanJob) -> Result<()> {
     Ok(())
 }
 
+fn validate_fresh_attempt_recovery_query(query: &FreshAttemptRecoveryQuery) -> Result<()> {
+    require_positive("volume_id", query.volume_id)?;
+    require_positive("namespace_profile_id", query.namespace_profile_id)?;
+    validate_v5_raw_path(
+        "mount_relative_root_raw",
+        &query.mount_relative_root_raw,
+        &query.path_encoding,
+        true,
+        None,
+    )?;
+    let _ = serialize_optional_json("config", &query.config, MAX_JSON_BYTES)?;
+    Ok(())
+}
+
 fn validate_bound_scan_run(input: &NewBoundScanRun) -> Result<()> {
     require_bounded_nonempty("run_key", &input.run_key, MAX_IDENTIFIER_BYTES)?;
     require_positive("scan_job_id", input.scan_job_id)?;
@@ -12386,6 +12667,25 @@ fn validate_bound_scan_run(input: &NewBoundScanRun) -> Result<()> {
             "unsupported scan mode",
         ));
     }
+    match input.attempt_strategy {
+        ScanAttemptStrategy::InitialFullV1
+            if input.parent_scan_run_id.is_some() || input.scan_mode != "full" =>
+        {
+            return Err(StoreError::invalid_input(
+                "attempt_strategy",
+                "initial_full_v1 requires no parent and full scan mode",
+            ));
+        }
+        ScanAttemptStrategy::FreshFullChildV1
+            if input.parent_scan_run_id.is_none() || input.scan_mode != "full" =>
+        {
+            return Err(StoreError::invalid_input(
+                "attempt_strategy",
+                "fresh_full_child_v1 requires a parent and full scan mode",
+            ));
+        }
+        _ => {}
+    }
     require_nonnegative("created_at_ms", input.created_at_ms)?;
     let _ = serialize_optional_json("config", &input.config, MAX_JSON_BYTES)?;
     Ok(())
@@ -12405,7 +12705,10 @@ fn validate_bound_run_parent(
              SELECT 1 FROM scan_runs AS parent \
              JOIN scan_run_sessions AS session ON session.scan_run_id = parent.id \
              WHERE parent.id = ?1 AND parent.volume_id = ?2 \
-               AND parent.state IN ('completed', 'failed', 'cancelled', 'interrupted') \
+               AND parent.state = 'interrupted' \
+               AND parent.attempt_strategy IN ( \
+                   'initial_full_v1', 'fresh_full_child_v1' \
+               ) \
                AND session.scan_job_id = ?3 AND session.namespace_profile_id = ?4 \
                AND session.root_scope_key = ?5 \
          )",

@@ -1242,6 +1242,9 @@ impl Store {
                      JOIN namespace_profiles AS namespace \
                        ON namespace.volume_id = current.volume_id \
                       AND namespace.id = current.namespace_profile_id \
+                     JOIN namespace_reuse_policies AS reuse_policy \
+                       ON reuse_policy.volume_id = namespace.volume_id \
+                      AND reuse_policy.namespace_profile_id = namespace.id \
                      JOIN volumes AS volume ON volume.id = current.volume_id \
                      JOIN capability_profiles AS current_capability \
                        ON current_capability.volume_id = current.volume_id \
@@ -1276,6 +1279,7 @@ impl Store {
                        AND volume.identity_strength = 'strong' \
                        AND namespace.origin = 'observed_v5' \
                        AND namespace.reuse_scope = 'cross_session' \
+                       AND reuse_policy.policy = 'evidence_reuse_eligible' \
                        AND current_capability.profile_hash_version = 2 \
                        AND current_capability.is_current = 1 \
                        AND current_capability.probe_status = 'complete' \
@@ -6671,20 +6675,31 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    const V7_TEST_TABLES_REVERSE: [&str; 13] = [
-        "capture_time_recommendations",
-        "capture_time_member_assessments",
-        "capture_time_policy_issues",
-        "capture_time_candidates",
-        "capture_time_observations",
-        "capture_time_analysis_sources",
-        "capture_time_analysis_builds",
-        "metadata_source_revalidations",
-        "metadata_extraction_issues",
-        "metadata_extraction_fields",
-        "metadata_extraction_reports",
-        "capture_time_group_outcomes",
-        "scan_time_sessions",
+    const V6_TEST_MIGRATIONS: [(&str, &str); 6] = [
+        (
+            "initial_data_model",
+            include_str!("migrations/0001_init.sql"),
+        ),
+        (
+            "store_runtime",
+            include_str!("migrations/0002_store_runtime.sql"),
+        ),
+        (
+            "store_hardening",
+            include_str!("migrations/0003_store_hardening.sql"),
+        ),
+        (
+            "evidence_binding",
+            include_str!("migrations/0004_evidence_binding.sql"),
+        ),
+        (
+            "session_bound_evidence",
+            include_str!("migrations/0005_session_bound_evidence.sql"),
+        ),
+        (
+            "runtime_stream_evidence",
+            include_str!("migrations/0006_runtime_stream_evidence.sql"),
+        ),
     ];
 
     #[test]
@@ -7228,58 +7243,52 @@ mod tests {
     }
 
     fn create_managed_v6_fixture(path: &Path) -> crate::Result<()> {
-        Store::open_or_create(path)?.close()?;
         let mut connection = Connection::open(path)?;
-        connection.pragma_update(None, "foreign_keys", false)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(
-            "DROP TRIGGER trg_scan_runs_runtime_control_gate_v8; \
-             DROP TRIGGER trg_scan_jobs_runtime_control_gate_v8; \
-             DROP TABLE scan_pause_checkpoints; \
-             DROP TABLE scan_control_requests; \
-             DROP TABLE scan_runtime_leases; \
-             DROP INDEX ux_scan_run_sessions_mount_binding_v8; \
-             DROP INDEX ux_exact_group_build_members_probe_binding_v7; \
-             DROP INDEX ux_exact_group_build_members_assessment_binding_v7;",
-        )?;
-        for table in V7_TEST_TABLES_REVERSE {
-            transaction.execute_batch(&format!("DROP TABLE {table};"))?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        for (index, (name, sql)) in V6_TEST_MIGRATIONS.iter().enumerate() {
+            let version = i64::try_from(index + 1).map_err(|_| {
+                StoreError::invalid_input("fixture_version", "migration index overflow")
+            })?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if version == 1 {
+                transaction.execute_batch(
+                    r#"CREATE TABLE guiying_schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    checksum BLOB NOT NULL CHECK (length(checksum) = 32),
+    applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0)
+) STRICT;"#,
+                )?;
+                transaction.pragma_update(None, "application_id", 0x4755_5949_i32)?;
+            }
+            let body = if version == 1 {
+                let begin = sql.find("BEGIN IMMEDIATE;\n").ok_or_else(|| {
+                    StoreError::MalformedMigration("initial migration is missing BEGIN IMMEDIATE")
+                })? + "BEGIN IMMEDIATE;\n".len();
+                let commit = sql.rfind("COMMIT;").ok_or_else(|| {
+                    StoreError::MalformedMigration("initial migration is missing COMMIT")
+                })?;
+                &sql[begin..commit]
+            } else {
+                sql
+            };
+            transaction.execute_batch(body)?;
+            let checksum = blake3::hash(sql.as_bytes());
+            transaction.execute(
+                "INSERT INTO guiying_schema_migrations ( \
+                     version, name, checksum, applied_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    version,
+                    name,
+                    checksum.as_bytes().as_slice(),
+                    1_000 + version,
+                ],
+            )?;
+            transaction.pragma_update(None, "user_version", version)?;
+            transaction.commit()?;
         }
-        let deleted = transaction.execute(
-            "DELETE FROM guiying_schema_migrations WHERE version IN (7, 8)",
-            [],
-        )?;
-        assert_eq!(
-            deleted, 2,
-            "v6 fixture must remove both v7 and v8 registry rows"
-        );
-        transaction.pragma_update(None, "user_version", 6)?;
-        let residual_v8_objects: i64 = transaction.query_row(
-            "SELECT count(*) FROM sqlite_schema \
-             WHERE name IN ( \
-                 'ux_scan_run_sessions_mount_binding_v8', \
-                 'scan_runtime_leases', 'scan_control_requests', \
-                 'scan_pause_checkpoints', \
-                 'trg_scan_runs_runtime_control_gate_v8', \
-                 'trg_scan_jobs_runtime_control_gate_v8' \
-             ) OR name GLOB '*_v8'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(
-            residual_v8_objects, 0,
-            "v6 fixture retained a v8 schema object"
-        );
-        let residual_new_registry_rows: i64 = transaction.query_row(
-            "SELECT count(*) FROM guiying_schema_migrations WHERE version > 6",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(
-            residual_new_registry_rows, 0,
-            "v6 fixture retained a post-v6 migration record"
-        );
-        transaction.commit()?;
         connection
             .close()
             .map_err(|(_, error)| StoreError::from(error))?;
@@ -7332,7 +7341,7 @@ mod tests {
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".guiying-pre-migration-from-v6-to-v8-"))
+                .is_some_and(|name| name.starts_with(".guiying-pre-migration-from-v6-to-v9-"))
             {
                 backups.push(path);
             }

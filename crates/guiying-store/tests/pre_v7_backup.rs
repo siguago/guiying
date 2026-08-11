@@ -11,10 +11,10 @@ use tempfile::TempDir;
 #[cfg(unix)]
 const APPLICATION_ID: i32 = 0x4755_5949;
 #[cfg(unix)]
-const PRE_MIGRATION_V6_TO_V8_PREFIX: &str = ".guiying-pre-migration-from-v6-to-v8-";
+const PRE_MIGRATION_V6_TO_V9_PREFIX: &str = ".guiying-pre-migration-from-v6-to-v9-";
 
 #[cfg(unix)]
-const MIGRATIONS: [(&str, &str); 7] = [
+const MIGRATIONS: [(&str, &str); 8] = [
     (
         "initial_data_model",
         include_str!("../src/migrations/0001_init.sql"),
@@ -43,6 +43,10 @@ const MIGRATIONS: [(&str, &str); 7] = [
         "capture_time_evidence",
         include_str!("../src/migrations/0007_capture_time_evidence.sql"),
     ),
+    (
+        "runtime_control",
+        include_str!("../src/migrations/0008_runtime_control.sql"),
+    ),
 ];
 
 #[cfg(unix)]
@@ -54,16 +58,16 @@ fn v6_open_publishes_one_verified_pre_migration_snapshot_before_upgrade(
     let database = private_parent.join("managed-v6.sqlite3");
     create_empty_managed_v6(&database)?;
 
-    let existing = private_parent.join(format!("{PRE_MIGRATION_V6_TO_V8_PREFIX}existing.sqlite3"));
+    let existing = private_parent.join(format!("{PRE_MIGRATION_V6_TO_V9_PREFIX}existing.sqlite3"));
     let sentinel = b"existing snapshot name must never be overwritten";
     fs::write(&existing, sentinel)?;
     make_private(&existing)?;
 
     let store = Store::open_existing(&database)?;
-    assert_eq!(store.schema_version()?, 8);
+    assert_eq!(store.schema_version()?, 9);
     store.close()?;
 
-    let candidates = pre_migration_candidates(&private_parent, 6, 8)?;
+    let candidates = pre_migration_candidates(&private_parent, 6, 9)?;
     assert_eq!(
         candidates.len(),
         2,
@@ -84,9 +88,9 @@ fn v6_open_publishes_one_verified_pre_migration_snapshot_before_upgrade(
 
     Store::open_existing(&database)?.close()?;
     assert_eq!(
-        pre_migration_candidates(&private_parent, 6, 8)?,
+        pre_migration_candidates(&private_parent, 6, 9)?,
         candidates,
-        "opening an already-v8 database must not create another snapshot"
+        "opening an already-v9 database must not create another snapshot"
     );
     Ok(())
 }
@@ -95,17 +99,17 @@ fn v6_open_publishes_one_verified_pre_migration_snapshot_before_upgrade(
 #[test]
 fn every_supported_pre_migration_version_gets_an_exact_self_contained_snapshot(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for expected_version in 1_i64..=6 {
+    for expected_version in 1_i64..=8 {
         let temporary = TempDir::new()?;
         let parent = fs::canonicalize(temporary.path())?;
         let database = parent.join(format!("managed-v{expected_version}.sqlite3"));
         create_empty_managed_version(&database, expected_version)?;
 
         let store = Store::open_existing(&database)?;
-        assert_eq!(store.schema_version()?, 8);
+        assert_eq!(store.schema_version()?, 9);
         store.close()?;
 
-        let prefix = pre_migration_prefix(expected_version, 8);
+        let prefix = pre_migration_prefix(expected_version, 9);
         let snapshots = candidates_with_prefix(&parent, &prefix)?;
         assert_eq!(snapshots.len(), 1, "version {expected_version}");
         assert_pre_migration_snapshot(&snapshots[0], expected_version)?;
@@ -115,28 +119,28 @@ fn every_supported_pre_migration_version_gets_an_exact_self_contained_snapshot(
 
 #[cfg(unix)]
 #[test]
-fn v7_to_v8_open_snapshots_exact_v7_then_migrates_once() -> Result<(), Box<dyn std::error::Error>> {
+fn v8_to_v9_open_snapshots_exact_v8_then_migrates_once() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let parent = fs::canonicalize(temporary.path())?;
-    let database = parent.join("managed-v7.sqlite3");
-    create_empty_managed_version(&database, 7)?;
+    let database = parent.join("managed-v8.sqlite3");
+    create_empty_managed_version(&database, 8)?;
 
     let store = Store::open_existing(&database)?;
-    assert_eq!(store.schema_version()?, 8);
+    assert_eq!(store.schema_version()?, 9);
     store.close()?;
 
-    let snapshots = pre_migration_candidates(&parent, 7, 8)?;
+    let snapshots = pre_migration_candidates(&parent, 8, 9)?;
     assert_eq!(snapshots.len(), 1);
-    assert_pre_migration_snapshot(&snapshots[0], 7)?;
+    assert_pre_migration_snapshot(&snapshots[0], 8)?;
     assert_latest_source_after_migration(&database)?;
 
     let reopened = Store::open_existing(&database)?;
-    assert_eq!(reopened.schema_version()?, 8);
+    assert_eq!(reopened.schema_version()?, 9);
     reopened.close()?;
     assert_eq!(
-        pre_migration_candidates(&parent, 7, 8)?,
+        pre_migration_candidates(&parent, 8, 9)?,
         snapshots,
-        "reopening an already-v8 source must not publish another snapshot"
+        "reopening an already-v9 source must not publish another snapshot"
     );
     Ok(())
 }
@@ -209,7 +213,7 @@ fn unknown_source_sidecar_fails_closed_before_sqlite_open() -> Result<(), Box<dy
     assert!(matches!(error, StoreError::PreV7SourceFamilyUnsafe { .. }));
     assert_eq!(fs::read(&database)?, before);
     assert_eq!(fs::read(&unknown)?, sentinel);
-    assert!(pre_migration_candidates(&parent, 6, 8)?.is_empty());
+    assert!(pre_migration_candidates(&parent, 6, 9)?.is_empty());
     Ok(())
 }
 
@@ -237,7 +241,7 @@ fn simultaneous_wal_and_journal_fail_closed_before_sqlite_open(
     assert_eq!(fs::read(&database)?, before);
     assert_eq!(fs::read(&wal)?, b"WAL sentinel");
     assert_eq!(fs::read(&journal)?, b"journal sentinel");
-    assert!(pre_migration_candidates(&parent, 6, 8)?.is_empty());
+    assert!(pre_migration_candidates(&parent, 6, 9)?.is_empty());
     Ok(())
 }
 
@@ -267,7 +271,7 @@ fn crash_wal_without_shm_is_recovered_into_the_snapshot() -> Result<(), Box<dyn 
 
     Store::open_existing(&database)?.close()?;
 
-    let snapshots = candidates_with_prefix(&parent, PRE_MIGRATION_V6_TO_V8_PREFIX)?;
+    let snapshots = candidates_with_prefix(&parent, PRE_MIGRATION_V6_TO_V9_PREFIX)?;
     assert_eq!(snapshots.len(), 1);
     assert_pre_migration_snapshot(&snapshots[0], 6)?;
     assert_eq!(migration_applied_at(&snapshots[0], 1)?, 424_242);
@@ -293,7 +297,7 @@ fn hot_rollback_journal_is_recovered_only_on_the_isolated_clone(
 
     Store::open_existing(&database)?.close()?;
 
-    let snapshots = candidates_with_prefix(&parent, PRE_MIGRATION_V6_TO_V8_PREFIX)?;
+    let snapshots = candidates_with_prefix(&parent, PRE_MIGRATION_V6_TO_V9_PREFIX)?;
     assert_eq!(snapshots.len(), 1);
     assert_pre_migration_snapshot(&snapshots[0], 6)?;
     assert_eq!(migration_checksum(&snapshots[0], 1)?, checksum_before);
@@ -409,6 +413,13 @@ fn assert_pre_migration_snapshot(
         [],
         |row| row.get(0),
     )?;
+    let v9_object_count: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_schema \
+         WHERE name IN ('namespace_reuse_policies', 'scan_attempt_strategy_epochs') \
+            OR name GLOB '*_v9'",
+        [],
+        |row| row.get(0),
+    )?;
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_key_violations: i64 =
         connection.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
@@ -418,7 +429,12 @@ fn assert_pre_migration_snapshot(
     assert_eq!(application_id, i64::from(APPLICATION_ID));
     assert_eq!(migration_count, expected_version);
     assert_eq!(v7_table_count, if expected_version >= 7 { 1 } else { 0 });
-    assert_eq!(v8_object_count, 0);
+    if expected_version >= 8 {
+        assert!(v8_object_count > 0);
+    } else {
+        assert_eq!(v8_object_count, 0);
+    }
+    assert_eq!(v9_object_count, 0);
     assert_eq!(integrity, "ok");
     assert_eq!(foreign_key_violations, 0);
     Ok(())
@@ -442,14 +458,35 @@ fn assert_latest_source_after_migration(path: &Path) -> Result<(), Box<dyn std::
         [],
         |row| row.get(0),
     )?;
+    let v9_policy_tables: i64 = connection.query_row(
+        "SELECT count(*) FROM pragma_table_list \
+         WHERE name = 'namespace_reuse_policies' AND strict = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let attempt_strategy_columns: i64 = connection.query_row(
+        "SELECT count(*) FROM pragma_table_xinfo('scan_runs') \
+         WHERE name = 'attempt_strategy' AND type = 'TEXT' \
+           AND \"notnull\" = 1 AND dflt_value = '''legacy'''",
+        [],
+        |row| row.get(0),
+    )?;
+    let strategy_epoch: i64 = connection.query_row(
+        "SELECT legacy_scan_run_id_cutoff FROM scan_attempt_strategy_epochs WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_key_violations: i64 =
         connection.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
         })?;
-    assert_eq!(version, 8);
-    assert_eq!(migration_count, 8);
+    assert_eq!(version, 9);
+    assert_eq!(migration_count, 9);
     assert_eq!(v8_tables, 3);
+    assert_eq!(v9_policy_tables, 1);
+    assert_eq!(attempt_strategy_columns, 1);
+    assert_eq!(strategy_epoch, 0);
     assert_eq!(integrity, "ok");
     assert_eq!(foreign_key_violations, 0);
     Ok(())

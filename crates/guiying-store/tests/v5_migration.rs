@@ -8,7 +8,7 @@ fn fresh_store_has_latest_runtime_companion_schema_and_manifest_guards(
     let temporary = TempDir::new()?;
     let database = temporary.path().join("guiying-v5.sqlite3");
     let store = Store::open_or_create(&database)?;
-    assert_eq!(store.schema_version()?, 8);
+    assert_eq!(store.schema_version()?, 9);
     store.close()?;
 
     let connection = Connection::open(&database)?;
@@ -21,18 +21,19 @@ fn fresh_store_has_latest_runtime_companion_schema_and_manifest_guards(
              'exact_group_builds', 'exact_group_build_members', \
              'exact_verification_edges', 'scan_core_sessions', \
              'scan_file_tickets', 'scan_directory_observations', \
-             'scan_coverage_outcomes' \
+             'scan_coverage_outcomes', 'namespace_reuse_policies', \
+             'scan_attempt_strategy_epochs' \
          ) AND strict = 1",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(strict_tables, 14);
+    assert_eq!(strict_tables, 16);
     let migration_count: i64 = connection.query_row(
         "SELECT count(*) FROM guiying_schema_migrations",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(migration_count, 8);
+    assert_eq!(migration_count, 9);
     connection.execute_batch("DROP TRIGGER trg_scan_runs_enter_running_session_gate_v5;")?;
     connection.close().map_err(|(_, error)| error)?;
 
@@ -95,8 +96,12 @@ fn direct_sql_cannot_enter_running_without_a_bound_session(
          ); \
          INSERT INTO scan_runs ( \
              id, run_key, volume_id, capability_profile_id, root_relative_path, \
-             root_path_key, scan_mode, state, created_at_ms, updated_at_ms \
-         ) VALUES (1, 'run', 1, 1, 'DCIM', zeroblob(32), 'full', 'queued', 1, 1); \
+             root_path_key, scan_mode, state, created_at_ms, updated_at_ms, \
+             attempt_strategy \
+         ) VALUES ( \
+             1, 'run', 1, 1, 'DCIM', zeroblob(32), 'full', 'queued', 1, 1, \
+             'initial_full_v1' \
+         ); \
          INSERT INTO scan_run_roots ( \
              scan_run_id, volume_id, capability_profile_id, path_semantics_version, \
              relative_path_raw, path_encoding, semantic_path_key, created_at_ms \

@@ -18,10 +18,11 @@ use guiying_store::{
     MetadataSourceRevalidationInput, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey,
     NewBoundScanRun, NewScopedScanJob, NormalizedCaptureTime, ObservationInput, ParametersHash,
     RootObjectSignature, RootScopeKey, RunEvidenceGuard, RuntimeLeaseGuard, RuntimeLeaseKey,
-    ScanStage, SourceSignature, StablePathKey, Store, StoreError, StoredMetadataEncoding,
-    StoredMetadataFieldKind, StoredTiffByteOrder, TicketSortKey, TimeDonorEligibility,
-    TimeEvidenceManifestDigest, TimeExactFingerprintMaterial, TimeSessionBudget, TimeSessionKey,
-    TimeSessionOutcome, TimeSourceKeyMaterial, VolumeCoverageManifest, VolumeInput,
+    ScanAttemptStrategy, ScanStage, SourceSignature, StablePathKey, Store, StoreError,
+    StoredMetadataEncoding, StoredMetadataFieldKind, StoredTiffByteOrder, TicketSortKey,
+    TimeDonorEligibility, TimeEvidenceManifestDigest, TimeExactFingerprintMaterial,
+    TimeSessionBudget, TimeSessionKey, TimeSessionOutcome, TimeSourceKeyMaterial,
+    VolumeCoverageManifest, VolumeInput,
 };
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags};
@@ -1613,6 +1614,7 @@ fn create_running_run(
             root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
             root_object_signature: RootObjectSignature::from_volume_adapter([14; 32]),
             scan_mode: "full".into(),
+            attempt_strategy: ScanAttemptStrategy::InitialFullV1,
             config: None,
             created_at_ms: 120,
         })?;

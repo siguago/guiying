@@ -5,8 +5,9 @@ use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
 
 use guiying_volume::{
-    BoundMediaPath, BoundVolumeSession, IdentityStrength, NamespaceReuseScope, NativePathEncoding,
-    PathError, UnicodeNormalizationObservation, VolumeError, MAX_ROOT_PATH_BYTES,
+    BoundMediaPath, BoundVolumeSession, CaseBehaviorObservation, IdentityStrength,
+    NamespaceReuseScope, NativePathEncoding, PathError, UnicodeNormalizationObservation,
+    VolumeError, MAX_ROOT_PATH_BYTES,
 };
 use tempfile::{Builder, TempDir};
 
@@ -82,9 +83,16 @@ fn observation_is_read_only_and_every_binding_has_a_new_session() {
         observation.path_semantics().unicode_normalization(),
         UnicodeNormalizationObservation::Unknown
     );
+    let expected_reuse_scope = if observation.identity().strength() == IdentityStrength::Strong
+        && observation.path_semantics().case_behavior() != CaseBehaviorObservation::Unknown
+    {
+        NamespaceReuseScope::FreshAttemptOnly
+    } else {
+        NamespaceReuseScope::CurrentSessionOnly
+    };
     assert_eq!(
         observation.path_semantics().reuse_scope(),
-        NamespaceReuseScope::CurrentSessionOnly
+        expected_reuse_scope
     );
     assert_eq!(
         observation.mount_relative_root().decode_raw().unwrap(),
@@ -119,7 +127,14 @@ fn observation_is_read_only_and_every_binding_has_a_new_session() {
     );
 
     let json = serde_json::to_value(observation).expect("serialize volume observation for IPC");
-    assert!(json["path_semantics"]["reuse_scope"].is_string());
+    assert_eq!(
+        json["path_semantics"]["reuse_scope"],
+        match expected_reuse_scope {
+            NamespaceReuseScope::FreshAttemptOnly => "fresh_attempt_only",
+            NamespaceReuseScope::CurrentSessionOnly => "current_session_only",
+            NamespaceReuseScope::CrossSession => unreachable!("macOS reports Unicode as unknown"),
+        }
+    );
     assert!(json["mount_relative_root"]["raw_base64"].is_string());
     assert!(json["stable_root_path_key"].is_string());
     assert!(json["root_scope_key"].is_string());

@@ -39,7 +39,7 @@ fn empty_v6_database_upgrades_transactionally_to_latest_without_legacy_copy(
     create_empty_managed_v6(&database)?;
 
     let store = Store::open_existing(&database)?;
-    assert_eq!(store.schema_version()?, 8);
+    assert_eq!(store.schema_version()?, 9);
     store.close()?;
 
     let connection = Connection::open(&database)?;
@@ -48,7 +48,7 @@ fn empty_v6_database_upgrades_transactionally_to_latest_without_legacy_copy(
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(registered, 8);
+    assert_eq!(registered, 9);
     let v7_tables: i64 = connection.query_row(
         "SELECT count(*) FROM pragma_table_list \
          WHERE name IN ( \
