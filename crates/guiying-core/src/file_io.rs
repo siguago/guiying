@@ -5,17 +5,23 @@ use std::time::SystemTime;
 
 use crate::model::{FileId, FileTimestamp};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct FileSnapshot {
     pub(crate) len: u64,
+    pub(crate) allocated_size: Option<u64>,
+    pub(crate) accessed: Option<SystemTime>,
     pub(crate) modified: Option<SystemTime>,
     pub(crate) created: Option<SystemTime>,
     pub(crate) file_id: Option<FileId>,
     pub(crate) hard_link_count: Option<u64>,
     #[cfg(unix)]
-    change_seconds: i64,
+    pub(crate) mode: u32,
+    #[cfg(target_os = "macos")]
+    pub(crate) generation: u32,
     #[cfg(unix)]
-    change_nanoseconds: i64,
+    pub(crate) change_seconds: i64,
+    #[cfg(unix)]
+    pub(crate) change_nanoseconds: i64,
 }
 
 impl FileSnapshot {
@@ -25,6 +31,11 @@ impl FileSnapshot {
 
         Self {
             len: metadata.len(),
+            #[cfg(unix)]
+            allocated_size: metadata.blocks().checked_mul(512),
+            #[cfg(not(unix))]
+            allocated_size: None,
+            accessed: metadata.accessed().ok(),
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
             #[cfg(unix)]
@@ -39,6 +50,10 @@ impl FileSnapshot {
             #[cfg(not(unix))]
             hard_link_count: None,
             #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(target_os = "macos")]
+            generation: std::os::macos::fs::MetadataExt::st_gen(metadata),
+            #[cfg(unix)]
             change_seconds: metadata.ctime(),
             #[cfg(unix)]
             change_nanoseconds: metadata.ctime_nsec(),
@@ -49,6 +64,10 @@ impl FileSnapshot {
         self.modified.and_then(FileTimestamp::from_system_time)
     }
 
+    pub(crate) fn accessed_timestamp(&self) -> Option<FileTimestamp> {
+        self.accessed.and_then(FileTimestamp::from_system_time)
+    }
+
     pub(crate) fn created_timestamp(&self) -> Option<FileTimestamp> {
         self.created.and_then(FileTimestamp::from_system_time)
     }
@@ -56,6 +75,78 @@ impl FileSnapshot {
     pub(crate) fn device(&self) -> Option<u64> {
         self.file_id.map(|id| id.device)
     }
+
+    pub(crate) fn mode(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            Some(self.mode)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn generation(&self) -> Option<u32> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(self.generation)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn change_timestamp(&self) -> Option<FileTimestamp> {
+        #[cfg(unix)]
+        {
+            let nanoseconds = u32::try_from(self.change_nanoseconds).ok()?;
+            (nanoseconds < 1_000_000_000).then_some(FileTimestamp {
+                seconds: self.change_seconds,
+                nanoseconds,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+}
+
+// Access time is observation-only. Merely reading a file can update atime, so
+// it must not invalidate an otherwise stable, read-only source binding.
+impl PartialEq for FileSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.allocated_size == other.allocated_size
+            && self.modified == other.modified
+            && self.created == other.created
+            && self.file_id == other.file_id
+            && self.hard_link_count == other.hard_link_count
+            && platform_identity_equal(self, other)
+    }
+}
+
+impl Eq for FileSnapshot {}
+
+fn platform_identity_equal(_left: &FileSnapshot, _right: &FileSnapshot) -> bool {
+    #[cfg(unix)]
+    {
+        if _left.mode != _right.mode
+            || _left.change_seconds != _right.change_seconds
+            || _left.change_nanoseconds != _right.change_nanoseconds
+        {
+            return false;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if _left.generation != _right.generation {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Debug)]

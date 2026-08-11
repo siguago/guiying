@@ -12,6 +12,7 @@ mod error;
 mod file_io;
 mod model;
 mod scan;
+mod streaming;
 
 pub use compare::{compare_files_exact, files_are_identical, ByteComparison};
 pub use error::{PathRefDecodeError, ScanError, VerificationError};
@@ -21,3 +22,12 @@ pub use model::{
     ScanStats, ScanStatus, REPORT_SCHEMA_VERSION,
 };
 pub use scan::{CancellationToken, NoopScanControl, ScanControl, Scanner};
+pub use streaming::{
+    CoverageSeal, DirectoryObservation, DirectoryObservationTicket, ExactCandidatePair,
+    ExactComparisonEvidence, FileObservation, FileObservationTicket, FreshFingerprintEvidence,
+    FreshReadOrigin, StageBatchOutcome, StreamBatchStatus, StreamEvent, StreamLimits,
+    StreamRootKind, StreamRootObservation, StreamScanError, StreamSessionId, StreamTrustScope,
+    StreamingEnumerationOutcome, StreamingScanSession, StreamingScanSink, TicketDecodeError,
+    STREAM_EVENT_BATCH_HARD_MAX, STREAM_EVENT_BYTES_HARD_MAX, STREAM_EVENT_BYTES_MIN,
+    STREAM_INPUT_BATCH_HARD_MAX, STREAM_TICKET_BYTES_HARD_MAX,
+};

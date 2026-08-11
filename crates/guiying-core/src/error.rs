@@ -9,6 +9,8 @@ pub enum ScanError {
     NoRoots,
     #[error("invalid scan option: {0}")]
     InvalidOption(String),
+    #[error("streaming scan root must be absolute: {0}")]
+    RelativeRoot(PathBuf),
     #[error("cannot inspect scan root {path}: {source}")]
     RootMetadata {
         path: PathBuf,
@@ -21,6 +23,8 @@ pub enum ScanError {
     UnsupportedRoot(PathBuf),
     #[error("scan root is excluded by the safety policy: {path} ({reason})")]
     ExcludedRoot { path: PathBuf, reason: String },
+    #[error("cannot create a fresh scan session identity: {0}")]
+    SessionEntropy(String),
 }
 
 #[derive(Debug, Error)]
