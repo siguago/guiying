@@ -118,6 +118,36 @@ fixed_evidence_type!(
     from_runtime_evidence,
     "Current observation's independently derived physical-file identity."
 );
+fixed_evidence_type!(
+    CoreSessionId,
+    from_runtime_evidence,
+    "Random identity of one live authenticated core scanner session."
+);
+fixed_evidence_type!(
+    TicketSortKey,
+    from_core_evidence,
+    "Canonical ordering key of one opaque authenticated core ticket."
+);
+fixed_evidence_type!(
+    DirectoryObjectSignature,
+    from_runtime_evidence,
+    "Current-session identity signature of one enumerated directory."
+);
+fixed_evidence_type!(
+    CoreDirectoryManifest,
+    from_core_evidence,
+    "Core-owned manifest digest of a complete directory ticket set."
+);
+fixed_evidence_type!(
+    CoreCoverageSealDigest,
+    from_core_evidence,
+    "Core-owned digest sealing a complete directory coverage replay."
+);
+fixed_evidence_type!(
+    VolumeCoverageManifest,
+    from_volume_adapter,
+    "Volume-adapter manifest proving every directory remained on the bound mount."
+);
 
 /// Authenticated mount generation emitted by the volume runtime.
 ///
@@ -230,6 +260,49 @@ pub struct ScanIssueCursor {
     pub cursor_version: i64,
     pub scan_run_id: i64,
     pub last_issue_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTicketCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub last_ticket_sort_key: TicketSortKey,
+    pub last_observation_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryTicketCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub last_ticket_sort_key: TicketSortKey,
+    pub last_directory_observation_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTicketRecord {
+    pub observation_id: i64,
+    pub root_relative_path_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub display_path: String,
+    pub source_signature: SourceSignature,
+    pub size_bytes: i64,
+    pub ticket_format_version: i64,
+    pub ticket_blob: Vec<u8>,
+    pub ticket_sort_key: TicketSortKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryTicketRecord {
+    pub directory_observation_id: i64,
+    pub root_relative_path_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub display_path: String,
+    pub source_signature: SourceSignature,
+    pub directory_object_signature: DirectoryObjectSignature,
+    pub ticket_format_version: i64,
+    pub ticket_blob: Vec<u8>,
+    pub ticket_sort_key: TicketSortKey,
+    pub observed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +584,64 @@ pub struct ObservationInput {
     pub accessed_time: Option<FileTimestampParts>,
     pub timestamp_granularity_ns: Option<i64>,
     pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoreSessionInput {
+    pub core_session_id: CoreSessionId,
+    pub root_object_signature: RootObjectSignature,
+    pub root_source_signature: SourceSignature,
+    pub bound_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoreFileObservationInput {
+    pub observation: ObservationInput,
+    pub ticket_blob: Vec<u8>,
+    pub ticket_sort_key: TicketSortKey,
+    pub ticket_created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoreDirectoryObservationInput {
+    pub root_relative_path_raw: Vec<u8>,
+    pub path_encoding: String,
+    pub display_path: String,
+    pub source_signature: SourceSignature,
+    pub directory_object_signature: DirectoryObjectSignature,
+    pub ticket_blob: Vec<u8>,
+    pub ticket_sort_key: TicketSortKey,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CoverageStatus {
+    Complete,
+    Partial,
+    Interrupted,
+}
+
+impl CoverageStatus {
+    pub(crate) const fn as_storage_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageOutcomeInput {
+    pub status: CoverageStatus,
+    pub directory_count: i64,
+    pub replayed_count: i64,
+    pub stable_count: i64,
+    pub failed_count: i64,
+    pub core_manifest_digest: Option<CoreDirectoryManifest>,
+    pub core_seal_digest: Option<CoreCoverageSealDigest>,
+    pub volume_verification_manifest: Option<VolumeCoverageManifest>,
+    pub finalized_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

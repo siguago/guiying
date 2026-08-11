@@ -20,14 +20,15 @@ use tempfile::NamedTempFile;
 use crate::error::{Result, StoreError};
 use crate::migrations;
 use crate::model::{
-    CandidateBucketRecord, DuplicateGroupCursor, DuplicateGroupMemberCursor,
-    DuplicateGroupMemberRecord, ExactDigestBucketCursor, ExactGroupKey, FileTimestampParts,
-    FingerprintBucketRecord, FingerprintHintRecord, ForeignKeyViolation, FreshFingerprintKind,
-    IntegrityCheckKind, IntegrityReport, KeysetPage, ManifestDigest, MediaFileRecord,
-    ObservationCursor, ObservationRecord, Page, ParametersHash, SampleBucketCursor,
-    ScanCheckpointRecord, ScanIssueCursor, ScanIssueRecord, ScanJobRecord, ScanReportRecord,
-    ScanRunRecord, SizeBucketCursor, SizeMemberCursor, StoreSettings, VerifiedExactGroup,
-    MAX_PAGE_SIZE,
+    CandidateBucketRecord, CoreSessionId, DirectoryObjectSignature, DirectoryTicketCursor,
+    DirectoryTicketRecord, DuplicateGroupCursor, DuplicateGroupMemberCursor,
+    DuplicateGroupMemberRecord, ExactDigestBucketCursor, ExactGroupKey, FileTicketCursor,
+    FileTicketRecord, FileTimestampParts, FingerprintBucketRecord, FingerprintHintRecord,
+    ForeignKeyViolation, FreshFingerprintKind, IntegrityCheckKind, IntegrityReport, KeysetPage,
+    ManifestDigest, MediaFileRecord, ObservationCursor, ObservationRecord, Page, ParametersHash,
+    RunEvidenceGuard, SampleBucketCursor, ScanCheckpointRecord, ScanIssueCursor, ScanIssueRecord,
+    ScanJobRecord, ScanReportRecord, ScanRunRecord, SizeBucketCursor, SizeMemberCursor,
+    StoreSettings, TicketSortKey, VerifiedExactGroup, MAX_PAGE_SIZE,
 };
 use crate::repository::RepositoryTx;
 
@@ -323,6 +324,242 @@ impl Store {
                 cursor_version: KEYSET_CURSOR_VERSION,
                 scan_run_id,
                 last_observation_id: record.id,
+            })
+        })
+    }
+
+    /// Lists opaque authenticated file tickets after enumeration is sealed.
+    /// Ticket bytes are process-local evidence and must only be passed back to
+    /// the still-live core session that created them.
+    pub fn list_file_tickets_page(
+        &self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        cursor: Option<&FileTicketCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<FileTicketRecord, FileTicketCursor>> {
+        let scan_run_id = guard.scan_run_id;
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        let after = validate_file_ticket_cursor(scan_run_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_current_core_session(connection, guard, core_session_id)?;
+            require_stage_sealed(connection, scan_run_id, "enumeration")?;
+            let (after_key, after_id) = after
+                .map(|(key, id)| (Some(key.as_bytes().to_vec()), id))
+                .unwrap_or((None, 0));
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+                     SELECT 1024 + length(observation.root_relative_path_raw) \
+                                 + length(CAST(observation.path_encoding AS BLOB)) \
+                                 + length(CAST(observation.display_path AS BLOB)) \
+                                 + length(ticket.source_signature) \
+                                 + length(ticket.ticket_blob) \
+                                 + length(ticket.ticket_sort_key) AS row_bytes \
+                     FROM scan_file_tickets AS ticket \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.volume_id = ticket.volume_id \
+                      AND observation.scan_run_id = ticket.scan_run_id \
+                      AND observation.id = ticket.media_observation_snapshot_id \
+                     WHERE ticket.scan_run_id = ?1 \
+                       AND (?2 IS NULL OR ticket.ticket_sort_key > ?2 \
+                            OR (ticket.ticket_sort_key = ?2 \
+                                AND ticket.media_observation_snapshot_id > ?3)) \
+                     ORDER BY ticket.ticket_sort_key, ticket.media_observation_snapshot_id \
+                     LIMIT ?4 \
+                 )",
+                rusqlite::params![scan_run_id, after_key, after_id, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget("file ticket page", page_bytes, MAX_PAGE_RESULT_BYTES)?;
+            let mut statement = connection.prepare(
+                "SELECT ticket.media_observation_snapshot_id, \
+                        observation.root_relative_path_raw, observation.path_encoding, \
+                        observation.display_path, ticket.source_signature, \
+                        observation.size_bytes, ticket.ticket_format_version, \
+                        ticket.ticket_blob, ticket.ticket_sort_key \
+                 FROM scan_file_tickets AS ticket \
+                 JOIN media_observation_snapshots AS observation \
+                   ON observation.volume_id = ticket.volume_id \
+                  AND observation.scan_run_id = ticket.scan_run_id \
+                  AND observation.id = ticket.media_observation_snapshot_id \
+                 WHERE ticket.scan_run_id = ?1 \
+                   AND (?2 IS NULL OR ticket.ticket_sort_key > ?2 \
+                        OR (ticket.ticket_sort_key = ?2 \
+                            AND ticket.media_observation_snapshot_id > ?3)) \
+                 ORDER BY ticket.ticket_sort_key, ticket.media_observation_snapshot_id \
+                 LIMIT ?4",
+            )?;
+            let raw = statement
+                .query_map(
+                    rusqlite::params![scan_run_id, after_key, after_id, fetch_limit],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let items = raw
+                .into_iter()
+                .map(
+                    |(
+                        observation_id,
+                        root_relative_path_raw,
+                        path_encoding,
+                        display_path,
+                        source_signature,
+                        size_bytes,
+                        ticket_format_version,
+                        ticket_blob,
+                        ticket_sort_key,
+                    )| {
+                        Ok(FileTicketRecord {
+                            observation_id,
+                            root_relative_path_raw,
+                            path_encoding,
+                            display_path,
+                            source_signature: crate::model::SourceSignature::from_runtime_evidence(
+                                fixed_32_bytes("source_signature", source_signature)?,
+                            ),
+                            size_bytes,
+                            ticket_format_version,
+                            ticket_blob,
+                            ticket_sort_key: TicketSortKey::from_core_evidence(fixed_32_bytes(
+                                "ticket_sort_key",
+                                ticket_sort_key,
+                            )?),
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?;
+            keyset_page_from_items(items, limit, |record| FileTicketCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                last_ticket_sort_key: record.ticket_sort_key,
+                last_observation_id: record.observation_id,
+            })
+        })
+    }
+
+    /// Lists opaque authenticated directory tickets for volume-bracketed
+    /// coverage replay after the enumeration set has been sealed.
+    pub fn list_directory_tickets_page(
+        &self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        cursor: Option<&DirectoryTicketCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<DirectoryTicketRecord, DirectoryTicketCursor>> {
+        let scan_run_id = guard.scan_run_id;
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        let after = validate_directory_ticket_cursor(scan_run_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_current_core_session(connection, guard, core_session_id)?;
+            require_stage_sealed(connection, scan_run_id, "enumeration")?;
+            let (after_key, after_id) = after
+                .map(|(key, id)| (Some(key.as_bytes().to_vec()), id))
+                .unwrap_or((None, 0));
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+                     SELECT 1024 + length(root_relative_path_raw) \
+                                 + length(CAST(path_encoding AS BLOB)) \
+                                 + length(CAST(display_path AS BLOB)) \
+                                 + length(source_signature) \
+                                 + length(directory_object_signature) \
+                                 + length(ticket_blob) + length(ticket_sort_key) AS row_bytes \
+                     FROM scan_directory_observations \
+                     WHERE scan_run_id = ?1 \
+                       AND (?2 IS NULL OR ticket_sort_key > ?2 \
+                            OR (ticket_sort_key = ?2 AND id > ?3)) \
+                     ORDER BY ticket_sort_key, id LIMIT ?4 \
+                 )",
+                rusqlite::params![scan_run_id, after_key, after_id, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget("directory ticket page", page_bytes, MAX_PAGE_RESULT_BYTES)?;
+            let mut statement = connection.prepare(
+                "SELECT id, root_relative_path_raw, path_encoding, display_path, \
+                        source_signature, directory_object_signature, ticket_format_version, \
+                        ticket_blob, ticket_sort_key, observed_at_ms \
+                 FROM scan_directory_observations \
+                 WHERE scan_run_id = ?1 \
+                   AND (?2 IS NULL OR ticket_sort_key > ?2 \
+                        OR (ticket_sort_key = ?2 AND id > ?3)) \
+                 ORDER BY ticket_sort_key, id LIMIT ?4",
+            )?;
+            let raw = statement
+                .query_map(
+                    rusqlite::params![scan_run_id, after_key, after_id, fetch_limit],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                            row.get::<_, i64>(9)?,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let items = raw
+                .into_iter()
+                .map(
+                    |(
+                        directory_observation_id,
+                        root_relative_path_raw,
+                        path_encoding,
+                        display_path,
+                        source_signature,
+                        directory_object_signature,
+                        ticket_format_version,
+                        ticket_blob,
+                        ticket_sort_key,
+                        observed_at_ms,
+                    )| {
+                        Ok(DirectoryTicketRecord {
+                            directory_observation_id,
+                            root_relative_path_raw,
+                            path_encoding,
+                            display_path,
+                            source_signature: crate::model::SourceSignature::from_runtime_evidence(
+                                fixed_32_bytes("source_signature", source_signature)?,
+                            ),
+                            directory_object_signature:
+                                DirectoryObjectSignature::from_runtime_evidence(fixed_32_bytes(
+                                    "directory_object_signature",
+                                    directory_object_signature,
+                                )?),
+                            ticket_format_version,
+                            ticket_blob,
+                            ticket_sort_key: TicketSortKey::from_core_evidence(fixed_32_bytes(
+                                "ticket_sort_key",
+                                ticket_sort_key,
+                            )?),
+                            observed_at_ms,
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?;
+            keyset_page_from_items(items, limit, |record| DirectoryTicketCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                last_ticket_sort_key: record.ticket_sort_key,
+                last_directory_observation_id: record.directory_observation_id,
             })
         })
     }
@@ -2468,6 +2705,57 @@ fn require_stage_sealed(
     Ok(())
 }
 
+fn require_current_core_session(
+    connection: &Connection,
+    guard: &RunEvidenceGuard,
+    core_session_id: &CoreSessionId,
+) -> Result<()> {
+    let mount_session_key = guard.mount_session_key.to_storage_hex();
+    let matches = connection.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_core_sessions AS core \
+             JOIN scan_runs AS run \
+               ON run.id = core.scan_run_id AND run.volume_id = core.volume_id \
+             JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = core.scan_run_id \
+              AND session.volume_id = core.volume_id \
+              AND session.capability_profile_id = core.capability_profile_id \
+              AND session.namespace_profile_id = core.namespace_profile_id \
+             JOIN scan_jobs AS job \
+               ON job.id = session.scan_job_id AND job.volume_id = session.volume_id \
+              AND job.active_scan_run_id = run.id \
+             JOIN capability_profiles AS capability \
+               ON capability.id = session.capability_profile_id \
+              AND capability.volume_id = session.volume_id \
+             WHERE core.scan_run_id = ?1 \
+               AND core.capability_profile_id = ?2 \
+               AND core.core_session_id = ?3 \
+               AND run.state = 'running' AND job.state = 'running' \
+               AND session.mount_session_key = ?4 COLLATE BINARY \
+               AND capability.mount_session_key = session.mount_session_key COLLATE BINARY \
+               AND capability.profile_hash_version = 2 \
+               AND capability.is_current = 1 \
+               AND capability.probe_status = 'complete' \
+               AND capability.can_read = 1 \
+         )",
+        rusqlite::params![
+            guard.scan_run_id,
+            guard.capability_profile_id,
+            core_session_id.as_bytes().as_slice(),
+            mount_session_key,
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !matches {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "current_core_session_read_guard",
+            id: guard.scan_run_id,
+        });
+    }
+    Ok(())
+}
+
 fn validated_keyset_limit(limit: u32) -> Result<i64> {
     validated_page(None, limit).map(|(_, fetch_limit)| fetch_limit)
 }
@@ -2490,6 +2778,56 @@ fn validate_observation_cursor(
             "observation cursor id must be positive",
         )),
         Some(cursor) => Ok(cursor.last_observation_id),
+    }
+}
+
+fn validate_file_ticket_cursor(
+    scan_run_id: i64,
+    cursor: Option<&FileTicketCursor>,
+) -> Result<Option<(TicketSortKey, i64)>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id => Err(StoreError::invalid_input(
+            "cursor",
+            "file-ticket cursor belongs to a different scan run",
+        )),
+        Some(cursor) if cursor.last_observation_id <= 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "file-ticket cursor observation id must be positive",
+        )),
+        Some(cursor) => Ok(Some((
+            cursor.last_ticket_sort_key,
+            cursor.last_observation_id,
+        ))),
+    }
+}
+
+fn validate_directory_ticket_cursor(
+    scan_run_id: i64,
+    cursor: Option<&DirectoryTicketCursor>,
+) -> Result<Option<(TicketSortKey, i64)>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id => Err(StoreError::invalid_input(
+            "cursor",
+            "directory-ticket cursor belongs to a different scan run",
+        )),
+        Some(cursor) if cursor.last_directory_observation_id <= 0 => {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "directory-ticket cursor observation id must be positive",
+            ))
+        }
+        Some(cursor) => Ok(Some((
+            cursor.last_ticket_sort_key,
+            cursor.last_directory_observation_id,
+        ))),
     }
 }
 

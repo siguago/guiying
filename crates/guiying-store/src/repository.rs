@@ -2,13 +2,15 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::error::{Result, StoreError};
 use crate::model::{
-    BeginExactGroupInput, CapabilityProfileInput, ExactGroupKey, ExactGroupManifestMember,
-    ExactGroupMemberInput, ExactVerificationEdgeInput, FileTimestampParts, FreshFingerprintInput,
-    FreshFingerprintKind, ManifestDigest, MediaFileInput, MountSessionKey, NamespaceProfileInput,
-    NewBoundScanRun, NewScanIssue, NewScanJob, NewScanReport, NewScanRun, NewScopedScanJob,
-    ObservationInput, RunEvidenceGuard, ScanCheckpointInput, ScanStage, SourceSignature,
-    VerifiedExactGroup, VolumeInput, MAX_IDENTIFIER_BYTES, MAX_JSON_BYTES, MAX_OPAQUE_BLOB_BYTES,
-    MAX_PATH_BYTES, MAX_TEXT_BYTES,
+    BeginExactGroupInput, CapabilityProfileInput, CoreDirectoryObservationInput,
+    CoreFileObservationInput, CoreSessionId, CoreSessionInput, CoverageOutcomeInput,
+    CoverageStatus, ExactGroupKey, ExactGroupManifestMember, ExactGroupMemberInput,
+    ExactVerificationEdgeInput, FileTimestampParts, FreshFingerprintInput, FreshFingerprintKind,
+    ManifestDigest, MediaFileInput, MountSessionKey, NamespaceProfileInput, NewBoundScanRun,
+    NewScanIssue, NewScanJob, NewScanReport, NewScanRun, NewScopedScanJob, ObservationInput,
+    RunEvidenceGuard, ScanCheckpointInput, ScanStage, SourceSignature, VerifiedExactGroup,
+    VolumeInput, MAX_IDENTIFIER_BYTES, MAX_JSON_BYTES, MAX_OPAQUE_BLOB_BYTES, MAX_PATH_BYTES,
+    MAX_TEXT_BYTES,
 };
 
 const MAX_V5_WRITE_BATCH: usize = 128;
@@ -175,6 +177,56 @@ impl<'transaction> RepositoryTx<'transaction> {
         inputs: &[ObservationInput],
     ) -> Result<Vec<i64>> {
         self.run_mutator(|repository| repository.record_observation_batch_impl(guard, inputs))
+    }
+
+    /// Binds one authenticated, process-local core scanner to the current
+    /// volume-backed run. The stored id is evidence, never durable read
+    /// authority after process restart.
+    pub fn bind_core_session(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        input: &CoreSessionInput,
+    ) -> Result<()> {
+        self.run_mutator(|repository| repository.bind_core_session_impl(guard, input))
+    }
+
+    /// Atomically records immutable media observations and their opaque core
+    /// tickets. A ticket failure rolls back the matching observation too.
+    pub fn record_core_observation_batch(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        inputs: &[CoreFileObservationInput],
+    ) -> Result<Vec<i64>> {
+        self.run_mutator(|repository| {
+            repository.record_core_observation_batch_impl(guard, core_session_id, inputs)
+        })
+    }
+
+    /// Records authenticated directory tickets for later volume-bracketed
+    /// coverage replay. Opaque ticket bytes are never interpreted as paths.
+    pub fn record_core_directory_batch(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        inputs: &[CoreDirectoryObservationInput],
+    ) -> Result<Vec<i64>> {
+        self.run_mutator(|repository| {
+            repository.record_core_directory_batch_impl(guard, core_session_id, inputs)
+        })
+    }
+
+    /// Persists the terminal result of core replay plus volume verification.
+    /// Only `Complete` evidence can later unlock exact-stage sealing.
+    pub fn record_core_coverage(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        input: &CoverageOutcomeInput,
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.record_core_coverage_impl(guard, core_session_id, input)
+        })
     }
 
     pub fn seal_scan_stage(
@@ -887,6 +939,335 @@ impl<'transaction> RepositoryTx<'transaction> {
         Ok(ids)
     }
 
+    fn bind_core_session_impl(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        input: &CoreSessionInput,
+    ) -> Result<()> {
+        let context = self.validate_v5_run_guard(guard)?;
+        require_nonnegative("bound_at_ms", input.bound_at_ms)?;
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT volume_id, capability_profile_id, namespace_profile_id, \
+                        core_session_id, trust_scope, engine_contract_version, root_index, \
+                        root_kind, root_object_signature, root_source_signature, bound_at_ms \
+                 FROM scan_core_sessions WHERE scan_run_id = ?1",
+                params![guard.scan_run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let matches = existing.0 == context.volume_id
+                && existing.1 == context.capability_profile_id
+                && existing.2 == context.namespace_profile_id
+                && existing.3.as_slice() == input.core_session_id.as_bytes()
+                && existing.4 == "current_core_session_only"
+                && existing.5 == 1
+                && existing.6 == 0
+                && existing.7 == "directory"
+                && existing.8.as_slice() == input.root_object_signature.as_bytes()
+                && existing.9.as_slice() == input.root_source_signature.as_bytes()
+                && existing.10 == input.bound_at_ms;
+            if matches {
+                return Ok(());
+            }
+            return Err(StoreError::IdempotencyConflict {
+                entity: "core_scan_session",
+                key: guard.scan_run_id.to_string(),
+            });
+        }
+
+        self.transaction.execute(
+            "INSERT INTO scan_core_sessions ( \
+                 scan_run_id, volume_id, capability_profile_id, namespace_profile_id, \
+                 core_session_id, trust_scope, engine_contract_version, root_index, root_kind, \
+                 root_object_signature, root_source_signature, bound_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'current_core_session_only', 1, 0, \
+                       'directory', ?6, ?7, ?8)",
+            params![
+                guard.scan_run_id,
+                context.volume_id,
+                context.capability_profile_id,
+                context.namespace_profile_id,
+                input.core_session_id.as_bytes().as_slice(),
+                input.root_object_signature.as_bytes().as_slice(),
+                input.root_source_signature.as_bytes().as_slice(),
+                input.bound_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn record_core_observation_batch_impl(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        inputs: &[CoreFileObservationInput],
+    ) -> Result<Vec<i64>> {
+        validate_v5_batch("core_file_observations", inputs.len())?;
+        let context = self.validate_core_session_guard(guard, core_session_id)?;
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            validate_observation(&input.observation, context.path_encoding.as_str())?;
+            validate_observation_path_binding(&context, &input.observation)?;
+            validate_opaque_ticket(&input.ticket_blob)?;
+            require_nonnegative("ticket_created_at_ms", input.ticket_created_at_ms)?;
+            if input.ticket_created_at_ms < input.observation.observed_at_ms {
+                return Err(StoreError::invalid_input(
+                    "ticket_created_at_ms",
+                    "file ticket cannot predate its observation",
+                ));
+            }
+            let observation_id = self.record_one_observation(&context, &input.observation)?;
+            let existing = self
+                .transaction
+                .query_row(
+                    "SELECT volume_id, scan_run_id, core_session_id, source_signature, \
+                            ticket_format_version, ticket_blob, ticket_sort_key, created_at_ms \
+                     FROM scan_file_tickets WHERE media_observation_snapshot_id = ?1",
+                    params![observation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, i64>(7)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                let matches = existing.0 == context.volume_id
+                    && existing.1 == guard.scan_run_id
+                    && existing.2.as_slice() == core_session_id.as_bytes()
+                    && existing.3.as_slice() == input.observation.source_signature.as_bytes()
+                    && existing.4 == 1
+                    && existing.5 == input.ticket_blob
+                    && existing.6.as_slice() == input.ticket_sort_key.as_bytes()
+                    && existing.7 == input.ticket_created_at_ms;
+                if !matches {
+                    return Err(StoreError::IdempotencyConflict {
+                        entity: "core_file_ticket",
+                        key: observation_id.to_string(),
+                    });
+                }
+                ids.push(observation_id);
+                continue;
+            }
+            self.transaction.execute(
+                "INSERT INTO scan_file_tickets ( \
+                     media_observation_snapshot_id, volume_id, scan_run_id, core_session_id, \
+                     source_signature, ticket_format_version, ticket_blob, ticket_sort_key, \
+                     created_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
+                params![
+                    observation_id,
+                    context.volume_id,
+                    guard.scan_run_id,
+                    core_session_id.as_bytes().as_slice(),
+                    input.observation.source_signature.as_bytes().as_slice(),
+                    input.ticket_blob,
+                    input.ticket_sort_key.as_bytes().as_slice(),
+                    input.ticket_created_at_ms,
+                ],
+            )?;
+            ids.push(observation_id);
+        }
+        Ok(ids)
+    }
+
+    fn record_core_directory_batch_impl(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        inputs: &[CoreDirectoryObservationInput],
+    ) -> Result<Vec<i64>> {
+        validate_v5_batch("core_directory_observations", inputs.len())?;
+        let context = self.validate_core_session_guard(guard, core_session_id)?;
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            validate_directory_observation(input, context.path_encoding.as_str())?;
+            validate_opaque_ticket(&input.ticket_blob)?;
+            let existing = self
+                .transaction
+                .query_row(
+                    "SELECT id, volume_id, core_session_id, display_path, source_signature, \
+                            directory_object_signature, ticket_format_version, ticket_blob, \
+                            ticket_sort_key, observed_at_ms \
+                     FROM scan_directory_observations \
+                     WHERE scan_run_id = ?1 AND root_index = 0 AND path_encoding = ?2 \
+                       AND root_relative_path_raw = ?3",
+                    params![
+                        guard.scan_run_id,
+                        input.path_encoding,
+                        input.root_relative_path_raw,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                            row.get::<_, i64>(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                let matches = existing.1 == context.volume_id
+                    && existing.2.as_slice() == core_session_id.as_bytes()
+                    && existing.3 == input.display_path
+                    && existing.4.as_slice() == input.source_signature.as_bytes()
+                    && existing.5.as_slice() == input.directory_object_signature.as_bytes()
+                    && existing.6 == 1
+                    && existing.7 == input.ticket_blob
+                    && existing.8.as_slice() == input.ticket_sort_key.as_bytes()
+                    && existing.9 == input.observed_at_ms;
+                if !matches {
+                    return Err(StoreError::IdempotencyConflict {
+                        entity: "core_directory_ticket",
+                        key: existing.0.to_string(),
+                    });
+                }
+                ids.push(existing.0);
+                continue;
+            }
+            self.transaction.execute(
+                "INSERT INTO scan_directory_observations ( \
+                     volume_id, scan_run_id, core_session_id, root_index, \
+                     root_relative_path_raw, path_encoding, display_path, source_signature, \
+                     directory_object_signature, ticket_format_version, ticket_blob, \
+                     ticket_sort_key, observed_at_ms \
+                 ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11)",
+                params![
+                    context.volume_id,
+                    guard.scan_run_id,
+                    core_session_id.as_bytes().as_slice(),
+                    input.root_relative_path_raw,
+                    input.path_encoding,
+                    input.display_path,
+                    input.source_signature.as_bytes().as_slice(),
+                    input.directory_object_signature.as_bytes().as_slice(),
+                    input.ticket_blob,
+                    input.ticket_sort_key.as_bytes().as_slice(),
+                    input.observed_at_ms,
+                ],
+            )?;
+            ids.push(self.transaction.last_insert_rowid());
+        }
+        Ok(ids)
+    }
+
+    fn record_core_coverage_impl(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        input: &CoverageOutcomeInput,
+    ) -> Result<()> {
+        let context = self.validate_core_session_guard(guard, core_session_id)?;
+        validate_coverage_outcome(input)?;
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT volume_id, core_session_id, status, directory_count, replayed_count, \
+                        stable_count, failed_count, core_manifest_digest, core_seal_digest, \
+                        volume_verification_manifest, finalized_at_ms \
+                 FROM scan_coverage_outcomes WHERE scan_run_id = ?1",
+                params![guard.scan_run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                        row.get::<_, Option<Vec<u8>>>(8)?,
+                        row.get::<_, Option<Vec<u8>>>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let manifest = input
+            .core_manifest_digest
+            .map(|value| value.as_bytes().to_vec());
+        let seal = input
+            .core_seal_digest
+            .map(|value| value.as_bytes().to_vec());
+        let volume_manifest = input
+            .volume_verification_manifest
+            .map(|value| value.as_bytes().to_vec());
+        if let Some(existing) = existing {
+            let matches = existing.0 == context.volume_id
+                && existing.1.as_slice() == core_session_id.as_bytes()
+                && existing.2 == input.status.as_storage_str()
+                && existing.3 == input.directory_count
+                && existing.4 == input.replayed_count
+                && existing.5 == input.stable_count
+                && existing.6 == input.failed_count
+                && existing.7 == manifest
+                && existing.8 == seal
+                && existing.9 == volume_manifest
+                && existing.10 == input.finalized_at_ms;
+            if matches {
+                return Ok(());
+            }
+            return Err(StoreError::IdempotencyConflict {
+                entity: "core_coverage_outcome",
+                key: guard.scan_run_id.to_string(),
+            });
+        }
+        self.transaction.execute(
+            "INSERT INTO scan_coverage_outcomes ( \
+                 scan_run_id, volume_id, core_session_id, status, directory_count, \
+                 replayed_count, stable_count, failed_count, core_manifest_digest, \
+                 core_seal_digest, volume_verification_manifest, finalized_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                guard.scan_run_id,
+                context.volume_id,
+                core_session_id.as_bytes().as_slice(),
+                input.status.as_storage_str(),
+                input.directory_count,
+                input.replayed_count,
+                input.stable_count,
+                input.failed_count,
+                manifest,
+                seal,
+                volume_manifest,
+                input.finalized_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn record_one_observation(
         &self,
         context: &BoundRunContext,
@@ -1451,6 +1832,39 @@ impl<'transaction> RepositoryTx<'transaction> {
         if context.run_state != "running" || context.job_state != "running" {
             return Err(StoreError::ConcurrencyConflict {
                 entity: "running_run_evidence_guard",
+                id: guard.scan_run_id,
+            });
+        }
+        Ok(context)
+    }
+
+    fn validate_core_session_guard(
+        &self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+    ) -> Result<BoundRunContext> {
+        let context = self.validate_v5_run_guard(guard)?;
+        let matches = self.transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM scan_core_sessions \
+                 WHERE scan_run_id = ?1 AND volume_id = ?2 \
+                   AND capability_profile_id = ?3 AND namespace_profile_id = ?4 \
+                   AND core_session_id = ?5 AND trust_scope = 'current_core_session_only' \
+                   AND engine_contract_version = 1 AND root_index = 0 \
+                   AND root_kind = 'directory' \
+             )",
+            params![
+                guard.scan_run_id,
+                context.volume_id,
+                context.capability_profile_id,
+                context.namespace_profile_id,
+                core_session_id.as_bytes().as_slice(),
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !matches {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "core_session_evidence_guard",
                 id: guard.scan_run_id,
             });
         }
@@ -5393,6 +5807,84 @@ fn validate_timestamp(field: &'static str, timestamp: Option<FileTimestampParts>
             field,
             "nanoseconds must be between 0 and 999999999",
         ));
+    }
+    Ok(())
+}
+
+fn validate_directory_observation(
+    input: &CoreDirectoryObservationInput,
+    native_path_encoding: &str,
+) -> Result<()> {
+    let compatible = match native_path_encoding {
+        "unix_bytes" => matches!(input.path_encoding.as_str(), "utf8" | "unix_bytes"),
+        "windows_utf16_le" => input.path_encoding == "windows_utf16_le",
+        _ => false,
+    };
+    if !compatible {
+        return Err(StoreError::invalid_input(
+            "path_encoding",
+            "directory encoding does not match the bound namespace",
+        ));
+    }
+    validate_persisted_path_evidence(
+        &input.display_path,
+        &input.root_relative_path_raw,
+        &input.path_encoding,
+        true,
+    )?;
+    require_nonnegative("observed_at_ms", input.observed_at_ms)?;
+    Ok(())
+}
+
+fn validate_opaque_ticket(ticket: &[u8]) -> Result<()> {
+    if ticket.is_empty() || ticket.len() > MAX_PATH_BYTES {
+        return Err(StoreError::invalid_input(
+            "ticket_blob",
+            "opaque core ticket must contain between 1 and 65536 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_coverage_outcome(input: &CoverageOutcomeInput) -> Result<()> {
+    require_nonnegative("directory_count", input.directory_count)?;
+    require_nonnegative("replayed_count", input.replayed_count)?;
+    require_nonnegative("stable_count", input.stable_count)?;
+    require_nonnegative("failed_count", input.failed_count)?;
+    require_nonnegative("finalized_at_ms", input.finalized_at_ms)?;
+    let replayed = input
+        .stable_count
+        .checked_add(input.failed_count)
+        .ok_or_else(|| StoreError::invalid_input("coverage_count", "coverage count overflow"))?;
+    if input.replayed_count != replayed || input.replayed_count > input.directory_count {
+        return Err(StoreError::invalid_input(
+            "coverage_count",
+            "replayed directories must equal stable plus failed and not exceed total",
+        ));
+    }
+    match input.status {
+        CoverageStatus::Complete => {
+            if input.replayed_count != input.directory_count
+                || input.stable_count != input.directory_count
+                || input.failed_count != 0
+                || input.core_manifest_digest.is_none()
+                || input.core_seal_digest.is_none()
+                || input.volume_verification_manifest.is_none()
+            {
+                return Err(StoreError::invalid_input(
+                    "coverage_status",
+                    "complete coverage requires every directory stable and all three manifests",
+                ));
+            }
+        }
+        CoverageStatus::Partial | CoverageStatus::Interrupted => {
+            if input.core_seal_digest.is_some() {
+                return Err(StoreError::invalid_input(
+                    "core_seal_digest",
+                    "incomplete coverage cannot carry a complete core seal",
+                ));
+            }
+        }
     }
     Ok(())
 }

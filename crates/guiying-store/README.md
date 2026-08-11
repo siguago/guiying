@@ -133,7 +133,13 @@ Safety properties:
   seal exact verification until both the core coverage seal and an independent
   volume-verification manifest are complete. Tickets remain opaque current-
   process evidence; reopening interrupts the run instead of treating them as
-  reusable authority;
+  reusable authority. Public version-6 mutators atomically bind the core
+  session, pair each file observation with its ticket, record directory replay
+  tickets, and persist the terminal coverage result. Any changed idempotent
+  retry poisons and rolls back the whole write transaction. File and directory
+  ticket pages use bounded keyset cursors and additionally require the current
+  run, capability, mount-session, and core-session guards, so stale rows cannot
+  be paged as live read authority after restart;
 - filesystem timestamp precision is nullable in version 6. The nanosecond
   representation unit is stored separately from actual filesystem granularity,
   so an unknown APFS/exFAT/NTFS/SMB precision stays unknown and disables cache
