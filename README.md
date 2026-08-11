@@ -9,6 +9,7 @@
 - 在扫描前后校验文件身份、长度、mtime 与 ctime，变化中的文件不参与定案。
 - 桌面端同一时间只运行一个扫描任务；扫描根只能由当前原生窗口选择并换取一次性、限时、窗口绑定的随机 token，WebView 不能用路径字符串自行扩大读取范围。目录枚举阶段支持同一进程、同一次打开期间的暂停与继续，并始终支持合作式安全停止；未完成阶段不会封印，草稿组不可见。
 - `guiying-runtime` 将 core 的不可构造读取证明、volume 的 descriptor/mount 复核和 Store 的不可变观察接成同一当前会话主链；SQLite 只写入每用户应用数据目录，不写目标照片盘。
+- 进程退出、重启或挂载变化后不存在断点续扫。用户必须重新选择根；只有“同一逻辑文件系统 UUID + 精确原生根字节 + 完全相同配置”的 v9 候选唯一时，才在同一逻辑 job 下建立 `fresh_full_child_v1`。它重建 volume/core/mount session 和 runtime lease，并从根开始新的全量扫描；不恢复 fd、walker、cursor、checkpoint、root token，也不继承父 run 的 observation、fingerprint、group 或 seal。候选为零或有歧义时创建独立的 `initial_full_v1` job，不猜测关联对象。
 - Tauri 不再传输整份扫描报告；React 首屏只读取第一组有界结果，重复组、组内成员和问题清单都按游标逐页替换，不在内存里累积整个图库。活动扫描的当前 run 不得被签发历史读取授权；同一进程仍可用专用只读连接复核更早的封存 run。
 - 已完成或部分覆盖的 D1 运行会进入本机历史目录。catalog 由 owner-window 并发门有界读取；打开后的详细证据只通过 `READ_ONLY + query_only` 读取器和窗口绑定、限时的随机结果 token 分页复核。封存根路径只是显示文本，不会恢复目录权限。进程级数据库锁在任何 Store 打开前取得，避免第二实例把活动会话误判成崩溃残留。
 - 历史结果可导出版本化 JSON 或 CSV。导出可选 `summary` 或 `complete_evidence`；后者只含 D1 摘要、确定重复组、组成员和扫描问题，不含拍摄时间明细、raw metadata、原生 locator 或文件动作权限。默认脱敏，只有用户显式选择 display 投影才带展示文本。
@@ -21,9 +22,11 @@
 当前时间链只生成、封印和展示历史证据：floating/offset 不会套用系统时区，重复份数不会
 被当作独立投票，keeper 与 time donor 仍保持未选择，任何 evidence-eligible 结论也不构成
 文件动作授权。暂停 checkpoint 是持久化审计承诺，不是跨进程恢复目录 walker、descriptor
-或文件系统权限的凭据；窗口退出、进程重启或挂载变化都会取消/中断当前 run，后续跨进程
-恢复必须重新选择根并建立新的 attempt。真实外置卷矩阵和这条跨进程恢复链仍是 Phase 1
-后续门槛；M2 才会另行实现并故障注入验证同卷隔离与恢复事务。
+或文件系统权限的凭据。v9 把“只允许建立新 attempt 血缘”与“允许历史指纹 hint”
+分成 `fresh_attempt_only` 和 `evidence_reuse_eligible`；前者不会调用 fingerprint hint，也不证明
+是同一块物理磁盘或同一个目录对象。自动化门禁已覆盖唯一/歧义候选、配置变化、
+新 session 与证据从零开始；真实 APFS/HFS+/exFAT 外置卷拔插、重挂和克隆 UUID
+矩阵仍待验证。M2 才会另行实现并故障注入验证同卷隔离与恢复事务。
 
 设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、
 [扫描任务协议](docs/engineering/SCAN_JOBS.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、
@@ -78,11 +81,11 @@ cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets -
 ## 仓库结构
 
 - `crates/guiying-core/`：不提供变更 API 的扫描与逐字节复核核心。读取在部分卷上可能更新文件系统管理的 atime。
-- `crates/guiying-runtime/`：唯一能把 core/volume 的不可构造证明转换为 Store 证据的只读适配层。
+- `crates/guiying-runtime/`：唯一能把 core/volume 的不可构造证明转换为 Store 证据的只读适配层；新 attempt 只携带 job/run 血缘。
 - `crates/guiying-metadata/`：有硬预算的原始 EXIF / QuickTime 时间字段提取；不负责日期可信度、时区推断或写回。
 - `crates/guiying-time/`：时间语义、冲突与证据资格策略；资格结果不构成照片写入授权。
 - `crates/guiying-volume/`：macOS descriptor-bound 卷会话和无损路径证据；其他平台绑定目前 fail closed。
-- `crates/guiying-store/`：应用数据目录内的 SQLite 证据持久化、迁移、分页、审计 checkpoint、历史导出快照与备份；不打开用户媒体。
+- `crates/guiying-store/`：应用数据目录内的 SQLite 证据持久化、迁移、分页、审计 checkpoint、v9 新 attempt 血缘、历史导出快照与备份；不打开用户媒体。
 - `src-tauri/`：最小权限桌面壳、单实例数据库锁、持久化只读扫描任务、同进程枚举暂停/继续、历史结果授权、有界分页与安全导出；不暴露照片写命令。
 - `src/`：React 证据复核界面。
 - `design-system/`：DTCG 设计令牌及生成的 CSS 消费关系。

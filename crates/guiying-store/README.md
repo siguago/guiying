@@ -54,7 +54,7 @@ Safety properties:
   and `-journal` names must all be absent before work, immediately before
   publication, and after publication; none may alias any source-family name;
 - before opening any managed source older than the embedded latest schema with
-  SQLite (currently v1-v7 migrating to v8), Unix builds enumerate the
+  SQLite (currently v1-v8 migrating to v9), Unix builds enumerate the
   main/`-wal`/`-shm`/`-journal` family twice through a stable private-parent
   directory descriptor. Unknown sidecars, symlinks, non-regular or linked
   members, unsafe ownership/modes, simultaneous WAL and rollback journals,
@@ -209,6 +209,29 @@ Safety properties:
   a descriptor, walker, root token, or cross-process authority. Cancel supersedes
   pause/resume, stale generations fail closed, and direct-SQL half states are
   rejected during validation;
+- version 9 adds fresh-attempt recovery without treating a pause checkpoint or
+  historical fingerprint as live filesystem authority. An immutable companion
+  policy separates `fresh_attempt_only` lineage from
+  `evidence_reuse_eligible` hints. A strong, cross-session, exact-native
+  namespace with known case behavior may therefore start a new full attempt
+  even when Unicode behavior is unknown; that unknown value means byte-exact
+  names only and grants no Unicode equivalence. Fingerprint hints still require
+  the evidence-eligible policy and known timestamp granularity, and no old
+  observation or fingerprint is copied into the child;
+- every v9-created run declares `initial_full_v1` or
+  `fresh_full_child_v1`. A persisted migration epoch keeps all v8-and-earlier
+  rows `legacy`, and the run id, strategy, parent, and scan mode are immutable.
+  Initial attempts are full, first, queued, and parentless. Fresh children are
+  full attempts created only for a recoverable failed job whose exact active
+  parent is interrupted, explicitly v9-originated, and has no active lease;
+- recovery selection and child creation are intended to run in one short
+  `BEGIN IMMEDIATE` repository transaction. Selection matches the exact volume,
+  namespace, raw root bytes and encoding, stable/root-scope keys, and canonical
+  runtime configuration. Zero matches returns none and any count above one is
+  explicitly ambiguous; recency never chooses between candidates. The returned
+  job/run ids are process-local coordination data, not serializable IPC
+  authority. The caller must independently reacquire and validate a new root
+  handle before scanning;
 - `EvidenceReader::open_existing_read_only` is the separate historical-read
   boundary. It requires an existing absolute regular database path and opens a
   persistent SQLite `READ_ONLY | NOFOLLOW` connection with `query_only=1`; it

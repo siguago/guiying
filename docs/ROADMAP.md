@@ -13,9 +13,10 @@
 - Phase 1 的 D1 主链与历史只读入口已接通：core 的不可构造读取证明、volume 的 descriptor/mount 复核、Store 的 session-bound 不可变观察与阶段封印由唯一 runtime 适配；历史 catalog 受 owner-window 有界门控制，详细证据只通过窗口绑定 result token 读取有界游标页，不传整库报告，也不把封存路径当作当前权限。
 - 已完成重复成员的文件系统 birth/mtime 展示并保留卷精度未知状态；它们明确是低可信线索，不冒充拍摄时间。
 - 已完成 [拍摄时间证据契约](./engineering/CAPTURE_TIME_EVIDENCE.md)的只读主链：descriptor-bound 双重 metadata 提取、时间策略与原始证据封印、候选/成员/问题分页，以及报告→字段→单字段原始字节的三级懒加载复核。keeper、time donor 与任何写授权均保持为空或关闭。
-- 已实现同一进程、同一次打开期间的枚举暂停/继续：v8 Store 保存 append-only 审计 checkpoint、runtime lease 和持久控制请求，但 checkpoint 不恢复 descriptor、目录 walker 或文件系统权限。窗口退出、进程重启或挂载变化会取消/中断当前 run，后续跨进程恢复必须重新选择根并建立新 attempt。
+- 已实现同一进程、同一次打开期间的枚举暂停/继续：v8 Store 保存 append-only 审计 checkpoint、runtime lease 和持久控制请求，但 checkpoint 不恢复 descriptor、目录 walker 或文件系统权限。窗口退出、进程重启或挂载变化会取消/中断当前 run，暂停仍不可跨进程继续。
+- v9 fresh-attempt 已接入并通过自动化门禁：用户重新选择根后，只有同一逻辑文件系统 UUID、精确原生根字节和完全相同配置的唯一合格候选，才在同一 job 下建立 `fresh_full_child_v1`。子 attempt 使用全新 volume/core/mount session 和 lease，并从根开始全量重扫；它不恢复 fd/cursor/checkpoint/token，也不继承父 run 的 observation/fingerprint/group/seal，不证明同一物理盘或目录对象。候选为零或有歧义时建立独立 `initial_full_v1` job。
 - 已实现历史只读 JSON/CSV 导出：范围为 `summary` 或仅含 D1 摘要、确定重复组、成员及扫描问题的 `complete_evidence`；默认脱敏，可显式选择 display 投影，不导出拍摄时间明细、raw metadata 或 locator。Unix 以目录句柄和 no-replace 发布，非 Unix 当前 fail closed。
-- 仍在后续门槛中：跨进程新 attempt 恢复链、掉盘重连体验和真实 APFS/HFS+/exFAT 外置卷矩阵。
+- 仍在后续门槛中：掉盘重连完整体验和真实 APFS/HFS+/exFAT 外置卷的拔插、重挂、同名替换及克隆 UUID 矩阵；自动化临时卷测试不能替代真实介质验收。
 - 尚未开放：任何时间写入、隔离、恢复或永久清理。相关 SQL 只是一份受测试的安全契约，不是可执行写能力。
 - 本轮复核记录：[engineering/M0_REVIEW.md](./engineering/M0_REVIEW.md)。
 
@@ -81,7 +82,7 @@
 
 - 扫描根选择、重叠目录去重、挂载边界与默认排除；
 - 流水线：大小分桶、分段快速指纹、流式 BLAKE3；
-- 本机 SQLite 增量索引、同进程枚举暂停/继续；跨进程或重新挂载后的恢复必须重新授权根并建立新 attempt；
+- 本机 SQLite 增量索引、同进程枚举暂停/继续；跨进程或重新挂载后必须重新授权根，唯一精确候选只建立同 job 的新全量 child attempt，零/歧义候选建立独立 initial job；
 - D1 重复组、路径/大小/时间对比和 keeper 建议；
 - 基础 EXIF/QuickTime/sidecar 时间提取，原始值与置信度留档；
 - 只读卷信息与未经写探测的风险提示；
@@ -93,7 +94,7 @@
 - 基准语料 D1 召回率和准确率 100%；
 - 文件名、时间或快速指纹碰撞不会产生 D1；
 - 旋转硬盘与 SSD 上均无失控并发，单文件内存使用为常数级；
-- 同进程暂停/继续不丢失或越权提升证据；后续跨进程新 attempt、重新插入原卷与同名替换卷拒绝路径需通过真实介质门禁；
+- 同进程暂停/继续不丢失或越权提升证据；v9 fresh-attempt 必须证明新 session/全量起点、旧证据不复用、零/歧义候选 fail closed；重新插入逻辑卷与替换介质路径仍需通过真实介质门禁；
 - 损坏媒体只影响自身解析，不影响哈希主进程；
 - 用户可完整理解 keeper 建议和 time donor 建议是两个决策；
 - 发布为 Preview Read-only。

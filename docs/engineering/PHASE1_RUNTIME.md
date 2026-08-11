@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | 分阶段实施中；持久化 D1、时间证据、Tauri 有界复核、同进程枚举暂停/继续与历史 JSON/CSV 导出已接通；跨进程新 attempt 恢复和真实外置卷矩阵待完成 |
+| 状态 | 分阶段实施中；v9 fresh-attempt 已通过自动化门禁，真实外置卷矩阵待验证 |
 | 最近更新 | 2026-08-11 |
 | 适用路线图 | [Phase 1：只读精确扫描 MVP](../ROADMAP.md#4-phase-1只读精确扫描-mvp) |
 | 写能力 | 无；本阶段不移动、不重命名、不改时、不隔离、不删除照片 |
@@ -17,7 +17,7 @@
 Phase 1 的目标是安全交付以下只读能力：
 
 - 持久化、分页、常数级单文件内存的 D1 字节完全相同扫描；
-- 同一进程、同一次打开期间的枚举暂停/继续、合作式取消，以及掉盘和进程重启后的 fail-closed 解释；
+- 同一进程、同一次打开期间的枚举暂停/继续、合作式取消，以及掉盘和进程重启后重新选根、从根全量开始的 fresh attempt；
 - 强卷身份上的受控增量索引复用；
 - 有界 EXIF / QuickTime 元数据提取和时间证据分析；
 - 不经 IPC 传输整份大型扫描报告；
@@ -34,7 +34,7 @@ Tauri command 或 UI 入口。
 
 ## 2. 原始基线与当前进展
 
-本节 2.1–2.5 保留方案制定时的差距分析，不代表当前缺口。当前代码已经完成 core 流式票据与枚举 stepper、volume 当前挂载夹持、Store v8 认证证据/runtime lease/控制请求/暂停审计 checkpoint、runtime D1/时间封印，以及 Tauri 轻量状态、有界证据复核和历史导出；仍未完成的部分以第 11 节和路线图为准。
+本节 2.1–2.5 保留方案制定时的差距分析，不代表当前缺口。当前代码已经完成 core 流式票据与枚举 stepper、volume 当前挂载夹持、Store v8 runtime control 基础和 v9 fresh-attempt、runtime D1/时间封印，以及 Tauri 轻量状态、有界证据复核和历史导出；fresh-attempt 自动化门禁已通过，仍未完成的真实介质验收以第 11 节和路线图为准。
 
 ### 2.1 `guiying-core`
 
@@ -100,7 +100,7 @@ job/run 乐观状态版本。
 
 ### 2.5 Tauri 与前端
 
-原始 Tauri 任务注册表只存在于进程内，并返回 `Arc<ScanReport>`。当前已改为 SQLite 是证据真相源，事件和 `get_scan_status` 只发送轻量摘要；重复组、成员、扫描问题、时间摘要/候选/成员/问题，以及封印 metadata 报告/字段/单字段原始详情都由上下文绑定的有界接口读取。历史目录通过真正的只读 EvidenceReader 与窗口绑定 result token 复核，封存 display path 不恢复文件系统权限。目录枚举可在同一 live worker 中暂停/继续，历史 D1 可按限定范围导出 JSON/CSV。应用进程重启会令旧挂载会话失效并中断非终态 run；跨进程恢复仍必须重新授权根并建立新 attempt。
+原始 Tauri 任务注册表只存在于进程内，并返回 `Arc<ScanReport>`。当前已改为 SQLite 是证据真相源，事件和 `get_scan_status` 只发送轻量摘要；重复组、成员、扫描问题、时间摘要/候选/成员/问题，以及封印 metadata 报告/字段/单字段原始详情都由上下文绑定的有界接口读取。历史目录通过真正的只读 EvidenceReader 与窗口绑定 result token 复核，封存 display path 不恢复文件系统权限。目录枚举可在同一 live worker 中暂停/继续，历史 D1 可按限定范围导出 JSON/CSV。应用进程重启会令旧挂载会话失效并中断非终态 run；重新选根后只能建立新的全量 attempt，不能恢复旧暂停点。
 
 ## 3. 双键信任模型
 
@@ -149,7 +149,7 @@ stable namespace/path key 用于：
 
 ### 3.2 Strong 与 Weak volume identity
 
-只有 `Strong` volume identity 可以跨 mount session 关联 job、root scope 或缓存候选。
+只有 `Strong` logical-filesystem identity 才能成为跨 mount session 关联 job/root scope 或缓存 hint 的先决条件，但两种能力必须分开授予。强 UUID 不证明同一物理盘，也不证明同一目录对象；克隆 UUID 不能在这一身份层中区分。
 
 `Weak` identity 的规则是：
 
@@ -159,11 +159,13 @@ stable namespace/path key 用于：
 - 旧 fingerprint 和 group 只能作为历史展示，不能参与当前候选裁剪；
 - 若之后从 weak 升级为 strong，也不能追溯性提升旧观察的可信度，必须重新扫描。
 
-对应 namespace profile 应保存 `reuse_scope`：
+对应 volume profile 暴露三种范围：
 
 ```text
-cross_session | current_session_only
+cross_session | fresh_attempt_only | current_session_only
 ```
+
+`fresh_attempt_only` 要求强逻辑身份、已知且不矛盾的大小写行为，并只使用 `ExactNativeV1` 原生字节；Unicode normalization 未知时不得升级为历史证据复用。Store v9 仍以 `cross_session` 表达可跨 session 建立血缘的 namespace，再以不可变 `namespace_reuse_policies` 精确区分 `fresh_attempt_only` 和 `evidence_reuse_eligible`；缺少 policy 时两者均 fail closed。
 
 ### 3.3 Ephemeral capability/session binding
 
@@ -217,7 +219,7 @@ volume 层应：
 无法获得可信 mount-relative scope 时，当前 session 仍可只读扫描，但 job 必须标为
 `current_session_only`，不得跨 session 恢复。
 
-## 4. SQLite v4 到 v8
+## 4. SQLite v4 到 v9
 
 ### 4.1 新的规范化绑定
 
@@ -316,9 +318,15 @@ checkpoint 或终态。控制请求按 run 单调排序，cancel 可 supersede p
 
 自动迁移快照不再使用只适合 v7 的文件名或判断。任何低于 embedded latest schema 的受管
 数据库都会先生成精确源版本、no-clobber 的
-`.guiying-pre-migration-from-v<source>-to-v<target>-*.sqlite3` 快照，再迁移；v7→v8 与更早版本
+`.guiying-pre-migration-from-v<source>-to-v<target>-*.sqlite3` 快照，再迁移；所有旧版本到 embedded latest
 使用同一套 pre-migration 安全协议。快照用于数据库恢复，不包含也不会恢复媒体 descriptor、
 root token 或 mount session。
+
+### 4.4 v9 fresh-attempt policy 与血缘
+
+v9 新增 `namespace_reuse_policies`，把只允许新 attempt 血缘的 `fresh_attempt_only` 与可作为 fingerprint hint 先决条件的 `evidence_reuse_eligible` 分开。`find_fingerprint_hint` 必须显式匹配后者并保留时间粒度等既有门槛；本轮 fresh-attempt runtime 不调用该 hint。合法 v8 cross-session profile 在迁移时保存为 `evidence_reuse_eligible`，而 Unicode 行为未知的新 profile 只能得到 `fresh_attempt_only`。
+
+`scan_runs.attempt_strategy` 对 v9 新 run 强制 `initial_full_v1` 或 `fresh_full_child_v1`，两者均要求 `scan_mode='full'`；后者必须指向同 job 中无 active lease 的 interrupted parent。迁移前的 run 保留 `legacy`，不能被选为 fresh parent。选择器只在同一逻辑 filesystem UUID、namespace、精确原生根字节/编码、stable/root-scope key 和配置下接受唯一候选；None 或 Ambiguous 一律创建独立 initial job。
 
 ## 5. Normalized observation 与 fingerprint
 
@@ -559,10 +567,7 @@ checkpoint 的作用是证明“哪个 worker 在哪一份证据和计数上确�
 root token、mount session 或文件系统授权。
 
 文件 descriptor 和目录 walker 不能跨进程序列化。窗口退出、进程重启或挂载变化后，当前
-run 必须 cancelled/interrupted。后续跨进程恢复链只能重新选择并 bind 原卷/原 root，建立
-新的 capability/mount/core session 和新 attempt，从根重新枚举；是否以及如何受控复用旧
-观察/指纹仍需通过后续实现与真实外置卷门禁。旧 checkpoint cursor 不能用于打开路径、跳过
-root-fd 复核或直接 finalize 旧 run 的 draft。
+run 必须 cancelled/interrupted。用户重新选根后，v9 只在同一逻辑 filesystem UUID + 精确原生根范围的合格候选唯一时建立同 job 的 `fresh_full_child_v1`；否则建立独立 `initial_full_v1` job。两条路径都创建新 capability/mount/core session 和 lease，从根全量重扫。旧 checkpoint cursor、fd、root token、observation、fingerprint、group 和 seal 不作为新 run 权限，fresh-attempt 路径也不调用 fingerprint hint。
 
 ### 8.2 状态和 fallback
 
@@ -577,7 +582,9 @@ root-fd 复核或直接 finalize 旧 run 的 draft。
 | 根、挂载或卷变化 | job failed + run interrupted，错误码 `VOLUME_UNAVAILABLE` 等 | 当前 worker 不得继续；后续需新 attempt |
 | 进程崩溃或重启且 pending cancel | 释放旧 lease，收敛为 cancelled/cancelled | 保留已确认取消意图，不恢复 descriptor |
 | 进程崩溃或重启且 pending pause/resume | 释放旧 lease，活跃 run 转 interrupted | 控制请求记 interrupted；checkpoint 不授予续扫 |
-| 进程崩溃或重启且无 pending control | 释放旧 lease，活跃 run 转 interrupted | 后续跨进程新 attempt 恢复仍待完成 |
+| 进程崩溃或重启且无 pending control | 释放旧 lease，活跃 run 转 interrupted | 不自动续扫；等待用户重新选根 |
+| 重新选根且唯一 v9 精确候选 | parent 保持 interrupted，同 job 的 child 转 running | 新 session/lease，从根全量扫描 |
+| 重新选根且候选为 None/Ambiguous | 原 job 不变，独立 initial job/run 转 running | 不猜测血缘 |
 | SQLite 损坏或 schema 不符 | 不猜状态，应用进入只读错误页 | 从验证备份恢复或人工处理 |
 
 v8 启动收敛顺序：
@@ -703,8 +710,8 @@ start_scan({ rootToken })
 
 native dialog 返回的 `PathBuf` 保留在 Rust token registry。token 必须随机、有限期、
 单进程且绑定 owner window；过期、跨进程、已消费或 window 不匹配都拒绝。这样非 UTF-8
-root 不会在 JS IPC 中丢失。后续跨进程恢复仍要求用户重新选择 root，再由 fresh session
-复核 stable volume/root scope 并建立新 attempt；当前不会从旧 token 恢复权限。
+root 不会在 JS IPC 中丢失。跨进程后仍要求用户重新选择 root，再由 fresh session
+复核 stable logical volume/root scope 并建立新的全量 attempt；不会从旧 token 恢复权限。
 
 ### 10.3 分页命令
 
@@ -869,7 +876,7 @@ fmt、all-target tests 和 rustdoc，并运行 macOS volume integration tests。
 ### 11.3 `feat(runtime): persist and recover read-only scans`
 
 实施状态：D1 持久运行时、v8 runtime lease/control/checkpoint 与同进程枚举暂停/继续已完成；
-跨进程新 attempt 恢复和真实掉盘重连门禁仍待后续。
+v9 唯一精确候选的 fresh-full child 已接入并通过自动化门禁；真实掉盘重连体验和外置卷矩阵仍待完成。
 
 内容：
 
@@ -900,6 +907,7 @@ fmt、all-target tests 和 rustdoc，并运行 macOS volume integration tests。
 - 双进程 lease；
 - stale active run reconciliation；
 - Weak volume 恢复拒绝。
+- v9 legacy 不提权、唯一/None/Ambiguous 候选、精确原生根字节匹配、fresh child 新 session 与证据从零开始、hint 不调用。
 
 验收：runtime + store/core/volume 全部 MSRV gate，并运行故障注入集成测试。
 
@@ -944,7 +952,7 @@ tests 和 rustdoc。
 - 小状态 DTO；
 - groups/members/issues/time 分页；
 - 删除完整 report IPC；
-- UI 有界页替换、历史入口与同进程枚举暂停/继续已完成；虚拟列表、跨进程新 attempt 恢复与掉盘专用页仍待完成；
+- UI 有界页替换、历史入口与同进程枚举暂停/继续已完成；fresh child 的不透明 attempt kind 和“从根全量重扫”披露已通过自动化门禁，虚拟列表、真实介质验收与掉盘专用页仍待完成；
 - Preview Read-only release QA。
 
 安全不变量：
@@ -971,7 +979,7 @@ pnpm tauri build
 
 ### 11.6 `feat(history): authorize immutable result reads`
 
-实施状态：已完成；最初建立于 schema v7，当前 reader 严格验证 embedded latest schema v8。
+实施状态：已完成；最初建立于 schema v7，当前 reader 严格验证 embedded latest schema v9。
 
 内容：
 
@@ -1028,7 +1036,7 @@ verified groups、members 与 scan issues，不含拍摄时间明细、raw metad
 - EvidenceReader 首开会在 64 GiB 文件族/逻辑上限内执行 quick/FK 与完整 manifest 重算，目前没有 wall-clock deadline、取消或进度回调；它不复制整库到内存，但损坏或超大私有数据库仍可能造成较长首开延迟。
 - app-data 进程锁与 SQLite 身份已做 owner/mode/nlink、NOFOLLOW 和路径前后复核，但还不是目录 handle/openat 到 SQLite 已开句柄的全链绑定；同 UID 恶意路径替换属于后续本机硬化，当前依赖 0700 私有目录和单实例所有权。
 - Windows Store 的既有数据库读取仍 fail closed，desktop runtime-lock 也没有原生 Windows CI；项目保持 macOS-first，不能把交叉编译或离线 Windows 路径模型宣传成可用后端。
-- pause checkpoint 不支持跨进程恢复；窗口退出、进程重启或挂载变化后必须取消/中断当前 run，跨进程新 attempt 恢复仍是后续能力。
+- pause checkpoint 不支持跨进程恢复；窗口退出、进程重启或挂载变化后必须取消/中断当前 run。v9 fresh child 只保留血缘并从根全量扫描；自动化门禁已通过，但它不证明同一物理介质，真实外置卷矩阵仍待验证。
 - 历史导出 v1 不含拍摄时间明细、raw metadata 或 locator；非 Unix 发布在具备等价目录句柄与 no-replace 证明前 fail closed。
 - Phase 1 不创建隔离目录、不修改照片时间、不移动或删除照片；M2 写能力必须另行设计、
   审计和授权。

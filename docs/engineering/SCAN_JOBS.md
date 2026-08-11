@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | Implemented for read-only scan runtime |
+| 状态 | 同次打开的只读控制与 v9 fresh-attempt 自动化门禁已实现；真实外置卷矩阵待验收 |
 | 最近更新 | 2026-08-11 |
 | 写能力 | 无；本协议只控制只读扫描 |
 
@@ -24,6 +24,12 @@
 - 核心在安全检查点观察取消。未完成的阶段不封印，草稿组不可见；Tauri 只返回取消摘要，不把未完成覆盖复核的证据提升为 D1 结果。
 - 重复暂停、继续和取消按当前状态幂等或明确拒绝；任务完成后，活动槽位一定释放。
 - 窗口关闭或销毁时只取消属于该窗口的活动任务；窗口退出不提供续扫权限。
+
+## 重新选择后的 fresh attempt
+
+v9 只恢复 job/run 血缘，不恢复扫描进度或文件系统权限。用户重新选择根后，必须建立全新 volume/core/mount session 和 runtime lease。只有同一强逻辑 filesystem UUID、精确原生根字节/编码、stable root/root scope key 和扫描配置的合格候选恰好一个时，才在同一 job 下建立 `scan_mode='full'` 的 `fresh_full_child_v1`。候选为 None 或 Ambiguous 时建立独立 `initial_full_v1` job，不按时间、行 ID 或 display path 猜测。v8 迁移来的 `legacy` run 永不自动提权。
+
+child 始终从根全量枚举，计数和证据从零开始；旧 fd、walker、cursor、checkpoint、root token、observation、fingerprint、group 和 seal 不复制。`namespace_reuse_policies` 把只允许这种血缘的 `fresh_attempt_only` 与可能允许历史 hint 的 `evidence_reuse_eligible` 分开；fresh-attempt 链不调用 `find_fingerprint_hint`。这些匹配只证明同一逻辑文件系统标识和精确原生根范围，不证明同一物理盘或同一目录对象。Tauri 只公布 `initial_full` / `fresh_full_child` 展示值；该链仍无任何照片写能力。
 
 ## 事件与持久化结果边界
 
@@ -58,7 +64,7 @@
 
 ## 当前限制
 
-- 暂停/继续只覆盖目录枚举，并要求同一进程、同一次打开、同一 live descriptor/mount/core session。窗口退出、进程重启或挂载变化会使当前 run cancelled/interrupted；后续必须重新选择根并建立新的 descriptor-bound attempt。跨进程恢复链仍是后续工作。
+- 暂停/继续只覆盖目录枚举，并要求同一进程、同一次打开、同一 live descriptor/mount/core session。窗口退出、进程重启或挂载变化会使当前 run cancelled/interrupted；后续必须重新选择根并建立新 descriptor-bound attempt。fresh child 只保留血缘，不改变“退出后 pause 不可续”。
 - checkpoint 只证明某次 pause 在哪个 generation、计数和证据 manifest 上被确认；它不能被反序列化为目录 walker、文件 descriptor、root token 或跳过复核的可信缓存。
 - 历史目录中的 root display 只是封存文本，不是可打开路径、root token 或当前目录授权；从历史结果发起新扫描必须重新使用原生目录选择器。
 - 取消无法抢占正在阻塞的内核读取；故障盘、网络卷或 FUSE 读取不返回时，界面只能说明“等待当前读取返回”。不可信解析器与文件系统的硬超时需要后续独立工作进程。
@@ -69,3 +75,5 @@
 ## 回归门禁
 
 Rust 测试必须覆盖：单任务/单实例互斥、暂停 flush 边界、checkpoint generation/manifest、旧 resume 拒绝、暂停中取消优先、重启时 pending control 收敛、取消幂等、最终复核取消点、取消终态、失败序列化、终态确认门、owner 窗口清理、进度节流、历史资格、只读 reader 无迁移、result token owner/TTL/generation、pending/in-flight 请求硬上限、游标长度/上下文，以及真实临时文件从 runtime 封印到历史分页。导出测试还必须覆盖 summary/complete_evidence 的精确范围、redacted/display 投影、JSON/CSV 逻辑等价、预算/取消/超时、token owner/context、目标已存在、目录/临时文件置换和 no-replace 发布。前端测试还需覆盖短暂状态查询失败和恢复、暂停/继续/取消竞态、历史空态/分页/精确失败重试、异步打开后卸载撤销、display-only 范围、分页替换、上一页、双击抑制、取消态锁定和终态适配失败后的任务确认；真实阻塞 I/O 与外置卷矩阵需要故障注入环境。
+
+v9 自动化门禁已证明唯一精确候选、None/Ambiguous 独立 job、不同扫描配置不关联、新 session/lease、全量起点、父 run 观察/指纹/分组/封印不继承、hint 不调用、v8 legacy 不提权，以及 UI 对尝试类型的严格适配。真实外置卷拔插、重挂、同名替换和克隆 UUID 仍需专门介质验收。

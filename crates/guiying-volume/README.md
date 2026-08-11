@@ -25,9 +25,15 @@ target-volume write APIs.
   nonce: it is derived from the volume identity and observed native path
   semantics. `cross_session` requires a `Strong` identity plus fully known,
   internally consistent case behavior and fully known Unicode normalization.
-  Otherwise the scope is `current_session_only`. The current macOS backend
-  reports Unicode normalization as `Unknown`, so even a strong UUID remains
-  current-session-only. A UUID by itself never authorizes access or a write.
+  `fresh_attempt_only` requires the same strong identity and known, internally
+  consistent case behavior but permits Unicode normalization to remain
+  `Unknown`. It allows only a fresh, full child lineage after independently
+  matching the same logical filesystem UUID and exact native selected-root
+  bytes. It does not prove the same physical medium or directory object,
+  establish Unicode/case alias equivalence, reuse a fingerprint hint, open a
+  file, or continue a persisted cursor. Weak identity or unknown/contradictory
+  case behavior remains `current_session_only`. A UUID by itself never
+  authorizes access or a write.
 - The selected root is exposed as lossless mount-relative bytes, a versioned
   stable root path key, and a domain-separated `RootScopeKey`. The root scope
   includes the stable volume identity, namespace profile, native encoding, and
@@ -45,8 +51,9 @@ target-volume write APIs.
 - `BoundVolumeSession::relative_path` returns a `BoundMediaPath` containing a
   non-serializable `RootRelativePath` locator bound to the exact live mount
   session and a `MountRelativePath` stable namespace address. This binding is
-  required for every identity/scope, including future cross-session profiles.
-  `open_regular_file` and `verify_directory` accept only `BoundMediaPath`;
+  required for every identity/scope, including `fresh_attempt_only` and
+  `cross_session`. `open_regular_file` and `verify_directory` accept only
+  `BoundMediaPath`;
   persisted or caller-constructed `MountRelativePath` values are untrusted
   evidence and can never be passed to an open API.
 - `ReadOnlyFile::verify_unchanged` first rejects a different mount-session key,
@@ -90,12 +97,15 @@ rebind the resulting path before it becomes trusted evidence.
 
 ## Deliberate limitations
 
-- A weak identity, or any profile with incomplete case/Unicode evidence, is
+- A weak identity, or any profile with unknown/contradictory case evidence, is
   suitable for a current-session read-only scan observation, not automatic
-  reuse after rebinding.
+  reuse after rebinding. Unknown Unicode normalization on a strong identity
+  with known case behavior permits only `fresh_attempt_only`, never broader
+  cross-session reuse.
 - Unicode normalization behavior remains `Unknown`; the current key strategy
-  hashes exact native bytes. It never guesses equivalence from a filesystem
-  name.
+  hashes exact native bytes. A fresh attempt must rebuild full child evidence
+  from exact native root/path bytes; it never guesses equivalence from a
+  filesystem name.
 - macOS currently supplies no reliable read-only observation of actual
   filesystem timestamp precision, so `timestamp_granularity_ns` is `None`.
   `*_nanoseconds` stat fields preserve returned values but do not imply one-

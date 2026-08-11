@@ -38,8 +38,15 @@ and wakes a paused worker without manufacturing a resume transition.
 This checkpoint is durable audit evidence, not serialized traversal authority.
 It cannot recreate a directory walker, descriptor, root token, or mount session.
 Window exit, process restart, or mount change cancels or interrupts the current
-run; any future cross-process continuation must reselect and bind the root and
-create a fresh attempt.
+run. After the user reselects the root, the runtime creates a new volume/core/
+mount session and lease. Exactly one version-9 candidate with the same strong
+logical-filesystem identity, exact native root scope, and configuration may
+receive a `fresh_full_child_v1` under the same logical job; no or ambiguous
+candidates create a separate `initial_full_v1` job. Both start a full scan at
+the root. A child copies no cursor, checkpoint, token, observation, fingerprint,
+group, or seal and does not call the fingerprint-hint API. Migrated version-8
+`legacy` runs are never promoted. This proves neither the same physical medium
+nor the same directory object, and it does not make pause resumable after exit.
 
 Before either core read starts, the adapter opens the same lossless locator
 through the bound volume session and matches its stable path, physical file
