@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | 分阶段实施中；持久化 D1、时间证据与 Tauri 有界复核主链已接通，暂停恢复、历史与导出待完成 |
+| 状态 | 分阶段实施中；持久化 D1、时间证据、Tauri 有界复核与历史只读入口已接通，暂停恢复与导出待完成 |
 | 最近更新 | 2026-08-11 |
 | 适用路线图 | [Phase 1：只读精确扫描 MVP](../ROADMAP.md#4-phase-1只读精确扫描-mvp) |
 | 写能力 | 无；本阶段不移动、不重命名、不改时、不隔离、不删除照片 |
@@ -100,7 +100,7 @@ job/run 乐观状态版本。
 
 ### 2.5 Tauri 与前端
 
-原始 Tauri 任务注册表只存在于进程内，并返回 `Arc<ScanReport>`。当前已改为 SQLite 是证据真相源，事件和 `get_scan_status` 只发送轻量摘要；重复组、成员、扫描问题、时间摘要/候选/成员/问题，以及封印 metadata 报告/字段/单字段原始详情都由上下文绑定的有界接口读取。应用进程重启会令旧挂载会话失效并中断非终态 run；历史结果浏览、真正的持久化暂停恢复与导出仍待接入。
+原始 Tauri 任务注册表只存在于进程内，并返回 `Arc<ScanReport>`。当前已改为 SQLite 是证据真相源，事件和 `get_scan_status` 只发送轻量摘要；重复组、成员、扫描问题、时间摘要/候选/成员/问题，以及封印 metadata 报告/字段/单字段原始详情都由上下文绑定的有界接口读取。历史目录通过真正的只读 EvidenceReader 与窗口绑定 result token 复核，封存 display path 不恢复文件系统权限。应用进程重启会令旧挂载会话失效并中断非终态 run；真正的持久化暂停恢复与导出仍待接入。
 
 ## 3. 双键信任模型
 
@@ -551,12 +551,12 @@ verified group 或产品策略指定的媒体进入第 9 节的 pinned-source �
 | 用户放弃恢复 | guarded job-only failed → cancelled | 旧 interrupted run 保留 |
 | SQLite 损坏或 schema 不符 | 不猜状态，应用进入只读错误页 | 从验证备份恢复或人工处理 |
 
-需要增加：
+持久化暂停恢复仍需增加：
 
 - `queued/queued -> failed/interrupted` 恢复边；
 - guarded `failed -> cancelled` job-only 边，且 active run 必须已 terminal；
 - `scan_control_requests`，持久化 cancel/pause 请求和幂等 key；
-- app-private process lock 与 DB runtime lease；
+- run-level DB runtime lease；app-private process lock 已由桌面进程在任何 Store/EvidenceReader 打开前持有；
 - heartbeat 用于诊断和 stale-state 识别，不替代 OS 进程锁。
 
 启动恢复顺序：
@@ -688,21 +688,22 @@ scope 匹配旧 job。
 
 ### 10.3 分页命令
 
-建议命令面：
+当前命令面分为控制权与证据读取权：
 
 ```text
-start_scan
-pause_scan
-resume_scan
-cancel_scan
-get_scan_job
-list_scan_jobs
-get_scan_run_summary
-list_duplicate_groups
-list_duplicate_group_members
-list_scan_issues
-get_group_time_analysis
-list_time_evidence_fields
+select_scan_root -> rootToken
+start_scan(rootToken) -> jobId
+cancel_scan(jobId)
+get_scan_status(jobId) -> historyEntryId on completion
+acknowledge_scan(jobId)
+
+list_scan_history(cursor)
+open_scan_history(historyEntryId) -> resultReadToken
+close_result_read(resultReadToken)
+list_duplicate_groups(resultReadToken, cursor)
+list_duplicate_group_members(resultReadToken, groupId, cursor)
+list_scan_issues(resultReadToken, cursor)
+list_capture_time_*(resultReadToken, ...)
 ```
 
 停止注册：
@@ -711,8 +712,17 @@ list_time_evidence_fields
 - 带 `report` 字段的 `get_scan_status`；
 - 仅为释放大型内存报告而存在的旧 `acknowledge_scan` 语义；当前同名命令只解除下一任务并发门，不删除持久化证据。
 
-状态事件只含 job/run key、state/version、stage、decimal-string counters 和有界 display
-path。事件丢失由 durable status 查询兜底。
+状态事件只含 job ID、stage、decimal-string counters 和有界 display path。job ID 只控制当前
+进程任务，绝不授权历史证据读取；事件丢失由 durable status 查询兜底。
+
+### 10.3.1 历史结果读取边界
+
+- 桌面进程在任何 Store/EvidenceReader 前取得应用数据目录的进程级 OS 锁；锁持有到进程退出。
+- EvidenceReader 只以 `READ_ONLY | NOFOLLOW`、`query_only` 打开当前 schema，不执行迁移、WAL 配置、优化或 stale-session reconciliation。
+- 历史目录要求 completed job/run、exact-verification seal 与 terminal complete/partial coverage。时间阶段可独立为 complete、partial、not_run、unavailable 或 failed。
+- `historyEntryId` 只是 selector；只有重新验证后签发的随机、owner-window 绑定、限时 `resultReadToken` 才是读取授权。
+- token 绑定 database scope、reader instance 与 typed run context。每 token 单飞，catalog/open 请求也有同步 pending/in-flight 硬上限；窗口关闭、过期、重签或显式 close 会撤销，阻塞查询返回前再次复核 generation。
+- root display、cursor 与 DTO 都不能被用作路径或权限。历史读取不会打开用户媒体。
 
 ### 10.4 Cursor 与 DTO
 
@@ -729,7 +739,7 @@ SQLite ID、字节数、文件计数和 Unix 时间通过 IPC 时使用十进制
 53 位整数精度丢失。列表 DTO 只返回摘要；raw metadata field 仅由单独有界分页 endpoint
 按需读取。
 
-## 11. 五个独立提交
+## 11. 分阶段独立提交
 
 ### 11.1 `feat(store): normalize session-bound scan evidence`
 
@@ -885,7 +895,7 @@ tests 和 rustdoc。
 - 小状态 DTO；
 - groups/members/issues/time 分页；
 - 删除完整 report IPC；
-- UI 有界页替换已完成；虚拟列表、历史/重启入口与掉盘专用页仍待完成；
+- UI 有界页替换与历史/重启入口已完成；虚拟列表、持久化暂停恢复与掉盘专用页仍待完成；
 - Preview Read-only release QA。
 
 安全不变量：
@@ -910,6 +920,35 @@ cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets
 pnpm tauri build
 ```
 
+### 11.6 `feat(history): authorize immutable result reads`
+
+实施状态：已完成，且不改变 schema v7。
+
+内容：
+
+- Store `EvidenceReader` 的真正只读打开、历史目录、point resolve 与 typed context 查询；
+- completed exact-sealed D1 的 complete/partial 覆盖历史，capture-time 五种独立状态；
+- 桌面进程级数据库锁、共享只读 reader、窗口绑定 `resultReadToken`；
+- pending/open/query 数量硬上限、单 token 单飞、窗口销毁 tombstone 与返回前 generation 门；
+- React 历史目录、精确失败游标重试、迟到打开撤销及 display-only 权限文案。
+
+安全不变量：
+
+- 进程锁先于任何可迁移 Store 或 EvidenceReader；
+- `historyEntryId`、job ID、display path 和 cursor 都不是证据读取或文件系统权限；
+- reader 不执行迁移、恢复、WAL 配置或写性 PRAGMA；
+- active run 不签发历史 token，窗口关闭或 token 撤销后的在途结果不交付；
+- 历史 D1 不依赖可选时间阶段成功，partial coverage 必须显式标记；
+- 硬链接别名不重复计入独立冗余副本。
+
+重点测试：
+
+- read-only open 无 migration/reconcile，hot journal/异常 sidecar/路径替换 fail closed；
+- 两条历史跨 reader reopen 游标续页、partial/time fallback、硬链接统计；
+- 第二进程与崩溃释放锁、owner/TTL/generation、pending/in-flight 上限；
+- window-close 排队打开、阻塞返回、token 重签与 active-run 竞态；
+- 历史空态、分页、失败精确重试、退出后迟到响应、axe 与截图全尺寸检查。
+
 ## 12. 已知风险与明确 fallback
 
 - volume backend 当前仅实现 macOS；Linux/Windows 继续 fail closed，不用路径字符串或
@@ -927,5 +966,9 @@ pnpm tauri build
   自动删除。
 - SQLite ID 和大计数超过 JavaScript 安全整数范围时必须继续使用 decimal-string DTO。
 - 时间 policy 的 EvidenceEligible 只是证据门，不是 filesystem mutation 授权。
+- 历史 catalog 的 `(finished_at_ms, run_id)` 当前没有专用 schema 索引；现实扫描次数下可接受，但大规模历史分页仍是后续 schema 性能债，不能通过取消查询预算来放宽安全检查。
+- EvidenceReader 首开会在 64 GiB 文件族/逻辑上限内执行 quick/FK 与完整 manifest 重算，目前没有 wall-clock deadline、取消或进度回调；它不复制整库到内存，但损坏或超大私有数据库仍可能造成较长首开延迟。
+- app-data 进程锁与 SQLite 身份已做 owner/mode/nlink、NOFOLLOW 和路径前后复核，但还不是目录 handle/openat 到 SQLite 已开句柄的全链绑定；同 UID 恶意路径替换属于后续本机硬化，当前依赖 0700 私有目录和单实例所有权。
+- Windows Store 的既有数据库读取仍 fail closed，desktop runtime-lock 也没有原生 Windows CI；项目保持 macOS-first，不能把交叉编译或离线 Windows 路径模型宣传成可用后端。
 - Phase 1 不创建隔离目录、不修改照片时间、不移动或删除照片；M2 写能力必须另行设计、
   审计和授权。

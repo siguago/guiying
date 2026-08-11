@@ -1,5 +1,5 @@
 归影 Tauri debug bundle 构建
-时间：2026-08-11T01:06:38+08:00
+时间：2026-08-11T17:43:13+08:00
 环境：Tauri CLI 2.11.4; Rust 1.92.0; macOS arm64
 
 命令：pnpm exec tauri build --debug
@@ -7,9 +7,12 @@
 
 结果：
 - beforeBuildCommand 的 TypeScript + Vite build 通过。
-- Rust dev profile 构建通过。
-- 新增的 start_scan、cancel_scan、acknowledge_scan、get_scan_status 与兼容 scan_directory 命令完成 Tauri codegen 和链接。
-- 生成 src-tauri/target/debug/bundle/macos/归影.app。
-- 生成 src-tauri/target/debug/bundle/dmg/归影_0.1.0_aarch64.dmg。
+- Rust dev profile 构建、Tauri command codegen 与链接通过。
+- command 面包含原生 root token、扫描控制、历史 catalog/open/close、重复与时间证据分页；没有 legacy
+  scan_directory，也没有移动、重命名、改时、删除、shell、HTTP 或 WebView 路径读取命令。
+- 生成 src-tauri/target/debug/bundle/macos/归影.app（约 43 MiB）。
+- 生成 src-tauri/target/debug/bundle/dmg/归影_0.1.0_aarch64.dmg（约 11 MiB）。
 
-说明：构建产物仅包含只读扫描任务控制；未注册文件写、shell 或网络 capability。
+说明：17:51 的前端-only result token 串行队列随后通过独立 TypeScript/Vite/Playwright 门禁；没有再次生成
+相同 Rust bundle。为响应磁盘治理，验收后已删除约 27 GiB 的可重建 target、bundle、dist 和测试缓存；
+源码、锁文件和证据未删除。最终集成构建由推送后的 CI 对当前提交复验。

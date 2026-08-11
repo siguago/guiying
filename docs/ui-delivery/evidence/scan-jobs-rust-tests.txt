@@ -1,15 +1,18 @@
-归影桌面扫描任务控制验证
-时间：2026-08-11T01:02:04+08:00
+归影 Phase 1 桌面任务、历史授权与单实例锁验证
+时间：2026-08-11T17:49:00+08:00
 环境：rustc/cargo 1.92.0; macOS arm64
 
-按 Tauri 工程门禁顺序执行：
-1. cargo clippy --fix --allow-dirty --allow-staged
-2. cargo clippy --all-targets -- -D warnings
-3. cargo fmt
-4. cargo test
+命令：
+1. cargo +1.92.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+2. cargo +1.92.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+3. cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features
+4. RUSTDOCFLAGS=-D warnings cargo +1.92.0 doc --locked --manifest-path src-tauri/Cargo.toml --no-deps
 
 退出码：全部为 0。
 
-结果：7/7 lib tests passed，main 与 doc tests passed，0 failed。
+结果：53/53 tests passed，fmt、strict clippy 与 rustdoc 均通过，0 failed。
 
-覆盖：单活动任务互斥、合作式取消与重复取消幂等、取消报告终态、失败状态结构化序列化、未确认终态阻断新任务、显式确认与幂等释放、owner 窗口关闭清理、阶段/时间/计数进度节流、旧任务进度隔离，以及大型报告通过 Arc 共享同一实例。
+覆盖：原生一次性 root token、单活动任务、合作式取消与回执解耦；历史 catalog、completed/exact/coverage
+资格门、持久 EvidenceReader、窗口绑定 result token、owner/TTL/generation/DB-scope 二次门、pending/in-flight
+硬上限、关闭窗口 tombstone、迟到结果丢弃；应用数据库进程锁先于 Store 打开，路径替换、第二实例和子进程
+崩溃释放均 fail closed。所有证据读取只接受 resultReadToken；jobId 仅用于当前进程控制。

@@ -1,10 +1,18 @@
-归影只读扫描核心验证
-时间：2026-08-11T01:02:04+08:00
-环境：rustc/cargo 1.92.0; macOS arm64
+归影只读流式扫描核心验证
+时间：2026-08-11T17:49:00+08:00
+环境：rustc/cargo 1.77.2; macOS arm64
 
-命令：cargo fmt --manifest-path crates/guiying-core/Cargo.toml -- --check && cargo clippy --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings && cargo test --manifest-path crates/guiying-core/Cargo.toml --all-features
-退出码：0
+命令：
+1. cargo +1.77.2 fmt --manifest-path crates/guiying-core/Cargo.toml --all -- --check
+2. cargo +1.77.2 clippy --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings
+3. cargo +1.77.2 test --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features
+4. RUSTDOCFLAGS=-D warnings cargo +1.77.2 doc --locked --manifest-path crates/guiying-core/Cargo.toml --no-deps
 
-结果：fmt 通过，clippy -D warnings 通过，34 tests passed（10 unit + 24 integration），0 failed；doc tests 通过。
+退出码：全部为 0。
 
-覆盖：root-fd 相对打开、祖先 symlink 置换、根/嵌套目录身份变化清空定案组、目录 `(device, inode)` 防循环并降级 partial、目录深度与宽目录句柄上限、直接/子级默认排除、非 UTF-8 路径无损 JSON 往返、硬链接不虚报空间、短读/超长读拒绝、抽样碰撞由完整哈希消解、同哈希桶逐字节等价类与唯一稳定 group id、扫描中替换排除、精确比较中的并发变化、不可读文件降级为 issue、取消与最终复核取消点返回不含 D1 组的安全部分报告、同内容不同名称和时间仍可成组。
+结果：59/59 tests passed（13 unit + 24 legacy scanner + 22 streaming），fmt、strict clippy 与 rustdoc 均通过。
+
+覆盖：root-fd/openat/no-follow 相对遍历、多根原始索引、非 UTF 路径、祖先与根替换、同步背压、批次和
+字节硬上限、取消/短读/读中变化；不可构造的 fresh/full/exact proof 绑定 current core session、root index、
+lossless root-relative locator 和完整 source signature。core 不提供移动、重命名、改时或删除 API，且不会把
+同设备根身份冒充稳定 mount 证明；持久化前仍由 volume/runtime 复核。

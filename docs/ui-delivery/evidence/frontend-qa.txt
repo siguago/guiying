@@ -1,19 +1,24 @@
 归影 Phase 1 前端与可访问性验证
-时间：2026-08-11T16:19:16+08:00
-环境：macOS 26.5.2 arm64; Node.js v26.5.0; pnpm 10.12.1
+时间：2026-08-11T17:51:31+08:00
+环境：macOS 26.5.2 arm64; Node.js v26.5.0; pnpm 10.34.5
 
-命令：pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui
+命令：pnpm exec tsc --noEmit && pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui
 退出码：0
 
 结果：
-- DTCG CSS export is current.
-- TypeScript + Vite production build passed; 1802 modules transformed.
+- TypeScript no-emit check and DTCG CSS export synchronization passed.
+- Vite production build passed; 1802 modules transformed.
 - Oxlint passed with no diagnostics.
-- Playwright desktop-chromium: 11 passed, 0 failed。
-- axe-core scanned landing, results and expanded raw-metadata states: 0 violations.
-- Keyboard-only test reached native-token directory selection, scan action and results.
-- Cursor paging, stale-response isolation, exact failed-page retry, terminal acknowledgement,
-  cancelled-result locking and three-level raw-metadata lazy loading passed.
-- Rendered evidence includes 1280x820, 1024x768, paged-result and expanded raw-metadata captures.
+- Playwright desktop-chromium: 13 passed, 0 failed.
+- axe-core scanned landing, results, historical catalog and expanded raw-metadata states: 0 violations.
+- Keyboard-only flow reached native-token directory selection, scan action and results.
+- Root authority, status recovery, history pagination/open/revocation, late-open cleanup, bounded group/member/issue pages,
+  exact failed-page retry, terminal acknowledgement, cancelled-result locking and three-level raw metadata all passed.
+- The real result-token single-flight fixture delayed every evidence request and observed maxInFlight=1, busyConflicts=0;
+  the shared frontend queue prevents member and time-summary effects from racing the native token permit.
+- Final browser evidence hashes are recorded in qa-evidence.json; tests were not rerun after those hashes were fixed.
 
-首轮曾发现对比度、可滚动详情焦点和目录对话框返回焦点问题；后续安全复核又发现路径字符串授权、结果回执锁死、分页并发/重试游标和 raw Base64/定位范围问题。上述问题均已修复。本记录对应一次性原生 root token、单任务控制、合作式停止、旧响应隔离、封印证据分页和 raw 详情 fail-closed 校验后的全量复跑；原生任务与 Store 状态机由 Rust 测试覆盖。
+首轮曾发现对比度、可滚动详情焦点和目录对话框返回焦点问题；后续安全复核又发现路径字符串授权、
+结果回执锁死、分页并发/重试游标、历史 display path 权限混淆、迟到历史 token、同 token 单飞冲突，
+以及 raw Base64/定位范围问题。上述问题均已修复。原生任务、EvidenceReader、result token 和 Store 状态机
+由独立 Rust 测试覆盖；当前环境未取得 Phase 1 原生窗口截图，因此浏览器视觉证据不冒充原生 WebView 证据。

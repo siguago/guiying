@@ -10,10 +10,10 @@
 
 - 已完成：产品/安全/文件系统/数据模型规范、设计系统与桌面证据界面、无主动变更的流式扫描核心、完整 BLAKE3 后逐字节 D1 定案、根句柄路径保护、可取消单任务桌面运行时、SQLite 安全迁移与自动化门禁。
 - 已完成基础层：有硬预算、路径无关、保留原始字节与定位符的 EXIF/TIFF/QuickTime 时间字段提取；所有结果均为未验证原始证据，不会直接升级为可信拍摄时间。
-- Phase 1 的 D1 主链已接通：core 的不可构造读取证明、volume 的 descriptor/mount 复核、Store 的 session-bound 不可变观察与阶段封印由唯一 runtime 适配；Tauri 和 React 只读取有界游标页，不传整库报告。
+- Phase 1 的 D1 主链与历史只读入口已接通：core 的不可构造读取证明、volume 的 descriptor/mount 复核、Store 的 session-bound 不可变观察与阶段封印由唯一 runtime 适配；历史 catalog 受 owner-window 有界门控制，详细证据只通过窗口绑定 result token 读取有界游标页，不传整库报告，也不把封存路径当作当前权限。
 - 已完成重复成员的文件系统 birth/mtime 展示并保留卷精度未知状态；它们明确是低可信线索，不冒充拍摄时间。
 - 已完成 [拍摄时间证据契约](./engineering/CAPTURE_TIME_EVIDENCE.md)的只读主链：descriptor-bound 双重 metadata 提取、时间策略与原始证据封印、候选/成员/问题分页，以及报告→字段→单字段原始字节的三级懒加载复核。keeper、time donor 与任何写授权均保持为空或关闭。
-- 正在实现：持久化暂停/恢复、历史结果、只读报告导出和真实外置卷矩阵。当前桌面取消仍是合作式停止，不等同于持久化暂停；应用重启会安全中断旧会话，而不会伪装成可无缝续扫的 checkpoint。
+- 正在实现：持久化暂停/恢复、只读报告导出和真实外置卷矩阵。当前桌面取消仍是合作式停止，不等同于持久化暂停；应用重启会安全中断旧会话，而不会伪装成可无缝续扫的 checkpoint。
 - 尚未开放：任何时间写入、隔离、恢复或永久清理。相关 SQL 只是一份受测试的安全契约，不是可执行写能力。
 - 本轮复核记录：[engineering/M0_REVIEW.md](./engineering/M0_REVIEW.md)。
 
