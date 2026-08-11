@@ -51,6 +51,7 @@ interface CoreScanResultSummary {
   fullHashBytesRead: string
   verifiedGroups: string
   verifiedMembers: string
+  redundantIndependentFiles: string
   comparedPairs: string
   comparedBytes: string
   logicalReclaimableBytes: string
@@ -62,6 +63,8 @@ interface CoreDuplicateGroupItem {
   groupKeyHex: string
   memberCount: string
   independentFileCount: string
+  sizeBytes: string
+  previewPath: string
   logicalReclaimableBytes: string
   finalizedAtUnixMs: string
 }
@@ -91,45 +94,32 @@ interface CoreResultPage<T> {
   nextCursor: string | null
 }
 
-const RESULT_PAGE_SIZE = 128
+const RESULT_PAGE_SIZE = 64
 const MEMBER_PAGE_SIZE = 256
-const MAX_UI_GROUPS = 2_000
-const MAX_UI_MEMBERS = 50_000
-const MAX_UI_ISSUES = 5_000
+const ISSUE_PAGE_SIZE = 128
 
 function formatFromPath(path: string): string {
   const extension = fileNameFromPath(path).split('.').at(-1)
   return extension?.toUpperCase() ?? '媒体'
 }
 
-function adaptGroup(
-  group: CoreDuplicateGroupItem,
-  members: CoreDuplicateGroupMemberItem[],
-): DuplicateGroup {
-  const sizeBytes = decimalToSafeNumber(members[0]?.sizeBytes ?? '0', '重复组文件大小')
+function adaptGroup(group: CoreDuplicateGroupItem): DuplicateGroup {
   const memberCount = decimalToSafeNumber(group.memberCount, '重复组成员数量')
   return {
     id: group.groupBuildId,
     hashPrefix: `组:${group.groupKeyHex.slice(0, 10)}…`,
-    mediaKind: members[0]?.displayPath.toLowerCase().match(/\.(mov|mp4|m4v|avi|mkv)$/)
+    previewName: fileNameFromPath(group.previewPath),
+    mediaKind: group.previewPath.toLowerCase().match(/\.(mov|mp4|m4v|avi|mkv)$/)
       ? 'video'
       : 'image',
-    format: formatFromPath(members[0]?.displayPath ?? ''),
-    sizeBytes,
+    format: formatFromPath(group.previewPath),
+    memberCount,
+    sizeBytes: decimalToSafeNumber(group.sizeBytes, '重复组文件大小'),
     reclaimableBytes: decimalToSafeNumber(
       group.logicalReclaimableBytes,
       '重复组逻辑可回收大小',
     ),
-    files: members.map((file, index) => ({
-      id: file.observationId,
-      name: fileNameFromPath(file.displayPath),
-      path: file.displayPath,
-      sizeBytes: decimalToSafeNumber(file.sizeBytes, '重复文件大小'),
-      isRecommendedKeeper: index === 0,
-      keeperReason: index === 0
-        ? '当前只按封印后的稳定顺序暂定；尚未解析内嵌拍摄时间与伴随资产'
-        : undefined,
-    })),
+    files: [],
     evidence: [
       {
         label: '拍摄时间',
@@ -159,94 +149,133 @@ async function adaptPersistentReport(
   if (result.schemaVersion !== 1) {
     throw new Error(`不支持持久化扫描结果版本 ${result.schemaVersion}；为避免误读证据，本次结果已拒绝显示。`)
   }
-  const groupRecords = includeEvidencePages
-    ? await readAllPages<CoreDuplicateGroupItem>(
-      'list_duplicate_groups',
-      { jobId },
-      RESULT_PAGE_SIZE,
-      MAX_UI_GROUPS,
-      '确定重复组',
-    )
-    : []
-  let memberTotal = 0
-  const duplicateGroups: DuplicateGroup[] = []
-  for (const group of groupRecords) {
-    const members = await readAllPages<CoreDuplicateGroupMemberItem>(
-      'list_duplicate_group_members',
-      { jobId, groupBuildId: group.groupBuildId },
-      MEMBER_PAGE_SIZE,
-      MAX_UI_MEMBERS - memberTotal,
-      '重复组成员',
-    )
-    memberTotal += members.length
-    duplicateGroups.push(adaptGroup(group, members))
-  }
-  const issueRecords = includeEvidencePages
-    ? await readAllPages<CoreScanIssueItem>(
-      'list_scan_issues',
-      { jobId },
-      MEMBER_PAGE_SIZE,
-      MAX_UI_ISSUES,
-      '扫描问题',
-    )
-    : []
-  const duplicateFiles = groupRecords.reduce((total, group) => {
-    const independent = decimalToSafeNumber(group.independentFileCount, '独立文件数量')
-    return total + Math.max(0, independent - 1)
-  }, 0)
+  const groupPage = includeEvidencePages
+    ? await loadDuplicateGroupPage(jobId, null)
+    : { groups: [], nextCursor: null }
+  const verifiedGroups = includeEvidencePages
+    ? decimalToSafeNumber(result.verifiedGroups, '确定重复组数量')
+    : 0
   return {
     dataMode: 'live',
     status: result.status,
+    resultJobId: includeEvidencePages ? jobId : undefined,
     root: result.root,
     scannedFiles: decimalToSafeNumber(result.mediaFiles, '媒体文件数量'),
     mediaFiles: decimalToSafeNumber(result.mediaFiles, '媒体文件数量'),
     candidateFiles: decimalToSafeNumber(result.sampledFiles, '候选文件数量'),
     scannedBytes: decimalToSafeNumber(result.logicalBytes, '媒体逻辑大小'),
-    duplicateFiles,
-    reclaimableBytes: decimalToSafeNumber(
-      result.logicalReclaimableBytes,
-      '逻辑重复上限',
-    ),
+    duplicateFiles: includeEvidencePages
+      ? decimalToSafeNumber(result.redundantIndependentFiles, '冗余独立副本数量')
+      : 0,
+    reclaimableBytes: includeEvidencePages
+      ? decimalToSafeNumber(result.logicalReclaimableBytes, '逻辑重复上限')
+      : 0,
     durationMs,
     skippedFiles: decimalToSafeNumber(result.issues, '问题数量'),
-    issues: issueRecords.map((issue) => ({
+    issues: [],
+    totalDuplicateGroups: verifiedGroups,
+    nextDuplicateGroupCursor: groupPage.nextCursor,
+    duplicateGroups: groupPage.groups,
+  }
+}
+
+async function readPage<T>(
+  command: string,
+  scope: Record<string, string>,
+  cursor: string | null,
+  limit: number,
+  label: string,
+): Promise<CoreResultPage<T>> {
+  const page = await invoke<CoreResultPage<T>>(command, { ...scope, cursor, limit })
+  if (page.items.length > limit) {
+    throw new Error(`${label}返回数量超过请求上限；为避免内存失控，页面已拒绝接收。`)
+  }
+  if (page.nextCursor !== null && page.nextCursor === cursor) {
+    throw new Error(`${label}分页游标没有前进；为避免重复展示，页面已停止。`)
+  }
+  return page
+}
+
+export interface DuplicateGroupPageResult {
+  groups: DuplicateGroup[]
+  nextCursor: string | null
+}
+
+export async function loadDuplicateGroupPage(
+  jobId: string,
+  cursor: string | null,
+): Promise<DuplicateGroupPageResult> {
+  const page = await readPage<CoreDuplicateGroupItem>(
+    'list_duplicate_groups',
+    { jobId },
+    cursor,
+    RESULT_PAGE_SIZE,
+    '确定重复组',
+  )
+  return {
+    groups: page.items.map(adaptGroup),
+    nextCursor: page.nextCursor,
+  }
+}
+
+export interface DuplicateMemberPageResult {
+  files: DuplicateGroup['files']
+  nextCursor: string | null
+}
+
+export async function loadDuplicateGroupMemberPage(
+  jobId: string,
+  groupBuildId: string,
+  cursor: string | null,
+): Promise<DuplicateMemberPageResult> {
+  const page = await readPage<CoreDuplicateGroupMemberItem>(
+    'list_duplicate_group_members',
+    { jobId, groupBuildId },
+    cursor,
+    MEMBER_PAGE_SIZE,
+    '重复组成员',
+  )
+  return {
+    files: page.items.map((file) => {
+      const isKeeper = file.ordinal === '0'
+      return {
+        id: file.observationId,
+        name: fileNameFromPath(file.displayPath),
+        path: file.displayPath,
+        sizeBytes: decimalToSafeNumber(file.sizeBytes, '重复文件大小'),
+        isRecommendedKeeper: isKeeper,
+        keeperReason: isKeeper
+          ? '当前只按封印后的稳定顺序暂定；尚未解析内嵌拍摄时间与伴随资产'
+          : undefined,
+      }
+    }),
+    nextCursor: page.nextCursor,
+  }
+}
+
+export interface ScanIssuePageResult {
+  issues: ScanReport['issues']
+  nextCursor: string | null
+}
+
+export async function loadScanIssuePage(
+  jobId: string,
+  cursor: string | null,
+): Promise<ScanIssuePageResult> {
+  const page = await readPage<CoreScanIssueItem>(
+    'list_scan_issues',
+    { jobId },
+    cursor,
+    ISSUE_PAGE_SIZE,
+    '扫描问题',
+  )
+  return {
+    issues: page.items.map((issue) => ({
       code: issue.code,
       path: '',
       detail: `${issue.stage}：${issue.message}`,
     })),
-    duplicateGroups: duplicateGroups
-      .sort((left, right) => right.reclaimableBytes - left.reclaimableBytes),
-  }
-}
-
-async function readAllPages<T>(
-  command: string,
-  scope: Record<string, string>,
-  limit: number,
-  hardLimit: number,
-  label: string,
-): Promise<T[]> {
-  if (hardLimit <= 0) {
-    throw new Error(`${label}超过当前界面的有界加载上限；完整证据仍保存在本地数据库中。`)
-  }
-  const items: T[] = []
-  const seenCursors = new Set<string>()
-  let cursor: string | null = null
-  for (;;) {
-    const page: CoreResultPage<T> = await invoke<CoreResultPage<T>>(
-      command,
-      { ...scope, cursor, limit },
-    )
-    if (items.length + page.items.length > hardLimit) {
-      throw new Error(`${label}超过当前界面的有界加载上限（${hardLimit.toLocaleString('zh-CN')}）；完整证据仍保存在本地数据库中。`)
-    }
-    items.push(...page.items)
-    if (page.nextCursor === null) return items
-    if (seenCursors.has(page.nextCursor)) {
-      throw new Error(`${label}分页游标重复；为避免遗漏或重复展示，结果加载已停止。`)
-    }
-    seenCursors.add(page.nextCursor)
-    cursor = page.nextCursor
+    nextCursor: page.nextCursor,
   }
 }
 
@@ -365,14 +394,19 @@ async function waitForScanResult(
         const measuredDuration = status.finishedAtUnixMs === null
           ? Math.round(performance.now() - startedAt)
           : Math.max(0, status.finishedAtUnixMs - status.startedAtUnixMs)
-        const report = await adaptPersistentReport(
-          jobId,
-          status.result,
-          measuredDuration,
-          status.phase === 'completed',
-        )
-        await acknowledgeScanWithRetry(jobId, onStatusWarning)
-        return report
+        try {
+          return await adaptPersistentReport(
+            jobId,
+            status.result,
+            measuredDuration,
+            status.phase === 'completed',
+          )
+        } finally {
+          // A malformed or unreadable result must not permanently occupy the
+          // single scan slot. The persisted evidence remains in SQLite, while
+          // the original adaptation error is re-thrown after acknowledgement.
+          await acknowledgeScanWithRetry(jobId, onStatusWarning)
+        }
       }
       if (status.phase === 'failed') {
         const failure = status.error ?? new Error('扫描任务失败，且没有返回结构化错误。')

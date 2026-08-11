@@ -29,9 +29,11 @@ export interface DuplicateFile {
 export interface DuplicateGroup {
   id: string
   hashPrefix: string
+  previewName: string
   mediaKind: 'image' | 'video' | 'asset'
   format: string
   dimensions?: string
+  memberCount: number
   sizeBytes: number
   reclaimableBytes: number
   files: DuplicateFile[]
@@ -46,6 +48,7 @@ export interface DuplicateGroup {
 export interface ScanReport {
   dataMode: 'live' | 'synthetic'
   status: 'complete' | 'partial' | 'cancelled' | 'interrupted'
+  resultJobId?: string
   root: string
   rootPath?: NativePathRef
   scannedFiles: number
@@ -62,6 +65,8 @@ export interface ScanReport {
     nativePath?: NativePathRef
     detail: string
   }>
+  totalDuplicateGroups: number
+  nextDuplicateGroupCursor?: string | null
   duplicateGroups: DuplicateGroup[]
 }
 

@@ -15,7 +15,7 @@
 
 `design-system/tokens.tokens.json` 是 DTCG 源，`pnpm tokens:build` 确定性生成 `src/styles/tokens.css`。组件不依赖外部 UI 框架；图标统一从 `lucide-react` 导入，品牌标记由 `src/components/BrandMark.tsx` 原创绘制。
 
-核心组件状态包括 idle、ready-to-scan、scanning、results 与 error。目录对话框关闭后恢复触发按钮焦点；重复组使用 `aria-pressed` 表达选择；详情区可聚焦滚动；`prefers-reduced-motion` 关闭非必要动画。
+核心组件状态包括 idle、ready-to-scan、scanning、results 与 error。目录对话框关闭后恢复触发按钮焦点；重复组使用 `aria-pressed` 表达选择；详情区可聚焦滚动；`prefers-reduced-motion` 关闭非必要动画。持久化结果只保留当前 group/member/issue 页，分页导航带有明确的 loading、error、retry、previous 与 next 状态；失败不会清空上一成功页。
 
 ## 构建与运行
 

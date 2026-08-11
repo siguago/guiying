@@ -164,6 +164,7 @@ pub(crate) struct ScanResultSummary {
     full_hash_bytes_read: String,
     verified_groups: String,
     verified_members: String,
+    redundant_independent_files: String,
     compared_pairs: String,
     compared_bytes: String,
     logical_reclaimable_bytes: String,
@@ -755,6 +756,9 @@ fn result_summary(
         ),
         verified_groups: decimal(exact.map_or(0, |summary| summary.verified_groups)),
         verified_members: decimal(exact.map_or(0, |summary| summary.verified_members)),
+        redundant_independent_files: decimal(
+            exact.map_or(0, |summary| summary.redundant_independent_files),
+        ),
         compared_pairs: decimal(exact.map_or(0, |summary| summary.compared_pairs)),
         compared_bytes: decimal(exact.map_or(0, |summary| summary.compared_bytes)),
         logical_reclaimable_bytes: decimal(
@@ -806,6 +810,8 @@ pub(crate) struct DuplicateGroupItem {
     group_key_hex: String,
     member_count: String,
     independent_file_count: String,
+    size_bytes: String,
+    preview_path: String,
     logical_reclaimable_bytes: String,
     finalized_at_unix_ms: String,
 }
@@ -861,7 +867,7 @@ pub(crate) async fn list_duplicate_groups(
         let page = store
             .list_duplicate_groups_page(scan_run_id, decoded.as_ref(), limit)
             .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_group_page(&blocking_job_id, page)
+        map_group_page(&blocking_job_id, &store, scan_run_id, page)
     })
     .await
     .map_err(|error| AppError::task(job_id, error.to_string()))?
@@ -915,20 +921,35 @@ pub(crate) async fn list_scan_issues(
 
 fn map_group_page(
     job_id: &str,
+    store: &Store,
+    scan_run_id: i64,
     page: KeysetPage<VerifiedExactGroup, DuplicateGroupCursor>,
 ) -> Result<DuplicateGroupPage, AppError> {
-    let items = page
-        .items
-        .into_iter()
-        .map(|group| DuplicateGroupItem {
+    let mut items = Vec::with_capacity(page.items.len());
+    for group in page.items {
+        let preview = store
+            .list_duplicate_group_members_page(scan_run_id, group.build_id, None, 1)
+            .map_err(|error| AppError::store(job_id.to_owned(), error.to_string()))?
+            .items
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                AppError::store(
+                    job_id.to_owned(),
+                    "已验证重复组缺少可显示的成员；结果已拒绝展示。",
+                )
+            })?;
+        items.push(DuplicateGroupItem {
             group_build_id: group.build_id.to_string(),
             group_key_hex: hex(group.group_key.as_bytes()),
             member_count: group.member_count.to_string(),
             independent_file_count: group.independent_file_count.to_string(),
+            size_bytes: preview.size_bytes.to_string(),
+            preview_path: preview.display_path,
             logical_reclaimable_bytes: group.logical_reclaimable_bytes.to_string(),
             finalized_at_unix_ms: group.finalized_at_ms.to_string(),
-        })
-        .collect();
+        });
+    }
     Ok(ResultPage {
         items,
         next_cursor: encode_cursor(job_id, page.next_cursor)?,
@@ -1078,6 +1099,7 @@ mod tests {
             full_hash_bytes_read: "20".to_owned(),
             verified_groups: "1".to_owned(),
             verified_members: "2".to_owned(),
+            redundant_independent_files: "1".to_owned(),
             compared_pairs: "1".to_owned(),
             compared_bytes: "10".to_owned(),
             logical_reclaimable_bytes: "10".to_owned(),
@@ -1232,6 +1254,7 @@ mod tests {
         };
         assert_eq!(summary.verified_groups, "1");
         assert_eq!(summary.verified_members, "2");
+        assert_eq!(summary.redundant_independent_files, "1");
         assert_eq!(summary.logical_reclaimable_bytes, content.len().to_string());
 
         tauri::async_runtime::block_on(manager.finish(&reservation.job_id, &outcome))
@@ -1245,5 +1268,11 @@ mod tests {
             .expect("verified groups should page");
         assert_eq!(groups.items.len(), 1);
         assert_eq!(groups.items[0].member_count, 2);
+        let mapped = map_group_page(&reservation.job_id, &store, scan_run_id, groups)
+            .expect("verified groups should map to bounded preview records");
+        assert_eq!(mapped.items.len(), 1);
+        assert_eq!(mapped.items[0].member_count, "2");
+        assert_eq!(mapped.items[0].size_bytes, content.len().to_string());
+        assert!(mapped.items[0].preview_path.ends_with(".jpg"));
     }
 }

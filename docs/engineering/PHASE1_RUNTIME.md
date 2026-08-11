@@ -885,7 +885,7 @@ tests 和 rustdoc。
 - 小状态 DTO；
 - groups/members/issues/time 分页；
 - 删除完整 report IPC；
-- UI load-more/virtualized list、重启恢复页、掉盘页；
+- UI 有界页替换已完成；虚拟列表、历史/重启入口与掉盘专用页仍待完成；
 - Preview Read-only release QA。
 
 安全不变量：

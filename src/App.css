@@ -858,6 +858,105 @@
   white-space: nowrap;
 }
 
+.inline-load-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 2px;
+  padding: 10px 12px;
+  color: var(--semantic-text-secondary);
+  background: var(--semantic-surface-canvas);
+  border: 1px solid var(--semantic-border-default);
+  border-radius: var(--semantic-radius-control);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.inline-load-state > span {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.inline-load-state > button,
+.pagination-bar > button {
+  display: inline-flex;
+  min-height: 30px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 10px;
+  color: var(--semantic-text-primary);
+  background: var(--semantic-surface-primary);
+  border: 1px solid var(--semantic-border-default);
+  border-radius: var(--semantic-radius-control);
+  font-size: 9px;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background var(--semantic-motion-fast) var(--semantic-motion-ease),
+    border-color var(--semantic-motion-fast) var(--semantic-motion-ease);
+}
+
+.inline-load-state > button:hover,
+.pagination-bar > button:hover:not(:disabled) {
+  background: var(--semantic-surface-secondary);
+  border-color: var(--semantic-border-strong);
+}
+
+.inline-load-state--error {
+  color: var(--semantic-text-danger);
+  background: var(--semantic-surface-danger);
+  border-color: color-mix(in srgb, var(--semantic-text-danger) 24%, var(--semantic-border-default));
+}
+
+.pagination-bar {
+  display: flex;
+  min-height: 43px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 18px;
+  color: var(--semantic-text-secondary);
+  background: var(--semantic-surface-primary);
+  border-top: 1px solid var(--semantic-border-default);
+  font-size: 9px;
+}
+
+.pagination-bar > span {
+  min-width: 0;
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pagination-bar > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.pagination-bar--compact,
+.pagination-bar--issues {
+  min-height: 36px;
+  margin-top: 10px;
+  padding: 7px 0 0;
+  background: transparent;
+}
+
+.pagination-bar--compact {
+  border-top-color: var(--semantic-border-default);
+}
+
+.pagination-bar--issues {
+  border-top-color: color-mix(in srgb, var(--semantic-border-default) 70%, transparent);
+}
+
+.is-spinning {
+  animation: spin 1s linear infinite;
+}
+
 .metrics-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

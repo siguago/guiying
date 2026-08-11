@@ -2,6 +2,7 @@ import {
   Archive,
   Check,
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   Circle,
   Database,
@@ -21,7 +22,7 @@ import {
   TriangleAlert,
   Video,
 } from 'lucide-react'
-import { useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import './App.css'
 import { BrandMark } from './components/BrandMark'
@@ -37,11 +38,15 @@ import {
   chooseScanDirectory,
   cancelDirectoryScanReadOnly,
   isDesktopRuntime,
+  loadDuplicateGroupMemberPage,
+  loadDuplicateGroupPage,
+  loadScanIssuePage,
   runSyntheticScan,
   startDirectoryScanReadOnly,
 } from './lib/backend'
 
 type AppPhase = 'idle' | 'ready-to-scan' | 'scanning' | 'results' | 'error'
+type PageDirection = 'initial' | 'next' | 'previous'
 
 const scanStages = [
   { label: '建立只读索引', description: '枚举受支持媒体；伴随资产将在后续里程碑分析' },
@@ -354,8 +359,8 @@ function GroupRow({
     >
       <span className="group-row__media"><MediaIcon aria-hidden="true" size={20} /></span>
       <span className="group-row__identity">
-        <strong>{group.files[0]?.name ?? '未命名媒体'}</strong>
-        <small>{group.format} · {group.dimensions ?? '尺寸未知'} · {group.files.length} 份</small>
+        <strong>{group.previewName}</strong>
+        <small>{group.format} · {group.dimensions ?? '尺寸未知'} · {group.memberCount} 份</small>
       </span>
       <span className="group-row__proofs">
         <span className="content-proof"><CheckCircle2 aria-hidden="true" size={12} /> D1 · 逐字节确认</span>
@@ -372,13 +377,33 @@ function GroupRow({
   )
 }
 
-function GroupInspector({ group }: { group: DuplicateGroup }) {
+function GroupInspector({
+  group,
+  isLoading,
+  loadError,
+  memberPage,
+  canLoadPrevious,
+  canLoadNext,
+  onRetry,
+  onLoadPrevious,
+  onLoadNext,
+}: {
+  group: DuplicateGroup
+  isLoading: boolean
+  loadError: string | null
+  memberPage: number
+  canLoadPrevious: boolean
+  canLoadNext: boolean
+  onRetry: () => void
+  onLoadPrevious: () => void
+  onLoadNext: () => void
+}) {
   const keeper = group.files.find((file) => file.isRecommendedKeeper)
   return (
     <aside aria-labelledby="inspector-title" className="inspector" tabIndex={0}>
       <header className="inspector__header">
         <span>重复组证据</span>
-        <strong id="inspector-title">{group.files[0]?.name ?? '未命名媒体'}</strong>
+        <strong id="inspector-title">{group.previewName}</strong>
         <small>{group.hashPrefix}</small>
       </header>
 
@@ -391,24 +416,49 @@ function GroupInspector({ group }: { group: DuplicateGroup }) {
       </section>
 
       <section className="inspector-section">
-        <div className="inspector-section__title"><span>组内全部文件</span><span>{group.files.length} 份内容相同</span></div>
-        <ol className="group-members">
-          {group.files.map((file) => (
-            <li className={file.isRecommendedKeeper ? 'group-member group-member--keeper' : 'group-member'} key={file.id}>
-              <div className="group-member__heading">
-                <strong>{file.name}</strong>
-                {file.isRecommendedKeeper ? <span><Archive aria-hidden="true" size={11} /> 暂定保留</span> : <span>重复成员</span>}
-              </div>
-              <code title={file.path}>{file.path}</code>
-              <dl>
-                <div><dt>大小</dt><dd>{formatBytes(file.sizeBytes)}</dd></div>
-                <div><dt>文件创建</dt><dd>{file.createdAt ?? '未知'}</dd></div>
-                <div><dt>文件修改</dt><dd>{file.modifiedAt ?? '未知'}</dd></div>
-                <div><dt>拍摄时间</dt><dd>{file.captureTime ?? '尚无内嵌证据'}</dd></div>
-              </dl>
-            </li>
-          ))}
-        </ol>
+        <div className="inspector-section__title"><span>组内文件</span><span>共 {group.memberCount} 份内容相同</span></div>
+        {isLoading && group.files.length === 0 ? (
+          <div className="inline-load-state" role="status">
+            <LoaderCircle aria-hidden="true" className="is-spinning" size={16} /> 正在读取这一页成员…
+          </div>
+        ) : null}
+        {loadError ? (
+          <div className="inline-load-state inline-load-state--error" role="alert">
+            <TriangleAlert aria-hidden="true" size={15} />
+            <span>{loadError}</span>
+            <button onClick={onRetry} type="button">重试</button>
+          </div>
+        ) : null}
+        {group.files.length > 0 ? (
+          <ol className="group-members">
+            {group.files.map((file) => (
+              <li className={file.isRecommendedKeeper ? 'group-member group-member--keeper' : 'group-member'} key={file.id}>
+                <div className="group-member__heading">
+                  <strong>{file.name}</strong>
+                  {file.isRecommendedKeeper ? <span><Archive aria-hidden="true" size={11} /> 暂定保留</span> : <span>重复成员</span>}
+                </div>
+                <code title={file.path}>{file.path}</code>
+                <dl>
+                  <div><dt>大小</dt><dd>{formatBytes(file.sizeBytes)}</dd></div>
+                  <div><dt>文件创建</dt><dd>{file.createdAt ?? '尚未分析'}</dd></div>
+                  <div><dt>文件修改</dt><dd>{file.modifiedAt ?? '尚未分析'}</dd></div>
+                  <div><dt>拍摄时间</dt><dd>{file.captureTime ?? '尚无内嵌证据'}</dd></div>
+                </dl>
+              </li>
+            ))}
+          </ol>
+        ) : null}
+        {(canLoadPrevious || canLoadNext) && !loadError ? (
+          <nav aria-busy={isLoading} aria-label="组内文件分页" className="pagination-bar pagination-bar--compact">
+            <button disabled={!canLoadPrevious || isLoading} onClick={onLoadPrevious} type="button">
+              <ChevronLeft aria-hidden="true" size={14} /> 上一页
+            </button>
+            <span>{isLoading ? '正在读取成员…' : `成员第 ${memberPage} 页`}</span>
+            <button disabled={!canLoadNext || isLoading} onClick={onLoadNext} type="button">
+              下一页 <ChevronRight aria-hidden="true" size={14} />
+            </button>
+          </nav>
+        ) : null}
       </section>
 
       <section className="inspector-section">
@@ -416,7 +466,7 @@ function GroupInspector({ group }: { group: DuplicateGroup }) {
         <div className="keeper-block">
           <span className="keeper-block__icon"><Archive size={18} /></span>
           <div>
-            <strong>{keeper?.name ?? group.files[0]?.name}</strong>
+            <strong>{keeper?.name ?? (isLoading ? '正在载入暂定保留项…' : group.previewName)}</strong>
             <small title={keeper?.path}>{keeper?.path}</small>
             <p>{keeper?.keeperReason ?? '当前里程碑仅展示候选，不执行保留选择。'}</p>
           </div>
@@ -455,21 +505,146 @@ function EmptyResults({ status }: { status: ScanReport['status'] }) {
 }
 
 function IssueDisclosure({ report }: { report: ScanReport }) {
-  if (report.dataMode !== 'live' || report.issues.length === 0) return null
+  const [issues, setIssues] = useState(report.issues)
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [failedCursor, setFailedCursor] = useState<string | null>(null)
+  const [failedDirection, setFailedDirection] = useState<PageDirection | null>(null)
+  const [history, setHistory] = useState<Array<string | null>>([])
+  const [hasLoaded, setHasLoaded] = useState(report.dataMode === 'synthetic')
+  const [isLoading, setIsLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const requestGenerationRef = useRef(0)
+  const requestBusyRef = useRef(false)
+
+  useEffect(() => () => {
+    requestGenerationRef.current += 1
+    requestBusyRef.current = false
+  }, [])
+
+  if (report.dataMode === 'live' && report.skippedFiles === 0) return null
+  if (report.dataMode === 'synthetic' && report.issues.length === 0) return null
+  if (report.dataMode === 'live' && !report.resultJobId) {
+    return (
+      <div className="issue-disclosure" role="status">
+        本次未完成任务记录了 {report.skippedFiles.toLocaleString('zh-CN')} 条问题；取消态不会开放未封印的问题分页。
+      </div>
+    )
+  }
+
+  async function fetchIssuePage(targetCursor: string | null): Promise<boolean> {
+    if (!report.resultJobId || requestBusyRef.current) return false
+    requestBusyRef.current = true
+    const requestGeneration = requestGenerationRef.current + 1
+    requestGenerationRef.current = requestGeneration
+    setIsLoading(true)
+    setLoadError(null)
+    try {
+      const page = await loadScanIssuePage(report.resultJobId, targetCursor)
+      if (requestGenerationRef.current !== requestGeneration) return false
+      setIssues(page.issues)
+      setCursor(targetCursor)
+      setNextCursor(page.nextCursor)
+      setFailedCursor(null)
+      setFailedDirection(null)
+      setHasLoaded(true)
+      return true
+    } catch (pageError) {
+      if (requestGenerationRef.current === requestGeneration) {
+        setFailedCursor(targetCursor)
+        setLoadError(asScanError(pageError).message)
+      }
+      return false
+    } finally {
+      if (requestGenerationRef.current === requestGeneration) {
+        requestBusyRef.current = false
+        setIsLoading(false)
+      }
+    }
+  }
+
+  async function loadNextIssues() {
+    if (nextCursor === null) return
+    const currentCursor = cursor
+    setFailedDirection('next')
+    if (await fetchIssuePage(nextCursor)) {
+      setHistory((current) => [...current, currentCursor])
+    }
+  }
+
+  async function loadPreviousIssues() {
+    const previousCursor = history.at(-1)
+    if (previousCursor === undefined) return
+    setFailedDirection('previous')
+    if (await fetchIssuePage(previousCursor)) {
+      setHistory((current) => current.slice(0, -1))
+    }
+  }
+
+  async function retryIssues() {
+    const direction = failedDirection
+    const currentCursor = cursor
+    if (!(await fetchIssuePage(failedCursor))) return
+    if (direction === 'next') {
+      setHistory((current) => [...current, currentCursor])
+    } else if (direction === 'previous') {
+      setHistory((current) => current.slice(0, -1))
+    }
+  }
 
   return (
-    <details className="issue-disclosure">
-      <summary>查看 {report.issues.length.toLocaleString('zh-CN')} 条扫描问题记录</summary>
-      <ul>
-        {report.issues.slice(0, 50).map((issue, index) => (
-          <li key={`${issue.code}-${issue.path}-${issue.detail}-${index}`}>
-            <code>{issue.code}</code>
-            <span title={issue.path}>{issue.path}</span>
-            <small>{issue.detail}</small>
-          </li>
-        ))}
-      </ul>
-      {report.issues.length > 50 ? <p>当前界面仅显示前 50 条；在本地审计账本接入前，请勿把这份视图当作完整问题导出。</p> : null}
+    <details
+      className="issue-disclosure"
+      onToggle={(event) => {
+        if (event.currentTarget.open && !hasLoaded && !requestBusyRef.current) {
+          setFailedDirection('initial')
+          void fetchIssuePage(null)
+        }
+      }}
+    >
+      <summary>查看 {report.skippedFiles.toLocaleString('zh-CN')} 条扫描问题记录</summary>
+      {isLoading && !hasLoaded ? (
+        <div className="inline-load-state" role="status">
+          <LoaderCircle aria-hidden="true" className="is-spinning" size={15} /> 正在读取问题账本…
+        </div>
+      ) : null}
+      {loadError ? (
+        <div className="inline-load-state inline-load-state--error" role="alert">
+          <TriangleAlert aria-hidden="true" size={15} />
+          <span>{loadError}</span>
+          <button onClick={() => void retryIssues()} type="button">重试</button>
+        </div>
+      ) : null}
+      {issues.length > 0 ? (
+        <ul>
+          {issues.map((issue, index) => (
+            <li key={`${issue.code}-${issue.detail}-${index}`}>
+              <code>{issue.code}</code>
+              {issue.path ? <span title={issue.path}>{issue.path}</span> : null}
+              <small>{issue.detail}</small>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {hasLoaded && report.dataMode === 'live' ? (
+        <nav aria-busy={isLoading} aria-label="扫描问题分页" className="pagination-bar pagination-bar--issues">
+          <button
+            disabled={history.length === 0 || isLoading}
+            onClick={() => void loadPreviousIssues()}
+            type="button"
+          >
+            <ChevronLeft aria-hidden="true" size={14} /> 上一页
+          </button>
+          <span>{isLoading ? '正在读取问题…' : `问题第 ${history.length + 1} 页`}</span>
+          <button
+            disabled={nextCursor === null || isLoading}
+            onClick={() => void loadNextIssues()}
+            type="button"
+          >
+            下一页 <ChevronRight aria-hidden="true" size={14} />
+          </button>
+        </nav>
+      ) : null}
     </details>
   )
 }
@@ -481,10 +656,199 @@ function ResultsWorkspace({
   report: ScanReport
   onReset: () => void
 }) {
-  const [selectedGroupId, setSelectedGroupId] = useState(report.duplicateGroups[0]?.id)
+  const [groups, setGroups] = useState(report.duplicateGroups)
+  const [groupCursor, setGroupCursor] = useState<string | null>(null)
+  const [nextGroupCursor, setNextGroupCursor] = useState(
+    report.nextDuplicateGroupCursor ?? null,
+  )
+  const [failedGroupCursor, setFailedGroupCursor] = useState<string | null>(null)
+  const [failedGroupDirection, setFailedGroupDirection] = useState<PageDirection | null>(null)
+  const [groupHistory, setGroupHistory] = useState<Array<string | null>>([])
+  const [isLoadingGroups, setIsLoadingGroups] = useState(false)
+  const [groupLoadError, setGroupLoadError] = useState<string | null>(null)
+  const groupRequestGenerationRef = useRef(0)
+  const groupRequestBusyRef = useRef(false)
+  const [selectedGroupId, setSelectedGroupId] = useState(groups[0]?.id)
   const selectedGroup = useMemo(
-    () => report.duplicateGroups.find((group) => group.id === selectedGroupId) ?? report.duplicateGroups[0],
-    [report.duplicateGroups, selectedGroupId],
+    () => groups.find((group) => group.id === selectedGroupId) ?? groups[0],
+    [groups, selectedGroupId],
+  )
+  const [memberFiles, setMemberFiles] = useState<DuplicateGroup['files']>(
+    selectedGroup?.files ?? [],
+  )
+  const [memberCursor, setMemberCursor] = useState<string | null>(null)
+  const [nextMemberCursor, setNextMemberCursor] = useState<string | null>(null)
+  const [failedMemberCursor, setFailedMemberCursor] = useState<string | null>(null)
+  const [failedMemberDirection, setFailedMemberDirection] = useState<PageDirection | null>(null)
+  const [memberHistory, setMemberHistory] = useState<Array<string | null>>([])
+  const [isLoadingMembers, setIsLoadingMembers] = useState(false)
+  const [memberLoadError, setMemberLoadError] = useState<string | null>(null)
+  const memberRequestRef = useRef(0)
+  const memberRequestBusyRef = useRef(false)
+
+  const fetchMemberPage = useCallback(async function fetchMemberPage(
+    group: DuplicateGroup,
+    targetCursor: string | null,
+  ): Promise<boolean> {
+    if (!report.resultJobId) {
+      setMemberFiles(group.files)
+      setMemberCursor(null)
+      setNextMemberCursor(null)
+      setFailedMemberCursor(null)
+      setFailedMemberDirection(null)
+      return true
+    }
+    if (memberRequestBusyRef.current) return false
+    memberRequestBusyRef.current = true
+    const requestId = memberRequestRef.current + 1
+    memberRequestRef.current = requestId
+    setIsLoadingMembers(true)
+    setMemberLoadError(null)
+    try {
+      const page = await loadDuplicateGroupMemberPage(
+        report.resultJobId,
+        group.id,
+        targetCursor,
+      )
+      if (memberRequestRef.current !== requestId) return false
+      setMemberFiles(page.files)
+      setMemberCursor(targetCursor)
+      setNextMemberCursor(page.nextCursor)
+      setFailedMemberCursor(null)
+      setFailedMemberDirection(null)
+      return true
+    } catch (pageError) {
+      if (memberRequestRef.current === requestId) {
+        setFailedMemberCursor(targetCursor)
+        setMemberLoadError(asScanError(pageError).message)
+      }
+      return false
+    } finally {
+      if (memberRequestRef.current === requestId) {
+        memberRequestBusyRef.current = false
+        setIsLoadingMembers(false)
+      }
+    }
+  }, [report.resultJobId])
+
+  useEffect(() => {
+    memberRequestRef.current += 1
+    memberRequestBusyRef.current = false
+    setMemberFiles(selectedGroup?.files ?? [])
+    setMemberCursor(null)
+    setNextMemberCursor(null)
+    setFailedMemberCursor(null)
+    setFailedMemberDirection(null)
+    setMemberHistory([])
+    setMemberLoadError(null)
+    setIsLoadingMembers(false)
+    if (selectedGroup && report.resultJobId) {
+      setFailedMemberDirection('initial')
+      void fetchMemberPage(selectedGroup, null)
+    }
+  }, [fetchMemberPage, selectedGroup, report.resultJobId])
+
+  useEffect(() => () => {
+    groupRequestGenerationRef.current += 1
+    groupRequestBusyRef.current = false
+    memberRequestRef.current += 1
+    memberRequestBusyRef.current = false
+  }, [])
+
+  async function fetchGroupPage(targetCursor: string | null): Promise<boolean> {
+    if (!report.resultJobId || groupRequestBusyRef.current) return false
+    groupRequestBusyRef.current = true
+    const requestGeneration = groupRequestGenerationRef.current + 1
+    groupRequestGenerationRef.current = requestGeneration
+    setIsLoadingGroups(true)
+    setGroupLoadError(null)
+    try {
+      const page = await loadDuplicateGroupPage(report.resultJobId, targetCursor)
+      if (groupRequestGenerationRef.current !== requestGeneration) return false
+      setGroups(page.groups)
+      setGroupCursor(targetCursor)
+      setNextGroupCursor(page.nextCursor)
+      setFailedGroupCursor(null)
+      setFailedGroupDirection(null)
+      setSelectedGroupId(page.groups[0]?.id)
+      return true
+    } catch (pageError) {
+      if (groupRequestGenerationRef.current === requestGeneration) {
+        setFailedGroupCursor(targetCursor)
+        setGroupLoadError(asScanError(pageError).message)
+      }
+      return false
+    } finally {
+      if (groupRequestGenerationRef.current === requestGeneration) {
+        groupRequestBusyRef.current = false
+        setIsLoadingGroups(false)
+      }
+    }
+  }
+
+  async function loadNextGroups() {
+    if (nextGroupCursor === null) return
+    const currentCursor = groupCursor
+    setFailedGroupDirection('next')
+    if (await fetchGroupPage(nextGroupCursor)) {
+      setGroupHistory((current) => [...current, currentCursor])
+    }
+  }
+
+  async function loadPreviousGroups() {
+    const previousCursor = groupHistory.at(-1)
+    if (previousCursor === undefined) return
+    setFailedGroupDirection('previous')
+    if (await fetchGroupPage(previousCursor)) {
+      setGroupHistory((current) => current.slice(0, -1))
+    }
+  }
+
+  async function loadNextMembers() {
+    if (!selectedGroup || nextMemberCursor === null) return
+    const currentCursor = memberCursor
+    setFailedMemberDirection('next')
+    if (await fetchMemberPage(selectedGroup, nextMemberCursor)) {
+      setMemberHistory((current) => [...current, currentCursor])
+    }
+  }
+
+  async function loadPreviousMembers() {
+    if (!selectedGroup) return
+    const previousCursor = memberHistory.at(-1)
+    if (previousCursor === undefined) return
+    setFailedMemberDirection('previous')
+    if (await fetchMemberPage(selectedGroup, previousCursor)) {
+      setMemberHistory((current) => current.slice(0, -1))
+    }
+  }
+
+  async function retryGroups() {
+    const direction = failedGroupDirection
+    const currentCursor = groupCursor
+    if (!(await fetchGroupPage(failedGroupCursor))) return
+    if (direction === 'next') {
+      setGroupHistory((current) => [...current, currentCursor])
+    } else if (direction === 'previous') {
+      setGroupHistory((current) => current.slice(0, -1))
+    }
+  }
+
+  async function retryMembers() {
+    if (!selectedGroup) return
+    const direction = failedMemberDirection
+    const currentCursor = memberCursor
+    if (!(await fetchMemberPage(selectedGroup, failedMemberCursor))) return
+    if (direction === 'next') {
+      setMemberHistory((current) => [...current, currentCursor])
+    } else if (direction === 'previous') {
+      setMemberHistory((current) => current.slice(0, -1))
+    }
+  }
+
+  const inspectedGroup = useMemo(
+    () => selectedGroup ? { ...selectedGroup, files: memberFiles } : undefined,
+    [memberFiles, selectedGroup],
   )
 
   return (
@@ -502,7 +866,7 @@ function ResultsWorkspace({
                     ? '扫描被中断 · 根目录身份变化'
                     : '只读报告部分完成'}
           </span>
-          <h1>发现 {report.duplicateGroups.length.toLocaleString('zh-CN')} 组确定重复</h1>
+          <h1>发现 {report.totalDuplicateGroups.toLocaleString('zh-CN')} 组确定重复</h1>
           <p title={report.root}>{report.root}</p>
         </div>
         <button className="button button--quiet" onClick={onReset} type="button">
@@ -528,7 +892,7 @@ function ResultsWorkspace({
 
       <section aria-label="扫描摘要" className="metrics-strip">
         <Metric label="媒体文件" value={report.mediaFiles.toLocaleString('zh-CN')} detail={`${formatBytes(report.scannedBytes)} 逻辑大小`} />
-        <Metric label="冗余独立副本" value={report.duplicateFiles.toLocaleString('zh-CN')} detail={`${report.duplicateGroups.length.toLocaleString('zh-CN')} 个证据组`} />
+        <Metric label="冗余独立副本" value={report.duplicateFiles.toLocaleString('zh-CN')} detail={`${report.totalDuplicateGroups.toLocaleString('zh-CN')} 个证据组`} />
         <Metric label="逻辑重复上限" value={formatBytes(report.reclaimableBytes)} detail="克隆、稀疏文件与快照会影响实际释放" />
         <Metric label="需要留意" value={report.skippedFiles.toLocaleString('zh-CN')} detail="跳过、排除、变化或读取问题" />
       </section>
@@ -539,9 +903,9 @@ function ResultsWorkspace({
             <div><span>确定重复</span><strong id="groups-title">按逻辑重复上限排序</strong></div>
             <span className="read-only-badge"><LockKeyhole size={13} /> 当前仅查看</span>
           </div>
-          {report.duplicateGroups.length > 0 ? (
-            <div className="group-list">
-              {report.duplicateGroups.map((group) => (
+          {groups.length > 0 ? (
+            <div aria-busy={isLoadingGroups} className="group-list">
+              {groups.map((group) => (
                 <GroupRow
                   group={group}
                   isSelected={group.id === selectedGroup?.id}
@@ -550,13 +914,53 @@ function ResultsWorkspace({
                 />
               ))}
             </div>
-          ) : <EmptyResults status={report.status} />}
+          ) : report.totalDuplicateGroups === 0 ? <EmptyResults status={report.status} /> : null}
+          {groupLoadError ? (
+            <div className="inline-load-state inline-load-state--error" role="alert">
+              <TriangleAlert aria-hidden="true" size={15} />
+              <span>{groupLoadError}</span>
+              <button onClick={() => void retryGroups()} type="button">重试失败页</button>
+            </div>
+          ) : null}
+          {report.resultJobId && report.totalDuplicateGroups > 0 ? (
+            <nav aria-busy={isLoadingGroups} aria-label="确定重复组分页" className="pagination-bar pagination-bar--groups">
+              <button
+                disabled={groupHistory.length === 0 || isLoadingGroups}
+                onClick={() => void loadPreviousGroups()}
+                type="button"
+              >
+                <ChevronLeft aria-hidden="true" size={14} /> 上一页
+              </button>
+              <span>
+                {isLoadingGroups ? '正在读取…' : `第 ${groupHistory.length + 1} 页 · 当前 ${groups.length} 组`}
+              </span>
+              <button
+                disabled={nextGroupCursor === null || isLoadingGroups}
+                onClick={() => void loadNextGroups()}
+                type="button"
+              >
+                下一页 <ChevronRight aria-hidden="true" size={14} />
+              </button>
+            </nav>
+          ) : null}
           <div className="group-panel__footer">
             <Info aria-hidden="true" size={15} />
             本结果中的组已在当前挂载会话逐字节确认并持久化；未来执行隔离前仍会再次复核。当前阶段尚不分析伴随资产，也不会执行清理。
           </div>
         </section>
-        {selectedGroup ? <GroupInspector group={selectedGroup} /> : null}
+        {inspectedGroup ? (
+          <GroupInspector
+            canLoadNext={nextMemberCursor !== null}
+            canLoadPrevious={memberHistory.length > 0}
+            group={inspectedGroup}
+            isLoading={isLoadingMembers}
+            loadError={memberLoadError}
+            memberPage={memberHistory.length + 1}
+            onLoadNext={() => void loadNextMembers()}
+            onLoadPrevious={() => void loadPreviousMembers()}
+            onRetry={() => void retryMembers()}
+          />
+        ) : null}
       </div>
     </main>
   )

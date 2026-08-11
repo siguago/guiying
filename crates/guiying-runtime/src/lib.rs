@@ -127,6 +127,7 @@ pub struct ExactDuplicateSummary {
     pub candidate_buckets: u64,
     pub verified_groups: u64,
     pub verified_members: u64,
+    pub redundant_independent_files: u64,
     pub compared_pairs: u64,
     pub compared_bytes: u64,
     pub persisted_identical_edges: u64,
@@ -1085,6 +1086,7 @@ impl ActiveReadOnlyScan {
             candidate_buckets: 0,
             verified_groups: 0,
             verified_members: 0,
+            redundant_independent_files: 0,
             compared_pairs: 0,
             compared_bytes: 0,
             persisted_identical_edges: 0,
@@ -1153,6 +1155,13 @@ impl ActiveReadOnlyScan {
                             summary.verified_members,
                             u64::try_from(verified.member_count)
                                 .map_err(|_| RuntimeError::NumericRange("group member count"))?,
+                        )?;
+                        let independent_files = u64::try_from(verified.independent_file_count)
+                            .map_err(|_| RuntimeError::NumericRange("independent file count"))?;
+                        summary.redundant_independent_files = checked_add_u64(
+                            "redundant independent file count",
+                            summary.redundant_independent_files,
+                            independent_files.saturating_sub(1),
                         )?;
                         summary.logical_reclaimable_bytes = checked_add_u64(
                             "logical reclaimable bytes",
@@ -3213,6 +3222,7 @@ mod tests {
         assert_eq!(exact.candidate_buckets, 1);
         assert_eq!(exact.verified_groups, 1);
         assert_eq!(exact.verified_members, 2);
+        assert_eq!(exact.redundant_independent_files, 1);
         assert_eq!(exact.compared_pairs, 1);
         assert_eq!(exact.compared_bytes, duplicate.len() as u64);
         assert_eq!(exact.persisted_identical_edges, 1);
@@ -3380,6 +3390,7 @@ mod tests {
         assert_eq!(exact.candidate_buckets, 0);
         assert_eq!(exact.verified_groups, 0);
         assert_eq!(exact.verified_members, 0);
+        assert_eq!(exact.redundant_independent_files, 0);
         assert_eq!(exact.logical_reclaimable_bytes, 0);
         assert_eq!(
             runtime.coverage_summary().map(|value| value.status),
@@ -3420,6 +3431,7 @@ mod tests {
         let exact = runtime.verify_exact_duplicates(&NoopScanControl, &mut ())?;
         assert_eq!(exact.verified_groups, 1);
         assert_eq!(exact.verified_members, 2);
+        assert_eq!(exact.redundant_independent_files, 0);
         assert_eq!(exact.persisted_identical_edges, 1);
         assert_eq!(exact.logical_reclaimable_bytes, 0);
         let groups =

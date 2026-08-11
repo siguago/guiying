@@ -13,6 +13,7 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
     reclaimableBytes: 37_861_867_520,
     durationMs: 174_000,
     skippedFiles: 6,
+    totalDuplicateGroups: 3,
     issues: [
       {
         code: 'SYNTHETIC_UNREADABLE',
@@ -29,9 +30,11 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
       {
         id: 'demo-heic-001',
         hashPrefix: 'b3:9fb3c2a4…',
+        previewName: 'IMG_4821.HEIC',
         mediaKind: 'image',
         format: 'HEIC',
         dimensions: '4032 × 3024',
+        memberCount: 3,
         sizeBytes: 3_842_166,
         reclaimableBytes: 7_684_332,
         files: [
@@ -94,9 +97,11 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
       {
         id: 'demo-mov-002',
         hashPrefix: 'b3:3d1072aa…',
+        previewName: 'IMG_7710.MOV',
         mediaKind: 'video',
         format: 'MOV',
         dimensions: '3840 × 2160 · 00:18',
+        memberCount: 2,
         sizeBytes: 92_481_332,
         reclaimableBytes: 92_481_332,
         files: [
@@ -148,9 +153,11 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
       {
         id: 'demo-jpeg-003',
         hashPrefix: 'b3:6a1180e9…',
+        previewName: 'PXL_20220712_092011.jpg',
         mediaKind: 'image',
         format: 'JPEG',
         dimensions: '3024 × 4032',
+        memberCount: 2,
         sizeBytes: 5_228_910,
         reclaimableBytes: 5_228_910,
         files: [
