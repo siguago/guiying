@@ -21,13 +21,13 @@ pub use model::{
     PathRef, ProgressStage, ScanIssue, ScanIssueCode, ScanOptions, ScanProgress, ScanReport,
     ScanStats, ScanStatus, REPORT_SCHEMA_VERSION,
 };
-pub use scan::{CancellationToken, NoopScanControl, ScanControl, Scanner};
+pub use scan::{CancellationToken, NoopScanControl, ScanControl, ScanDirective, Scanner};
 pub use streaming::{
     CoverageSeal, DirectoryObservation, DirectoryObservationTicket, ExactCandidatePair,
     ExactComparisonEvidence, FileObservation, FileObservationTicket, FreshFingerprintEvidence,
     FreshReadOrigin, StageBatchOutcome, StreamBatchStatus, StreamEvent, StreamLimits,
     StreamRootKind, StreamRootObservation, StreamScanError, StreamSessionId, StreamTrustScope,
     StreamingEnumerationOutcome, StreamingScanSession, StreamingScanSink, TicketDecodeError,
-    STREAM_EVENT_BATCH_HARD_MAX, STREAM_EVENT_BYTES_HARD_MAX, STREAM_EVENT_BYTES_MIN,
-    STREAM_INPUT_BATCH_HARD_MAX, STREAM_TICKET_BYTES_HARD_MAX,
+    STREAM_ENUMERATION_STEP_HARD_MAX, STREAM_EVENT_BATCH_HARD_MAX, STREAM_EVENT_BYTES_HARD_MAX,
+    STREAM_EVENT_BYTES_MIN, STREAM_INPUT_BATCH_HARD_MAX, STREAM_TICKET_BYTES_HARD_MAX,
 };

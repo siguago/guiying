@@ -22,14 +22,46 @@ const MAX_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_READ_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DIRECTORY_DEPTH: u16 = 512;
 
-/// Observer and cancellation interface used by long-running scans and exact
-/// verification. Implementations must keep callbacks quick and non-blocking.
+/// Cooperative instruction observed at bounded scan safe points.
+///
+/// `Pause` is resumable only for APIs that explicitly document resumability.
+/// It must never be treated as cancellation or as terminal evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanDirective {
+    Continue,
+    Pause,
+    Cancel,
+}
+
+/// Observer and cooperative-control interface used by long-running scans and
+/// exact verification. Implementations must keep callbacks quick and
+/// non-blocking.
 pub trait ScanControl: Send + Sync {
     fn is_cancelled(&self) -> bool {
         false
     }
 
+    /// Returns the instruction to apply at the next safe point.
+    ///
+    /// Legacy cancellation is resolved by the internal effective-directive
+    /// path before this method is consulted. Keeping this default side-effect
+    /// free avoids polling an existing `is_cancelled` implementation twice at
+    /// one safe point.
+    fn directive(&self) -> ScanDirective {
+        ScanDirective::Continue
+    }
+
     fn on_progress(&self, _progress: &ScanProgress) {}
+}
+
+/// Resolves legacy cancellation and the tri-state directive through one
+/// fail-closed path. A legacy cancellation bit always wins over `Pause`.
+pub(crate) fn effective_scan_directive(control: &dyn ScanControl) -> ScanDirective {
+    if control.is_cancelled() {
+        ScanDirective::Cancel
+    } else {
+        control.directive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -158,7 +190,7 @@ impl Scanner {
         let mut enumeration_completed = 0_u64;
 
         for root in &root_sessions {
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 return Ok(finish_report(
                     roots,
                     scanned,
@@ -223,7 +255,7 @@ impl Scanner {
                 }];
 
                 while let Some(mut frame) = directories.pop() {
-                    if control.is_cancelled() {
+                    if effective_scan_directive(control) == ScanDirective::Cancel {
                         return Ok(finish_report(
                             roots,
                             scanned,
@@ -251,7 +283,7 @@ impl Scanner {
                         None,
                         Some(&path),
                     );
-                    if control.is_cancelled() {
+                    if effective_scan_directive(control) == ScanDirective::Cancel {
                         return Ok(finish_report(
                             roots,
                             scanned,
@@ -463,7 +495,7 @@ impl Scanner {
                 Some(sample_total),
                 Some(&path),
             );
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 return Ok(finish_report(
                     roots,
                     scanned,
@@ -510,7 +542,7 @@ impl Scanner {
                 Some(full_total),
                 Some(&path),
             );
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 return Ok(finish_report(
                     roots,
                     scanned,
@@ -583,7 +615,7 @@ impl Scanner {
                 ScanStatus::Cancelled,
             ));
         };
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Ok(finish_report(
                 roots,
                 scanned,
@@ -617,7 +649,7 @@ fn revalidate_directories(
 ) -> Option<bool> {
     let mut stable = true;
     for directory in directories {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return None;
         }
         if let Err(error) = directory.revalidate() {
@@ -630,7 +662,7 @@ fn revalidate_directories(
             );
         }
     }
-    (!control.is_cancelled()).then_some(stable)
+    (effective_scan_directive(control) != ScanDirective::Cancel).then_some(stable)
 }
 
 fn normalize_values(values: BTreeSet<String>, trim_dot: bool) -> BTreeSet<String> {
@@ -685,7 +717,7 @@ fn revalidate_roots(
 ) -> Option<bool> {
     let mut stable = true;
     for root in root_sessions {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return None;
         }
         let result = snapshot_path(&root.path);
@@ -713,7 +745,7 @@ fn revalidate_roots(
             }
         }
     }
-    (!control.is_cancelled()).then_some(stable)
+    (effective_scan_directive(control) != ScanDirective::Cancel).then_some(stable)
 }
 
 fn child_device(directory: &BoundDirectory) -> Option<u64> {
@@ -848,7 +880,7 @@ fn sample_fingerprint(
     let mut bytes_read = 0_u64;
 
     for offset in offsets {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(ReadHashError::Cancelled);
         }
         hasher.update(&offset.to_le_bytes());
@@ -911,7 +943,7 @@ fn hash_reader_exact(
     let mut bytes_read = 0_u64;
 
     loop {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(ReadHashError::Cancelled);
         }
         let read = match reader.read(&mut buffer) {
@@ -1075,7 +1107,7 @@ fn build_exact_duplicate_groups(
                 None,
                 Some(&right_file.path),
             );
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 return PairRelation::Cancelled;
             }
 

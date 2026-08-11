@@ -16,6 +16,7 @@ pub use time_bridge::{
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -23,24 +24,27 @@ use base64::Engine;
 use guiying_core::{
     CoverageSeal, DirectoryObservation, DirectoryObservationTicket, ExactCandidatePair,
     ExactComparisonEvidence, FileObservation, FileObservationTicket, FreshFingerprintEvidence,
-    FreshReadOrigin, MediaKind, PathEncoding, PathRef, ScanControl, ScanIssue, ScanIssueCode,
-    ScanOptions, ScanProgress, Scanner, StageBatchOutcome, StreamBatchStatus, StreamEvent,
-    StreamLimits, StreamRootKind, StreamRootObservation, StreamTrustScope,
+    FreshReadOrigin, MediaKind, PathEncoding, PathRef, ScanControl, ScanDirective, ScanIssue,
+    ScanIssueCode, ScanOptions, ScanProgress, Scanner, StageBatchOutcome, StreamBatchStatus,
+    StreamEvent, StreamLimits, StreamRootKind, StreamRootObservation, StreamTrustScope,
     StreamingEnumerationOutcome, StreamingScanSession, StreamingScanSink,
 };
 use guiying_store::{
-    compute_exact_group_member_leaf, BeginExactGroupInput, BuildKey, CapabilityProfileInput,
-    CoreCoverageSealDigest, CoreDirectoryManifest, CoreDirectoryObservationInput,
-    CoreFileObservationInput, CoreSessionId, CoreSessionInput, CoverageOutcomeInput,
-    CoverageStatus, DirectoryObjectSignature, DirectoryTicketCursor, DirectoryTicketRecord,
-    ExactDigestBucketCursor, ExactGroupManifestMember, ExactGroupMemberInput,
-    ExactVerificationEdgeInput, FileObjectKey, FileTicketRecord, FileTimestampParts,
-    FingerprintBucketRecord, FingerprintFileTicketRecord, FingerprintReadOrigin,
-    FreshFingerprintInput, FreshFingerprintKind, ManifestDigest, MountSessionKey,
-    NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue, NewScopedScanJob,
-    ObservationInput, ParametersHash, RootObjectSignature, RootScopeKey, RunEvidenceGuard,
-    SampleBucketCursor, ScanStage, SizeBucketCursor, SourceSignature, StablePathKey, Store,
-    StoreError, TicketSortKey, VerifiedExactGroup, VolumeCoverageManifest, VolumeInput,
+    compute_exact_group_member_leaf, AcquireRuntimeLeaseInput, BeginExactGroupInput, BuildKey,
+    CapabilityProfileInput, CoreCoverageSealDigest, CoreDirectoryManifest,
+    CoreDirectoryObservationInput, CoreFileObservationInput, CoreSessionId, CoreSessionInput,
+    CoverageOutcomeInput, CoverageStatus, DirectoryObjectSignature, DirectoryTicketCursor,
+    DirectoryTicketRecord, ExactDigestBucketCursor, ExactGroupManifestMember,
+    ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey, FileTicketRecord,
+    FileTimestampParts, FingerprintBucketRecord, FingerprintFileTicketRecord,
+    FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind, LeasedScanTerminalOutcome,
+    ManifestDigest, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun,
+    NewScanIssue, NewScopedScanJob, ObservationInput, ParametersHash, PauseCheckpointCursor,
+    PauseCheckpointInput, PauseCheckpointWriteKey, RootObjectSignature, RootScopeKey,
+    RunEvidenceGuard, RuntimeLeaseGuard, RuntimeLeaseKey, SampleBucketCursor, ScanControlKind,
+    ScanControlRequestInput, ScanControlRequestKey, ScanStage, SizeBucketCursor, SourceSignature,
+    StablePathKey, Store, StoreError, TicketSortKey, VerifiedExactGroup, VolumeCoverageManifest,
+    VolumeInput,
 };
 use guiying_volume::{
     BoundMediaPath, BoundVolumeSession, CaseBehaviorObservation, FileObjectIdentity,
@@ -75,6 +79,8 @@ pub enum RuntimeError {
     NumericRange(&'static str),
     #[error("system clock is before the Unix epoch or exceeds i64 milliseconds")]
     InvalidSystemClock,
+    #[error("operating-system secure random source is unavailable: {0}")]
+    Entropy(String),
     #[error("path evidence could not be decoded: {0}")]
     PathDecode(String),
     #[error("{0} was cancelled before its evidence set could be sealed")]
@@ -87,6 +93,7 @@ pub enum RuntimeError {
 /// active runtime or perform filesystem mutations.
 pub trait RuntimeObserver {
     fn on_progress(&mut self, _progress: &ScanProgress) {}
+    fn on_enumeration_resumed(&mut self) {}
 }
 
 impl RuntimeObserver for () {}
@@ -107,6 +114,13 @@ pub struct EnumerationSummary {
     pub logical_bytes: u64,
     pub issues: u64,
     pub directory_observations: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnumerationDriveMode {
+    Start,
+    Resume,
+    PausedCancelTerminalOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +186,9 @@ pub struct ActiveReadOnlyScan {
     ids: RuntimeScanIds,
     job_state_version: i64,
     run_state_version: i64,
+    runtime_lease_key: RuntimeLeaseKey,
+    runtime_lease: Option<RuntimeLeaseGuard>,
+    checkpoint_generation: Option<i64>,
     enumeration: Option<EnumerationSummary>,
     fingerprint_analysis: Option<FingerprintAnalysisState>,
     coverage: Option<CoverageSummary>,
@@ -193,6 +210,7 @@ impl ActiveReadOnlyScan {
         let scanner = Scanner::new(options)?;
         let core = scanner.start_streaming([root.to_path_buf()], StreamLimits::default())?;
         let core_session_id = CoreSessionId::from_runtime_evidence(*core.session_id().as_bytes());
+        let runtime_lease_key = RuntimeLeaseKey::from_runtime_evidence(random_key_material()?);
         let mut store = Store::open_or_create(database_path)?;
         let now_ms = now_ms()?;
         let setup =
@@ -206,6 +224,9 @@ impl ActiveReadOnlyScan {
             ids: setup.ids,
             job_state_version: setup.job_state_version,
             run_state_version: setup.run_state_version,
+            runtime_lease_key,
+            runtime_lease: None,
+            checkpoint_generation: None,
             enumeration: None,
             fingerprint_analysis: None,
             coverage: None,
@@ -276,7 +297,73 @@ impl ActiveReadOnlyScan {
                 "enumeration is allowed exactly once per runtime attempt",
             ));
         }
-        let (result, sink_outcome, sink_counts) = {
+        self.drive_enumeration(EnumerationDriveMode::Start, control, observer)
+    }
+
+    /// Continues a descriptor-bound enumeration after its durable pause safe
+    /// point was acknowledged. The live core session, traversal stack, volume
+    /// binding, and runtime lease all remain process-local; this method cannot
+    /// restore an attempt after process exit.
+    pub fn resume_enumeration(
+        &mut self,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<EnumerationSummary, RuntimeError> {
+        if !self
+            .enumeration
+            .as_ref()
+            .is_some_and(|summary| summary.status == StreamBatchStatus::Paused)
+        {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "resume requires a live paused enumeration",
+            ));
+        }
+        let directive = if control.is_cancelled() {
+            ScanDirective::Cancel
+        } else {
+            control.directive()
+        };
+        if directive == ScanDirective::Cancel {
+            // Let core consume cancellation from its paused state so it drops
+            // the live traversal before the durable cancel request is acked.
+            // No synthetic resume request is written on this path.
+            return self.drive_enumeration(
+                EnumerationDriveMode::PausedCancelTerminalOnly,
+                control,
+                observer,
+            );
+        }
+        if directive == ScanDirective::Pause {
+            return self
+                .enumeration
+                .clone()
+                .ok_or(RuntimeError::UnsupportedEvidence(
+                    "paused enumeration summary disappeared",
+                ));
+        }
+        if let Err(error) = self.acknowledge_enumeration_resume() {
+            return Err(self.interrupt_for_failure("RUNTIME_RESUME_ACK_FAILED", error));
+        }
+        if let Some(summary) = self.enumeration.as_mut() {
+            summary.status = StreamBatchStatus::InProgress;
+        }
+        observer.on_enumeration_resumed();
+        self.drive_enumeration(EnumerationDriveMode::Resume, control, observer)
+    }
+
+    fn drive_enumeration(
+        &mut self,
+        mode: EnumerationDriveMode,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<EnumerationSummary, RuntimeError> {
+        let previous = self.enumeration.clone();
+        let pause_armed = AtomicBool::new(self.runtime_lease.is_some());
+        let gated_control = EnumerationControl {
+            inner: control,
+            pause_armed: &pause_armed,
+        };
+        let (result, sink_outcome, sink_counts, runtime_lease) = {
             let mut sink = EnumerationSink {
                 store: &mut self.store,
                 volume: &self.volume,
@@ -287,15 +374,26 @@ impl ActiveReadOnlyScan {
                     self.volume.observation().root_identity(),
                     self.volume.observation().mount_session_key().as_bytes(),
                 ),
-                core_bound: false,
-                files: 0,
-                logical_bytes: 0,
-                issues: 0,
-                directories: 0,
+                runtime_lease_key: self.runtime_lease_key,
+                runtime_lease: self.runtime_lease,
+                core_bound: self.runtime_lease.is_some(),
+                files: previous.as_ref().map_or(0, |summary| summary.media_files),
+                logical_bytes: previous.as_ref().map_or(0, |summary| summary.logical_bytes),
+                issues: previous.as_ref().map_or(0, |summary| summary.issues),
+                directories: previous
+                    .as_ref()
+                    .map_or(0, |summary| summary.directory_observations),
                 observed_outcome: None,
+                paused_cancel_terminal_only: mode == EnumerationDriveMode::PausedCancelTerminalOnly,
+                pause_armed: &pause_armed,
                 observer,
             };
-            let result = self.core.enumerate(&mut sink, control);
+            let result = match mode {
+                EnumerationDriveMode::Start => self.core.enumerate(&mut sink, &gated_control),
+                EnumerationDriveMode::Resume | EnumerationDriveMode::PausedCancelTerminalOnly => {
+                    self.core.resume_enumeration(&mut sink, &gated_control)
+                }
+            };
             (
                 result,
                 sink.observed_outcome.clone(),
@@ -305,8 +403,10 @@ impl ActiveReadOnlyScan {
                     sink.issues,
                     sink.directories,
                 ),
+                sink.runtime_lease,
             )
         };
+        self.runtime_lease = runtime_lease;
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -314,16 +414,30 @@ impl ActiveReadOnlyScan {
                 return Err(self.interrupt_for_failure("RUNTIME_ENUMERATION_FAILED", primary));
             }
         };
-        let Some(sink_outcome) = sink_outcome else {
-            let primary =
-                RuntimeError::EvidenceMismatch("core omitted EnumerationFinished".to_owned());
-            return Err(self.interrupt_for_failure("RUNTIME_ENUMERATION_OUTCOME_MISSING", primary));
-        };
-        if sink_outcome != outcome {
-            let primary = RuntimeError::EvidenceMismatch(
-                "returned enumeration outcome differs from the persisted event".to_owned(),
-            );
-            return Err(self.interrupt_for_failure("RUNTIME_ENUMERATION_OUTCOME_MISMATCH", primary));
+        if outcome.status == StreamBatchStatus::Paused {
+            if sink_outcome.is_some() {
+                let primary = RuntimeError::EvidenceMismatch(
+                    "paused enumeration emitted a terminal outcome".to_owned(),
+                );
+                return Err(self.interrupt_for_failure("RUNTIME_PAUSE_OUTCOME_UNEXPECTED", primary));
+            }
+        } else {
+            let Some(sink_outcome) = sink_outcome else {
+                let primary =
+                    RuntimeError::EvidenceMismatch("core omitted EnumerationFinished".to_owned());
+                return Err(
+                    self.interrupt_for_failure("RUNTIME_ENUMERATION_OUTCOME_MISSING", primary)
+                );
+            };
+            if !enumeration_terminal_outcomes_match(&outcome, &sink_outcome) {
+                let primary = RuntimeError::EvidenceMismatch(
+                    "returned enumeration outcome differs from the emitted terminal evidence"
+                        .to_owned(),
+                );
+                return Err(
+                    self.interrupt_for_failure("RUNTIME_ENUMERATION_OUTCOME_MISMATCH", primary)
+                );
+            }
         }
         let summary = EnumerationSummary {
             status: outcome.status,
@@ -334,10 +448,24 @@ impl ActiveReadOnlyScan {
         };
         match outcome.status {
             StreamBatchStatus::Completed | StreamBatchStatus::Partial => {
-                let item_count = i64::try_from(summary.media_files)
-                    .map_err(|_| RuntimeError::NumericRange("media file count"))?;
-                let logical_bytes = i64::try_from(summary.logical_bytes)
-                    .map_err(|_| RuntimeError::NumericRange("logical byte count"))?;
+                let item_count = match i64::try_from(summary.media_files) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Err(self.interrupt_for_failure(
+                            "RUNTIME_ENUMERATION_COUNT_OUT_OF_RANGE",
+                            RuntimeError::NumericRange("media file count"),
+                        ));
+                    }
+                };
+                let logical_bytes = match i64::try_from(summary.logical_bytes) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Err(self.interrupt_for_failure(
+                            "RUNTIME_ENUMERATION_BYTES_OUT_OF_RANGE",
+                            RuntimeError::NumericRange("logical byte count"),
+                        ));
+                    }
+                };
                 let sealed = self.store.write_transaction(|repository| {
                     repository.seal_scan_stage(
                         &self.guard,
@@ -367,10 +495,107 @@ impl ActiveReadOnlyScan {
                     )),
                 )?;
             }
+            StreamBatchStatus::Paused => {
+                if let Err(error) = self.acknowledge_enumeration_pause(&summary) {
+                    return Err(
+                        self.interrupt_for_failure("RUNTIME_PAUSE_CHECKPOINT_FAILED", error)
+                    );
+                }
+            }
+            StreamBatchStatus::InProgress => {
+                return Err(self.interrupt_for_failure(
+                    "RUNTIME_ENUMERATION_UNSUPPORTED_YIELD",
+                    RuntimeError::UnsupportedEvidence(
+                        "the core enumeration driver returned an unconsumed in-progress yield",
+                    ),
+                ));
+            }
         }
         self.issues_recorded = summary.issues;
         self.enumeration = Some(summary.clone());
         Ok(summary)
+    }
+
+    fn acknowledge_enumeration_pause(
+        &mut self,
+        summary: &EnumerationSummary,
+    ) -> Result<(), RuntimeError> {
+        let lease = self.runtime_lease.ok_or(RuntimeError::UnsupportedEvidence(
+            "pause cannot be acknowledged before the root runtime lease exists",
+        ))?;
+        let request_key = ScanControlRequestKey::from_runtime_evidence(random_key_material()?);
+        let write_key = PauseCheckpointWriteKey::from_runtime_evidence(random_key_material()?);
+        let requested_at_ms = now_ms()?;
+        let request = ScanControlRequestInput::new(
+            request_key,
+            ScanControlKind::Pause,
+            self.job_state_version,
+            self.run_state_version,
+            None,
+            requested_at_ms,
+        )?;
+        let discovered_count = checked_i64("media file count", summary.media_files)?;
+        let error_count = checked_i64("issue count", summary.issues)?;
+        let logical_bytes_seen = checked_i64("logical byte count", summary.logical_bytes)?;
+        let expected_generation = self.checkpoint_generation;
+        let expected_job_state_version = self.job_state_version;
+        let expected_run_state_version = self.run_state_version;
+        let directory_ordinal = summary.directory_observations;
+        let file_ordinal = summary.media_files;
+        let (job_version, run_version, generation) =
+            self.store.write_transaction(|repository| {
+                let record = repository.request_scan_control(&lease, &request)?;
+                let checkpoint = PauseCheckpointInput::new(
+                    record.id,
+                    request_key,
+                    expected_generation,
+                    write_key,
+                    PauseCheckpointCursor::Enumeration {
+                        next_directory_ordinal: directory_ordinal,
+                        next_file_ordinal: file_ordinal,
+                    },
+                    expected_job_state_version,
+                    expected_run_state_version,
+                    discovered_count,
+                    0,
+                    error_count,
+                    logical_bytes_seen,
+                    requested_at_ms,
+                )?;
+                repository.acknowledge_pause(&lease, &checkpoint, requested_at_ms)
+            })?;
+        self.job_state_version = job_version;
+        self.run_state_version = run_version;
+        self.checkpoint_generation = Some(generation);
+        Ok(())
+    }
+
+    fn acknowledge_enumeration_resume(&mut self) -> Result<(), RuntimeError> {
+        let lease = self.runtime_lease.ok_or(RuntimeError::UnsupportedEvidence(
+            "resume requires the live runtime lease",
+        ))?;
+        let generation = self
+            .checkpoint_generation
+            .ok_or(RuntimeError::UnsupportedEvidence(
+                "resume requires an acknowledged pause checkpoint",
+            ))?;
+        let request_key = ScanControlRequestKey::from_runtime_evidence(random_key_material()?);
+        let acknowledged_at_ms = now_ms()?;
+        let input = ScanControlRequestInput::new(
+            request_key,
+            ScanControlKind::Resume,
+            self.job_state_version,
+            self.run_state_version,
+            Some(generation),
+            acknowledged_at_ms,
+        )?;
+        let (job_version, run_version) = self.store.write_transaction(|repository| {
+            let request = repository.request_scan_control(&lease, &input)?;
+            repository.acknowledge_resume(&lease, request.id, &request_key, acknowledged_at_ms)
+        })?;
+        self.job_state_version = job_version;
+        self.run_state_version = run_version;
+        Ok(())
     }
 
     /// Samples every sealed duplicate-size candidate, then fully hashes only
@@ -908,6 +1133,11 @@ impl ActiveReadOnlyScan {
                     "cancelled coverage escaped its terminal handler".to_owned(),
                 ));
             }
+            StreamBatchStatus::InProgress | StreamBatchStatus::Paused => {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "unfinished coverage escaped its bounded stage driver".to_owned(),
+                ));
+            }
         };
         let finalized_at_ms = now_ms()?;
         self.persist_coverage_outcome(
@@ -1069,6 +1299,11 @@ impl ActiveReadOnlyScan {
                     stage: "directory coverage",
                     failed: coverage_failed,
                 });
+            }
+            StreamBatchStatus::InProgress | StreamBatchStatus::Paused => {
+                return Err(RuntimeError::UnsupportedEvidence(
+                    "directory coverage yielded before runtime checkpoint support",
+                ));
             }
         }
         summary.issues = self.issues_recorded;
@@ -1654,23 +1889,102 @@ impl ActiveReadOnlyScan {
         target_run_state: &str,
         error: Option<(&str, &str)>,
     ) -> Result<(), RuntimeError> {
+        if target_job_state == "cancelled" && target_run_state == "cancelled" {
+            return self.acknowledge_cancel();
+        }
         let now = now_ms()?;
+        let (job_version, run_version) = if let Some(lease) = self.runtime_lease {
+            let outcome = match (target_job_state, target_run_state) {
+                ("completed", "completed") => LeasedScanTerminalOutcome::Completed,
+                ("failed", "failed") => LeasedScanTerminalOutcome::Failed,
+                ("failed", "interrupted") => LeasedScanTerminalOutcome::Interrupted,
+                _ => {
+                    return Err(RuntimeError::UnsupportedEvidence(
+                        "unsupported leased terminal transition",
+                    ))
+                }
+            };
+            let expected_state = if self
+                .enumeration
+                .as_ref()
+                .is_some_and(|summary| summary.status == StreamBatchStatus::Paused)
+            {
+                "paused"
+            } else {
+                "running"
+            };
+            self.store.write_transaction(|repository| {
+                repository.transition_leased_scan_job_and_run(
+                    &lease,
+                    expected_state,
+                    self.job_state_version,
+                    expected_state,
+                    self.run_state_version,
+                    outcome,
+                    now,
+                    error,
+                )
+            })?
+        } else {
+            self.store.write_transaction(|repository| {
+                repository.transition_bound_scan_job_and_run(
+                    &self.guard,
+                    self.ids.scan_job_id,
+                    "running",
+                    self.job_state_version,
+                    "running",
+                    self.run_state_version,
+                    target_job_state,
+                    target_run_state,
+                    now,
+                    error,
+                )
+            })?
+        };
+        self.job_state_version = job_version;
+        self.run_state_version = run_version;
+        self.runtime_lease = None;
+        Ok(())
+    }
+
+    fn acknowledge_cancel(&mut self) -> Result<(), RuntimeError> {
+        let Some(lease) = self.runtime_lease else {
+            let now = now_ms()?;
+            let (job_version, run_version) = self.store.write_transaction(|repository| {
+                repository.transition_bound_scan_job_and_run(
+                    &self.guard,
+                    self.ids.scan_job_id,
+                    "running",
+                    self.job_state_version,
+                    "running",
+                    self.run_state_version,
+                    "cancelled",
+                    "cancelled",
+                    now,
+                    None,
+                )
+            })?;
+            self.job_state_version = job_version;
+            self.run_state_version = run_version;
+            return Ok(());
+        };
+        let request_key = ScanControlRequestKey::from_runtime_evidence(random_key_material()?);
+        let acknowledged_at_ms = now_ms()?;
+        let input = ScanControlRequestInput::new(
+            request_key,
+            ScanControlKind::Cancel,
+            self.job_state_version,
+            self.run_state_version,
+            None,
+            acknowledged_at_ms,
+        )?;
         let (job_version, run_version) = self.store.write_transaction(|repository| {
-            repository.transition_bound_scan_job_and_run(
-                &self.guard,
-                self.ids.scan_job_id,
-                "running",
-                self.job_state_version,
-                "running",
-                self.run_state_version,
-                target_job_state,
-                target_run_state,
-                now,
-                error,
-            )
+            let request = repository.request_scan_control(&lease, &input)?;
+            repository.acknowledge_cancel(&lease, request.id, &request_key, acknowledged_at_ms)
         })?;
         self.job_state_version = job_version;
         self.run_state_version = run_version;
+        self.runtime_lease = None;
         Ok(())
     }
 
@@ -2067,6 +2381,11 @@ fn validate_coverage_seal<'a>(
         StreamBatchStatus::Cancelled => Err(RuntimeError::EvidenceMismatch(
             "cancelled coverage escaped its terminal handler".to_owned(),
         )),
+        StreamBatchStatus::InProgress | StreamBatchStatus::Paused => {
+            Err(RuntimeError::EvidenceMismatch(
+                "unfinished coverage carried no runtime continuation".to_owned(),
+            ))
+        }
     }
 }
 
@@ -2346,7 +2665,8 @@ fn validate_stage_counts(
         .ok_or(RuntimeError::NumericRange("processed candidate count"))?;
     let input_count = u64::try_from(input_count)
         .map_err(|_| RuntimeError::NumericRange("fingerprint input count"))?;
-    if processed > input_count
+    if outcome.consumed != processed
+        || processed > input_count
         || (outcome.status == StreamBatchStatus::Completed && processed != input_count)
     {
         return Err(RuntimeError::EvidenceMismatch(
@@ -2373,6 +2693,12 @@ fn ensure_stage_batch_complete(
 fn checked_add_u64(field: &'static str, left: u64, right: u64) -> Result<u64, RuntimeError> {
     left.checked_add(right)
         .ok_or(RuntimeError::NumericRange(field))
+}
+
+fn publish_after_transaction<T, E>(slot: &mut T, result: Result<T, E>) -> Result<(), E> {
+    let committed = result?;
+    *slot = committed;
+    Ok(())
 }
 
 struct StoreAttempt {
@@ -2476,6 +2802,31 @@ fn create_store_attempt(
     Ok(setup)
 }
 
+struct EnumerationControl<'a> {
+    inner: &'a dyn ScanControl,
+    pause_armed: &'a AtomicBool,
+}
+
+impl ScanControl for EnumerationControl<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn directive(&self) -> ScanDirective {
+        match self.inner.directive() {
+            ScanDirective::Cancel => ScanDirective::Cancel,
+            ScanDirective::Pause if self.pause_armed.load(Ordering::Acquire) => {
+                ScanDirective::Pause
+            }
+            ScanDirective::Pause | ScanDirective::Continue => ScanDirective::Continue,
+        }
+    }
+
+    fn on_progress(&self, progress: &ScanProgress) {
+        self.inner.on_progress(progress);
+    }
+}
+
 struct EnumerationSink<'a> {
     store: &'a mut Store,
     volume: &'a BoundVolumeSession,
@@ -2483,12 +2834,16 @@ struct EnumerationSink<'a> {
     guard: RunEvidenceGuard,
     core_session_id: CoreSessionId,
     expected_root_signature: RootObjectSignature,
+    runtime_lease_key: RuntimeLeaseKey,
+    runtime_lease: Option<RuntimeLeaseGuard>,
     core_bound: bool,
     files: u64,
     logical_bytes: u64,
     issues: u64,
     directories: u64,
     observed_outcome: Option<StreamingEnumerationOutcome>,
+    paused_cancel_terminal_only: bool,
+    pause_armed: &'a AtomicBool,
     observer: &'a mut dyn RuntimeObserver,
 }
 
@@ -2500,6 +2855,15 @@ impl StreamingScanSink for EnumerationSink<'_> {
             return Err(RuntimeError::EvidenceMismatch(
                 "core event batch exceeds the Store adapter limit".to_owned(),
             ));
+        }
+        if self.paused_cancel_terminal_only {
+            let outcome = paused_cancel_terminal_outcome(events, self.observed_outcome.is_some())?;
+            // The Store job/run are still paused here. Progress writes require
+            // running state, so this terminal-only core acknowledgement remains
+            // in memory until acknowledge_cancel atomically persists the
+            // durable cancel request and terminal transition.
+            self.observed_outcome = Some(outcome);
+            return Ok(());
         }
         self.volume.revalidate()?;
         let now = now_ms()?;
@@ -2586,9 +2950,17 @@ impl StreamingScanSink for EnumerationSink<'_> {
         }
         self.volume.revalidate()?;
 
-        self.store.write_transaction(|repository| {
+        let current_lease = self.runtime_lease;
+        let acquired_lease = self.store.write_transaction(|repository| {
+            let mut next_lease = current_lease;
             if let Some(session) = &root_session {
                 repository.bind_core_session(&self.guard, session)?;
+                let input = AcquireRuntimeLeaseInput::new(
+                    self.runtime_lease_key,
+                    self.core_session_id,
+                    now,
+                )?;
+                next_lease = Some(repository.acquire_runtime_lease(&self.guard, &input)?);
             }
             if !files.is_empty() {
                 repository.record_core_observation_batch(
@@ -2614,10 +2986,14 @@ impl StreamingScanSink for EnumerationSink<'_> {
                 checked_i64("issue count", next_issues).map_err(runtime_store_error)?,
                 checked_i64("logical byte count", next_bytes).map_err(runtime_store_error)?,
                 now,
-            )
-        })?;
-
+            )?;
+            Ok(next_lease)
+        });
+        publish_after_transaction(&mut self.runtime_lease, acquired_lease)?;
         self.core_bound |= root_session.is_some();
+        if self.runtime_lease.is_some() {
+            self.pause_armed.store(true, Ordering::Release);
+        }
         self.files = next_files;
         self.logical_bytes = next_bytes;
         self.issues = next_issues;
@@ -2630,6 +3006,40 @@ impl StreamingScanSink for EnumerationSink<'_> {
         }
         Ok(())
     }
+}
+
+fn paused_cancel_terminal_outcome(
+    events: &[StreamEvent],
+    already_observed: bool,
+) -> Result<StreamingEnumerationOutcome, RuntimeError> {
+    match events {
+        [StreamEvent::EnumerationFinished(outcome)]
+            if outcome.status == StreamBatchStatus::Cancelled && !already_observed =>
+        {
+            Ok(outcome.clone())
+        }
+        _ => Err(RuntimeError::EvidenceMismatch(
+            "paused cancellation emitted evidence other than one cancelled terminal outcome"
+                .to_owned(),
+        )),
+    }
+}
+
+fn enumeration_terminal_outcomes_match(
+    returned: &StreamingEnumerationOutcome,
+    emitted: &StreamingEnumerationOutcome,
+) -> bool {
+    // Core flushes EnumerationFinished inside the final bounded step, then its
+    // compatibility driver replaces only the returned `consumed` field with
+    // the sum across every step in this call. Normalize that documented
+    // per-step/call-total distinction while keeping every evidence field exact
+    // and rejecting a terminal step count larger than the call total.
+    if emitted.consumed > returned.consumed {
+        return false;
+    }
+    let mut normalized = emitted.clone();
+    normalized.consumed = returned.consumed;
+    normalized == *returned
 }
 
 fn validate_root_observation(
@@ -3102,6 +3512,12 @@ fn now_ms() -> Result<i64, RuntimeError> {
     i64::try_from(duration.as_millis()).map_err(|_| RuntimeError::InvalidSystemClock)
 }
 
+fn random_key_material() -> Result<[u8; 32], RuntimeError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| RuntimeError::Entropy(error.to_string()))?;
+    Ok(bytes)
+}
+
 fn runtime_store_error(error: RuntimeError) -> StoreError {
     StoreError::InvalidInput {
         field: "runtime_evidence",
@@ -3123,8 +3539,10 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
-    use guiying_core::{CancellationToken, NoopScanControl};
+    use guiying_core::{CancellationToken, NoopScanControl, ScanDirective};
     use tempfile::TempDir;
 
     use super::*;
@@ -3138,6 +3556,309 @@ mod tests {
         fn on_progress(&mut self, _progress: &ScanProgress) {
             self.events += 1;
         }
+    }
+
+    #[derive(Default)]
+    struct ResumeObserver {
+        resumed: bool,
+    }
+
+    impl RuntimeObserver for ResumeObserver {
+        fn on_enumeration_resumed(&mut self) {
+            self.resumed = true;
+        }
+    }
+
+    struct EnumerationDirective {
+        value: AtomicU8,
+    }
+
+    impl EnumerationDirective {
+        fn paused() -> Self {
+            Self {
+                value: AtomicU8::new(1),
+            }
+        }
+
+        fn resume(&self) {
+            self.value.store(0, Ordering::Release);
+        }
+
+        fn cancel(&self) {
+            self.value.store(2, Ordering::Release);
+        }
+    }
+
+    impl ScanControl for EnumerationDirective {
+        fn is_cancelled(&self) -> bool {
+            self.value.load(Ordering::Acquire) == 2
+        }
+
+        fn directive(&self) -> ScanDirective {
+            match self.value.load(Ordering::Acquire) {
+                1 => ScanDirective::Pause,
+                2 => ScanDirective::Cancel,
+                _ => ScanDirective::Continue,
+            }
+        }
+    }
+
+    fn control_request_audit(
+        database: &Path,
+        scan_run_id: i64,
+    ) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT kind, disposition, ack_reason_code FROM scan_control_requests \
+             WHERE scan_run_id = ?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([scan_run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    fn acknowledged_pause_then_cancel() -> Vec<(String, String, Option<String>)> {
+        vec![
+            (
+                "pause".to_owned(),
+                "acknowledged".to_owned(),
+                Some("PAUSE_SAFE_POINT_ACKNOWLEDGED".to_owned()),
+            ),
+            (
+                "cancel".to_owned(),
+                "acknowledged".to_owned(),
+                Some("CANCEL_ACKNOWLEDGED".to_owned()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn paused_cancel_terminal_mode_accepts_only_one_cancelled_terminal_event() {
+        let cancelled = StreamingEnumerationOutcome {
+            status: StreamBatchStatus::Cancelled,
+            consumed: 0,
+            stats: guiying_core::ScanStats::default(),
+            directory_observations: 0,
+        };
+        let cancelled_event = StreamEvent::EnumerationFinished(cancelled.clone());
+        assert_eq!(
+            paused_cancel_terminal_outcome(std::slice::from_ref(&cancelled_event), false)
+                .expect("one cancelled terminal event should be accepted"),
+            cancelled
+        );
+        assert!(
+            paused_cancel_terminal_outcome(std::slice::from_ref(&cancelled_event), true,).is_err()
+        );
+        assert!(paused_cancel_terminal_outcome(&[], false).is_err());
+
+        let completed = StreamingEnumerationOutcome {
+            status: StreamBatchStatus::Completed,
+            consumed: 0,
+            stats: guiying_core::ScanStats::default(),
+            directory_observations: 0,
+        };
+        assert!(paused_cancel_terminal_outcome(
+            &[StreamEvent::EnumerationFinished(completed)],
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn terminal_outcome_comparison_normalizes_only_core_step_consumption() {
+        let emitted = StreamingEnumerationOutcome {
+            status: StreamBatchStatus::Completed,
+            consumed: 32,
+            stats: guiying_core::ScanStats::default(),
+            directory_observations: 4,
+        };
+        let mut returned = emitted.clone();
+        returned.consumed = 96;
+        assert!(enumeration_terminal_outcomes_match(&returned, &emitted));
+
+        let mut impossible_step_total = emitted.clone();
+        impossible_step_total.consumed = 97;
+        assert!(!enumeration_terminal_outcomes_match(
+            &returned,
+            &impossible_step_total,
+        ));
+
+        let mut changed_evidence = emitted;
+        changed_evidence.directory_observations += 1;
+        assert!(!enumeration_terminal_outcomes_match(
+            &returned,
+            &changed_evidence,
+        ));
+    }
+
+    #[test]
+    fn a_later_first_batch_write_failure_rolls_back_without_publishing_its_lease(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        let guard = runtime.guard;
+        let core_session_id = runtime.core_session_id;
+        let runtime_lease_key = runtime.runtime_lease_key;
+        let transaction_at_ms = now_ms()?;
+        let session = CoreSessionInput {
+            core_session_id,
+            root_object_signature: root_object_signature(
+                runtime.volume.observation().root_identity(),
+                runtime.volume.observation().mount_session_key().as_bytes(),
+            ),
+            root_source_signature: SourceSignature::from_runtime_evidence([7; 32]),
+            bound_at_ms: transaction_at_ms,
+        };
+        let lease_input =
+            AcquireRuntimeLeaseInput::new(runtime_lease_key, core_session_id, transaction_at_ms)?;
+
+        let failed = runtime.store.write_transaction(|repository| {
+            repository.bind_core_session(&guard, &session)?;
+            let candidate = repository.acquire_runtime_lease(&guard, &lease_input)?;
+            // This intentionally fails after both authority writes. The whole
+            // transaction must roll back and the candidate guard must remain
+            // unpublished in the live runtime.
+            repository.update_bound_scan_progress(&guard, 0, 1, 0, 0, transaction_at_ms)?;
+            Ok(Some(candidate))
+        });
+        assert!(publish_after_transaction(&mut runtime.runtime_lease, failed).is_err());
+        assert!(runtime.runtime_lease.is_none());
+        runtime.interrupt(
+            "ROLLED_BACK_FIRST_BATCH",
+            "rolled-back lease must not block legacy terminal closure",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn enumeration_pause_safe_point_resumes_with_the_same_live_attempt(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        for ordinal in 0..96 {
+            fs::write(
+                media.path().join(format!("pause-{ordinal:03}.jpg")),
+                b"bounded-pause-fixture",
+            )?;
+        }
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        let control = EnumerationDirective::paused();
+
+        let paused = runtime.enumerate(&control, &mut ())?;
+        assert_eq!(paused.status, StreamBatchStatus::Paused);
+        assert!(runtime.runtime_lease.is_some());
+        assert_eq!(runtime.checkpoint_generation, Some(1));
+        assert_eq!(
+            paused.directory_observations,
+            runtime
+                .enumeration_summary()
+                .expect("paused summary")
+                .directory_observations
+        );
+
+        control.resume();
+        let completed = runtime.resume_enumeration(&control, &mut ())?;
+        assert_eq!(completed.status, StreamBatchStatus::Completed);
+        assert_eq!(completed.media_files, 96);
+        assert_eq!(runtime.checkpoint_generation, Some(1));
+        runtime.interrupt("TEST_FINISHED", "pause/resume fixture completed")?;
+        Ok(())
+    }
+
+    #[test]
+    fn paused_cancel_does_not_acknowledge_a_synthetic_resume(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let database = application.path().join("runtime.sqlite3");
+        for ordinal in 0..96 {
+            fs::write(
+                media.path().join(format!("cancel-{ordinal:03}.jpg")),
+                b"bounded-cancel-fixture",
+            )?;
+        }
+        let mut runtime = ActiveReadOnlyScan::start(
+            &database,
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        let control = EnumerationDirective::paused();
+        assert_eq!(
+            runtime.enumerate(&control, &mut ())?.status,
+            StreamBatchStatus::Paused
+        );
+
+        control.cancel();
+        let cancelled = runtime.resume_enumeration(&control, &mut ())?;
+        assert_eq!(cancelled.status, StreamBatchStatus::Cancelled);
+        assert_eq!(runtime.checkpoint_generation, Some(1));
+        assert!(runtime.runtime_lease.is_none());
+        let scan_run_id = runtime.ids().scan_run_id;
+        drop(runtime);
+        assert_eq!(
+            control_request_audit(&database, scan_run_id)?,
+            acknowledged_pause_then_cancel()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resuming_before_ack_cancel_uses_the_paused_terminal_only_path(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let database = application.path().join("runtime.sqlite3");
+        for ordinal in 0..96 {
+            fs::write(
+                media.path().join(format!("resume-cancel-{ordinal:03}.jpg")),
+                b"bounded-resume-cancel-fixture",
+            )?;
+        }
+        let mut runtime = ActiveReadOnlyScan::start(
+            &database,
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        let control = EnumerationDirective::paused();
+        assert_eq!(
+            runtime.enumerate(&control, &mut ())?.status,
+            StreamBatchStatus::Paused
+        );
+
+        // This is the worker-visible Resuming window: Continue woke the
+        // paused worker, but Cancel won before runtime could acknowledge the
+        // durable resume request.
+        control.resume();
+        control.cancel();
+        let mut observer = ResumeObserver::default();
+        let cancelled = runtime.resume_enumeration(&control, &mut observer)?;
+        assert_eq!(cancelled.status, StreamBatchStatus::Cancelled);
+        assert!(!observer.resumed);
+        assert!(runtime.runtime_lease.is_none());
+        let scan_run_id = runtime.ids().scan_run_id;
+        drop(runtime);
+        assert_eq!(
+            control_request_audit(&database, scan_run_id)?,
+            acknowledged_pause_then_cancel()
+        );
+        Ok(())
     }
 
     #[test]

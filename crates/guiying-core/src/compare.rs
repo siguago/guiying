@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::error::VerificationError;
 use crate::file_io::{open_stable, unchanged_after_read, StableOpenError};
-use crate::scan::{NoopScanControl, ScanControl};
+use crate::scan::{effective_scan_directive, NoopScanControl, ScanControl, ScanDirective};
 
 const VERIFY_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -61,7 +61,7 @@ fn compare_files_exact_inner(
     right_expected: Option<&crate::file_io::FileSnapshot>,
     control: &dyn ScanControl,
 ) -> Result<ByteComparison, VerificationError> {
-    if control.is_cancelled() {
+    if effective_scan_directive(control) == ScanDirective::Cancel {
         return Err(VerificationError::Cancelled);
     }
 
@@ -87,7 +87,7 @@ fn compare_files_exact_inner(
     let mut identical = true;
 
     while bytes_compared < left_before.len {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(VerificationError::Cancelled);
         }
 

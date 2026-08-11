@@ -17,9 +17,11 @@ guiying-metadata = { version = "0.1.0", path = "../guiying-metadata" }
 guiying-store = { version = "0.1.0", path = "../guiying-store" }
 guiying-time = { version = "0.1.0", path = "../guiying-time" }
 guiying-volume = { version = "0.1.0", path = "../guiying-volume" }
+getrandom = "=0.3.4"
 serde_json = "=1.0.151"
 thiserror = "=2.0.20"
 
 [dev-dependencies]
 filetime = "=0.2.29"
+rusqlite = { version = "=0.32.1", default-features = false }
 tempfile = "=3.15.0"

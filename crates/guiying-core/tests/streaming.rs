@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use guiying_core::{
     ExactCandidatePair, FileObservationTicket, FreshReadOrigin, NoopScanControl, ScanControl,
-    ScanError, ScanIssueCode, ScanOptions, StreamBatchStatus, StreamEvent, StreamLimits,
-    StreamRootKind, StreamScanError, StreamingScanSink, TicketDecodeError,
-    STREAM_INPUT_BATCH_HARD_MAX,
+    ScanDirective, ScanError, ScanIssueCode, ScanOptions, StreamBatchStatus, StreamEvent,
+    StreamLimits, StreamRootKind, StreamScanError, StreamingScanSink, TicketDecodeError,
+    STREAM_ENUMERATION_STEP_HARD_MAX, STREAM_INPUT_BATCH_HARD_MAX,
 };
 use tempfile::TempDir;
 
@@ -55,6 +55,42 @@ impl RecordingSink {
             })
             .collect()
     }
+}
+
+fn enumeration_observation_keys(events: &[StreamEvent]) -> Vec<(u8, u16, PathBuf)> {
+    let mut keys = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::RootObservation(observation) => Some((
+                0,
+                observation.root_index,
+                observation.path.to_path_buf().expect("local root path"),
+            )),
+            StreamEvent::DirectoryObservation(observation) => Some((
+                1,
+                observation.root_index,
+                observation
+                    .path
+                    .to_path_buf()
+                    .expect("local directory path"),
+            )),
+            StreamEvent::FileObservation(observation) => Some((
+                2,
+                observation.root_index,
+                observation.path.to_path_buf().expect("local file path"),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+fn enumeration_finished_events(events: &[StreamEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, StreamEvent::EnumerationFinished(_)))
+        .count()
 }
 
 #[test]
@@ -120,6 +156,110 @@ fn enumeration_batches_are_hard_bounded_and_coverage_is_replayed() {
         .events
         .iter()
         .any(|event| matches!(event, StreamEvent::CoverageVerified(_))));
+}
+
+#[test]
+fn compatibility_enumerate_reports_every_entry_consumed_across_internal_steps() {
+    for entry_count in [65_u64, 128, 129] {
+        let temporary = TempDir::new().expect("tempdir");
+        for index in 0..entry_count {
+            write_media(
+                temporary.path(),
+                &format!("photo-{index:04}.jpg"),
+                b"fixture",
+            );
+        }
+        let mut session = guiying_core::Scanner::default()
+            .start_streaming([temporary.path()], StreamLimits::default())
+            .expect("start session");
+        let mut sink = RecordingSink::default();
+
+        let outcome = session
+            .enumerate(&mut sink, &NoopScanControl)
+            .expect("compatibility enumeration");
+
+        assert_eq!(outcome.status, StreamBatchStatus::Completed);
+        assert_eq!(outcome.consumed, entry_count);
+        assert_eq!(outcome.stats.entries_seen, entry_count);
+        assert_eq!(sink.file_tickets().len() as u64, entry_count);
+        assert_eq!(enumeration_finished_events(&sink.events), 1);
+    }
+}
+
+struct AlwaysPause;
+
+impl ScanControl for AlwaysPause {
+    fn directive(&self) -> ScanDirective {
+        ScanDirective::Pause
+    }
+}
+
+#[test]
+fn paused_step_resumes_without_missing_or_repeating_enumeration_events() {
+    let temporary = TempDir::new().expect("tempdir");
+    let entry_count = (STREAM_ENUMERATION_STEP_HARD_MAX * 2 + 1) as u64;
+    for index in 0..entry_count {
+        write_media(
+            temporary.path(),
+            &format!("photo-{index:04}.jpg"),
+            b"fixture",
+        );
+    }
+
+    let mut baseline_session = guiying_core::Scanner::default()
+        .start_streaming([temporary.path()], StreamLimits::default())
+        .expect("baseline session");
+    let mut baseline_sink = RecordingSink::default();
+    let baseline = baseline_session
+        .enumerate(&mut baseline_sink, &NoopScanControl)
+        .expect("baseline enumeration");
+
+    let mut stepped_session = guiying_core::Scanner::default()
+        .start_streaming([temporary.path()], StreamLimits::default())
+        .expect("stepped session");
+    let mut stepped_sink = RecordingSink::default();
+    let first = stepped_session
+        .enumerate_step(&mut stepped_sink, &NoopScanControl)
+        .expect("first bounded step");
+    assert_eq!(first.status, StreamBatchStatus::InProgress);
+    assert_eq!(first.consumed, STREAM_ENUMERATION_STEP_HARD_MAX as u64);
+
+    let events_before_pause = stepped_sink.events.len();
+    let paused = stepped_session
+        .enumerate_step(&mut stepped_sink, &AlwaysPause)
+        .expect("cooperative pause");
+    assert_eq!(paused.status, StreamBatchStatus::Paused);
+    assert_eq!(paused.consumed, 0);
+    assert_eq!(stepped_sink.events.len(), events_before_pause);
+
+    let resumed = stepped_session
+        .resume_enumeration(&mut stepped_sink, &NoopScanControl)
+        .expect("resume enumeration");
+    assert_eq!(resumed.status, StreamBatchStatus::Completed);
+    assert_eq!(resumed.stats, baseline.stats);
+    assert_eq!(
+        resumed.directory_observations,
+        baseline.directory_observations
+    );
+    assert_eq!(
+        enumeration_observation_keys(&stepped_sink.events),
+        enumeration_observation_keys(&baseline_sink.events)
+    );
+    assert_eq!(stepped_sink.file_tickets().len() as u64, entry_count);
+    let mut unique_files = stepped_sink
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::FileObservation(observation) => {
+                Some(observation.path.to_path_buf().expect("local file path"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    unique_files.sort();
+    unique_files.dedup();
+    assert_eq!(unique_files.len() as u64, entry_count);
+    assert_eq!(enumeration_finished_events(&stepped_sink.events), 1);
 }
 
 #[test]
@@ -638,6 +778,18 @@ impl ScanControl for AlreadyCancelled {
     }
 }
 
+struct CancelledAndPaused;
+
+impl ScanControl for CancelledAndPaused {
+    fn is_cancelled(&self) -> bool {
+        true
+    }
+
+    fn directive(&self) -> ScanDirective {
+        ScanDirective::Pause
+    }
+}
+
 #[test]
 fn cancellation_is_terminal_and_emits_no_file_observation() {
     let temporary = TempDir::new().expect("tempdir");
@@ -653,6 +805,27 @@ fn cancellation_is_terminal_and_emits_no_file_observation() {
 
     assert_eq!(outcome.status, StreamBatchStatus::Cancelled);
     assert!(sink.file_tickets().is_empty());
+}
+
+#[test]
+fn cancellation_dominates_a_simultaneous_pause_and_cannot_resume() {
+    let temporary = TempDir::new().expect("tempdir");
+    write_media(temporary.path(), "photo.jpg", b"fixture");
+    let mut session = guiying_core::Scanner::default()
+        .start_streaming([temporary.path()], StreamLimits::default())
+        .expect("start session");
+    let mut sink = RecordingSink::default();
+
+    let outcome = session
+        .enumerate_step(&mut sink, &CancelledAndPaused)
+        .expect("cancellation wins at the safe point");
+
+    assert_eq!(outcome.status, StreamBatchStatus::Cancelled);
+    assert!(sink.file_tickets().is_empty());
+    let error = session
+        .resume_enumeration(&mut sink, &NoopScanControl)
+        .expect_err("cancelled traversal cannot resume");
+    assert!(matches!(error, StreamScanError::InvalidState(_)));
 }
 
 struct CancelFreshRead {
@@ -718,6 +891,35 @@ fn hashing_never_follows_an_enumerated_ancestor_replaced_by_a_symlink() {
         .events
         .iter()
         .any(|event| matches!(event, StreamEvent::FreshFingerprint(_))));
+}
+
+#[test]
+fn coverage_finalization_consumes_no_caller_supplied_items() {
+    let temporary = TempDir::new().expect("tempdir");
+    let album = temporary.path().join("album");
+    fs::create_dir(&album).expect("album");
+    write_media(&album, "photo.jpg", b"fixture");
+    let mut session = guiying_core::Scanner::default()
+        .start_streaming([temporary.path()], StreamLimits::default())
+        .expect("start session");
+    let mut enumeration = RecordingSink::default();
+    session
+        .enumerate(&mut enumeration, &NoopScanControl)
+        .expect("enumerate");
+    let mut directories = enumeration.directory_tickets();
+    directories.sort_by_key(|ticket| *ticket.sort_key());
+    let mut coverage_sink = RecordingSink::default();
+
+    let replay = session
+        .revalidate_directory_batch(&directories, &mut coverage_sink, &NoopScanControl)
+        .expect("revalidate directory tickets");
+    assert_eq!(replay.consumed, directories.len() as u64);
+    let finalization = session
+        .finalize_coverage(&mut coverage_sink, &NoopScanControl)
+        .expect("finalize coverage");
+
+    assert_eq!(finalization.status, StreamBatchStatus::Completed);
+    assert_eq!(finalization.consumed, 0);
 }
 
 #[test]

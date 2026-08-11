@@ -22,11 +22,15 @@ use crate::model::{
     FileId, FileTimestamp, MediaKind, PathRef, ProgressStage, ScanIssue, ScanIssueCode,
     ScanProgress, ScanStats,
 };
-use crate::{ScanControl, ScanError, Scanner};
+use crate::scan::effective_scan_directive;
+use crate::{ScanControl, ScanDirective, ScanError, Scanner};
 
 /// Maximum number of caller-provided tickets or pairs accepted by one stage
 /// call. This is a hard safety limit, independent of configured event batches.
 pub const STREAM_INPUT_BATCH_HARD_MAX: usize = 128;
+/// Maximum number of complete directory entries advanced by one enumeration
+/// step. This keeps pause latency and synchronous work independently bounded.
+pub const STREAM_ENUMERATION_STEP_HARD_MAX: usize = 64;
 
 /// Absolute maximum event count in one synchronous sink callback.
 pub const STREAM_EVENT_BATCH_HARD_MAX: usize = 128;
@@ -491,8 +495,12 @@ impl CoverageSeal {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamBatchStatus {
+    /// A bounded step committed successfully, but more work remains.
+    InProgress,
     Completed,
     Partial,
+    /// Resumable cooperative pause. Unlike cancellation this is not terminal.
+    Paused,
     Cancelled,
     Interrupted,
 }
@@ -500,6 +508,10 @@ pub enum StreamBatchStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamingEnumerationOutcome {
     pub status: StreamBatchStatus,
+    /// Complete entries consumed by this call. A paused, partially processed
+    /// entry is deliberately excluded and will be retried after resume.
+    pub consumed: u64,
+    /// Cumulative statistics for the live enumeration session.
     pub stats: ScanStats,
     pub directory_observations: u64,
 }
@@ -507,6 +519,10 @@ pub struct StreamingEnumerationOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StageBatchOutcome {
     pub status: StreamBatchStatus,
+    /// Caller-supplied items conclusively completed or failed in this call.
+    /// This is currently provided for runtime checkpoint accounting; the
+    /// fingerprint/exact/coverage methods do not yet observe `Pause`.
+    pub consumed: u64,
     pub completed: u64,
     pub failed: u64,
 }
@@ -605,6 +621,26 @@ struct PendingRoot {
     snapshot: FileSnapshot,
 }
 
+struct EnumerationProgress {
+    root_index: usize,
+    stack: Vec<StreamDirectoryFrame>,
+    stats: ScanStats,
+    partial: bool,
+    accepted_root_directory_ids: Vec<FileId>,
+}
+
+impl EnumerationProgress {
+    fn new() -> Self {
+        Self {
+            root_index: 0,
+            stack: Vec::new(),
+            stats: ScanStats::default(),
+            partial: false,
+            accepted_root_directory_ids: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 enum RootAccess {
     Directory {
@@ -631,6 +667,9 @@ pub struct StreamingScanSession {
     ticket_key: [u8; 32],
     pending_roots: Vec<PendingRoot>,
     roots: Vec<Option<RootAccess>>,
+    /// Live descriptor traversal. This is intentionally process-local and is
+    /// never exposed as a serializable checkpoint.
+    enumeration: Option<EnumerationProgress>,
     state: SessionState,
     expected_directory_tickets: u64,
     expected_directory_ticket_xor: [u8; 32],
@@ -707,13 +746,15 @@ impl Scanner {
         let mut ticket_key = [0_u8; 32];
         ticket_key.copy_from_slice(&entropy[32..]);
 
+        let root_count = pending_roots.len();
         Ok(StreamingScanSession {
             scanner: self.clone(),
             limits,
             session_id,
             ticket_key,
             pending_roots,
-            roots: Vec::new(),
+            roots: (0..root_count).map(|_| None).collect(),
+            enumeration: Some(EnumerationProgress::new()),
             state: SessionState::Ready,
             expected_directory_tickets: 0,
             expected_directory_ticket_xor: [0_u8; 32],
@@ -738,6 +779,10 @@ impl StreamingScanSession {
     }
 
     /// Enumerates with O(configured depth + bounded batch) core memory.
+    ///
+    /// This compatibility entry point drives bounded steps until enumeration
+    /// reaches a terminal state or the control requests `Pause`. A paused call
+    /// must be continued through [`Self::resume_enumeration`].
     pub fn enumerate<S: StreamingScanSink>(
         &mut self,
         sink: &mut S,
@@ -749,64 +794,250 @@ impl StreamingScanSession {
             ));
         }
         self.state = SessionState::Enumerating;
-        let result = self.enumerate_inner(sink, control);
+        self.drive_enumeration(sink, control)
+    }
+
+    /// Continues an enumeration that returned [`StreamBatchStatus::Paused`]
+    /// (or an explicitly stepped enumeration that is still in progress).
+    pub fn resume_enumeration<S: StreamingScanSink>(
+        &mut self,
+        sink: &mut S,
+        control: &dyn ScanControl,
+    ) -> Result<StreamingEnumerationOutcome, StreamScanError<S::Error>> {
+        if self.state != SessionState::Enumerating {
+            return Err(StreamScanError::InvalidState(
+                "resume requires a live paused or in-progress enumeration",
+            ));
+        }
+        self.drive_enumeration(sink, control)
+    }
+
+    /// Advances at most [`STREAM_ENUMERATION_STEP_HARD_MAX`] complete entries.
+    /// `InProgress` and `Paused` preserve the live descriptor stack; all other
+    /// statuses are terminal. No descriptor, ticket key, or traversal frame is
+    /// serializable outside this process.
+    pub fn enumerate_step<S: StreamingScanSink>(
+        &mut self,
+        sink: &mut S,
+        control: &dyn ScanControl,
+    ) -> Result<StreamingEnumerationOutcome, StreamScanError<S::Error>> {
+        match self.state {
+            SessionState::Ready => self.state = SessionState::Enumerating,
+            SessionState::Enumerating => {}
+            _ => {
+                return Err(StreamScanError::InvalidState(
+                    "enumeration step requires a ready or live enumerating session",
+                ))
+            }
+        }
+        let result = self.enumerate_step_inner(sink, control);
+        self.settle_enumeration_result(result)
+    }
+
+    fn drive_enumeration<S: StreamingScanSink>(
+        &mut self,
+        sink: &mut S,
+        control: &dyn ScanControl,
+    ) -> Result<StreamingEnumerationOutcome, StreamScanError<S::Error>> {
+        let mut consumed = 0_u64;
+        loop {
+            let result = self
+                .enumerate_step_inner(sink, control)
+                .and_then(|mut outcome| {
+                    consumed = consumed.checked_add(outcome.consumed).ok_or(
+                        StreamScanError::InvalidState("enumeration consumed count overflowed"),
+                    )?;
+                    outcome.consumed = consumed;
+                    Ok(outcome)
+                });
+            match result {
+                Ok(outcome) if outcome.status == StreamBatchStatus::InProgress => continue,
+                other => return self.settle_enumeration_result(other),
+            }
+        }
+    }
+
+    fn settle_enumeration_result<E>(
+        &mut self,
+        result: Result<StreamingEnumerationOutcome, StreamScanError<E>>,
+    ) -> Result<StreamingEnumerationOutcome, StreamScanError<E>> {
         match result {
             Ok(outcome) => {
                 self.state = match outcome.status {
+                    StreamBatchStatus::InProgress | StreamBatchStatus::Paused => {
+                        SessionState::Enumerating
+                    }
                     StreamBatchStatus::Completed | StreamBatchStatus::Partial => {
+                        self.enumeration = None;
                         SessionState::Enumerated
                     }
-                    StreamBatchStatus::Cancelled => SessionState::Cancelled,
-                    StreamBatchStatus::Interrupted => SessionState::Interrupted,
+                    StreamBatchStatus::Cancelled => {
+                        self.enumeration = None;
+                        self.roots.clear();
+                        SessionState::Cancelled
+                    }
+                    StreamBatchStatus::Interrupted => {
+                        self.enumeration = None;
+                        self.roots.clear();
+                        SessionState::Interrupted
+                    }
                 };
                 Ok(outcome)
             }
             Err(error) => {
+                self.enumeration = None;
+                self.roots.clear();
                 self.state = SessionState::Poisoned;
                 Err(error)
             }
         }
     }
 
-    fn enumerate_inner<S: StreamingScanSink>(
+    fn enumerate_step_inner<S: StreamingScanSink>(
         &mut self,
         sink: &mut S,
         control: &dyn ScanControl,
     ) -> Result<StreamingEnumerationOutcome, StreamScanError<S::Error>> {
         let mut events = EventBuffer::new(sink, self.limits);
-        let mut stats = ScanStats::default();
-        let mut partial = false;
-        let mut root_accesses: Vec<Option<RootAccess>> =
-            (0..self.pending_roots.len()).map(|_| None).collect();
-        let pending_roots = self.pending_roots.clone();
-        let mut accepted_root_directory_ids = Vec::<FileId>::new();
+        let mut progress = self
+            .enumeration
+            .take()
+            .ok_or(StreamScanError::InvalidState(
+                "live enumeration traversal is unavailable",
+            ))?;
+        let mut consumed = 0_u64;
 
-        for (root_index, root) in pending_roots.iter().enumerate() {
-            if control.is_cancelled() {
+        loop {
+            let directive = effective_scan_directive(control);
+            if directive == ScanDirective::Cancel {
                 let outcome = enumeration_outcome(
                     StreamBatchStatus::Cancelled,
-                    stats,
+                    progress.stats.clone(),
                     self.expected_directory_tickets,
+                    consumed,
                 );
                 events.push(StreamEvent::EnumerationFinished(outcome.clone()))?;
                 events.finish()?;
                 return Ok(outcome);
             }
-            if root.is_directory {
+
+            if progress.root_index >= self.pending_roots.len() && progress.stack.is_empty() {
+                self.enumeration_partial = progress.partial;
+                let outcome = enumeration_outcome(
+                    if progress.partial {
+                        StreamBatchStatus::Partial
+                    } else {
+                        StreamBatchStatus::Completed
+                    },
+                    progress.stats,
+                    self.expected_directory_tickets,
+                    consumed,
+                );
+                events.push(StreamEvent::EnumerationFinished(outcome.clone()))?;
+                events.finish()?;
+                return Ok(outcome);
+            }
+
+            if directive == ScanDirective::Pause {
+                events.finish()?;
+                let outcome = enumeration_outcome(
+                    StreamBatchStatus::Paused,
+                    progress.stats.clone(),
+                    self.expected_directory_tickets,
+                    consumed,
+                );
+                self.enumeration = Some(progress);
+                return Ok(outcome);
+            }
+
+            if consumed >= STREAM_ENUMERATION_STEP_HARD_MAX as u64 {
+                events.finish()?;
+                let outcome = enumeration_outcome(
+                    StreamBatchStatus::InProgress,
+                    progress.stats.clone(),
+                    self.expected_directory_tickets,
+                    consumed,
+                );
+                self.enumeration = Some(progress);
+                return Ok(outcome);
+            }
+
+            if progress.stack.is_empty() {
+                let root_index = progress.root_index;
+                let root = self.pending_roots[root_index].clone();
+                if !root.is_directory {
+                    let Some(media_kind) = self.scanner.options().media_kind(&root.path) else {
+                        progress.stats.non_media_files_skipped =
+                            progress.stats.non_media_files_skipped.saturating_add(1);
+                        progress.root_index = progress.root_index.saturating_add(1);
+                        consumed = consumed.saturating_add(1);
+                        continue;
+                    };
+                    let binding = match BoundFile::bind_root_file(root.path.clone(), &root.snapshot)
+                    {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            emit_issue(
+                                &mut events,
+                                &mut progress.stats,
+                                &mut progress.partial,
+                                stable_open_issue(root.path.clone(), error),
+                            )?;
+                            let outcome = enumeration_outcome(
+                                StreamBatchStatus::Interrupted,
+                                progress.stats,
+                                self.expected_directory_tickets,
+                                consumed,
+                            );
+                            events.push(StreamEvent::EnumerationFinished(outcome.clone()))?;
+                            events.finish()?;
+                            return Ok(outcome);
+                        }
+                    };
+                    progress.stats.entries_seen = progress.stats.entries_seen.saturating_add(1);
+                    progress.stats.media_files = progress.stats.media_files.saturating_add(1);
+                    let observation = self.make_file_observation(
+                        root_index,
+                        &[],
+                        root.path.clone(),
+                        media_kind,
+                        &root.snapshot,
+                    )?;
+                    let ticket = observation.ticket.clone();
+                    events.push(StreamEvent::RootObservation(make_root_observation(
+                        self.session_id,
+                        root_index,
+                        root.path.clone(),
+                        StreamRootKind::RegularFile,
+                        &root.snapshot,
+                    )))?;
+                    events.push(StreamEvent::FileObservation(observation))?;
+                    self.roots[root_index] = Some(RootAccess::File {
+                        path: root.path,
+                        binding,
+                        snapshot: Box::new(root.snapshot),
+                        ticket,
+                    });
+                    progress.root_index = progress.root_index.saturating_add(1);
+                    consumed = consumed.saturating_add(1);
+                    continue;
+                }
+
                 let bound_root = match BoundDirectory::bind_root(root.path.clone(), &root.snapshot)
                 {
                     Ok(bound) => bound,
                     Err(error) => {
                         emit_issue(
                             &mut events,
-                            &mut stats,
-                            &mut partial,
+                            &mut progress.stats,
+                            &mut progress.partial,
                             directory_bind_issue(root.path.clone(), error, true),
                         )?;
                         let outcome = enumeration_outcome(
                             StreamBatchStatus::Interrupted,
-                            stats,
+                            progress.stats,
                             self.expected_directory_tickets,
+                            consumed,
                         );
                         events.push(StreamEvent::EnumerationFinished(outcome.clone()))?;
                         events.finish()?;
@@ -815,7 +1046,7 @@ impl StreamingScanSession {
                 };
                 let root_device = root.snapshot.device();
                 let anchor = bound_root.root_anchor();
-                root_accesses[root_index] = Some(RootAccess::Directory {
+                self.roots[root_index] = Some(RootAccess::Directory {
                     path: root.path.clone(),
                     anchor,
                 });
@@ -829,392 +1060,322 @@ impl StreamingScanSession {
                 let Some(root_identity) = bound_root.identity() else {
                     emit_issue(
                         &mut events,
-                        &mut stats,
-                        &mut partial,
+                        &mut progress.stats,
+                        &mut progress.partial,
                         make_issue(
                             ScanIssueCode::MetadataUnreadable,
-                            root.path.clone(),
+                            root.path,
                             "opened root directory has no stable device/inode identity".to_owned(),
                         ),
                     )?;
+                    progress.root_index = progress.root_index.saturating_add(1);
                     continue;
                 };
-                if accepted_root_directory_ids.contains(&root_identity) {
-                    stats.directory_identity_revisits_skipped =
-                        stats.directory_identity_revisits_skipped.saturating_add(1);
+                if progress
+                    .accepted_root_directory_ids
+                    .contains(&root_identity)
+                {
+                    progress.stats.directory_identity_revisits_skipped = progress
+                        .stats
+                        .directory_identity_revisits_skipped
+                        .saturating_add(1);
                     emit_issue(
                         &mut events,
-                        &mut stats,
-                        &mut partial,
+                        &mut progress.stats,
+                        &mut progress.partial,
                         make_issue(
                             ScanIssueCode::DirectoryIdentityAlreadyVisited,
-                            root.path.clone(),
+                            root.path,
                             format!(
                                 "root directory identity ({}, {}) was already selected",
                                 root_identity.device, root_identity.inode
                             ),
                         ),
                     )?;
+                    progress.root_index = progress.root_index.saturating_add(1);
                     continue;
                 }
-                accepted_root_directory_ids.push(root_identity);
+                progress.accepted_root_directory_ids.push(root_identity);
                 self.emit_directory_observation(root_index, &bound_root, &mut events)?;
-                let mut stack = vec![StreamDirectoryFrame {
+                progress.stack.push(StreamDirectoryFrame {
                     root_index,
                     root_device,
                     depth: 0,
                     directory: bound_root,
-                }];
+                });
+                continue;
+            }
 
-                while !stack.is_empty() {
-                    if control.is_cancelled() {
-                        let outcome = enumeration_outcome(
-                            StreamBatchStatus::Cancelled,
-                            stats,
-                            self.expected_directory_tickets,
-                        );
-                        events.push(StreamEvent::EnumerationFinished(outcome.clone()))?;
-                        events.finish()?;
-                        return Ok(outcome);
+            let next = {
+                let frame = progress.stack.last_mut().expect("stack checked non-empty");
+                frame.directory.next_name()
+            };
+            let name = match next {
+                Ok(Some(name)) => name,
+                Ok(None) => {
+                    progress.stack.pop();
+                    if progress.stack.is_empty() {
+                        progress.root_index = progress.root_index.saturating_add(1);
                     }
+                    continue;
+                }
+                Err(error) => {
+                    let path = progress
+                        .stack
+                        .last()
+                        .expect("stack checked non-empty")
+                        .directory
+                        .path()
+                        .to_path_buf();
+                    emit_issue(
+                        &mut events,
+                        &mut progress.stats,
+                        &mut progress.partial,
+                        make_issue(ScanIssueCode::DirectoryUnreadable, path, error.to_string()),
+                    )?;
+                    progress.stack.pop();
+                    if progress.stack.is_empty() {
+                        progress.root_index = progress.root_index.saturating_add(1);
+                    }
+                    continue;
+                }
+            };
 
-                    let next = {
-                        let frame = stack.last_mut().expect("stack checked non-empty");
-                        frame.directory.next_name()
-                    };
-                    let name = match next {
-                        Ok(Some(name)) => name,
-                        Ok(None) => {
-                            stack.pop();
-                            continue;
-                        }
-                        Err(error) => {
-                            let path = stack
-                                .last()
-                                .expect("stack checked non-empty")
-                                .directory
-                                .path()
-                                .to_path_buf();
-                            emit_issue(
-                                &mut events,
-                                &mut stats,
-                                &mut partial,
-                                make_issue(
-                                    ScanIssueCode::DirectoryUnreadable,
-                                    path,
-                                    error.to_string(),
-                                ),
-                            )?;
-                            stack.pop();
-                            continue;
-                        }
-                    };
+            let (path, kind, child_depth, frame_root_index, frame_root_device) = {
+                let frame = progress.stack.last().expect("stack checked non-empty");
+                let path = frame.directory.path().join(&name);
+                let kind = frame.directory.entry_kind(&name);
+                (
+                    path,
+                    kind,
+                    frame.depth.saturating_add(1),
+                    frame.root_index,
+                    frame.root_device,
+                )
+            };
+            progress.stats.entries_seen = progress.stats.entries_seen.saturating_add(1);
+            events.push(StreamEvent::Progress(ScanProgress {
+                stage: ProgressStage::Enumerating,
+                completed: progress.stats.entries_seen,
+                total: None,
+                current_path: Some(PathRef::from_path(&path)),
+            }))?;
+            let kind = match kind {
+                Ok(kind) => kind,
+                Err(error) => {
+                    emit_issue(
+                        &mut events,
+                        &mut progress.stats,
+                        &mut progress.partial,
+                        make_issue(ScanIssueCode::MetadataUnreadable, path, error.to_string()),
+                    )?;
+                    consumed = consumed.saturating_add(1);
+                    continue;
+                }
+            };
 
-                    let (path, kind, child_depth, frame_root_index, frame_root_device) = {
-                        let frame = stack.last().expect("stack checked non-empty");
-                        let path = frame.directory.path().join(&name);
-                        let kind = frame.directory.entry_kind(&name);
-                        (
+            match kind {
+                EntryKind::Symlink => {
+                    progress.stats.symlinks_skipped =
+                        progress.stats.symlinks_skipped.saturating_add(1);
+                    emit_issue(
+                        &mut events,
+                        &mut progress.stats,
+                        &mut progress.partial,
+                        make_issue(
+                            ScanIssueCode::SymlinkSkipped,
                             path,
-                            kind,
-                            frame.depth.saturating_add(1),
-                            frame.root_index,
-                            frame.root_device,
-                        )
-                    };
-                    stats.entries_seen = stats.entries_seen.saturating_add(1);
-                    events.push(StreamEvent::Progress(ScanProgress {
-                        stage: ProgressStage::Enumerating,
-                        completed: stats.entries_seen,
-                        total: None,
-                        current_path: Some(PathRef::from_path(&path)),
-                    }))?;
-                    if control.is_cancelled() {
-                        let outcome = enumeration_outcome(
-                            StreamBatchStatus::Cancelled,
-                            stats,
-                            self.expected_directory_tickets,
-                        );
-                        events.push(StreamEvent::EnumerationFinished(outcome.clone()))?;
-                        events.finish()?;
-                        return Ok(outcome);
-                    }
-                    let kind = match kind {
-                        Ok(kind) => kind,
-                        Err(error) => {
-                            emit_issue(
-                                &mut events,
-                                &mut stats,
-                                &mut partial,
-                                make_issue(
-                                    ScanIssueCode::MetadataUnreadable,
-                                    path,
-                                    error.to_string(),
+                            "symbolic links are never followed".to_owned(),
+                        ),
+                    )?;
+                }
+                EntryKind::Directory => {
+                    if let Some(reason) = self.scanner.options().directory_exclusion(&path) {
+                        progress.stats.excluded_directories_skipped = progress
+                            .stats
+                            .excluded_directories_skipped
+                            .saturating_add(1);
+                        emit_issue(
+                            &mut events,
+                            &mut progress.stats,
+                            &mut progress.partial,
+                            make_issue(ScanIssueCode::DirectoryExcluded, path, reason),
+                        )?;
+                    } else if child_depth > self.scanner.options().max_directory_depth {
+                        progress.stats.directory_depth_limit_skipped = progress
+                            .stats
+                            .directory_depth_limit_skipped
+                            .saturating_add(1);
+                        emit_issue(
+                            &mut events,
+                            &mut progress.stats,
+                            &mut progress.partial,
+                            make_issue(
+                                ScanIssueCode::DirectoryDepthLimitReached,
+                                path,
+                                format!(
+                                    "directory depth {child_depth} exceeds the configured safe limit {}",
+                                    self.scanner.options().max_directory_depth
                                 ),
-                            )?;
-                            continue;
-                        }
-                    };
-
-                    match kind {
-                        EntryKind::Symlink => {
-                            stats.symlinks_skipped = stats.symlinks_skipped.saturating_add(1);
-                            emit_issue(
-                                &mut events,
-                                &mut stats,
-                                &mut partial,
-                                make_issue(
-                                    ScanIssueCode::SymlinkSkipped,
-                                    path,
-                                    "symbolic links are never followed".to_owned(),
-                                ),
-                            )?;
-                        }
-                        EntryKind::Directory => {
-                            if let Some(reason) = self.scanner.options().directory_exclusion(&path)
-                            {
-                                stats.excluded_directories_skipped =
-                                    stats.excluded_directories_skipped.saturating_add(1);
-                                emit_issue(
-                                    &mut events,
-                                    &mut stats,
-                                    &mut partial,
-                                    make_issue(ScanIssueCode::DirectoryExcluded, path, reason),
-                                )?;
-                            } else if child_depth > self.scanner.options().max_directory_depth {
-                                stats.directory_depth_limit_skipped =
-                                    stats.directory_depth_limit_skipped.saturating_add(1);
-                                emit_issue(
-                                    &mut events,
-                                    &mut stats,
-                                    &mut partial,
-                                    make_issue(
-                                        ScanIssueCode::DirectoryDepthLimitReached,
-                                        path,
-                                        format!(
-                                            "directory depth {child_depth} exceeds the configured safe limit {}",
-                                            self.scanner.options().max_directory_depth
+                            ),
+                        )?;
+                    } else {
+                        let child = {
+                            let frame = progress.stack.last().expect("stack checked non-empty");
+                            frame.directory.bind_child(&name, path.clone())
+                        };
+                        match child {
+                            Ok(child) => {
+                                if self.scanner.options().stay_on_filesystem
+                                    && frame_root_device.is_some()
+                                    && child.device() != frame_root_device
+                                {
+                                    progress.stats.cross_filesystem_directories_skipped = progress
+                                        .stats
+                                        .cross_filesystem_directories_skipped
+                                        .saturating_add(1);
+                                    emit_issue(
+                                        &mut events,
+                                        &mut progress.stats,
+                                        &mut progress.partial,
+                                        make_issue(
+                                            ScanIssueCode::CrossFilesystemSkipped,
+                                            path,
+                                            "nested filesystem is outside the scan root volume"
+                                                .to_owned(),
                                         ),
-                                    ),
-                                )?;
-                            } else {
-                                let child = {
-                                    let frame = stack.last().expect("stack checked non-empty");
-                                    frame.directory.bind_child(&name, path.clone())
-                                };
-                                match child {
-                                    Ok(child) => {
-                                        if self.scanner.options().stay_on_filesystem
-                                            && frame_root_device.is_some()
-                                            && child.device() != frame_root_device
-                                        {
-                                            stats.cross_filesystem_directories_skipped = stats
-                                                .cross_filesystem_directories_skipped
-                                                .saturating_add(1);
-                                            emit_issue(
-                                                &mut events,
-                                                &mut stats,
-                                                &mut partial,
-                                                make_issue(
-                                                    ScanIssueCode::CrossFilesystemSkipped,
-                                                    path,
-                                                    "nested filesystem is outside the scan root volume"
-                                                        .to_owned(),
-                                                ),
-                                            )?;
-                                        } else if child.identity().is_some_and(|identity| {
-                                            stack.iter().any(|ancestor| {
-                                                ancestor.directory.identity() == Some(identity)
-                                            })
-                                        }) {
-                                            stats.directory_identity_revisits_skipped = stats
-                                                .directory_identity_revisits_skipped
-                                                .saturating_add(1);
-                                            emit_issue(
-                                                &mut events,
-                                                &mut stats,
-                                                &mut partial,
-                                                make_issue(
-                                                    ScanIssueCode::DirectoryIdentityAlreadyVisited,
-                                                    path,
-                                                    "directory identity matches an active ancestor; possible mount loop"
-                                                        .to_owned(),
-                                                ),
-                                            )?;
-                                        } else if child.identity().is_none() {
-                                            emit_issue(
-                                                &mut events,
-                                                &mut stats,
-                                                &mut partial,
-                                                make_issue(
-                                                    ScanIssueCode::MetadataUnreadable,
-                                                    path,
-                                                    "opened directory has no stable device/inode identity"
-                                                        .to_owned(),
-                                                ),
-                                            )?;
-                                        } else {
-                                            self.emit_directory_observation(
-                                                frame_root_index,
-                                                &child,
-                                                &mut events,
-                                            )?;
-                                            stack.push(StreamDirectoryFrame {
-                                                root_index: frame_root_index,
-                                                root_device: frame_root_device,
-                                                depth: child_depth,
-                                                directory: child,
-                                            });
-                                        }
-                                    }
-                                    Err(error) => emit_issue(
+                                    )?;
+                                } else if child.identity().is_some_and(|identity| {
+                                    progress.stack.iter().any(|ancestor| {
+                                        ancestor.directory.identity() == Some(identity)
+                                    })
+                                }) {
+                                    progress.stats.directory_identity_revisits_skipped = progress
+                                        .stats
+                                        .directory_identity_revisits_skipped
+                                        .saturating_add(1);
+                                    emit_issue(
                                         &mut events,
-                                        &mut stats,
-                                        &mut partial,
-                                        directory_bind_issue(path, error, false),
-                                    )?,
+                                        &mut progress.stats,
+                                        &mut progress.partial,
+                                        make_issue(
+                                            ScanIssueCode::DirectoryIdentityAlreadyVisited,
+                                            path,
+                                            "directory identity matches an active ancestor; possible mount loop"
+                                                .to_owned(),
+                                        ),
+                                    )?;
+                                } else if child.identity().is_none() {
+                                    emit_issue(
+                                        &mut events,
+                                        &mut progress.stats,
+                                        &mut progress.partial,
+                                        make_issue(
+                                            ScanIssueCode::MetadataUnreadable,
+                                            path,
+                                            "opened directory has no stable device/inode identity"
+                                                .to_owned(),
+                                        ),
+                                    )?;
+                                } else {
+                                    self.emit_directory_observation(
+                                        frame_root_index,
+                                        &child,
+                                        &mut events,
+                                    )?;
+                                    progress.stack.push(StreamDirectoryFrame {
+                                        root_index: frame_root_index,
+                                        root_device: frame_root_device,
+                                        depth: child_depth,
+                                        directory: child,
+                                    });
                                 }
                             }
-                        }
-                        EntryKind::RegularFile => {
-                            if let Some(media_kind) = self.scanner.options().media_kind(&path) {
-                                let info = {
-                                    let frame = stack.last().expect("stack checked non-empty");
-                                    frame.directory.bind_regular_file(&name, path.clone())
-                                };
-                                match info {
-                                    Ok(info) => {
-                                        if self.scanner.options().stay_on_filesystem
-                                            && frame_root_device.is_some()
-                                            && info.snapshot.device() != frame_root_device
-                                        {
-                                            stats.cross_filesystem_files_skipped = stats
-                                                .cross_filesystem_files_skipped
-                                                .saturating_add(1);
-                                            emit_issue(
-                                                &mut events,
-                                                &mut stats,
-                                                &mut partial,
-                                                make_issue(
-                                                    ScanIssueCode::CrossFilesystemSkipped,
-                                                    path,
-                                                    "file is outside the scan root volume"
-                                                        .to_owned(),
-                                                ),
-                                            )?;
-                                        } else {
-                                            let mut components = stack
-                                                .last()
-                                                .expect("stack checked non-empty")
-                                                .directory
-                                                .relative_components()
-                                                .to_vec();
-                                            components.push(name.clone());
-                                            let observation = self.make_file_observation(
-                                                frame_root_index,
-                                                &components,
-                                                path,
-                                                media_kind,
-                                                &info.snapshot,
-                                            )?;
-                                            stats.media_files = stats.media_files.saturating_add(1);
-                                            events
-                                                .push(StreamEvent::FileObservation(observation))?;
-                                        }
-                                    }
-                                    Err(error) => emit_issue(
-                                        &mut events,
-                                        &mut stats,
-                                        &mut partial,
-                                        file_bind_issue(path, error),
-                                    )?,
-                                }
-                            } else {
-                                stats.non_media_files_skipped =
-                                    stats.non_media_files_skipped.saturating_add(1);
-                            }
-                        }
-                        EntryKind::Other => {
-                            stats.special_files_skipped =
-                                stats.special_files_skipped.saturating_add(1);
-                            emit_issue(
+                            Err(error) => emit_issue(
                                 &mut events,
-                                &mut stats,
-                                &mut partial,
-                                make_issue(
-                                    ScanIssueCode::UnsupportedFileType,
-                                    path,
-                                    "only regular files are scanned".to_owned(),
-                                ),
-                            )?;
+                                &mut progress.stats,
+                                &mut progress.partial,
+                                directory_bind_issue(path, error, false),
+                            )?,
                         }
                     }
                 }
-            } else {
-                let Some(media_kind) = self.scanner.options().media_kind(&root.path) else {
-                    stats.non_media_files_skipped = stats.non_media_files_skipped.saturating_add(1);
-                    continue;
-                };
-                let binding = match BoundFile::bind_root_file(root.path.clone(), &root.snapshot) {
-                    Ok(binding) => binding,
-                    Err(error) => {
-                        emit_issue(
-                            &mut events,
-                            &mut stats,
-                            &mut partial,
-                            stable_open_issue(root.path.clone(), error),
-                        )?;
-                        let outcome = enumeration_outcome(
-                            StreamBatchStatus::Interrupted,
-                            stats,
-                            self.expected_directory_tickets,
-                        );
-                        events.push(StreamEvent::EnumerationFinished(outcome.clone()))?;
-                        events.finish()?;
-                        return Ok(outcome);
+                EntryKind::RegularFile => {
+                    if let Some(media_kind) = self.scanner.options().media_kind(&path) {
+                        let info = {
+                            let frame = progress.stack.last().expect("stack checked non-empty");
+                            frame.directory.bind_regular_file(&name, path.clone())
+                        };
+                        match info {
+                            Ok(info) => {
+                                if self.scanner.options().stay_on_filesystem
+                                    && frame_root_device.is_some()
+                                    && info.snapshot.device() != frame_root_device
+                                {
+                                    progress.stats.cross_filesystem_files_skipped = progress
+                                        .stats
+                                        .cross_filesystem_files_skipped
+                                        .saturating_add(1);
+                                    emit_issue(
+                                        &mut events,
+                                        &mut progress.stats,
+                                        &mut progress.partial,
+                                        make_issue(
+                                            ScanIssueCode::CrossFilesystemSkipped,
+                                            path,
+                                            "file is outside the scan root volume".to_owned(),
+                                        ),
+                                    )?;
+                                } else {
+                                    let mut components = progress
+                                        .stack
+                                        .last()
+                                        .expect("stack checked non-empty")
+                                        .directory
+                                        .relative_components()
+                                        .to_vec();
+                                    components.push(name);
+                                    let observation = self.make_file_observation(
+                                        frame_root_index,
+                                        &components,
+                                        path,
+                                        media_kind,
+                                        &info.snapshot,
+                                    )?;
+                                    progress.stats.media_files =
+                                        progress.stats.media_files.saturating_add(1);
+                                    events.push(StreamEvent::FileObservation(observation))?;
+                                }
+                            }
+                            Err(error) => emit_issue(
+                                &mut events,
+                                &mut progress.stats,
+                                &mut progress.partial,
+                                file_bind_issue(path, error),
+                            )?,
+                        }
+                    } else {
+                        progress.stats.non_media_files_skipped =
+                            progress.stats.non_media_files_skipped.saturating_add(1);
                     }
-                };
-                stats.entries_seen = stats.entries_seen.saturating_add(1);
-                stats.media_files = stats.media_files.saturating_add(1);
-                let observation = self.make_file_observation(
-                    root_index,
-                    &[],
-                    root.path.clone(),
-                    media_kind,
-                    &root.snapshot,
-                )?;
-                let ticket = observation.ticket.clone();
-                events.push(StreamEvent::RootObservation(make_root_observation(
-                    self.session_id,
-                    root_index,
-                    root.path.clone(),
-                    StreamRootKind::RegularFile,
-                    &root.snapshot,
-                )))?;
-                events.push(StreamEvent::FileObservation(observation))?;
-                root_accesses[root_index] = Some(RootAccess::File {
-                    path: root.path.clone(),
-                    binding,
-                    snapshot: Box::new(root.snapshot.clone()),
-                    ticket,
-                });
+                }
+                EntryKind::Other => {
+                    progress.stats.special_files_skipped =
+                        progress.stats.special_files_skipped.saturating_add(1);
+                    emit_issue(
+                        &mut events,
+                        &mut progress.stats,
+                        &mut progress.partial,
+                        make_issue(
+                            ScanIssueCode::UnsupportedFileType,
+                            path,
+                            "only regular files are scanned".to_owned(),
+                        ),
+                    )?;
+                }
             }
+            consumed = consumed.saturating_add(1);
         }
-
-        self.roots = root_accesses;
-        self.enumeration_partial = partial;
-        let outcome = enumeration_outcome(
-            if partial {
-                StreamBatchStatus::Partial
-            } else {
-                StreamBatchStatus::Completed
-            },
-            stats,
-            self.expected_directory_tickets,
-        );
-        events.push(StreamEvent::EnumerationFinished(outcome.clone()))?;
-        events.finish()?;
-        Ok(outcome)
     }
 
     fn emit_directory_observation<S: StreamingScanSink>(
@@ -1412,10 +1573,11 @@ impl StreamingScanSession {
         let mut completed = 0_u64;
         let mut failed = 0_u64;
         for ticket in tickets {
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 events.finish()?;
                 return Ok(StageBatchOutcome {
                     status: StreamBatchStatus::Cancelled,
+                    consumed: completed.saturating_add(failed),
                     completed,
                     failed,
                 });
@@ -1463,6 +1625,7 @@ impl StreamingScanSession {
                     events.finish()?;
                     return Ok(StageBatchOutcome {
                         status: StreamBatchStatus::Cancelled,
+                        consumed: completed.saturating_add(failed),
                         completed,
                         failed,
                     });
@@ -1476,6 +1639,7 @@ impl StreamingScanSession {
         events.finish()?;
         Ok(StageBatchOutcome {
             status: StreamBatchStatus::Completed,
+            consumed: completed.saturating_add(failed),
             completed,
             failed,
         })
@@ -1512,10 +1676,11 @@ impl StreamingScanSession {
         let mut completed = 0_u64;
         let mut failed = 0_u64;
         for pair in pairs {
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 events.finish()?;
                 return Ok(StageBatchOutcome {
                     status: StreamBatchStatus::Cancelled,
+                    consumed: completed.saturating_add(failed),
                     completed,
                     failed,
                 });
@@ -1565,6 +1730,7 @@ impl StreamingScanSession {
                     events.finish()?;
                     return Ok(StageBatchOutcome {
                         status: StreamBatchStatus::Cancelled,
+                        consumed: completed.saturating_add(failed),
                         completed,
                         failed,
                     });
@@ -1578,6 +1744,7 @@ impl StreamingScanSession {
         events.finish()?;
         Ok(StageBatchOutcome {
             status: StreamBatchStatus::Completed,
+            consumed: completed.saturating_add(failed),
             completed,
             failed,
         })
@@ -1615,10 +1782,11 @@ impl StreamingScanSession {
         let mut completed = 0_u64;
         let mut failed = 0_u64;
         for ticket in tickets {
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 events.finish()?;
                 return Ok(StageBatchOutcome {
                     status: StreamBatchStatus::Cancelled,
+                    consumed: completed.saturating_add(failed),
                     completed,
                     failed,
                 });
@@ -1686,6 +1854,7 @@ impl StreamingScanSession {
         events.finish()?;
         Ok(StageBatchOutcome {
             status: StreamBatchStatus::Completed,
+            consumed: completed.saturating_add(failed),
             completed,
             failed,
         })
@@ -1738,10 +1907,11 @@ impl StreamingScanSession {
             .ok_or(StreamScanError::InvalidState(
                 "directory coverage failures exceeded replayed tickets",
             ))?;
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             events.finish()?;
             return Ok(StageBatchOutcome {
                 status: StreamBatchStatus::Cancelled,
+                consumed: 0,
                 completed: completed_directories,
                 failed: self.verified_directory_failures,
             });
@@ -1833,6 +2003,7 @@ impl StreamingScanSession {
             events.finish()?;
             Ok(StageBatchOutcome {
                 status: StreamBatchStatus::Completed,
+                consumed: 0,
                 completed: self.expected_directory_tickets,
                 failed,
             })
@@ -1840,6 +2011,7 @@ impl StreamingScanSession {
             events.finish()?;
             Ok(StageBatchOutcome {
                 status: StreamBatchStatus::Partial,
+                consumed: 0,
                 completed: completed_directories,
                 failed,
             })
@@ -1847,6 +2019,7 @@ impl StreamingScanSession {
             events.finish()?;
             Ok(StageBatchOutcome {
                 status: StreamBatchStatus::Interrupted,
+                consumed: 0,
                 completed: completed_directories,
                 failed,
             })
@@ -2241,9 +2414,11 @@ fn enumeration_outcome(
     status: StreamBatchStatus,
     stats: ScanStats,
     directory_observations: u64,
+    consumed: u64,
 ) -> StreamingEnumerationOutcome {
     StreamingEnumerationOutcome {
         status,
+        consumed,
         stats,
         directory_observations,
     }
@@ -2415,7 +2590,7 @@ fn read_sample_fresh(
     let mut buffer = vec![0_u8; chunk];
     let mut bytes_read = 0_u64;
     for offset in offsets {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(FreshReadError::Cancelled);
         }
         hasher.update(&offset.to_le_bytes());
@@ -2458,7 +2633,7 @@ fn read_full_fresh(
     let mut buffer = vec![0_u8; buffer_bytes];
     let mut bytes_read = 0_u64;
     while bytes_read < before.len {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(FreshReadError::Cancelled);
         }
         let remaining = before.len - bytes_read;
@@ -2528,7 +2703,7 @@ fn compare_opened_fresh(
     let mut bytes_compared = 0_u64;
     let mut identical = true;
     while bytes_compared < left_before.len {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(ExactReadError::Cancelled);
         }
         let remaining = left_before.len - bytes_compared;
@@ -2638,7 +2813,7 @@ fn read_exact_cancel(
     let expected = destination.len();
     let mut actual = 0_usize;
     while !destination.is_empty() {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(CancelReadError::Cancelled);
         }
         match reader.read(destination) {
