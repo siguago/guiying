@@ -1313,6 +1313,8 @@ dependencies = [
 name = "guiying-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "getrandom 0.3.4",
  "guiying-core",
  "guiying-runtime",
  "guiying-store",
@@ -1329,13 +1331,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "guiying-metadata"
+version = "0.1.0"
+
+[[package]]
 name = "guiying-runtime"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
  "guiying-core",
+ "guiying-metadata",
  "guiying-store",
+ "guiying-time",
  "guiying-volume",
  "serde_json",
  "thiserror 2.0.20",
@@ -1348,11 +1356,19 @@ dependencies = [
  "blake3",
  "indexmap 2.11.4",
  "rusqlite",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "guiying-time"
+version = "0.1.0"
+dependencies = [
+ "guiying-metadata",
 ]
 
 [[package]]

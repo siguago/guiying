@@ -25,9 +25,11 @@ tauri-plugin-log = "2"
 tauri-plugin-dialog = "2.7.2"
 guiying-core = { version = "0.1.0", path = "../crates/guiying-core" }
 tokio = { version = "1.53.1", features = ["sync"] }
-uuid = { version = "=1.20.0", default-features = false }
 guiying-runtime = { version = "0.1.0", path = "../crates/guiying-runtime" }
 guiying-store = { version = "0.1.0", path = "../crates/guiying-store" }
+uuid = { version = "=1.20.0", default-features = false }
+getrandom = "=0.3.4"
+base64 = "=0.23.1"
 
 [dev-dependencies]
 tempfile = "=3.15.0"
