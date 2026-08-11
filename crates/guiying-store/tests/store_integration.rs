@@ -20,7 +20,7 @@ fn open_enforces_settings_migrations_and_integrity() -> Result<(), Box<dyn std::
     let database = temporary.path().join("guiying.sqlite3");
     let store = Store::open_or_create(&database)?;
 
-    assert_eq!(store.schema_version()?, 5);
+    assert_eq!(store.schema_version()?, 6);
     assert!(store.settings().foreign_keys);
     assert_eq!(store.settings().busy_timeout_ms, 5_000);
     assert_eq!(store.settings().synchronous, "FULL");
@@ -41,14 +41,14 @@ fn open_enforces_settings_migrations_and_integrity() -> Result<(), Box<dyn std::
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(migration_count, 5);
+    assert_eq!(migration_count, 6);
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     assert_eq!(application_id, 0x4755_5949);
     connection.close().map_err(|(_, error)| error)?;
 
     let reopened = Store::open_existing(&database)?;
-    assert_eq!(reopened.schema_version()?, 5);
+    assert_eq!(reopened.schema_version()?, 6);
     Ok(())
 }
 
@@ -1010,16 +1010,20 @@ fn v5_windows_namespaces_reject_ambiguous_paths_and_foreign_encoding(
         "windows_utf16_le",
     )?;
 
-    for (index, unsafe_path) in [
-        "DCIM\\..\\escape",
-        "DCIM\\photo.jpg:stream",
-        "DCIM\\CON.txt",
-        "DCIM\\trailing.",
-        "C:\\DCIM\\photo.jpg",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    let mut unsafe_paths = vec![
+        "DCIM\\..\\escape".to_string(),
+        "DCIM\\photo.jpg:stream".to_string(),
+        "DCIM\\CON.txt".to_string(),
+        "DCIM\\CLOCK$".to_string(),
+        "DCIM\\COM0.txt".to_string(),
+        "DCIM\\COM¹.txt".to_string(),
+        "DCIM\\bad?.jpg".to_string(),
+        "DCIM\\bad\u{1}.jpg".to_string(),
+        "DCIM\\trailing.".to_string(),
+        "C:\\DCIM\\photo.jpg".to_string(),
+    ];
+    unsafe_paths.push(format!("DCIM\\{}", "a".repeat(8_193)));
+    for (index, unsafe_path) in unsafe_paths.iter().enumerate() {
         let byte = 40_u8
             .checked_add(u8::try_from(index).expect("small fixture index"))
             .expect("fixture byte does not overflow");
@@ -1852,7 +1856,7 @@ fn observation_input(index: u8, size_bytes: i64) -> ObservationInput {
             nanoseconds: 0,
         },
         accessed_time: None,
-        timestamp_granularity_ns: 1,
+        timestamp_granularity_ns: Some(1),
         observed_at_ms: 220 + i64::from(index),
     }
 }

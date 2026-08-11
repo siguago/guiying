@@ -1043,12 +1043,12 @@ impl<'transaction> RepositoryTx<'transaction> {
                  size_bytes, allocated_bytes, link_count, is_sparse, may_share_content, \
                  birth_time_seconds, birth_time_nanoseconds, modified_time_seconds, \
                  modified_time_nanoseconds, changed_time_seconds, changed_time_nanoseconds, \
-                 accessed_time_seconds, accessed_time_nanoseconds, timestamp_granularity_ns, \
-                 observed_at_ms \
+                 accessed_time_seconds, accessed_time_nanoseconds, timestamp_storage_unit_ns, \
+                 timestamp_granularity_ns, observed_at_ms \
              ) VALUES ( \
                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                  ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, \
-                 ?30, ?31 \
+                 1, ?30, ?31 \
              )",
             params![
                 context.volume_id,
@@ -1152,7 +1152,8 @@ impl<'transaction> RepositoryTx<'transaction> {
                        AND modified_time_seconds = ?25 AND modified_time_nanoseconds = ?26 \
                        AND changed_time_seconds = ?27 AND changed_time_nanoseconds = ?28 \
                        AND accessed_time_seconds IS ?29 AND accessed_time_nanoseconds IS ?30 \
-                       AND timestamp_granularity_ns = ?31 AND observed_at_ms = ?32 \
+                       AND timestamp_storage_unit_ns = 1 \
+                       AND timestamp_granularity_ns IS ?31 AND observed_at_ms = ?32 \
                  )",
                 params![
                     observation_id,
@@ -1218,6 +1219,47 @@ impl<'transaction> RepositoryTx<'transaction> {
                     format!("{} must be sealed first", prerequisite.as_storage_str()),
                 ));
             }
+        }
+        let latest_evidence_ms = match stage {
+            ScanStage::Enumeration => self.transaction.query_row(
+                "SELECT COALESCE(max(observed_at_ms), 0) \
+                 FROM media_observation_snapshots WHERE scan_run_id = ?1",
+                [guard.scan_run_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            ScanStage::Sampling => self.transaction.query_row(
+                "SELECT COALESCE(max(completed_at_ms), 0) \
+                 FROM observation_fingerprints \
+                 WHERE scan_run_id = ?1 AND fingerprint_kind = 'sample'",
+                [guard.scan_run_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            ScanStage::FullHash => self.transaction.query_row(
+                "SELECT COALESCE(max(completed_at_ms), 0) \
+                 FROM observation_fingerprints \
+                 WHERE scan_run_id = ?1 AND fingerprint_kind = 'exact_bytes' \
+                   AND read_origin = 'full_hash_read'",
+                [guard.scan_run_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            ScanStage::ExactVerification => self.transaction.query_row(
+                "SELECT MAX( \
+                     COALESCE((SELECT max(verified_at_ms) FROM exact_verification_edges \
+                               WHERE scan_run_id = ?1), 0), \
+                     COALESCE((SELECT max(finalized_at_ms) FROM exact_group_builds \
+                               WHERE scan_run_id = ?1 AND state = 'verified'), 0), \
+                     COALESCE((SELECT finalized_at_ms FROM scan_coverage_outcomes \
+                               WHERE scan_run_id = ?1), 0) \
+                 )",
+                [guard.scan_run_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+        };
+        if sealed_at_ms < latest_evidence_ms {
+            return Err(StoreError::invalid_input(
+                "sealed_at_ms",
+                "stage seal cannot predate the evidence it seals",
+            ));
         }
         let existing = self
             .transaction
@@ -1921,6 +1963,18 @@ impl<'transaction> RepositoryTx<'transaction> {
             return Err(StoreError::invalid_input(
                 "exact_verification_edges",
                 "edge count does not match the draft manifest",
+            ));
+        }
+        let latest_edge_ms: i64 = self.transaction.query_row(
+            "SELECT COALESCE(max(verified_at_ms), 0) \
+             FROM exact_verification_edges WHERE exact_group_build_id = ?1",
+            [build_id],
+            |row| row.get(0),
+        )?;
+        if finalized_at_ms < latest_edge_ms {
+            return Err(StoreError::invalid_input(
+                "finalized_at_ms",
+                "group finalization cannot predate its verification edges",
             ));
         }
         let invalid_edge_bindings: i64 = self.transaction.query_row(
@@ -2915,6 +2969,22 @@ impl<'transaction> RepositoryTx<'transaction> {
                 entity: "scan_issue_run_evidence_guard",
                 id: input.scan_run_id,
             });
+        }
+        if let Some(media_file_id) = input.media_file_id {
+            let observed_by_run = self.transaction.query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM media_observation_snapshots \
+                     WHERE scan_run_id = ?1 AND volume_id = ?2 AND media_file_id = ?3 \
+                 )",
+                params![guard.scan_run_id, context.volume_id, media_file_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !observed_by_run {
+                return Err(StoreError::invalid_input(
+                    "media_file_id",
+                    "scan issue media file must have an observation in this run",
+                ));
+            }
         }
         self.record_scan_issue_impl(input)
     }
@@ -5178,7 +5248,7 @@ fn validate_observation(input: &ObservationInput, native_path_encoding: &str) ->
     validate_timestamp("modified_time", Some(input.modified_time))?;
     validate_timestamp("changed_time", Some(input.changed_time))?;
     validate_timestamp("accessed_time", input.accessed_time)?;
-    require_positive("timestamp_granularity_ns", input.timestamp_granularity_ns)?;
+    validate_optional_positive("timestamp_granularity_ns", input.timestamp_granularity_ns)?;
     require_nonnegative("observed_at_ms", input.observed_at_ms)
 }
 
@@ -5674,14 +5744,29 @@ fn validate_raw_relative_path(
                     "Unix path must be relative and contain no NUL",
                 ));
             }
-            if value
-                .split(|byte| *byte == b'/')
-                .any(|component| component.is_empty() || component == b"." || component == b"..")
-            {
-                return Err(StoreError::invalid_input(
-                    "relative_path_raw",
-                    "Unix path contains an empty, dot, or parent component",
-                ));
+            let mut component_count = 0_usize;
+            for component in value.split(|byte| *byte == b'/') {
+                if component.is_empty() || component == b"." || component == b".." {
+                    return Err(StoreError::invalid_input(
+                        "relative_path_raw",
+                        "Unix path contains an empty, dot, or parent component",
+                    ));
+                }
+                if component.len() > 16 * 1024 {
+                    return Err(StoreError::invalid_input(
+                        "relative_path_raw",
+                        "Unix path component exceeds 16384 bytes",
+                    ));
+                }
+                component_count = component_count.checked_add(1).ok_or_else(|| {
+                    StoreError::invalid_input("relative_path_raw", "component count overflow")
+                })?;
+                if component_count > 1_024 {
+                    return Err(StoreError::invalid_input(
+                        "relative_path_raw",
+                        "Unix path exceeds 1024 components",
+                    ));
+                }
             }
             if encoding == "utf8" && std::str::from_utf8(value).is_err() {
                 return Err(StoreError::invalid_input(
@@ -5764,45 +5849,104 @@ fn validate_windows_utf16_relative_path(value: &[u8]) -> Result<()> {
             "Windows path must be relative and contain no NUL, drive prefix, or alternate-data-stream colon",
         ));
     }
-    if code_units
-        .split(|unit| *unit == b'/' as u16 || *unit == b'\\' as u16)
-        .any(|component| {
-            component.is_empty()
-                || component == [b'.' as u16]
-                || component == [b'.' as u16, b'.' as u16]
-                || component
-                    .last()
-                    .is_some_and(|unit| *unit == b'.' as u16 || *unit == b' ' as u16)
-                || is_windows_device_component(component)
-        })
-    {
-        return Err(StoreError::invalid_input(
-            "relative_path_raw",
-            "Windows path contains an empty, dot, or parent component",
-        ));
+    let mut component_count = 0_usize;
+    for component in code_units.split(|unit| *unit == b'/' as u16 || *unit == b'\\' as u16) {
+        if component.is_empty()
+            || component == [b'.' as u16]
+            || component == [b'.' as u16, b'.' as u16]
+            || component
+                .last()
+                .is_some_and(|unit| *unit == b'.' as u16 || *unit == b' ' as u16)
+        {
+            return Err(StoreError::invalid_input(
+                "relative_path_raw",
+                "Windows path contains an empty, dot, parent, or ambiguous trailing component",
+            ));
+        }
+        if component.len().saturating_mul(2) > 16 * 1024 {
+            return Err(StoreError::invalid_input(
+                "relative_path_raw",
+                "Windows path component exceeds 16384 bytes",
+            ));
+        }
+        if component.iter().any(|unit| {
+            *unit < 0x20
+                || matches!(
+                    *unit,
+                    value if value == b'<' as u16
+                        || value == b'>' as u16
+                        || value == b'"' as u16
+                        || value == b'|' as u16
+                        || value == b'?' as u16
+                        || value == b'*' as u16
+                )
+        }) {
+            return Err(StoreError::invalid_input(
+                "relative_path_raw",
+                "Windows path contains a control or forbidden character",
+            ));
+        }
+        if is_windows_device_component(component) {
+            return Err(StoreError::invalid_input(
+                "relative_path_raw",
+                "Windows path contains a reserved device component",
+            ));
+        }
+        component_count = component_count.checked_add(1).ok_or_else(|| {
+            StoreError::invalid_input("relative_path_raw", "component count overflow")
+        })?;
+        if component_count > 1_024 {
+            return Err(StoreError::invalid_input(
+                "relative_path_raw",
+                "Windows path exceeds 1024 components",
+            ));
+        }
     }
     Ok(())
 }
 
 fn is_windows_device_component(component: &[u16]) -> bool {
-    let Some(ascii) = component
+    let stem_end = component
         .iter()
-        .map(|unit| u8::try_from(*unit).ok())
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let base = ascii
-        .split(|byte| *byte == b'.')
-        .next()
-        .unwrap_or_default()
+        .position(|unit| *unit == b'.' as u16)
+        .unwrap_or(component.len());
+    let stem = component[..stem_end]
         .iter()
-        .map(u8::to_ascii_uppercase)
+        .map(|unit| ascii_uppercase_u16(*unit))
         .collect::<Vec<_>>();
-    matches!(base.as_slice(), b"CON" | b"PRN" | b"AUX" | b"NUL")
-        || (base.len() == 4
-            && matches!(&base[..3], b"COM" | b"LPT")
-            && matches!(base[3], b'1'..=b'9'))
+    windows_units_match_ascii(&stem, b"CON")
+        || windows_units_match_ascii(&stem, b"PRN")
+        || windows_units_match_ascii(&stem, b"AUX")
+        || windows_units_match_ascii(&stem, b"NUL")
+        || windows_units_match_ascii(&stem, b"CLOCK$")
+        || windows_units_match_ascii(&stem, b"CONIN$")
+        || windows_units_match_ascii(&stem, b"CONOUT$")
+        || numbered_windows_device_component(&stem, b"COM")
+        || numbered_windows_device_component(&stem, b"LPT")
+}
+
+fn numbered_windows_device_component(stem: &[u16], prefix: &[u8; 3]) -> bool {
+    if stem.len() != 4 || !windows_units_match_ascii(&stem[..3], prefix) {
+        return false;
+    }
+    matches!(stem[3], value if (b'0' as u16..=b'9' as u16).contains(&value))
+        || matches!(stem[3], 0x00b9 | 0x00b2 | 0x00b3)
+}
+
+fn windows_units_match_ascii(units: &[u16], ascii: &[u8]) -> bool {
+    units.len() == ascii.len()
+        && units
+            .iter()
+            .zip(ascii)
+            .all(|(unit, byte)| *unit == *byte as u16)
+}
+
+fn ascii_uppercase_u16(value: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&value) {
+        value - (b'a' - b'A') as u16
+    } else {
+        value
+    }
 }
 
 fn validate_scan_issue(input: &NewScanIssue) -> Result<()> {

@@ -3,12 +3,12 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 #[test]
-fn fresh_store_has_v5_companion_schema_and_manifest_guards(
+fn fresh_store_has_v6_runtime_companion_schema_and_manifest_guards(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let database = temporary.path().join("guiying-v5.sqlite3");
     let store = Store::open_or_create(&database)?;
-    assert_eq!(store.schema_version()?, 5);
+    assert_eq!(store.schema_version()?, 6);
     store.close()?;
 
     let connection = Connection::open(&database)?;
@@ -19,18 +19,20 @@ fn fresh_store_has_v5_companion_schema_and_manifest_guards(
              'scan_stage_seals', 'media_namespace_paths', \
              'media_observation_snapshots', 'observation_fingerprints', \
              'exact_group_builds', 'exact_group_build_members', \
-             'exact_verification_edges' \
+             'exact_verification_edges', 'scan_core_sessions', \
+             'scan_file_tickets', 'scan_directory_observations', \
+             'scan_coverage_outcomes' \
          ) AND strict = 1",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(strict_tables, 10);
+    assert_eq!(strict_tables, 14);
     let migration_count: i64 = connection.query_row(
         "SELECT count(*) FROM guiying_schema_migrations",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(migration_count, 5);
+    assert_eq!(migration_count, 6);
     connection.execute_batch("DROP TRIGGER trg_scan_runs_enter_running_session_gate_v5;")?;
     connection.close().map_err(|(_, error)| error)?;
 
@@ -170,13 +172,13 @@ fn direct_sql_cannot_enter_running_without_a_bound_session(
              entry_type, size_bytes, allocated_bytes, link_count, is_sparse, \
              may_share_content, modified_time_seconds, modified_time_nanoseconds, \
              changed_time_seconds, changed_time_nanoseconds, \
-             timestamp_granularity_ns, observed_at_ms \
+             timestamp_storage_unit_ns, timestamp_granularity_ns, observed_at_ms \
          ) VALUES ( \
              1, 1, 1, 1, 1, 1, 1, CAST('photo.jpg' AS BLOB), 'utf8', 'photo.jpg', \
              x'1111111111111111111111111111111111111111111111111111111111111111', \
              1, \
              x'1212121212121212121212121212121212121212121212121212121212121212', \
-             x'01', 1, 33188, 'regular', 10, 10, 1, 0, 0, 1, 0, 1, 0, 1, 2 \
+             x'01', 1, 33188, 'regular', 10, 10, 1, 0, 0, 1, 0, 1, 0, 1, 1, 2 \
          ); \
          INSERT INTO scan_stage_seals ( \
              scan_run_id, volume_id, stage, item_count, logical_bytes, sealed_at_ms \

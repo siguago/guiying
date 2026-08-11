@@ -24,6 +24,240 @@ struct RunningRun {
 }
 
 #[test]
+fn v6_unknown_timestamp_precision_and_stage_chronology_fail_closed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let database_path = temporary.path().join("v6-chronology.sqlite3");
+    let mut store = Store::open_or_create(&database_path)?;
+    let run = create_running_run(&mut store, "chronology", 71)?;
+    let mut input = observation(0, 10);
+    input.timestamp_granularity_ns = None;
+    let observation_id = store.write_transaction(|repository| {
+        Ok(repository.record_observation_batch(&run.guard, &[input.clone()])?[0])
+    })?;
+    let error = store
+        .write_transaction(|repository| {
+            repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 1, 10, 159)
+        })
+        .expect_err("enumeration seal predated its observation");
+    assert!(matches!(error, StoreError::InvalidInput { .. }));
+
+    let connection = Connection::open(&database_path)?;
+    let precision: (i64, Option<i64>) = connection.query_row(
+        "SELECT timestamp_storage_unit_ns, timestamp_granularity_ns \
+         FROM media_observation_snapshots WHERE id = ?1",
+        [observation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(precision, (1, None));
+
+    store.write_transaction(|repository| {
+        repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 1, 10, 200)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::Sampling, 0, 0, 210)?;
+        let fingerprint = exact_fingerprint(
+            observation_id,
+            input.source_signature,
+            input.size_bytes,
+            ParametersHash::from_runtime_evidence([72; 32]),
+            300,
+        );
+        repository.record_fingerprint_fresh_batch(&run.guard, &[fingerprint])?;
+        Ok(())
+    })?;
+    let error = store
+        .write_transaction(|repository| {
+            repository.seal_scan_stage(&run.guard, ScanStage::FullHash, 1, 10, 299)
+        })
+        .expect_err("full-hash seal predated the hash evidence");
+    assert!(matches!(error, StoreError::InvalidInput { .. }));
+    store.write_transaction(|repository| {
+        repository.seal_scan_stage(&run.guard, ScanStage::FullHash, 1, 10, 300)
+    })?;
+    Ok(())
+}
+
+#[test]
+fn v6_core_ticket_coverage_is_required_before_exact_seal() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = TempDir::new()?;
+    let database_path = temporary.path().join("v6-coverage.sqlite3");
+    let mut store = Store::open_or_create(&database_path)?;
+    let run = create_running_run(&mut store, "coverage", 73)?;
+    let core_session_id = vec![74_u8; 32];
+    let connection = Connection::open(&database_path)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    connection.execute(
+        "INSERT INTO scan_core_sessions ( \
+             scan_run_id, volume_id, capability_profile_id, namespace_profile_id, \
+             core_session_id, trust_scope, engine_contract_version, root_index, root_kind, \
+             root_object_signature, root_source_signature, bound_at_ms \
+         ) SELECT session.scan_run_id, session.volume_id, session.capability_profile_id, \
+                  session.namespace_profile_id, ?1, 'current_core_session_only', 1, 0, \
+                  'directory', session.root_object_signature, ?2, 151 \
+             FROM scan_run_sessions AS session WHERE session.scan_run_id = ?3",
+        params![core_session_id, vec![75_u8; 32], run.run_id],
+    )?;
+
+    let mut input = observation(0, 10);
+    input.timestamp_granularity_ns = None;
+    let observation_id = store.write_transaction(|repository| {
+        Ok(repository.record_observation_batch(&run.guard, &[input.clone()])?[0])
+    })?;
+    connection.execute(
+        "INSERT INTO scan_file_tickets ( \
+             media_observation_snapshot_id, volume_id, scan_run_id, core_session_id, \
+             source_signature, ticket_format_version, ticket_blob, ticket_sort_key, \
+             created_at_ms \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 170)",
+        params![
+            observation_id,
+            run.volume_id,
+            run.run_id,
+            core_session_id,
+            input.source_signature.as_bytes().as_slice(),
+            vec![76_u8; 48],
+            vec![77_u8; 32],
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO scan_directory_observations ( \
+             volume_id, scan_run_id, core_session_id, root_index, root_relative_path_raw, \
+             path_encoding, display_path, source_signature, directory_object_signature, \
+             ticket_format_version, ticket_blob, ticket_sort_key, observed_at_ms \
+         ) VALUES (?1, ?2, ?3, 0, x'', 'utf8', '', ?4, ?5, 1, ?6, ?7, 171)",
+        params![
+            run.volume_id,
+            run.run_id,
+            core_session_id,
+            vec![78_u8; 32],
+            vec![79_u8; 32],
+            vec![80_u8; 48],
+            vec![81_u8; 32],
+        ],
+    )?;
+    store.write_transaction(|repository| {
+        repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 1, 10, 200)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::Sampling, 0, 0, 210)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::FullHash, 0, 0, 220)?;
+        Ok(())
+    })?;
+    store
+        .write_transaction(|repository| {
+            repository.seal_scan_stage(&run.guard, ScanStage::ExactVerification, 0, 0, 230)
+        })
+        .expect_err("exact stage sealed without complete directory coverage");
+    connection.execute(
+        "INSERT INTO scan_coverage_outcomes ( \
+             scan_run_id, volume_id, core_session_id, status, directory_count, \
+             replayed_count, stable_count, failed_count, core_manifest_digest, \
+             core_seal_digest, volume_verification_manifest, finalized_at_ms \
+         ) VALUES (?1, ?2, ?3, 'complete', 1, 1, 1, 0, ?4, ?5, ?6, 230)",
+        params![
+            run.run_id,
+            run.volume_id,
+            core_session_id,
+            vec![82_u8; 32],
+            vec![83_u8; 32],
+            vec![84_u8; 32],
+        ],
+    )?;
+    store.write_transaction(|repository| {
+        repository.seal_scan_stage(&run.guard, ScanStage::ExactVerification, 0, 0, 240)
+    })?;
+    Ok(())
+}
+
+#[test]
+fn v6_bound_issue_cannot_claim_media_from_outside_its_run() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = TempDir::new()?;
+    let database_path = temporary.path().join("v6-issue-binding.sqlite3");
+    let mut store = Store::open_or_create(&database_path)?;
+    let run = create_running_run(&mut store, "issue-binding", 85)?;
+    store.write_transaction(|repository| {
+        repository.record_observation_batch(&run.guard, &[observation(0, 10)])?;
+        Ok(())
+    })?;
+    let connection = Connection::open(&database_path)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    connection.execute(
+        "INSERT INTO media_files ( \
+             volume_id, first_seen_scan_run_id, last_seen_scan_run_id, relative_path, \
+             path_key, entry_type, media_kind, lifecycle_state, size_bytes, \
+             created_at_ms, updated_at_ms \
+         ) VALUES (?1, ?2, ?2, 'foreign.jpg', ?3, 'regular', 'photo', 'present', 10, 180, 180)",
+        params![run.volume_id, run.run_id, vec![86_u8; 32]],
+    )?;
+    let foreign_media_id = connection.last_insert_rowid();
+    let issue = NewScanIssue {
+        issue_key: "foreign-media-issue".into(),
+        volume_id: run.volume_id,
+        scan_run_id: run.run_id,
+        media_file_id: Some(foreign_media_id),
+        severity: "warning".into(),
+        stage: "enumeration".into(),
+        code: "TEST_FOREIGN_MEDIA".into(),
+        message: "must be rejected".into(),
+        details: None,
+        occurred_at_ms: 190,
+    };
+    let error = store
+        .write_transaction(|repository| repository.record_bound_scan_issue(&run.guard, &issue))
+        .expect_err("repository accepted media not observed by this run");
+    assert!(matches!(error, StoreError::InvalidInput { .. }));
+    let direct_error = connection
+        .execute(
+            "INSERT INTO scan_issues ( \
+                 issue_key, volume_id, scan_run_id, media_file_id, severity, stage, code, \
+                 message, occurred_at_ms \
+             ) VALUES ('direct-foreign', ?1, ?2, ?3, 'warning', 'enumeration', \
+                       'TEST_DIRECT_FOREIGN', 'must be rejected', 191)",
+            params![run.volume_id, run.run_id, foreign_media_id],
+        )
+        .expect_err("SQL trigger accepted media not observed by this run");
+    assert!(direct_error
+        .to_string()
+        .contains("not observed by this run"));
+    Ok(())
+}
+
+#[test]
+fn v6_reopen_rejects_a_restored_trigger_with_tampered_stage_time(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let database_path = temporary.path().join("v6-chronology-tamper.sqlite3");
+    let mut store = Store::open_or_create(&database_path)?;
+    let run = create_running_run(&mut store, "chronology-tamper", 87)?;
+    store.write_transaction(|repository| {
+        repository.record_observation_batch(&run.guard, &[observation(0, 10)])?;
+        repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 1, 10, 200)
+    })?;
+    store.close()?;
+
+    let connection = Connection::open(&database_path)?;
+    let immutable_trigger: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema \
+         WHERE type = 'trigger' AND name = 'trg_scan_stage_seals_no_update_v5'",
+        [],
+        |row| row.get(0),
+    )?;
+    connection.execute_batch("DROP TRIGGER trg_scan_stage_seals_no_update_v5;")?;
+    connection.execute(
+        "UPDATE scan_stage_seals SET sealed_at_ms = 159 \
+         WHERE scan_run_id = ?1 AND stage = 'enumeration'",
+        [run.run_id],
+    )?;
+    connection.execute_batch(&immutable_trigger)?;
+    connection.close().map_err(|(_, error)| error)?;
+
+    let error = Store::open_existing(&database_path)
+        .err()
+        .ok_or("store reopened a stage seal that predates its observation")?;
+    assert!(matches!(error, StoreError::MigrationHistoryMismatch(_)));
+    Ok(())
+}
+
+#[test]
 fn v5_write_pipeline_is_idempotent_and_finalizes_only_database_evidence(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
@@ -1052,7 +1286,7 @@ fn observation(index: u8, size_bytes: i64) -> ObservationInput {
             nanoseconds: 0,
         },
         accessed_time: None,
-        timestamp_granularity_ns: 1,
+        timestamp_granularity_ns: Some(1),
         observed_at_ms: 160 + i64::from(index),
     }
 }

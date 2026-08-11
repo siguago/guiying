@@ -261,7 +261,7 @@ pub struct ObservationRecord {
     pub modified_time: FileTimestampParts,
     pub changed_time: FileTimestampParts,
     pub accessed_time: Option<FileTimestampParts>,
-    pub timestamp_granularity_ns: i64,
+    pub timestamp_granularity_ns: Option<i64>,
     pub observed_at_ms: i64,
 }
 
@@ -509,7 +509,7 @@ pub struct ObservationInput {
     pub modified_time: FileTimestampParts,
     pub changed_time: FileTimestampParts,
     pub accessed_time: Option<FileTimestampParts>,
-    pub timestamp_granularity_ns: i64,
+    pub timestamp_granularity_ns: Option<i64>,
     pub observed_at_ms: i64,
 }
 

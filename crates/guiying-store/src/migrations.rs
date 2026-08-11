@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::error::{Result, StoreError};
 
 pub(crate) const APPLICATION_ID: i32 = 0x4755_5949; // ASCII "GUYI"
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 5;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 6;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_init.sql");
 
@@ -14,6 +14,8 @@ const STORE_HARDENING_MIGRATION: &str = include_str!("migrations/0003_store_hard
 const EVIDENCE_BINDING_MIGRATION: &str = include_str!("migrations/0004_evidence_binding.sql");
 const SESSION_BOUND_EVIDENCE_MIGRATION: &str =
     include_str!("migrations/0005_session_bound_evidence.sql");
+const RUNTIME_STREAM_EVIDENCE_MIGRATION: &str =
+    include_str!("migrations/0006_runtime_stream_evidence.sql");
 
 const REGISTRY_SQL: &str = r#"
 CREATE TABLE guiying_schema_migrations (
@@ -36,7 +38,7 @@ struct Migration {
     strips_embedded_transaction: bool,
 }
 
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     Migration {
         version: 1,
         name: "initial_data_model",
@@ -65,6 +67,12 @@ const MIGRATIONS: [Migration; 5] = [
         version: 5,
         name: "session_bound_evidence",
         sql: SESSION_BOUND_EVIDENCE_MIGRATION,
+        strips_embedded_transaction: false,
+    },
+    Migration {
+        version: 6,
+        name: "runtime_stream_evidence",
+        sql: RUNTIME_STREAM_EVIDENCE_MIGRATION,
         strips_embedded_transaction: false,
     },
 ];
@@ -503,6 +511,9 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
     if version >= 5 {
         validate_session_bound_evidence(connection)?;
     }
+    if version >= 6 {
+        validate_runtime_stream_evidence(connection)?;
+    }
     validate_stored_path_evidence(connection, version)?;
     Ok(())
 }
@@ -879,6 +890,251 @@ fn validate_session_bound_evidence(connection: &Connection) -> Result<()> {
     )?;
     crate::repository::verify_all_verified_exact_groups(connection)?;
     Ok(())
+}
+
+fn validate_runtime_stream_evidence(connection: &Connection) -> Result<()> {
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM media_observation_snapshots AS observation \
+             WHERE observation.timestamp_storage_unit_ns <> 1 \
+                OR (observation.timestamp_granularity_ns IS NOT NULL \
+                    AND observation.timestamp_granularity_ns <= 0) \
+         )",
+        "media observation has invalid timestamp precision evidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_core_sessions AS core \
+             LEFT JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = core.scan_run_id \
+              AND session.volume_id = core.volume_id \
+              AND session.capability_profile_id = core.capability_profile_id \
+              AND session.namespace_profile_id = core.namespace_profile_id \
+             LEFT JOIN scan_runs AS run \
+               ON run.id = core.scan_run_id \
+              AND run.volume_id = core.volume_id \
+             WHERE session.scan_run_id IS NULL \
+                OR run.id IS NULL \
+                OR core.trust_scope <> 'current_core_session_only' \
+                OR core.engine_contract_version <> 1 \
+                OR core.root_index <> 0 \
+                OR core.root_kind <> 'directory' \
+                OR core.root_object_signature <> session.root_object_signature \
+                OR core.bound_at_ms < session.created_at_ms \
+         )",
+        "core scan session is detached from its immutable volume session",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_file_tickets AS ticket \
+             LEFT JOIN scan_core_sessions AS core \
+               ON core.scan_run_id = ticket.scan_run_id \
+              AND core.volume_id = ticket.volume_id \
+              AND core.core_session_id = ticket.core_session_id \
+             LEFT JOIN media_observation_snapshots AS observation \
+               ON observation.id = ticket.media_observation_snapshot_id \
+              AND observation.scan_run_id = ticket.scan_run_id \
+              AND observation.volume_id = ticket.volume_id \
+             WHERE core.scan_run_id IS NULL \
+                OR observation.id IS NULL \
+                OR ticket.source_signature <> observation.source_signature \
+                OR ticket.created_at_ms < observation.observed_at_ms \
+                OR ticket.created_at_ms < core.bound_at_ms \
+         )",
+        "file ticket is detached from its core session or observation",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_directory_observations AS directory \
+             LEFT JOIN scan_core_sessions AS core \
+               ON core.scan_run_id = directory.scan_run_id \
+              AND core.volume_id = directory.volume_id \
+              AND core.core_session_id = directory.core_session_id \
+             LEFT JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = directory.scan_run_id \
+              AND session.volume_id = directory.volume_id \
+             WHERE core.scan_run_id IS NULL \
+                OR session.scan_run_id IS NULL \
+                OR directory.root_index <> core.root_index \
+                OR directory.path_encoding <> session.path_encoding \
+                OR directory.observed_at_ms < core.bound_at_ms \
+         )",
+        "directory ticket is detached from its core and volume session",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_coverage_outcomes AS coverage \
+             LEFT JOIN scan_core_sessions AS core \
+               ON core.scan_run_id = coverage.scan_run_id \
+              AND core.volume_id = coverage.volume_id \
+              AND core.core_session_id = coverage.core_session_id \
+             WHERE core.scan_run_id IS NULL \
+                OR coverage.directory_count <> ( \
+                    SELECT count(*) FROM scan_directory_observations AS directory \
+                    WHERE directory.scan_run_id = coverage.scan_run_id \
+                ) \
+                OR NOT EXISTS ( \
+                    SELECT 1 FROM scan_stage_seals AS full_hash \
+                    WHERE full_hash.scan_run_id = coverage.scan_run_id \
+                      AND full_hash.stage = 'full_hash' \
+                      AND full_hash.sealed_at_ms <= coverage.finalized_at_ms \
+                ) \
+                OR (coverage.status = 'complete' AND ( \
+                    coverage.replayed_count <> coverage.directory_count \
+                    OR coverage.stable_count <> coverage.directory_count \
+                    OR coverage.failed_count <> 0 \
+                    OR (SELECT count(*) FROM scan_file_tickets AS ticket \
+                        WHERE ticket.scan_run_id = coverage.scan_run_id) <> \
+                       (SELECT count(*) FROM media_observation_snapshots AS observation \
+                        WHERE observation.scan_run_id = coverage.scan_run_id) \
+                    OR coverage.finalized_at_ms < COALESCE(( \
+                        SELECT max(directory.observed_at_ms) \
+                        FROM scan_directory_observations AS directory \
+                        WHERE directory.scan_run_id = coverage.scan_run_id \
+                    ), core.bound_at_ms) \
+                )) \
+         )",
+        "coverage outcome is detached, incomplete, or predates its evidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_core_sessions AS core \
+             JOIN scan_stage_seals AS seal \
+               ON seal.scan_run_id = core.scan_run_id \
+              AND seal.volume_id = core.volume_id \
+             WHERE (seal.stage = 'enumeration' AND ( \
+                       (SELECT count(*) FROM scan_file_tickets AS ticket \
+                        WHERE ticket.scan_run_id = core.scan_run_id) <> \
+                       (SELECT count(*) FROM media_observation_snapshots AS observation \
+                        WHERE observation.scan_run_id = core.scan_run_id) \
+                       OR EXISTS ( \
+                           SELECT 1 FROM media_observation_snapshots AS observation \
+                           WHERE observation.scan_run_id = core.scan_run_id \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM scan_file_tickets AS ticket \
+                                 WHERE ticket.scan_run_id = observation.scan_run_id \
+                                   AND ticket.media_observation_snapshot_id = observation.id \
+                                   AND ticket.source_signature = observation.source_signature \
+                             ) \
+                       ) \
+                   )) \
+                OR (seal.stage = 'exact_verification' AND NOT EXISTS ( \
+                       SELECT 1 FROM scan_coverage_outcomes AS coverage \
+                       WHERE coverage.scan_run_id = core.scan_run_id \
+                         AND coverage.volume_id = core.volume_id \
+                         AND coverage.status = 'complete' \
+                         AND coverage.finalized_at_ms <= seal.sealed_at_ms \
+                   )) \
+         )",
+        "streaming scan seal lacks complete authenticated ticket coverage",
+    )?;
+    validate_v6_evidence_chronology(connection)?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_issues AS issue \
+             JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = issue.scan_run_id \
+              AND session.volume_id = issue.volume_id \
+             WHERE issue.media_file_id IS NOT NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM media_observation_snapshots AS observation \
+                   WHERE observation.scan_run_id = issue.scan_run_id \
+                     AND observation.volume_id = issue.volume_id \
+                     AND observation.media_file_id = issue.media_file_id \
+               ) \
+         )",
+        "scan issue references media that was not observed by its run",
+    )?;
+    Ok(())
+}
+
+fn validate_v6_upgrade_preconditions(connection: &Connection) -> Result<()> {
+    validate_v6_evidence_chronology(connection)?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_issues AS issue \
+             JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = issue.scan_run_id \
+              AND session.volume_id = issue.volume_id \
+             WHERE issue.media_file_id IS NOT NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM media_observation_snapshots AS observation \
+                   WHERE observation.scan_run_id = issue.scan_run_id \
+                     AND observation.volume_id = issue.volume_id \
+                     AND observation.media_file_id = issue.media_file_id \
+               ) \
+         )",
+        "v5 scan issue references media that was not observed by its run",
+    )
+}
+
+fn validate_v6_evidence_chronology(connection: &Connection) -> Result<()> {
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_stage_seals AS seal \
+             WHERE (seal.stage = 'enumeration' AND seal.sealed_at_ms < COALESCE(( \
+                       SELECT max(observation.observed_at_ms) \
+                       FROM media_observation_snapshots AS observation \
+                       WHERE observation.scan_run_id = seal.scan_run_id \
+                   ), 0)) \
+                OR (seal.stage = 'sampling' AND seal.sealed_at_ms < COALESCE(( \
+                       SELECT max(fingerprint.completed_at_ms) \
+                       FROM observation_fingerprints AS fingerprint \
+                       WHERE fingerprint.scan_run_id = seal.scan_run_id \
+                         AND fingerprint.fingerprint_kind = 'sample' \
+                   ), 0)) \
+                OR (seal.stage = 'full_hash' AND seal.sealed_at_ms < COALESCE(( \
+                       SELECT max(fingerprint.completed_at_ms) \
+                       FROM observation_fingerprints AS fingerprint \
+                       WHERE fingerprint.scan_run_id = seal.scan_run_id \
+                         AND fingerprint.fingerprint_kind = 'exact_bytes' \
+                         AND fingerprint.read_origin = 'full_hash_read' \
+                   ), 0)) \
+                OR (seal.stage = 'exact_verification' AND seal.sealed_at_ms < MAX( \
+                       COALESCE(( \
+                           SELECT max(edge.verified_at_ms) \
+                           FROM exact_verification_edges AS edge \
+                           WHERE edge.scan_run_id = seal.scan_run_id \
+                       ), 0), \
+                       COALESCE(( \
+                           SELECT max(build.finalized_at_ms) \
+                           FROM exact_group_builds AS build \
+                           WHERE build.scan_run_id = seal.scan_run_id \
+                             AND build.state = 'verified' \
+                       ), 0) \
+                   )) \
+         )",
+        "scan stage seal predates the evidence it seals",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM exact_group_builds AS build \
+             WHERE build.state = 'verified' \
+               AND build.finalized_at_ms < COALESCE(( \
+                   SELECT max(edge.verified_at_ms) \
+                   FROM exact_verification_edges AS edge \
+                   WHERE edge.exact_group_build_id = build.id \
+               ), 0) \
+         )",
+        "verified exact group predates its comparison evidence",
+    )
 }
 
 fn validate_stored_value_bounds(connection: &Connection, version: i64) -> Result<()> {
@@ -1415,6 +1671,9 @@ fn apply_migration(
     now_ms: i64,
     create_registry: bool,
 ) -> Result<()> {
+    if migration.version == 6 {
+        validate_v6_upgrade_preconditions(connection)?;
+    }
     let body = if migration.strips_embedded_transaction {
         strip_transaction(migration.sql)?
     } else {
@@ -1782,6 +2041,7 @@ mod tests {
         apply_migration(&mut connection, &MIGRATIONS[2], 1_002, false)?;
         apply_migration(&mut connection, &MIGRATIONS[3], 1_003, false)?;
         apply_migration(&mut connection, &MIGRATIONS[4], 1_004, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         validate_current_schema(&connection)?;
         let (encoding, raw): (String, Vec<u8>) = connection.query_row(
             "SELECT path_encoding, relative_path_raw FROM media_file_paths WHERE media_file_id = 1",
@@ -1876,6 +2136,7 @@ mod tests {
             assert!(error.to_string().contains("legacy or unscoped"));
             transaction.rollback()?;
         }
+        apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         validate_current_schema(&connection)?;
         Ok(())
     }
@@ -1911,6 +2172,7 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!((scope.0.as_str(), scope.1), ("legacy_session_v4", 0));
+        apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         validate_current_schema(&connection)?;
         Ok(())
     }
@@ -1944,7 +2206,7 @@ mod tests {
 
     #[test]
     fn exact_group_finalize_rejects_reclaimable_integer_overflow() -> crate::Result<()> {
-        let connection = empty_version_five_connection()?;
+        let connection = empty_latest_connection()?;
         connection.pragma_update(None, "foreign_keys", false)?;
         connection.execute_batch(
             "DROP TRIGGER trg_scan_runs_initial_state_v5; \
@@ -1989,20 +2251,20 @@ mod tests {
                  path_encoding, display_path, source_signature, stat_signature_version, \
                  file_object_key, file_mode, entry_type, size_bytes, modified_time_seconds, \
                  modified_time_nanoseconds, changed_time_seconds, changed_time_nanoseconds, \
-                 timestamp_granularity_ns, observed_at_ms \
+                 timestamp_storage_unit_ns, timestamp_granularity_ns, observed_at_ms \
              ) VALUES \
                  (1, 1, 1, 1, 1, 1, 1, x'61', 'utf8', 'a', \
                   x'1111111111111111111111111111111111111111111111111111111111111111', \
                   1, x'2121212121212121212121212121212121212121212121212121212121212121', \
-                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1), \
+                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1, 1), \
                  (2, 1, 1, 2, 2, 1, 1, x'62', 'utf8', 'b', \
                   x'1212121212121212121212121212121212121212121212121212121212121212', \
                   1, x'2222222222222222222222222222222222222222222222222222222222222222', \
-                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1), \
+                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1, 1), \
                  (3, 1, 1, 3, 3, 1, 1, x'63', 'utf8', 'c', \
                   x'1313131313131313131313131313131313131313131313131313131313131313', \
                   1, x'2323232323232323232323232323232323232323232323232323232323232323', \
-                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1); \
+                  33188, 'regular', 9223372036854775807, 1, 0, 1, 0, 1, 1, 1); \
              INSERT INTO exact_group_builds ( \
                  id, build_key, volume_id, scan_run_id, representative_observation_id, \
                  representative_fingerprint_id, expected_member_count, expected_edge_count, \
@@ -2047,6 +2309,36 @@ mod tests {
             )
             .expect_err("overflowing reclaimable byte calculation was accepted");
         assert!(error.to_string().contains("complete manifest and edge set"));
+        Ok(())
+    }
+
+    #[test]
+    fn version_five_timestamp_unit_migrates_to_unknown_actual_precision() -> crate::Result<()> {
+        let mut connection = empty_version_five_connection()?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.execute_batch(
+            "DROP TRIGGER trg_media_observation_snapshots_insert_guard_v5; \
+             INSERT INTO media_observation_snapshots ( \
+                 id, volume_id, scan_run_id, media_namespace_path_id, media_file_id, \
+                 namespace_profile_id, capability_profile_id, root_relative_path_raw, \
+                 path_encoding, display_path, source_signature, stat_signature_version, \
+                 file_mode, entry_type, size_bytes, modified_time_seconds, \
+                 modified_time_nanoseconds, changed_time_seconds, changed_time_nanoseconds, \
+                 timestamp_granularity_ns, observed_at_ms \
+             ) VALUES ( \
+                 1, 1, 1, 1, 1, 1, 1, x'61', 'utf8', 'a', zeroblob(32), 1, \
+                 33188, 'regular', 1, 1, 0, 1, 0, 1, 1 \
+             );",
+        )?;
+
+        apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
+        let precision: (i64, Option<i64>) = connection.query_row(
+            "SELECT timestamp_storage_unit_ns, timestamp_granularity_ns \
+             FROM media_observation_snapshots WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(precision, (1, None));
         Ok(())
     }
 
@@ -2375,10 +2667,24 @@ mod tests {
         Ok(connection)
     }
 
-    fn empty_version_five_connection() -> crate::Result<Connection> {
+    fn empty_latest_connection() -> crate::Result<Connection> {
         let mut connection = Connection::open_in_memory()?;
         connection.pragma_update(None, "foreign_keys", true)?;
         for (index, migration) in MIGRATIONS.iter().enumerate() {
+            apply_migration(
+                &mut connection,
+                migration,
+                1_000 + i64::try_from(index).expect("five migrations fit i64"),
+                index == 0,
+            )?;
+        }
+        Ok(connection)
+    }
+
+    fn empty_version_five_connection() -> crate::Result<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        for (index, migration) in MIGRATIONS.iter().take(5).enumerate() {
             apply_migration(
                 &mut connection,
                 migration,

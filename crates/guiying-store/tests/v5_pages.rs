@@ -388,18 +388,32 @@ fn fingerprint_hint_is_historical_v5_only_and_falls_back_on_missing_stat_evidenc
     })?;
 
     let resumed = create_running_run(&mut store, "hint", 10, Some(first.run_id))?;
-    let matching = observation_input(0, 10);
+    let mut matching = observation_input(0, 10);
     let mut missing_generation = observation_input(1, 10);
     missing_generation.native_file_generation = None;
     let mut changed_mtime = observation_input(2, 10);
     changed_mtime.modified_time.seconds += 1;
     let mut changed_ctime = observation_input(3, 10);
     changed_ctime.changed_time.nanoseconds += 1;
-    let changed_size = observation_input(4, 11);
+    let mut changed_size = observation_input(4, 11);
     let mut changed_native_id = observation_input(5, 10);
     changed_native_id.native_file_id = Some(vec![99; 8]);
     let mut changed_granularity = observation_input(6, 10);
-    changed_granularity.timestamp_granularity_ns = 2;
+    changed_granularity.timestamp_granularity_ns = Some(2);
+    for (index, input) in [
+        &mut matching,
+        &mut missing_generation,
+        &mut changed_mtime,
+        &mut changed_ctime,
+        &mut changed_size,
+        &mut changed_native_id,
+        &mut changed_granularity,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        input.observed_at_ms = 500 + i64::try_from(index).expect("small fixture index");
+    }
     let current_ids = store.write_transaction(|repository| {
         repository.record_observation_batch(
             &resumed.guard,
@@ -638,8 +652,8 @@ fn observation_input(index: u8, size_bytes: i64) -> ObservationInput {
             nanoseconds: 0,
         },
         accessed_time: None,
-        timestamp_granularity_ns: 1,
-        observed_at_ms: 500 + i64::from(index),
+        timestamp_granularity_ns: Some(1),
+        observed_at_ms: 160 + i64::from(index),
     }
 }
 
@@ -661,8 +675,8 @@ fn sample_fingerprint(
         observed_size_bytes: observation.input.size_bytes,
         bytes_read: 4,
         reached_expected_eof: false,
-        completed_at_ms: 600 + i64::try_from(index).expect("small fixture index"),
-        created_at_ms: 600 + i64::try_from(index).expect("small fixture index"),
+        completed_at_ms: 250 + i64::try_from(index).expect("small fixture index"),
+        created_at_ms: 250 + i64::try_from(index).expect("small fixture index"),
     }
 }
 
@@ -684,8 +698,8 @@ fn exact_fingerprint(
         observed_size_bytes: observation.input.size_bytes,
         bytes_read: observation.input.size_bytes,
         reached_expected_eof: true,
-        completed_at_ms: 700 + i64::try_from(index).expect("small fixture index"),
-        created_at_ms: 700 + i64::try_from(index).expect("small fixture index"),
+        completed_at_ms: 220 + i64::try_from(index).expect("small fixture index"),
+        created_at_ms: 220 + i64::try_from(index).expect("small fixture index"),
     }
 }
 

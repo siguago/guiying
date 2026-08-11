@@ -127,6 +127,20 @@ Safety properties:
   fingerprints. Enumeration, sampling, full-hash, and exact-verification seals
   are ordered and immutable, and a run cannot become completed before the final
   seal exists;
+- version 6 adds bounded process-local core tickets, directory observations,
+  and a separate coverage outcome. A run that opts into this bridge cannot seal
+  enumeration until every observation has its authenticated ticket, and cannot
+  seal exact verification until both the core coverage seal and an independent
+  volume-verification manifest are complete. Tickets remain opaque current-
+  process evidence; reopening interrupts the run instead of treating them as
+  reusable authority;
+- filesystem timestamp precision is nullable in version 6. The nanosecond
+  representation unit is stored separately from actual filesystem granularity,
+  so an unknown APFS/exFAT/NTFS/SMB precision stays unknown and disables cache
+  reuse instead of being guessed as one nanosecond. Stage seals and exact-group
+  finalization must not predate their observations, fingerprints, comparisons,
+  or coverage evidence. Bound issues may identify a media file only when that
+  same run recorded its immutable observation;
 - exact duplicate groups begin as drafts. The repository derives every member
   leaf from current database evidence, requires a full verification edge for
   each non-representative member, streams and recomputes the canonical manifest,
