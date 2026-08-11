@@ -13,7 +13,9 @@ publish = false
 base64 = "=0.23.1"
 blake3 = { version = "=1.5.5", features = ["pure"] }
 guiying-core = { version = "0.1.0", path = "../guiying-core" }
+guiying-metadata = { version = "0.1.0", path = "../guiying-metadata" }
 guiying-store = { version = "0.1.0", path = "../guiying-store" }
+guiying-time = { version = "0.1.0", path = "../guiying-time" }
 guiying-volume = { version = "0.1.0", path = "../guiying-volume" }
 serde_json = "=1.0.151"
 thiserror = "=2.0.20"

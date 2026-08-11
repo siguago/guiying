@@ -6,6 +6,14 @@
 
 #![deny(unsafe_code)]
 
+mod time_bridge;
+
+pub use time_bridge::{
+    TimestampStageFailureCode as CaptureTimeStageFailureCode,
+    TimestampStageStatus as CaptureTimeStageStatus,
+    TimestampStageSummary as CaptureTimeStageSummary,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -239,6 +247,21 @@ impl ActiveReadOnlyScan {
 
     pub const fn exact_duplicate_summary(&self) -> Option<&ExactDuplicateSummary> {
         self.exact_duplicates.as_ref()
+    }
+
+    /// Extracts and durably records capture-time evidence after D1 completes.
+    ///
+    /// The runtime reads the UTC clock exactly once to construct a conservative
+    /// policy context. It never applies the system timezone and accepts no
+    /// caller-supplied policy, path, proof, donor, or write authorization. All
+    /// media access remains descriptor-bound and read-only; failures only make
+    /// this optional stage partial and cannot change the completed D1 result.
+    pub fn analyze_capture_times(
+        &mut self,
+        control: &dyn ScanControl,
+    ) -> Result<CaptureTimeStageSummary, RuntimeError> {
+        let context = conservative_policy_context_from_system_time()?;
+        time_bridge::persist_sealed_exact_group_times(self, &context, control)
     }
 
     /// Enumerates once with synchronous storage backpressure. Every root,
@@ -3059,6 +3082,17 @@ const fn reuse_scope(value: NamespaceReuseScope) -> &'static str {
 
 fn checked_i64(field: &'static str, value: u64) -> Result<i64, RuntimeError> {
     i64::try_from(value).map_err(|_| RuntimeError::NumericRange(field))
+}
+
+fn conservative_policy_context_from_system_time(
+) -> Result<guiying_time::PolicyContext, RuntimeError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RuntimeError::InvalidSystemClock)?;
+    let reference_utc =
+        guiying_time::UtcInstant::new(i128::from(duration.as_secs()), duration.subsec_nanos())
+            .map_err(|_| RuntimeError::InvalidSystemClock)?;
+    Ok(guiying_time::PolicyContext::conservative(reference_utc))
 }
 
 fn now_ms() -> Result<i64, RuntimeError> {

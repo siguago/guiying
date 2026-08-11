@@ -160,6 +160,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "guiying-metadata"
+version = "0.1.0"
+
+[[package]]
 name = "guiying-runtime"
 version = "0.1.0"
 dependencies = [
@@ -167,7 +171,9 @@ dependencies = [
  "blake3",
  "filetime",
  "guiying-core",
+ "guiying-metadata",
  "guiying-store",
+ "guiying-time",
  "guiying-volume",
  "serde_json",
  "tempfile",
@@ -181,11 +187,19 @@ dependencies = [
  "blake3",
  "indexmap",
  "rusqlite",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "guiying-time"
+version = "0.1.0"
+dependencies = [
+ "guiying-metadata",
 ]
 
 [[package]]
