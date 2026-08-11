@@ -11,5 +11,5 @@
 - 512px 与 32px 位图均按原尺寸解码检查：照片叠层、圆角和确认标记清晰，无 Tauri scaffold 图形。
 - `git log -- src-tauri/icons` 的品牌替换提交为 `7ec51a0 feat(brand): replace default desktop app icon`。
 
-结论：生产包使用归影原创品牌图标；本检查只证明源、打包资源与像素导出，不替代 Dock、Finder、DMG
-在真实发布签名包中的人工视觉验收。
+结论：生产打包配置引用归影原创品牌图标；本检查只证明源、配置资源与像素导出，不证明本轮生成了
+bundle，也不替代 Dock、Finder、DMG 在真实发布签名包中的人工视觉验收。

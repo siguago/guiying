@@ -1,7 +1,7 @@
 {
   "schema_version": "2.0",
   "project": "归影 Guiying",
-  "scope": "Phase 1 desktop interface for no-active-mutation exact-byte scanning, sealed capture-time evidence, bounded result paging, and read-only historical review",
+  "scope": "Phase 1 desktop interface for no-active-mutation exact-byte scanning, same-process enumeration pause/resume, sealed capture-time evidence, bounded result paging, read-only historical review, and JSON/CSV duplicate-evidence export",
   "delivery_tier": "complete",
   "delivery_mode": "implementation",
   "integration_mode": "existing_repository",
@@ -17,7 +17,7 @@
         "macOS 26.5.2 arm64 verified"
       ],
       "implementation_stack": "Tauri + React + TypeScript + Rust",
-      "implementation_stack_version": "Tauri 2.11.x; React 19.2.8; TypeScript 6.0.2; Rust 1.92.0",
+      "implementation_stack_version": "Tauri 2.11.x; React 19.2.8; TypeScript 6.0.2; Rust 1.77.2 and 1.92.0 validation toolchains",
       "design_guidance": "Repository desktop safety model, platform-app guidance, and native macOS interaction conventions",
       "design_guidance_version": "reviewed 2026-08-10",
       "guidance_checked_at": "2026-08-10",
@@ -50,8 +50,8 @@
       "locales": [
         "zh-CN"
       ],
-      "target": "src-tauri/target/debug/bundle/macos/归影.app",
-      "open_instructions": "From the repository root run pnpm install, then pnpm tauri:dev. Build the debug app and DMG with pnpm exec tauri build --debug.",
+      "target": "src-tauri",
+      "open_instructions": "From the repository root run pnpm install, then pnpm tauri:dev. No current .app or .dmg is retained or claimed by this delivery record.",
       "qa_target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-core-flow",
         "desktop-product-entrypoint-desktop-zh-cn-contrast",
@@ -115,7 +115,7 @@
     "design_direction": {
       "status": "created",
       "kind": "documentation",
-      "notes": "The evidence-led direction, grammar, signature spine, anti-goals, current Phase 1 states, and safety language are documented.",
+      "notes": "The evidence-led direction, grammar, signature spine, same-process pause boundary, export scope, anti-goals, current Phase 1 states, and safety language are documented.",
       "path": "design-direction.md"
     },
     "token_source": {
@@ -147,7 +147,7 @@
     "icon_source": {
       "status": "inherited",
       "kind": "source",
-      "notes": "Functional icons use lucide-react under ISC; the original app icon is generated from design-system/assets/guiying-app-icon.svg and is packaged for macOS and Windows sizes."
+      "notes": "Functional icons use lucide-react under ISC; the original app icon is generated from design-system/assets/guiying-app-icon.svg and configured for macOS and Windows sizes. No current bundle is claimed."
     },
     "implementation_source": {
       "status": "inherited",
@@ -171,7 +171,7 @@
     },
     "native_runner": {
       "status": "unavailable",
-      "notes": "The Tauri app was bundled and its process launched, but the environment could not enumerate a current Phase 1 window or automate the native directory dialog. Native visual, responsive and end-to-end targets therefore remain explicit limitations; the archived M0 screenshot is not reused."
+      "notes": "This iteration did not build a Tauri bundle or perform a native run. Native visual, responsive, runtime and end-to-end targets therefore remain explicit limitations; historical bundle/run logs and the archived M0 screenshot are not reused as current evidence."
     },
     "image_inspection": {
       "status": "used",
@@ -182,7 +182,7 @@
     "qa": {
       "status": "partial",
       "path": "qa-evidence.json",
-      "notes": "Automated browser, code and asset evidence passed where mapped. Native process/build logs are contextual only; exact final bundle, current native visuals, real external-volume dialog flow and VoiceOver remain explicit limitations."
+      "notes": "Core 65, Store 134, runtime 32, Tauri 70 and Playwright 28 tests plus strict static gates passed where mapped. This iteration has no Tauri bundle/native-run; current native visuals, real external-volume dialog/export flow and VoiceOver remain explicit limitations."
     },
     "sources": {
       "path": "handoff/sources.md",

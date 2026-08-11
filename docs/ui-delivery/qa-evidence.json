@@ -16,7 +16,7 @@
       "result": "unavailable",
       "evidence_ids": [],
       "limitation_id": "limitation-native-core-flow",
-      "notes": "Native launch and the read-only core are verified independently, but the system directory dialog through a real external-volume scan was not automated or manually completed in this run."
+      "notes": "The read-only core and Tauri command layer passed independent cargo gates, but this iteration did not launch a native bundle and did not automate or manually complete the system directory dialog through a real external-volume scan."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-contrast",
@@ -53,7 +53,7 @@
       "result": "unavailable",
       "evidence_ids": [],
       "limitation_id": "limitation-native-visual",
-      "notes": "The current Phase 1 bundle launched, but this environment could not enumerate its native window for a fresh isolated capture. The archived M0 native screenshot is intentionally excluded from current visual proof."
+      "notes": "This iteration did not build or launch a Tauri bundle. The archived M0 native screenshot and historical native-run log are intentionally excluded from current visual proof."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-privacy",
@@ -74,7 +74,7 @@
         "manual-safety-review"
       ],
       "limitation_id": null,
-      "notes": "Code review found no WebView path authority and no network, move, rename, timestamp, or delete command. UI text discloses possible filesystem-managed atime updates."
+      "notes": "Code review found no WebView path authority and no network, photo move, rename, timestamp, or delete command. Same-process pause/resume retains live descriptors only for the current run; report export creates a separately selected new JSON/CSV file and never grants photo mutation authority. UI text discloses possible filesystem-managed atime updates."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-responsive",
@@ -127,7 +127,7 @@
         "packaged-icon-inspection"
       ],
       "limitation_id": null,
-      "notes": "The original Guiying photo-and-check icon is present in the deterministic source and packaged 512px/32px assets; both were decoded and inspected."
+      "notes": "The original Guiying photo-and-check icon is present in the deterministic source and configured 512px/32px Tauri assets; both were decoded and inspected. This iteration did not bundle them into a new app."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-keyboard",
@@ -146,7 +146,7 @@
         "frontend-qa-log"
       ],
       "limitation_id": null,
-      "notes": "A keyboard-only Playwright test reaches the explicitly labelled synthetic scan and results; focus indicators and focus restoration are covered."
+      "notes": "Keyboard-only Playwright coverage reaches the explicitly labelled synthetic scan and results, exercises same-process enumeration pause/resume controls, and reaches the sealed-history export panel; focus indicators and focus restoration are covered."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-build",
@@ -163,7 +163,7 @@
       "result": "unavailable",
       "evidence_ids": [],
       "limitation_id": "limitation-build-freshness",
-      "notes": "The Rust/Tauri bundle and the final frontend production build passed separately, but the bundle predates the last frontend-only result queue hardening and was deleted during build-artifact cleanup. It is not claimed as an exact final-tree integrated artifact."
+      "notes": "The frontend production build and Tauri cargo check/test/strict clippy/rustdoc/fmt passed, but this iteration intentionally did not run Tauri bundle. No exact-current-tree .app or .dmg is claimed."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-runtime",
@@ -180,7 +180,7 @@
       "result": "unavailable",
       "evidence_ids": [],
       "limitation_id": "limitation-native-visual",
-      "notes": "The bundled process launched and exited cleanly, but the current window could not be enumerated; the native runtime target remains unavailable rather than promoting process-only evidence to a visual run."
+      "notes": "No Tauri native process was launched in this iteration. Historical process evidence is not promoted to a current runtime result."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large",
@@ -222,7 +222,7 @@
         "historical-catalog-capture"
       ],
       "limitation_id": null,
-      "notes": "Current landing, scanning, compact/large results, paged-result, historical-catalog and expanded raw-metadata browser captures were reviewed at original size. The packaged icon has its own asset report."
+      "notes": "Current landing, scanning, compact/large results, paged-result with history export controls, historical-catalog and expanded raw-metadata browser captures were reviewed at original size. Their current SHA-256 values are mapped below; the packaged icon has its own asset report."
     },
     {
       "id": "desktop-system-entrypoint-desktop-zh-cn-visual",
@@ -263,7 +263,7 @@
       "id": "frontend-qa-log",
       "kind": "test-output",
       "path": "evidence/frontend-qa.txt",
-      "captured_at": "2026-08-11T17:51:31+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "Playwright, axe-core, Vite, Oxlint",
       "version": "Playwright 1.62.1; axe-core 4.12.1; Vite 8.2.1; Oxlint 1.78.0",
       "command": "pnpm exec tsc --noEmit && pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui",
@@ -272,41 +272,41 @@
         "desktop-product-entrypoint-desktop-zh-cn-contrast",
         "desktop-product-entrypoint-desktop-zh-cn-keyboard"
       ],
-      "notes": "Thirteen tests pass, covering token-only root authority, historical catalog pagination and result-token revocation, late-open isolation, per-token serial evidence reads, paged duplicate evidence, exact retry and stale-response behavior, terminal acknowledgement, cancelled-result locking, three-level raw-metadata review, and axe checks on historical and expanded raw states. Native locking and cancellation semantics are covered separately by Rust tests."
+      "notes": "Twenty-eight tests pass, covering token-only root authority, same-process enumeration pause/resume and cancel races, enumeration completion during pausing, historical catalog pagination and result-token revocation, late-open isolation, per-token serial evidence reads, paged duplicate evidence, exact retry and stale-response behavior, terminal acknowledgement, cancelled-result locking, three-level raw-metadata review, strict JSON/CSV export payload/result validation, export queue/cancel/late-response races, parent-path rejection, and axe checks on historical and expanded raw states. Native locking, checkpoint, export target and cancellation semantics are covered separately by Rust tests."
     },
     {
       "id": "core-rust-test-log",
       "kind": "test-output",
       "path": "evidence/core-rust-tests.txt",
-      "captured_at": "2026-08-11T17:49:00+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "Cargo",
       "version": "1.77.2",
-      "command": "cargo +1.77.2 fmt --manifest-path crates/guiying-core/Cargo.toml --all -- --check && cargo +1.77.2 clippy --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings && cargo +1.77.2 test --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features && RUSTDOCFLAGS=-D warnings cargo +1.77.2 doc --locked --manifest-path crates/guiying-core/Cargo.toml --no-deps",
+      "command": "Main-task local gate record: cargo fmt/check/test, strict clippy, and rustdoc with Rust 1.77.2 and a repository-external temporary target directory.",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-privacy"
       ],
-      "notes": "Fifty-nine core tests cover legacy and bounded streaming scanners, descriptor-relative traversal, cancellation, short-read/change rejection and unforgeable current-session read proofs; the core exposes no mutation API."
+      "notes": "Sixty-five core tests cover legacy and bounded streaming scanners, descriptor-relative traversal, pause-safe enumeration stepping, same-process resume, pause/cancel dominance, short-read/change rejection and unforgeable current-session read proofs; the core exposes no mutation API."
     },
     {
       "id": "scan-jobs-rust-test-log",
       "kind": "test-output",
       "path": "evidence/scan-jobs-rust-tests.txt",
-      "captured_at": "2026-08-11T17:49:00+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "Cargo",
-      "version": "1.92.0",
-      "command": "cargo +1.92.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check && cargo +1.92.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings && cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features && RUSTDOCFLAGS=-D warnings cargo +1.92.0 doc --locked --manifest-path src-tauri/Cargo.toml --no-deps",
+      "version": "1.77.2 and 1.92.0",
+      "command": "Main-task local gate record: Store and runtime cargo fmt/check/test, strict clippy and rustdoc with Rust 1.77.2; Tauri cargo fmt/check/test, strict clippy and rustdoc with Rust 1.92.0; repository-external temporary target directory.",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-privacy"
       ],
-      "notes": "Fifty-three desktop tests cover root/result authority, single-job and single-process exclusion, cooperative cancellation, terminal acknowledgement, history qualification, EvidenceReader paging, owner cleanup/tombstones, pending/in-flight limits, cursor scope, path replacement and structured failures."
+      "notes": "Store 134, runtime 32 and Tauri 70 tests pass. Coverage includes runtime leases, control requests, append-only pause checkpoints, same-process pause/resume, pause-then-cancel without synthetic resume, root/result/export authority, single-job/process exclusion, terminal acknowledgement, consistent history export snapshots, one-shot window-bound export tokens, directory-handle target binding, create-new publication, limits/deadlines/cancellation, owner cleanup, cursor scope, path replacement and structured failures. No bundle or native run was performed."
     },
     {
       "id": "manual-safety-review",
       "kind": "manual-review",
       "path": "handoff/qa-report.md",
-      "captured_at": "2026-08-11T17:52:00+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "independent code and documentation review",
       "version": "Phase 1 review 1",
       "command": "Review src-tauri capabilities, Rust command calls, UI claims, synthetic fixtures, and captured window contents.",
@@ -314,13 +314,13 @@
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-privacy"
       ],
-      "notes": "The review corrected atime, partial-report, synthetic-data, metric, path, mount-session, result-token concurrency, history display-only, native-evidence and capability-language overclaims."
+      "notes": "The review corrected atime, partial-report, synthetic-data, metric, path, mount-session, result/export-token concurrency, history display-only, same-process pause, complete-evidence export scope, native-evidence and capability-language overclaims."
     },
     {
       "id": "landing-phase1-capture",
       "kind": "screenshot",
       "path": "evidence/landing-1280x820.png",
-      "captured_at": "2026-08-11T17:51:31+08:00",
+      "captured_at": "2026-08-11T20:54:25+08:00",
       "tool": "Playwright Chromium and full-size image inspection",
       "version": "Playwright 1.62.1",
       "command": "pnpm test:ui",
@@ -334,7 +334,7 @@
       "id": "scanning-phase1-capture",
       "kind": "screenshot",
       "path": "evidence/scanning-1280x820.png",
-      "captured_at": "2026-08-11T17:51:31+08:00",
+      "captured_at": "2026-08-11T20:54:26+08:00",
       "tool": "Playwright Chromium and full-size image inspection",
       "version": "Playwright 1.62.1",
       "command": "pnpm test:ui",
@@ -342,13 +342,13 @@
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "The current 1280x820 scanning ledger retains the authority and atime boundaries without overflow; SHA-256 3e05d13894873e4d9b837a5c2a03b8e0caca2ffc040b9dfc0b0560617bae7bcb."
+      "notes": "The current 1280x820 scanning ledger retains the authority and atime boundaries without overflow; SHA-256 2c58ba82acf1904d8d89dce472425cc05fa12790d0416416bfdbfa13b51be3d7."
     },
     {
       "id": "responsive-compact-capture",
       "kind": "screenshot",
       "path": "evidence/results-1024x768.png",
-      "captured_at": "2026-08-11T17:51:31+08:00",
+      "captured_at": "2026-08-11T20:54:30+08:00",
       "tool": "Playwright Chromium",
       "version": "1.62.1",
       "command": "pnpm test:ui",
@@ -362,7 +362,7 @@
       "id": "responsive-large-capture",
       "kind": "screenshot",
       "path": "evidence/results-1280x820.png",
-      "captured_at": "2026-08-11T17:51:31+08:00",
+      "captured_at": "2026-08-11T20:54:27+08:00",
       "tool": "Playwright Chromium",
       "version": "1.62.1",
       "command": "pnpm test:ui",
@@ -376,7 +376,7 @@
       "id": "paged-results-capture",
       "kind": "screenshot",
       "path": "evidence/results-paged-1280x820.png",
-      "captured_at": "2026-08-11T17:51:31+08:00",
+      "captured_at": "2026-08-11T20:54:37+08:00",
       "tool": "Playwright Chromium and full-size image inspection",
       "version": "Playwright 1.62.1",
       "command": "pnpm test:ui",
@@ -384,13 +384,13 @@
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "The current 1280x820 synthetic result shows bounded group/member/issue pagination without accumulating previous pages; SHA-256 24191e202435c1486522ba932246daf2374ef3e5bbcb5da4eca82ec99779ba2a."
+      "notes": "The current 1280x820 synthetic result shows bounded group/member/issue pagination and the JSON/CSV sealed-history export controls without accumulating previous pages; SHA-256 d5646fbe8e4db37ef8e7a748daaa03bb95a0873b87a55b57adb354c17919b8ae."
     },
     {
       "id": "raw-metadata-review-capture",
       "kind": "screenshot",
       "path": "evidence/results-raw-metadata-1280x820.png",
-      "captured_at": "2026-08-11T17:51:31+08:00",
+      "captured_at": "2026-08-11T20:54:41+08:00",
       "tool": "Playwright Chromium, axe-core and full-size image inspection",
       "version": "Playwright 1.62.1; axe-core 4.12.1",
       "command": "pnpm test:ui",
@@ -398,13 +398,13 @@
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "The 1280x820 synthetic inspector shows report to field to byte-exact raw detail, contains no PII, and passed axe; SHA-256 b9b35f90259209d9b32e3b3b2b73b09dfe3a8fe534a2b878a1069f85abf6f5c9."
+      "notes": "The 1280x820 synthetic inspector shows report to field to byte-exact raw detail alongside the separate history-export controls, contains no PII, and passed axe; SHA-256 17d1ed2f9d3937e9f561bae388bc59066a5e065c497c3d33b1536a511f3b491c."
     },
     {
       "id": "historical-catalog-capture",
       "kind": "screenshot",
       "path": "evidence/history-1280x820.png",
-      "captured_at": "2026-08-11T17:51:31+08:00",
+      "captured_at": "2026-08-11T20:54:36+08:00",
       "tool": "Playwright Chromium, axe-core and full-size image inspection",
       "version": "Playwright 1.62.1; axe-core 4.12.1",
       "command": "pnpm test:ui",
@@ -432,7 +432,7 @@
       "id": "system-direction-artifact",
       "kind": "design-artifact",
       "path": "design-direction.md",
-      "captured_at": "2026-08-11T17:52:00+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "repository design review",
       "version": "Phase 1 direction 1",
       "command": "Review design-direction.md against src/App.tsx, src/App.css, and the product safety documents.",
@@ -459,7 +459,7 @@
       "affected_target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-build"
       ],
-      "impact": "The Tauri shell/Rust bundle and final frontend passed independently, but no retained .app/.dmg was built from the exact final frontend queue revision after generated artifacts were cleaned.",
+      "impact": "Tauri cargo check/test/strict clippy/rustdoc/fmt and the frontend production build passed, but this iteration did not run Tauri bundle and retained no exact-current-tree .app/.dmg.",
       "mitigation": "Let CI build the exact pushed tree, or run one clean Tauri bundle build on a runner with an explicit artifact-space budget and attach that result before promoting this target."
     },
     {
@@ -471,7 +471,7 @@
         "desktop-product-entrypoint-desktop-zh-cn-runtime",
         "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
       ],
-      "impact": "The current Phase 1 bundle process launched, but this environment could not enumerate the native window for fresh isolated visual, responsive or runtime evidence; the archived M0 capture is not current proof.",
+      "impact": "This iteration did not build or launch the current Phase 1 bundle, so there is no fresh isolated native visual, responsive or runtime evidence; historical bundle/run logs and the archived M0 capture are not current proof.",
       "mitigation": "Capture and exercise the current signed or debug bundle at 1024x768 and 1280x820 on a machine where Screen Recording/CoreGraphics window enumeration is available, then inspect the native states at full resolution."
     },
     {

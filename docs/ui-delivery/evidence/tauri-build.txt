@@ -1,4 +1,4 @@
-归影 Tauri debug bundle 构建
+归影 Tauri debug bundle 历史记录（非本轮证据）
 时间：2026-08-11T17:43:13+08:00
 环境：Tauri CLI 2.11.4; Rust 1.92.0; macOS arm64
 
@@ -13,6 +13,7 @@
 - 生成 src-tauri/target/debug/bundle/macos/归影.app（约 43 MiB）。
 - 生成 src-tauri/target/debug/bundle/dmg/归影_0.1.0_aarch64.dmg（约 11 MiB）。
 
-说明：17:51 的前端-only result token 串行队列随后通过独立 TypeScript/Vite/Playwright 门禁；没有再次生成
-相同 Rust bundle。为响应磁盘治理，验收后已删除约 27 GiB 的可重建 target、bundle、dist 和测试缓存；
-源码、锁文件和证据未删除。最终集成构建由推送后的 CI 对当前提交复验。
+说明：这份日志只记录 17:43 的旧树，早于后续 result token、同进程暂停/继续与历史 JSON/CSV 导出变更。
+旧可重建 target、bundle、dist 和测试缓存已按磁盘治理删除。本轮只完成 Tauri cargo
+check/test/strict clippy/rustdoc/fmt，没有执行 bundle；因此本文件不映射为当前 `qa-evidence.json` 的构建
+通过证据，也不证明当前树存在 `.app` 或 `.dmg`。

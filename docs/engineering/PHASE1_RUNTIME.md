@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | 分阶段实施中；持久化 D1、时间证据、Tauri 有界复核与历史只读入口已接通，暂停恢复与导出待完成 |
+| 状态 | 分阶段实施中；持久化 D1、时间证据、Tauri 有界复核、同进程枚举暂停/继续与历史 JSON/CSV 导出已接通；跨进程新 attempt 恢复和真实外置卷矩阵待完成 |
 | 最近更新 | 2026-08-11 |
 | 适用路线图 | [Phase 1：只读精确扫描 MVP](../ROADMAP.md#4-phase-1只读精确扫描-mvp) |
 | 写能力 | 无；本阶段不移动、不重命名、不改时、不隔离、不删除照片 |
@@ -17,7 +17,7 @@
 Phase 1 的目标是安全交付以下只读能力：
 
 - 持久化、分页、常数级单文件内存的 D1 字节完全相同扫描；
-- 暂停、取消、掉盘和进程重启后的可解释恢复；
+- 同一进程、同一次打开期间的枚举暂停/继续、合作式取消，以及掉盘和进程重启后的 fail-closed 解释；
 - 强卷身份上的受控增量索引复用；
 - 有界 EXIF / QuickTime 元数据提取和时间证据分析；
 - 不经 IPC 传输整份大型扫描报告；
@@ -34,7 +34,7 @@ Tauri command 或 UI 入口。
 
 ## 2. 原始基线与当前进展
 
-本节 2.1–2.5 保留方案制定时的差距分析。当前代码已经完成 core 流式票据、volume 当前挂载夹持、Store v7 认证证据、runtime D1/时间封印，以及 Tauri 轻量状态与有界证据复核；仍未完成的部分以第 11 节和路线图为准。
+本节 2.1–2.5 保留方案制定时的差距分析，不代表当前缺口。当前代码已经完成 core 流式票据与枚举 stepper、volume 当前挂载夹持、Store v8 认证证据/runtime lease/控制请求/暂停审计 checkpoint、runtime D1/时间封印，以及 Tauri 轻量状态、有界证据复核和历史导出；仍未完成的部分以第 11 节和路线图为准。
 
 ### 2.1 `guiying-core`
 
@@ -59,7 +59,7 @@ nofollow 遍历、目录身份复核和合作式取消。但它仍然是一次�
 - 不暴露 create、rename、timestamp、remove 或裸 descriptor API；
 - Linux 和 Windows 尚未实现时明确 fail closed。
 
-当前阻塞恢复扫描的关键点是：`PathSemanticsProfile` 把随机
+方案制定时阻塞恢复扫描的关键点是：`PathSemanticsProfile` 把随机
 `mount_session_key` 纳入 profile key，随后 path key 又绑定 profile key。因此同一卷
 重新绑定后，所有路径键都会改变。
 
@@ -73,7 +73,7 @@ SQLite v4 已具备严格迁移、schema manifest、权限检查、DB inode/File
 WAL/SHM 防替换、完整性检查、短事务、卷/capability 不可变证据、原始路径字节和
 job/run 乐观状态版本。
 
-仍缺少以下运行时能力：
+方案制定时仍缺少以下运行时能力：
 
 - job root 永久绑定第一次 capability profile，不能在新 mount session 下建立同一
   job 的恢复 attempt；
@@ -81,7 +81,7 @@ job/run 乐观状态版本。
   写入和分页读取 API；
 - 现有历史文件分页仍以可变的 `media_files.last_seen_scan_run_id` 为主要入口，不能作为
   历史扫描的完整 immutable observation；
-- checkpoint 尚未对应一个可序列化且不越过 root-fd 边界的扫描引擎；
+- 当时 checkpoint 尚未对应一个可序列化且不越过 root-fd 边界的扫描引擎；
 - full report JSON 虽有限额，但仍不适合保存或传输大规模逐文件结果。
 
 ### 2.4 `guiying-metadata` 与 `guiying-time`
@@ -95,12 +95,12 @@ job/run 乐观状态版本。
 - 时间策略不读取系统时区，不给 floating time 猜偏移；
 - 哨兵值、未来时间、超 i64 纳秒范围、冲突和复制数量投票均 fail closed。
 
-尚缺 runtime source identity、lineage 推导、SQLite 规范化持久化以及与 volume
+方案制定时尚缺 runtime source identity、lineage 推导、SQLite 规范化持久化以及与 volume
 `ReadOnlyFile` 的 positional-read 适配。
 
 ### 2.5 Tauri 与前端
 
-原始 Tauri 任务注册表只存在于进程内，并返回 `Arc<ScanReport>`。当前已改为 SQLite 是证据真相源，事件和 `get_scan_status` 只发送轻量摘要；重复组、成员、扫描问题、时间摘要/候选/成员/问题，以及封印 metadata 报告/字段/单字段原始详情都由上下文绑定的有界接口读取。历史目录通过真正的只读 EvidenceReader 与窗口绑定 result token 复核，封存 display path 不恢复文件系统权限。应用进程重启会令旧挂载会话失效并中断非终态 run；真正的持久化暂停恢复与导出仍待接入。
+原始 Tauri 任务注册表只存在于进程内，并返回 `Arc<ScanReport>`。当前已改为 SQLite 是证据真相源，事件和 `get_scan_status` 只发送轻量摘要；重复组、成员、扫描问题、时间摘要/候选/成员/问题，以及封印 metadata 报告/字段/单字段原始详情都由上下文绑定的有界接口读取。历史目录通过真正的只读 EvidenceReader 与窗口绑定 result token 复核，封存 display path 不恢复文件系统权限。目录枚举可在同一 live worker 中暂停/继续，历史 D1 可按限定范围导出 JSON/CSV。应用进程重启会令旧挂载会话失效并中断非终态 run；跨进程恢复仍必须重新授权根并建立新 attempt。
 
 ## 3. 双键信任模型
 
@@ -217,7 +217,7 @@ volume 层应：
 无法获得可信 mount-relative scope 时，当前 session 仍可只读扫描，但 job 必须标为
 `current_session_only`，不得跨 session 恢复。
 
-## 4. SQLite v4 到 v5
+## 4. SQLite v4 到 v8
 
 ### 4.1 新的规范化绑定
 
@@ -304,6 +304,21 @@ v5 应替换 v4 “job root capability 必须与 run root capability 相同”�
 升级时若发现结构合法但仍处于 queued/running/paused 的旧 attempt，应在迁移或启动恢复
 事务中明确记录 `PROCESS_UPGRADED_WITH_ACTIVE_RUN` 并转 interrupted。不能静默设为
 completed，也不能继续使用已丢失的 descriptor。
+
+### 4.3 v8 runtime control 与迁移快照
+
+v8 在既有证据 schema 上增加严格的 `scan_runtime_leases`、`scan_control_requests` 和
+append-only `scan_pause_checkpoints`。租约必须绑定当前 run、core session、capability、namespace
+与 mount session；活动 core bridge 建立后，没有当前进程持有的 active lease 就不能继续写进度、
+checkpoint 或终态。控制请求按 run 单调排序，cancel 可 supersede pause/resume；pause checkpoint
+的 generation、write key、payload digest、计数和 evidence/work-plan manifest 都必须一致，不能
+通过直接 SQL 拼出半状态后再被 runtime 接受。
+
+自动迁移快照不再使用只适合 v7 的文件名或判断。任何低于 embedded latest schema 的受管
+数据库都会先生成精确源版本、no-clobber 的
+`.guiying-pre-migration-from-v<source>-to-v<target>-*.sqlite3` 快照，再迁移；v7→v8 与更早版本
+使用同一套 pre-migration 安全协议。快照用于数据库恢复，不包含也不会恢复媒体 descriptor、
+root token 或 mount session。
 
 ## 5. Normalized observation 与 fingerprint
 
@@ -527,48 +542,53 @@ verified group 或产品策略指定的媒体进入第 9 节的 pinned-source �
 
 ### 8.1 Checkpoint 的边界
 
-文件 descriptor 和目录 walker 不能序列化。跨进程“续扫”必须解释为：
+当前实现的 pause/resume 是**同一进程、同一次打开、同一 live worker** 内的枚举控制：
 
-1. 旧 run 终止为 interrupted；
-2. 重新选择并 bind 原卷/原 root；
-3. 建立新的 capability profile 和 mount session；
-4. 新建 `mode=resume` 子 run；
-5. 从根重新枚举；
-6. 通过幂等 observation 和受控 fingerprint cache 减少重复计算。
+1. owner 窗口只可在 enumeration stage 提交 pause；
+2. core 的进程内 enumeration stepper 完成当前有界 event batch 并 flush 后返回 paused；
+3. runtime 在当前 active lease 下写入 pause control acknowledgement 和 append-only checkpoint，
+   再协调 job/run 的 `running → paused`；
+4. checkpoint 固定 core/mount session、计数、cursor contract、work-plan/evidence manifest 和单调
+   generation；
+5. resume 必须引用当前 generation，Store 先持久确认 `paused → running`，runtime 才发布
+   resumed observer；
+6. 仍存活的 worker 从进程内 traversal state 继续枚举。
 
-旧 JSON cursor 只能是工作进度提示，不能作为打开路径或跳过 root-fd 验证的授权。
+checkpoint 的作用是证明“哪个 worker 在哪一份证据和计数上确认了暂停”，并拒绝 A/B/A、
+陈旧 resume 或直接 SQL 半状态；它不是序列化的目录 walker，也不是可恢复的 descriptor、
+root token、mount session 或文件系统授权。
+
+文件 descriptor 和目录 walker 不能跨进程序列化。窗口退出、进程重启或挂载变化后，当前
+run 必须 cancelled/interrupted。后续跨进程恢复链只能重新选择并 bind 原卷/原 root，建立
+新的 capability/mount/core session 和新 attempt，从根重新枚举；是否以及如何受控复用旧
+观察/指纹仍需通过后续实现与真实外置卷门禁。旧 checkpoint cursor 不能用于打开路径、跳过
+root-fd 复核或直接 finalize 旧 run 的 draft。
 
 ### 8.2 状态和 fallback
 
 | 场景 | 持久状态 | 恢复行为 |
 | --- | --- | --- |
 | 正常启动 | queued/queued → running/running | transition 前 fresh session revalidate |
-| 同进程暂停 | running/running → paused/paused | 保留 live session；恢复前再次复核 |
+| 同进程暂停 | running/running → paused/paused | flush 后写 append-only checkpoint；保留 live worker/session |
+| 同进程继续 | paused/paused → running/running | 匹配最新 generation 并先持久确认，再唤醒原 worker |
+| 暂停中取消 | paused/paused → cancelling → cancelled/cancelled | cancel 优先并唤醒 worker；不伪造 resume |
 | 用户取消 | 先持久化 cancel request，再合作式停止，最终 cancelled/cancelled | draft 不可见，重复请求幂等 |
 | 单文件读取或解析失败 | 记录 bounded per-file issue | 其他文件继续，最终 coverage 标 partial |
-| 根、挂载或卷变化 | job failed + run interrupted，错误码 `VOLUME_UNAVAILABLE` 等 | UI 映射为等待重连/可恢复 |
-| 进程崩溃或重启 | 活跃 run 转 interrupted，job 为 recoverable failed | 重新选择根后建子 run |
-| 用户放弃恢复 | guarded job-only failed → cancelled | 旧 interrupted run 保留 |
+| 根、挂载或卷变化 | job failed + run interrupted，错误码 `VOLUME_UNAVAILABLE` 等 | 当前 worker 不得继续；后续需新 attempt |
+| 进程崩溃或重启且 pending cancel | 释放旧 lease，收敛为 cancelled/cancelled | 保留已确认取消意图，不恢复 descriptor |
+| 进程崩溃或重启且 pending pause/resume | 释放旧 lease，活跃 run 转 interrupted | 控制请求记 interrupted；checkpoint 不授予续扫 |
+| 进程崩溃或重启且无 pending control | 释放旧 lease，活跃 run 转 interrupted | 后续跨进程新 attempt 恢复仍待完成 |
 | SQLite 损坏或 schema 不符 | 不猜状态，应用进入只读错误页 | 从验证备份恢复或人工处理 |
 
-持久化暂停恢复仍需增加：
-
-- `queued/queued -> failed/interrupted` 恢复边；
-- guarded `failed -> cancelled` job-only 边，且 active run 必须已 terminal；
-- `scan_control_requests`，持久化 cancel/pause 请求和幂等 key；
-- run-level DB runtime lease；app-private process lock 已由桌面进程在任何 Store/EvidenceReader 打开前持有；
-- heartbeat 用于诊断和 stale-state 识别，不替代 OS 进程锁。
-
-启动恢复顺序：
+v8 启动收敛顺序：
 
 1. 获取 app-data runtime lock；
-2. 打开并完整校验 SQLite；
-3. 查询 active jobs；
+2. 对旧 schema 先完成通用 pre-migration 快照，再打开并完整校验 SQLite；
+3. 查询 active lease、job/run 和 pending control；
 4. 有 durable cancel request 的任务转 cancelled；
-5. 其他 queued/running/paused attempt 转 interrupted；
-6. 对应 draft group 标 abandoned；
-7. 向 UI 提供可恢复状态；
-8. 用户重新选择 root 后才建立新 session。
+5. pending pause/resume 记 interrupted，其他 queued/running/paused attempt 转 interrupted；
+6. 释放旧 lease，对应 draft group 保持不可见并按既有规则 abandoned；
+7. 不从数据库重建 descriptor、walker 或 root token。
 
 取消和掉盘同时发生时，volume/root identity 异常优先标 interrupted，不能伪装成已完成
 正常取消检查点。阻塞在内核中的磁盘读取也无法被合作式 token 强行终止，UI 必须诚实
@@ -683,8 +703,8 @@ start_scan({ rootToken })
 
 native dialog 返回的 `PathBuf` 保留在 Rust token registry。token 必须随机、有限期、
 单进程且绑定 owner window；过期、跨进程、已消费或 window 不匹配都拒绝。这样非 UTF-8
-root 不会在 JS IPC 中丢失。重启恢复要求用户重新选择 root，再由 stable volume/root
-scope 匹配旧 job。
+root 不会在 JS IPC 中丢失。后续跨进程恢复仍要求用户重新选择 root，再由 fresh session
+复核 stable volume/root scope 并建立新 attempt；当前不会从旧 token 恢复权限。
 
 ### 10.3 分页命令
 
@@ -693,6 +713,8 @@ scope 匹配旧 job。
 ```text
 select_scan_root -> rootToken
 start_scan(rootToken) -> jobId
+pause_scan(jobId)
+resume_scan(jobId)
 cancel_scan(jobId)
 get_scan_status(jobId) -> historyEntryId on completion
 acknowledge_scan(jobId)
@@ -700,6 +722,9 @@ acknowledge_scan(jobId)
 list_scan_history(cursor)
 open_scan_history(historyEntryId) -> resultReadToken
 close_result_read(resultReadToken)
+select_history_export_target(resultReadToken, format, scope, pathPolicy) -> exportToken
+export_scan_history(exportToken)
+cancel_history_export(exportToken)
 list_duplicate_groups(resultReadToken, cursor)
 list_duplicate_group_members(resultReadToken, groupId, cursor)
 list_scan_issues(resultReadToken, cursor)
@@ -723,6 +748,27 @@ list_capture_time_*(resultReadToken, ...)
 - `historyEntryId` 只是 selector；只有重新验证后签发的随机、owner-window 绑定、限时 `resultReadToken` 才是读取授权。
 - token 绑定 database scope、reader instance 与 typed run context。每 token 单飞，catalog/open 请求也有同步 pending/in-flight 硬上限；窗口关闭、过期、重签或显式 close 会撤销，阻塞查询返回前再次复核 generation。
 - root display、cursor 与 DTO 都不能被用作路径或权限。历史读取不会打开用户媒体。
+
+### 10.3.2 历史 JSON/CSV 导出边界
+
+- Store 在一个一致读事务中冻结指定历史 context。`summary` 只产生摘要；
+  `complete_evidence` 按固定顺序产生摘要、verified D1 groups、members 和 scan issues。
+- v1 导出明确排除 capture-time 候选/成员/报告/字段、raw metadata、native/raw locator、
+  fingerprint digest、source signature 和文件对象身份。摘要中的 capture-time outcome 仅保留
+  有界状态/计数，不是拍摄时间明细或 donor 建议。
+- privacy projection 在 Store 内完成：默认 `redacted`，只有用户显式选择 `display` 才带
+  root/member display path 与问题展示文本；两种投影都不授予媒体读取或动作权限。
+- JSON 和 CSV 序列化同一规范 record bytes 与 BLAKE3 logical digest。CSV 固定列为
+  `schema_version,profile,section,sequence,record_json`，不能另行拼接未审计字段。
+- batch 为 1–128；完整证据受 250,000 records、256 MiB 与 60 秒硬预算约束。读取必须消费
+  完整冻结范围才可发布，取消、超限、超时或上下文撤销都只清理私有临时文件。
+- 原生选择器把目标绑定为 process-local、owner/result-context 限时随机 token；WebView 只
+  获得 token 与安全文件名，不获得父目录/full path、目录 descriptor 或临时文件名。
+- Unix 发布持有并复核目录 FD，通过 `openat` 创建 `0600` 随机临时文件，写入并 `fsync`
+  后使用 `linkat` no-replace 提交，再 `unlinkat` 私有临时名并同步目录；同名目标已存在时
+  绝不覆盖。目标身份或发布结果无法确认时返回明确 uncertain/error。非 Unix 没有等价实现
+  前 fail closed。
+- 导出只写用户显式选择的报告目标，不打开、移动、隔离、改时或删除任何媒体文件。
 
 ### 10.4 Cursor 与 DTO
 
@@ -822,14 +868,17 @@ fmt、all-target tests 和 rustdoc，并运行 macOS volume integration tests。
 
 ### 11.3 `feat(runtime): persist and recover read-only scans`
 
+实施状态：D1 持久运行时、v8 runtime lease/control/checkpoint 与同进程枚举暂停/继续已完成；
+跨进程新 attempt 恢复和真实掉盘重连门禁仍待后续。
+
 内容：
 
 - 新 `guiying-runtime` crate；
 - app-data Store actor；
-- process lock/lease；
+- process lock 与 core/mount-bound runtime lease；
 - durable job supervisor；
-- checkpoint/heartbeat；
-- 掉盘、暂停、取消、崩溃恢复；
+- append-only pause audit checkpoint 与持久化 pause/resume/cancel control；
+- 同进程枚举暂停/继续、取消优先与崩溃后 fail-closed 收敛；
 - 由 store 分页驱动各扫描阶段。
 
 安全不变量：
@@ -895,7 +944,7 @@ tests 和 rustdoc。
 - 小状态 DTO；
 - groups/members/issues/time 分页；
 - 删除完整 report IPC；
-- UI 有界页替换与历史/重启入口已完成；虚拟列表、持久化暂停恢复与掉盘专用页仍待完成；
+- UI 有界页替换、历史入口与同进程枚举暂停/继续已完成；虚拟列表、跨进程新 attempt 恢复与掉盘专用页仍待完成；
 - Preview Read-only release QA。
 
 安全不变量：
@@ -922,7 +971,7 @@ pnpm tauri build
 
 ### 11.6 `feat(history): authorize immutable result reads`
 
-实施状态：已完成，且不改变 schema v7。
+实施状态：已完成；最初建立于 schema v7，当前 reader 严格验证 embedded latest schema v8。
 
 内容：
 
@@ -949,6 +998,15 @@ pnpm tauri build
 - window-close 排队打开、阻塞返回、token 重签与 active-run 竞态；
 - 历史空态、分页、失败精确重试、退出后迟到响应、axe 与截图全尺寸检查。
 
+### 11.7 `feat(export): publish bounded read-only history reports`
+
+实施状态：已完成 v1 JSON/CSV、summary/complete_evidence、redacted/display 与 Unix
+no-replace 发布；非 Unix 目标发布保持 fail closed。
+
+安全边界：导出复用 owner/result-context 授权和 Store 一致读快照；完整证据只含 D1 摘要、
+verified groups、members 与 scan issues，不含拍摄时间明细、raw metadata 或 locator。原生目标
+目录/full path 不进入 WebView，已有目标不覆盖，导出不会打开或修改用户媒体。
+
 ## 12. 已知风险与明确 fallback
 
 - volume backend 当前仅实现 macOS；Linux/Windows 继续 fail closed，不用路径字符串或
@@ -970,5 +1028,7 @@ pnpm tauri build
 - EvidenceReader 首开会在 64 GiB 文件族/逻辑上限内执行 quick/FK 与完整 manifest 重算，目前没有 wall-clock deadline、取消或进度回调；它不复制整库到内存，但损坏或超大私有数据库仍可能造成较长首开延迟。
 - app-data 进程锁与 SQLite 身份已做 owner/mode/nlink、NOFOLLOW 和路径前后复核，但还不是目录 handle/openat 到 SQLite 已开句柄的全链绑定；同 UID 恶意路径替换属于后续本机硬化，当前依赖 0700 私有目录和单实例所有权。
 - Windows Store 的既有数据库读取仍 fail closed，desktop runtime-lock 也没有原生 Windows CI；项目保持 macOS-first，不能把交叉编译或离线 Windows 路径模型宣传成可用后端。
+- pause checkpoint 不支持跨进程恢复；窗口退出、进程重启或挂载变化后必须取消/中断当前 run，跨进程新 attempt 恢复仍是后续能力。
+- 历史导出 v1 不含拍摄时间明细、raw metadata 或 locator；非 Unix 发布在具备等价目录句柄与 no-replace 证明前 fail closed。
 - Phase 1 不创建隔离目录、不修改照片时间、不移动或删除照片；M2 写能力必须另行设计、
   审计和授权。

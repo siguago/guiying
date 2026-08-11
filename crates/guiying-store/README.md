@@ -11,7 +11,7 @@ Safety properties:
 - the complete v1 migration is packaged inside this crate; packaged builds do
   not depend on a sibling `src-tauri` source tree;
 - an existing Unix database is inspected as a raw, descriptor-bound SQLite file
-  family before SQLite is allowed to open the source. A current-v7 main file
+  family before SQLite is allowed to open the source. A current-schema main file
   with the expected raw application id/version and no sidecar takes a bounded
   fast path. Every other family is first recovered and validated on an isolated
   clone. The source read-write handle then repeats the application id, migration
@@ -53,7 +53,8 @@ Safety properties:
   detected mismatch aborts. The destination main file and its `-wal`, `-shm`,
   and `-journal` names must all be absent before work, immediately before
   publication, and after publication; none may alias any source-family name;
-- before opening a possible v1-v6 source with SQLite, Unix builds enumerate the
+- before opening any managed source older than the embedded latest schema with
+  SQLite (currently v1-v7 migrating to v8), Unix builds enumerate the
   main/`-wal`/`-shm`/`-journal` family twice through a stable private-parent
   directory descriptor. Unknown sidecars, symlinks, non-regular or linked
   members, unsafe ownership/modes, simultaneous WAL and rollback journals,
@@ -66,11 +67,14 @@ Safety properties:
   the caller may open it read-write;
 - SQLite performs WAL or hot-journal recovery only on that isolated clone. The
   clone must pass exact managed-version preflight, `quick_check`, full
-  `integrity_check`, and foreign-key validation. For v1-v6, SQLite's Online
-  Backup API then creates a self-contained old-version snapshot in the source
-  database's application-private parent under a unique no-clobber
-  `.guiying-pre-v7-v<version>-*.sqlite3` name. The target is normalized to a
-  rollback-journal header and repeats exact-version/full-integrity validation;
+  `integrity_check`, and foreign-key validation. For every source version below
+  the embedded latest version, SQLite's Online Backup API then creates a
+  self-contained exact-source-version snapshot in the source database's
+  application-private parent under a unique no-clobber
+  `.guiying-pre-migration-from-v<source>-to-v<target>-*.sqlite3` name. Both the
+  source and intended target schema versions are therefore explicit. The
+  snapshot is normalized to a rollback-journal header and repeats
+  exact-version/full-integrity validation;
   its file, directory entry, and parent identity are synced and rechecked before
   the source receives any SQLite open;
 - a staging, recovery, validation, sync, or publication failure removes private
@@ -197,7 +201,15 @@ Safety properties:
   Every version-7 recommendation is constrained to `evidence_only = 1` and
   `write_authorized = 0`. Keeper/donor policy and every media mutation remain
   intentionally unimplemented;
-- `EvidenceReader::open_existing_read_only` is the separate v7 historical-read
+- version 8 adds strict runtime leases, ordered durable pause/resume/cancel
+  requests, and append-only enumeration pause checkpoints. An active core-bound
+  run requires its process-local lease for further evidence or terminal writes.
+  A pause checkpoint binds the live core/mount session, counters, work/evidence
+  manifests, and a monotonic generation; it is audit evidence and never restores
+  a descriptor, walker, root token, or cross-process authority. Cancel supersedes
+  pause/resume, stale generations fail closed, and direct-SQL half states are
+  rejected during validation;
+- `EvidenceReader::open_existing_read_only` is the separate historical-read
   boundary. It requires an existing absolute regular database path and opens a
   persistent SQLite `READ_ONLY | NOFOLLOW` connection with `query_only=1`; it
   never calls backup, migration, stale-session reconciliation, WAL
@@ -208,8 +220,8 @@ Safety properties:
   journal, a nonempty WAL without SHM (or an orphan SHM) observed before open,
   unsafe family member, or a family/logical size above 64 GiB fails closed. A
   zero-length WAL left by normal SQLite bookkeeping is accepted;
-- the historical reader validates the application id, exact v7 user version,
-  migration registry, actual schema manifest, runtime/evidence manifests,
+- the historical reader validates the application id, exact current user
+  version, migration registry, actual schema manifest, runtime/evidence manifests,
   capability hashes, `quick_check`, and foreign keys in one read transaction.
   A long-lived trusted grant can reuse that validated connection and call the
   cheap `revalidate_source_identity` check before each command rather than
@@ -228,6 +240,14 @@ Safety properties:
   fresh typed resolve. Catalog pages use a database-bound descending
   `(finished_at_ms, scan_run_id)` cursor, at most 64 records, and the common
   16 MiB aggregate read budget;
+- history export freezes one eligible run in a consistent read transaction.
+  `Summary` emits only its summary and `CompleteEvidence` additionally emits
+  verified D1 groups, members, and scan issues in fixed order. Capture-time
+  detail, raw metadata, native/raw locators, fingerprints, signatures, and file
+  identities are excluded. Projection is `Redacted` by default or explicit
+  `Display`; batches are 1--128 and the complete range is capped at 250,000
+  records and 256 MiB. This crate returns typed canonical records only and never
+  opens an export target or user media;
 - exact duplicate groups begin as drafts. The repository derives every member
   leaf from current database evidence, requires a full verification edge for
   each non-representative member, streams and recomputes the canonical manifest,
@@ -241,10 +261,11 @@ Safety properties:
   copy a historical hint back as if it had reread the source. Hints are only a
   fail-closed optimization, and pinned volume/root/file handles plus core-owned
   read proof remain a blocker for the execution phase;
-- every writable reopen reconciles any old nonterminal scan session to an
-  interrupted terminal state before new runtime work can resume. A worker from
-  the previous process therefore cannot continue progress, checkpoints, issues,
-  fingerprints, groups, or state transitions under a stale session guard;
+- every writable reopen releases old runtime leases before new work. A pending
+  cancel is honored to a cancelled terminal state; pending pause/resume and any
+  other nonterminal session become interrupted. A worker from the previous
+  process therefore cannot continue progress, checkpoints, issues, fingerprints,
+  groups, or state transitions under a stale session guard;
 - full report JSON is capped at 16 MiB. Large per-file or per-group result sets
   belong in normalized paginated tables rather than one report blob;
 - all crate tests use `tempfile::TempDir` and never point at user media.

@@ -27,6 +27,20 @@ The macOS runtime now implements the complete read-only D1 evidence pipeline:
 5. replay every directory ticket in canonical order, bracketed by the current
    volume mount, then seal the exact stage and complete the run.
 
+Enumeration can also yield a process-local paused step after its current bounded
+event buffer has been flushed. The runtime acknowledges that pause only while it
+holds the active Store v8 lease, and persists an append-only checkpoint binding
+the core/mount session, exact counters, work/evidence manifests, and a monotonic
+generation. Resume first acknowledges that same generation in the Store and
+then continues the original in-memory traversal. Cancel dominates pause/resume
+and wakes a paused worker without manufacturing a resume transition.
+
+This checkpoint is durable audit evidence, not serialized traversal authority.
+It cannot recreate a directory walker, descriptor, root token, or mount session.
+Window exit, process restart, or mount change cancels or interrupts the current
+run; any future cross-process continuation must reselect and bind the root and
+create a fresh attempt.
+
 Before either core read starts, the adapter opens the same lossless locator
 through the bound volume session and matches its stable path, physical file
 identity, and size. After the core read, the held descriptor, original path,

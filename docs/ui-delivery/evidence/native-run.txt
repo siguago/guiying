@@ -1,13 +1,13 @@
-归影当前 bundle 原生进程运行验证
+归影 bundle 原生进程历史记录（非本轮证据）
 时间：2026-08-11T17:44:00+08:00
 环境：Tauri 2.11.4; macOS 26.5.2 arm64
 
 命令：open -n src-tauri/target/debug/bundle/macos/归影.app；检查归影进程与 sample；验证后正常退出
 退出码：0
 
-结果：当前 bundle 的归影进程启动，sample 可见 AppKit/WebKit 事件循环，验证后进程正常退出。
+结果：当时 bundle 的归影进程启动，sample 可见 AppKit/WebKit 事件循环，验证后进程正常退出。
 
-限制：本次运行环境中 CoreGraphics 与 System Events 均未枚举到可捕获窗口，因此没有生成或声称当前
-Phase 1 原生窗口截图。仓库原有 native-landing-1280x820.png 是 M0 历史截图，已从当前 qa-evidence
-映射中移除。当前 Phase 1 视觉由明确标注为 Playwright Chromium 的合成浏览器截图证明；真实系统目录
-对话框到外置卷的全流程仍列为 limitation-native-core-flow。
+限制：这份日志早于同进程暂停/继续与历史 JSON/CSV 导出变更，只能作为历史上下文。本轮没有生成 bundle
+或执行 native-run；仓库原有 native-landing-1280x820.png 是 M0 历史截图，也已从当前 qa-evidence 映射
+中移除。当前 Phase 1 浏览器视觉由明确标注为 Playwright Chromium 的合成截图证明；它不证明当前原生
+WebView、系统目录对话框到外置卷、或真实目标目录导出流程。

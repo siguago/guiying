@@ -1,18 +1,17 @@
 归影只读流式扫描核心验证
-时间：2026-08-11T17:49:00+08:00
+时间：2026-08-11T20:57:52+08:00
 环境：rustc/cargo 1.77.2; macOS arm64
 
-命令：
-1. cargo +1.77.2 fmt --manifest-path crates/guiying-core/Cargo.toml --all -- --check
-2. cargo +1.77.2 clippy --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings
-3. cargo +1.77.2 test --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features
-4. RUSTDOCFLAGS=-D warnings cargo +1.77.2 doc --locked --manifest-path crates/guiying-core/Cargo.toml --no-deps
+来源：主任务本机门禁实时输出；本文件是静态结果摘要，不伪造独立原生日志。
+
+门禁：cargo fmt/check/test、strict clippy（-D warnings）与 rustdoc（-D warnings）；构建输出定向到仓库外临时 target。
 
 退出码：全部为 0。
 
-结果：59/59 tests passed（13 unit + 24 legacy scanner + 22 streaming），fmt、strict clippy 与 rustdoc 均通过。
+结果：65/65 tests passed，fmt、cargo check、strict clippy 与 rustdoc 均通过。
 
 覆盖：root-fd/openat/no-follow 相对遍历、多根原始索引、非 UTF 路径、祖先与根替换、同步背压、批次和
-字节硬上限、取消/短读/读中变化；不可构造的 fresh/full/exact proof 绑定 current core session、root index、
-lossless root-relative locator 和完整 source signature。core 不提供移动、重命名、改时或删除 API，且不会把
-同设备根身份冒充稳定 mount 证明；持久化前仍由 volume/runtime 复核。
+字节硬上限、目录枚举安全点、同一进程内继续、暂停后取消优先、短读/读中变化；不可构造的
+fresh/full/exact proof 绑定 current core session、root index、lossless root-relative locator 和完整 source
+signature。暂停遍历器只存在于当前进程，不构成跨进程恢复。core 不提供移动、重命名、改时或删除 API，
+且不会把同设备根身份冒充稳定 mount 证明；持久化前仍由 volume/runtime 复核。
