@@ -27,6 +27,7 @@
 - 进度按阶段变化、至少 200 ms 或累计 256 项节流；核心扫描不等待 UI。
 - `scan-job-status` 和 `get_scan_status` 只携带轻量状态、十进制字符串计数与持久化 run ID，不再传输完整 `ScanReport`。
 - `list_duplicate_groups`、`list_duplicate_group_members` 与 `list_scan_issues` 使用绑定 run/group 上下文的有界游标分页。前端拿不到 core ticket、原始定位器、mount session guard 或任何写入能力。
+- 成员页的文件系统 birth/mtime 以十进制秒/纳秒字符串传输，避免 JavaScript 53 位精度丢失；`timestamp_granularity_ns` 可空，空值必须展示为未知，不能把 stat 的纳秒字段误说成卷的实际纳秒精度。
 - SQLite 连接在扫描工作线程中独占。活动扫描存在时，所有结果分页命令返回 `SCAN_RESULT_UNAVAILABLE`，防止第二个 `Store` 连接把当前 descriptor-bound 会话当作崩溃残留并中断。
 - 最近一份终态只在内存中保留轻量摘要；证据本体在 SQLite。前端完整适配后调用 `acknowledge_scan` 只解除“启动下一任务”的并发门，不删除已持久化证据。
 

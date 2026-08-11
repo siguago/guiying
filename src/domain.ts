@@ -21,6 +21,7 @@ export interface DuplicateFile {
   sizeBytes: number
   createdAt?: string
   modifiedAt?: string
+  fileTimeNote?: string
   captureTime?: string
   isRecommendedKeeper: boolean
   keeperReason?: string

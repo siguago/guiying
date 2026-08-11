@@ -444,6 +444,7 @@ function GroupInspector({
                   <div><dt>文件修改</dt><dd>{file.modifiedAt ?? '尚未分析'}</dd></div>
                   <div><dt>拍摄时间</dt><dd>{file.captureTime ?? '尚无内嵌证据'}</dd></div>
                 </dl>
+                {file.fileTimeNote ? <p className="group-member__time-note">{file.fileTimeNote}</p> : null}
               </li>
             ))}
           </ol>

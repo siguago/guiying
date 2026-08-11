@@ -77,6 +77,11 @@ interface CoreDuplicateGroupMemberItem {
   pathEncoding: 'unix_bytes' | 'windows_utf16_le' | 'utf8'
   sizeBytes: string
   hasStableFileIdentity: boolean
+  birthTimeSeconds: string | null
+  birthTimeNanoseconds: string | null
+  modifiedTimeSeconds: string
+  modifiedTimeNanoseconds: string
+  timestampGranularityNs: string | null
 }
 
 interface CoreScanIssueItem {
@@ -101,6 +106,47 @@ const ISSUE_PAGE_SIZE = 128
 function formatFromPath(path: string): string {
   const extension = fileNameFromPath(path).split('.').at(-1)
   return extension?.toUpperCase() ?? '媒体'
+}
+
+function parseSignedDecimal(value: string, label: string): bigint {
+  if (!/^-?(0|[1-9]\d*)$/.test(value)) {
+    throw new Error(`${label}不是有效的有符号十进制数。`)
+  }
+  return BigInt(value)
+}
+
+function fileSystemTimestamp(
+  seconds: string | null,
+  nanoseconds: string | null,
+  label: string,
+): string | undefined {
+  if (seconds === null && nanoseconds === null) return undefined
+  if (seconds === null || nanoseconds === null) {
+    throw new Error(`${label}的秒与纳秒字段不完整；该页已拒绝展示。`)
+  }
+  const secondValue = parseSignedDecimal(seconds, `${label}秒`)
+  const nanosecondValue = decimalToSafeNumber(nanoseconds, `${label}纳秒`)
+  if (nanosecondValue > 999_999_999) {
+    throw new Error(`${label}纳秒超出有效范围；该页已拒绝展示。`)
+  }
+  const milliseconds = secondValue * 1_000n
+  if (milliseconds < -8_640_000_000_000_000n || milliseconds > 8_640_000_000_000_000n) {
+    return `Unix ${seconds}s（超出界面日期范围）`
+  }
+  const instant = new Date(Number(milliseconds))
+  if (Number.isNaN(instant.getTime())) {
+    return `Unix ${seconds}s（无法格式化）`
+  }
+  return `${instant.toISOString().slice(0, 19).replace('T', ' ')} UTC`
+}
+
+function fileTimePrecisionNote(granularity: string | null): string {
+  if (granularity === null) {
+    return '文件系统实际时间精度未知；仅作低可信线索，不等于拍摄时间。'
+  }
+  const value = decimalToSafeNumber(granularity, '文件系统时间精度')
+  if (value === 0) throw new Error('文件系统时间精度必须大于零。')
+  return `卷报告的时间精度为 ${value.toLocaleString('zh-CN')} ns；文件时间仍不等于拍摄时间。`
 }
 
 function adaptGroup(group: CoreDuplicateGroupItem): DuplicateGroup {
@@ -243,6 +289,17 @@ export async function loadDuplicateGroupMemberPage(
         name: fileNameFromPath(file.displayPath),
         path: file.displayPath,
         sizeBytes: decimalToSafeNumber(file.sizeBytes, '重复文件大小'),
+        createdAt: fileSystemTimestamp(
+          file.birthTimeSeconds,
+          file.birthTimeNanoseconds,
+          '文件创建时间',
+        ) ?? '卷或驱动未提供',
+        modifiedAt: fileSystemTimestamp(
+          file.modifiedTimeSeconds,
+          file.modifiedTimeNanoseconds,
+          '文件修改时间',
+        ),
+        fileTimeNote: fileTimePrecisionNote(file.timestampGranularityNs),
         isRecommendedKeeper: isKeeper,
         keeperReason: isKeeper
           ? '当前只按封印后的稳定顺序暂定；尚未解析内嵌拍摄时间与伴随资产'

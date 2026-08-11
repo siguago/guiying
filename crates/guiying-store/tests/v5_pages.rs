@@ -224,6 +224,21 @@ fn v5_candidate_pages_are_sealed_bounded_and_context_bound(
 
     let first_member_page =
         store.list_duplicate_group_members_page(run.run_id, first_group, None, 1)?;
+    assert_eq!(
+        first_member_page.items[0].birth_time,
+        Some(FileTimestampParts {
+            seconds: 1_000,
+            nanoseconds: 0,
+        })
+    );
+    assert_eq!(
+        first_member_page.items[0].modified_time,
+        FileTimestampParts {
+            seconds: 2_000,
+            nanoseconds: 0,
+        }
+    );
+    assert_eq!(first_member_page.items[0].timestamp_granularity_ns, Some(1));
     let mut wrong_group_member_cursor = first_member_page
         .next_cursor
         .ok_or("group-member page did not return a cursor")?;

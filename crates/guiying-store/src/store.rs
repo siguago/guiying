@@ -1432,7 +1432,10 @@ impl Store {
                         namespace_path.mount_relative_path_raw, \
                         observation.root_relative_path_raw, observation.path_encoding, \
                         observation.display_path, observation.source_signature, \
-                        observation.size_bytes, observation.file_object_key \
+                        observation.size_bytes, observation.file_object_key, \
+                        observation.birth_time_seconds, observation.birth_time_nanoseconds, \
+                        observation.modified_time_seconds, observation.modified_time_nanoseconds, \
+                        observation.timestamp_granularity_ns \
                  FROM exact_group_build_members AS member \
                  JOIN exact_group_builds AS build \
                    ON build.volume_id = member.volume_id \
@@ -1481,6 +1484,9 @@ impl Store {
                             source_signature: row.get(10)?,
                             size_bytes: row.get(11)?,
                             file_object_key: row.get(12)?,
+                            birth_time: optional_timestamp_from_row(row, 13, 14)?,
+                            modified_time: required_timestamp_from_row(row, 15, 16)?,
+                            timestamp_granularity_ns: row.get(17)?,
                         })
                     },
                 )?

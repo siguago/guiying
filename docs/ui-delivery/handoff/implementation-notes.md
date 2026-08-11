@@ -36,6 +36,7 @@ Rust 验证命令记录于仓库根 README。Tauri webview capability 只开放 
 
 - 当前阶段尚未在桌面主链接入 EXIF、QuickTime、XMP、AAE、Google Takeout JSON 或 Live Photo 配对关系。
 - 结果中的 keeper 仅按稳定路径顺序暂定，并明确标注不能作为删除依据。
+- 组内成员已展示扫描快照中的文件 birth/mtime 与精度说明；它们是低可信文件系统线索，不能代替尚未接入主链的内嵌拍摄时间。
 - SQLite 只读扫描证据已接入 UI；未来文件动作表仍 dormant，不构成执行授权。
 - 开发包仍使用 Tauri 脚手架应用图标；发布前必须完成品牌图标与小尺寸 QA。
 - 浏览器 E2E 覆盖合成数据流程；真实外置卷和系统目录对话框仍需人工验收矩阵。

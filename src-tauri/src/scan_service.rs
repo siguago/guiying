@@ -826,6 +826,11 @@ pub(crate) struct DuplicateGroupMemberItem {
     path_encoding: String,
     size_bytes: String,
     has_stable_file_identity: bool,
+    birth_time_seconds: Option<String>,
+    birth_time_nanoseconds: Option<String>,
+    modified_time_seconds: String,
+    modified_time_nanoseconds: String,
+    timestamp_granularity_ns: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -971,6 +976,13 @@ fn map_member_page(
             path_encoding: member.path_encoding,
             size_bytes: member.size_bytes.to_string(),
             has_stable_file_identity: member.file_object_key.is_some(),
+            birth_time_seconds: member.birth_time.map(|value| value.seconds.to_string()),
+            birth_time_nanoseconds: member.birth_time.map(|value| value.nanoseconds.to_string()),
+            modified_time_seconds: member.modified_time.seconds.to_string(),
+            modified_time_nanoseconds: member.modified_time.nanoseconds.to_string(),
+            timestamp_granularity_ns: member
+                .timestamp_granularity_ns
+                .map(|value| value.to_string()),
         })
         .collect();
     Ok(ResultPage {
@@ -1268,11 +1280,23 @@ mod tests {
             .expect("verified groups should page");
         assert_eq!(groups.items.len(), 1);
         assert_eq!(groups.items[0].member_count, 2);
+        let group_build_id = groups.items[0].build_id;
         let mapped = map_group_page(&reservation.job_id, &store, scan_run_id, groups)
             .expect("verified groups should map to bounded preview records");
         assert_eq!(mapped.items.len(), 1);
         assert_eq!(mapped.items[0].member_count, "2");
         assert_eq!(mapped.items[0].size_bytes, content.len().to_string());
         assert!(mapped.items[0].preview_path.ends_with(".jpg"));
+        let member_records = store
+            .list_duplicate_group_members_page(scan_run_id, group_build_id, None, 10)
+            .expect("verified group members should page");
+        let mapped_members = map_member_page(&reservation.job_id, member_records)
+            .expect("member filesystem timestamps should map without JS precision loss");
+        assert_eq!(mapped_members.items.len(), 2);
+        assert!(mapped_members.items[0].birth_time_seconds.is_some());
+        assert!(mapped_members.items[0].birth_time_nanoseconds.is_some());
+        assert!(!mapped_members.items[0].modified_time_seconds.is_empty());
+        assert!(!mapped_members.items[0].modified_time_nanoseconds.is_empty());
+        assert_eq!(mapped_members.items[0].timestamp_granularity_ns, None);
     }
 }

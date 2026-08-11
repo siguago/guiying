@@ -402,6 +402,9 @@ pub struct DuplicateGroupMemberRecord {
     pub source_signature: Vec<u8>,
     pub size_bytes: i64,
     pub file_object_key: Option<Vec<u8>>,
+    pub birth_time: Option<FileTimestampParts>,
+    pub modified_time: FileTimestampParts,
+    pub timestamp_granularity_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

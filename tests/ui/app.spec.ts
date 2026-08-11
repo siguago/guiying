@@ -15,6 +15,7 @@ test('landing page communicates the read-only boundary', async ({ page }) => {
   expect(accessibility.violations).toEqual([])
 
   await page.screenshot({
+    animations: 'disabled',
     path: `${evidenceDir}/landing-1280x820.png`,
     fullPage: true,
   })
@@ -22,14 +23,19 @@ test('landing page communicates the read-only boundary', async ({ page }) => {
 
 test('read-only demo scan exposes progress and exact duplicate evidence', async ({ page }) => {
   await page.goto('/')
+  await page.clock.install()
 
   await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
   await expect(page.getByRole('heading', { name: '正在建立内容证据' })).toBeVisible()
+  await expect(page.getByText('阶段 1 / 5')).toBeVisible()
 
   await page.screenshot({
+    animations: 'disabled',
     path: `${evidenceDir}/scanning-1280x820.png`,
     fullPage: true,
   })
+
+  await page.clock.runFor(1_500)
 
   await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /IMG_4821\.HEIC/ })).toHaveAttribute('aria-pressed', 'true')
@@ -45,6 +51,7 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
   expect(accessibility.violations).toEqual([])
 
   await page.screenshot({
+    animations: 'disabled',
     path: `${evidenceDir}/results-1280x820.png`,
     fullPage: true,
   })
@@ -65,6 +72,7 @@ test('results adapt at the compact desktop boundary', async ({ page }) => {
   await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
 
   await page.screenshot({
+    animations: 'disabled',
     path: `${evidenceDir}/results-1024x768.png`,
     fullPage: true,
   })
@@ -205,6 +213,11 @@ test('persistent results page groups, members, and issues without unbounded accu
       pathEncoding: 'utf8',
       sizeBytes: '4',
       hasStableFileIdentity: true,
+      birthTimeSeconds: ordinal === '0' ? '1609459200' : '1735689600',
+      birthTimeNanoseconds: '0',
+      modifiedTimeSeconds: ordinal === '0' ? '1609459200' : '1735689600',
+      modifiedTimeNanoseconds: '0',
+      timestampGranularityNs: null,
     })
 
     Object.assign(window, {
@@ -305,7 +318,11 @@ test('persistent results page groups, members, and issues without unbounded accu
   await expect(page.getByRole('button', { name: /A\.JPG/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /B\.JPG/ })).toHaveCount(0)
   await expect(page.locator('code').filter({ hasText: '/Volumes/Test Photos/A-copy.JPG' })).toBeVisible()
+  await expect(page.getByText('2021-01-01 00:00:00 UTC').first()).toBeVisible()
+  await expect(page.getByText('2025-01-01 00:00:00 UTC').first()).toBeVisible()
+  await expect(page.getByText(/文件系统实际时间精度未知/).first()).toBeVisible()
   await page.screenshot({
+    animations: 'disabled',
     path: `${evidenceDir}/results-paged-1280x820.png`,
     fullPage: true,
   })
