@@ -10,7 +10,7 @@ repository = "https://github.com/siguago/guiying"
 
 [dependencies]
 blake3 = "=1.5.5"
-indexmap = "=2.7.1"
+indexmap = "=2.11.4"
 rusqlite = { version = "=0.32.1", features = ["bundled", "backup", "limits"], default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
