@@ -2834,6 +2834,144 @@ pub struct MetadataFieldCursor {
     pub(crate) last_field_id: i64,
 }
 
+/// Keyset cursor for the immutable completed-scan catalog.
+///
+/// `database_scope_digest` binds the cursor to one canonical database file
+/// identity while remaining stable when the read-only connection is reopened.
+/// It is not a filesystem capability and must never be interpreted as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanHistoryCursor {
+    pub(crate) cursor_version: i64,
+    pub(crate) database_scope_digest: [u8; 32],
+    pub(crate) last_finished_at_ms: i64,
+    pub(crate) last_scan_run_id: i64,
+}
+
+/// Stable, process-safe identity for one canonical evidence database file.
+///
+/// This is deliberately non-serializable and conveys no filesystem access.
+/// A trusted boundary can retain it beside an opaque result token and compare
+/// it after reopening an `EvidenceReader`; replacing the database file changes
+/// the scope even if numeric scan ids happen to be reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EvidenceDatabaseScope(pub(crate) [u8; 32]);
+
+impl EvidenceDatabaseScope {
+    pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Optional capture-time outcome retained beside one immutable D1 result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanHistoryTimeOutcomeRecord {
+    pub state: String,
+    pub expected_group_count: Option<i64>,
+    pub evidence_group_count: Option<i64>,
+    pub unavailable_group_count: Option<i64>,
+    pub failed_group_count: Option<i64>,
+    pub max_total_read_bytes: Option<i64>,
+    pub max_probe_count_per_group: Option<i64>,
+    pub max_report_total_bytes_read: Option<i64>,
+    pub max_report_read_operations: Option<i64>,
+    pub max_report_retained_field_bytes: Option<i64>,
+    pub max_report_fields: Option<i64>,
+    pub max_report_issues: Option<i64>,
+    /// Reconstructable usage from sealed reports, counting both extraction
+    /// passes required by the double-extraction contract. Failed probes that
+    /// never sealed a report are intentionally not represented.
+    pub sealed_report_read_bytes: Option<i64>,
+    pub sealed_report_read_operations: Option<i64>,
+    pub finalized_at_ms: Option<i64>,
+}
+
+/// Display-safe summary of one completed, exact-sealed D1 history entry.
+///
+/// `root_display_path` is retained display text only. It is not a native path,
+/// an exact path byte sequence, or authority to open anything on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanHistoryRecord {
+    pub scan_run_id: i64,
+    pub root_display_path: String,
+    pub scan_mode: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+    pub duration_ms: i64,
+    pub coverage_status: String,
+    pub discovered_count: i64,
+    pub fingerprinted_count: i64,
+    pub error_count: i64,
+    pub logical_bytes_seen: i64,
+    pub observed_file_count: i64,
+    pub verified_group_count: i64,
+    pub verified_member_count: i64,
+    pub redundant_copy_count: i64,
+    pub logical_reclaimable_bytes: i64,
+    pub issue_count: i64,
+    pub unresolved_issue_count: i64,
+    pub time_outcome: ScanHistoryTimeOutcomeRecord,
+}
+
+/// Process-local typed context resolved from a visible history entry.
+///
+/// This intentionally has no serde implementation. A UI boundary should keep
+/// it in trusted Rust state and expose an owner-bound opaque result token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanHistoryContext {
+    pub(crate) reader_instance_key: [u8; 32],
+    pub(crate) database_scope: EvidenceDatabaseScope,
+    pub(crate) scan_job_id: i64,
+    pub(crate) scan_run_id: i64,
+    pub(crate) volume_id: i64,
+    pub(crate) time_session_id: Option<i64>,
+}
+
+impl ScanHistoryContext {
+    #[must_use]
+    pub const fn scan_run_id(&self) -> i64 {
+        self.scan_run_id
+    }
+}
+
+/// Process-local typed context for one verified exact group in history.
+///
+/// `analysis_build_id` is present only for an immutable evidence outcome;
+/// unavailable/failed terminal outcomes still permit duplicate-member review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanHistoryGroupContext {
+    pub(crate) history: ScanHistoryContext,
+    pub(crate) exact_group_build_id: i64,
+    pub(crate) time_outcome: Option<String>,
+    pub(crate) analysis_build_id: Option<i64>,
+}
+
+impl ScanHistoryGroupContext {
+    #[must_use]
+    pub const fn scan_run_id(&self) -> i64 {
+        self.history.scan_run_id
+    }
+
+    #[must_use]
+    pub const fn exact_group_build_id(&self) -> i64 {
+        self.exact_group_build_id
+    }
+
+    #[must_use]
+    pub fn time_outcome(&self) -> Option<&str> {
+        self.time_outcome.as_deref()
+    }
+
+    #[must_use]
+    pub const fn analysis_build_id(&self) -> Option<i64> {
+        self.analysis_build_id
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CaptureTimeGroupSummaryRecord {
     pub analysis_build_id: i64,

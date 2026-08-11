@@ -9,10 +9,10 @@ use guiying_store::{
     CaptureTimeObservationInterpretationInput, CaptureTimeRecommendationInput, CaptureWallTime,
     CoreCoverageSealDigest, CoreDirectoryManifest, CoreDirectoryObservationInput,
     CoreFileObservationInput, CoreSessionId, CoreSessionInput, CoverageOutcomeInput,
-    CoverageStatus, DirectoryObjectSignature, EvidenceParserIdentity, ExactGroupManifestMember,
-    ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey, FileTimeRelation,
-    FileTimestampParts, FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind,
-    ManifestDigest, MetadataDetectedFormat, MetadataExtractionLimitsInput,
+    CoverageStatus, DirectoryObjectSignature, EvidenceParserIdentity, EvidenceReader,
+    ExactGroupManifestMember, ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey,
+    FileTimeRelation, FileTimestampParts, FingerprintReadOrigin, FreshFingerprintInput,
+    FreshFingerprintKind, ManifestDigest, MetadataDetectedFormat, MetadataExtractionLimitsInput,
     MetadataExtractionStatus, MetadataExtractionUsageInput, MetadataFieldInput,
     MetadataLocatorInput, MetadataReportDigest, MetadataReportManifestPlan,
     MetadataSourceRevalidationInput, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey,
@@ -24,7 +24,7 @@ use guiying_store::{
     VolumeCoverageManifest, VolumeInput,
 };
 use rusqlite::config::DbConfig;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -45,13 +45,20 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
     let mut store = Store::open_or_create(&database_path)?;
     let run = create_running_run(&mut store, "time", 7)?;
     let core_session_id = CoreSessionId::from_runtime_evidence([70; 32]);
-    let observations = [observation(0), observation(1)];
+    let mut first_observation = observation(0);
+    first_observation.link_count = Some(2);
+    let mut hard_link_alias = observation(1);
+    hard_link_alias.file_object_key = first_observation.file_object_key;
+    hard_link_alias.native_file_id = first_observation.native_file_id.clone();
+    hard_link_alias.native_file_generation = first_observation.native_file_generation;
+    hard_link_alias.link_count = Some(2);
+    let observations = [first_observation, hard_link_alias, observation(2)];
     let files = observations
         .iter()
         .enumerate()
         .map(|(index, observation)| {
-            let index_u8 = u8::try_from(index).expect("two-item fixture index fits in u8");
-            let index_i64 = i64::try_from(index).expect("two-item fixture index fits in i64");
+            let index_u8 = u8::try_from(index).expect("fixture index fits in u8");
+            let index_i64 = i64::try_from(index).expect("fixture index fits in i64");
             CoreFileObservationInput {
                 observation: observation.clone(),
                 ticket_blob: vec![80 + index_u8; 48],
@@ -82,7 +89,7 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         )?;
         let ids = repository.record_core_observation_batch(&run.guard, &core_session_id, &files)?;
         repository.record_core_directory_batch(&run.guard, &core_session_id, &[directory])?;
-        repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 2, 256, 200)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 3, 384, 200)?;
         repository.seal_scan_stage(&run.guard, ScanStage::Sampling, 0, 0, 210)?;
         Ok(ids)
     })?;
@@ -91,7 +98,7 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         .iter()
         .enumerate()
         .map(|(index, observation_id)| {
-            let index_i64 = i64::try_from(index).expect("two-item fixture index fits in i64");
+            let index_i64 = i64::try_from(index).expect("fixture index fits in i64");
             FreshFingerprintInput {
                 observation_id: *observation_id,
                 fingerprint_kind: FreshFingerprintKind::ExactBytes,
@@ -112,10 +119,10 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         .collect::<Vec<_>>();
     let fingerprint_ids = store.write_transaction(|repository| {
         let ids = repository.record_fingerprint_fresh_batch(&run.guard, &fingerprints)?;
-        repository.seal_scan_stage(&run.guard, ScanStage::FullHash, 2, 256, 400)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::FullHash, 3, 384, 400)?;
         Ok(ids)
     })?;
-    let manifest_members = (0..2)
+    let manifest_members = (0..3)
         .map(|index| {
             Ok(ExactGroupManifestMember {
                 ordinal: u64::try_from(index)?,
@@ -145,7 +152,7 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
                 build_key: BuildKey::from_runtime_evidence([51; 32]),
                 representative_observation_id: observation_ids[0],
                 representative_fingerprint_id: fingerprint_ids[0],
-                expected_member_count: 2,
+                expected_member_count: 3,
                 expected_manifest_digest: exact_manifest,
                 created_at_ms: 500,
             },
@@ -166,19 +173,35 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
                     fingerprint_id: fingerprint_ids[1],
                     sort_rank: 1,
                 },
+                ExactGroupMemberInput {
+                    ordinal: 2,
+                    observation_id: observation_ids[2],
+                    fingerprint_id: fingerprint_ids[2],
+                    sort_rank: 2,
+                },
             ],
         )?;
         repository.append_exact_verification_edges(
             &run.guard,
             build_id,
-            &[ExactVerificationEdgeInput {
-                member_observation_id: observation_ids[1],
-                member_fingerprint_id: fingerprint_ids[1],
-                representative_source_signature: observations[0].source_signature,
-                member_source_signature: observations[1].source_signature,
-                compared_bytes: 128,
-                verified_at_ms: 600,
-            }],
+            &[
+                ExactVerificationEdgeInput {
+                    member_observation_id: observation_ids[1],
+                    member_fingerprint_id: fingerprint_ids[1],
+                    representative_source_signature: observations[0].source_signature,
+                    member_source_signature: observations[1].source_signature,
+                    compared_bytes: 128,
+                    verified_at_ms: 600,
+                },
+                ExactVerificationEdgeInput {
+                    member_observation_id: observation_ids[2],
+                    member_fingerprint_id: fingerprint_ids[2],
+                    representative_source_signature: observations[0].source_signature,
+                    member_source_signature: observations[2].source_signature,
+                    compared_bytes: 128,
+                    verified_at_ms: 600,
+                },
+            ],
         )?;
         let group = repository.finalize_exact_group(&run.guard, build_id, 700)?;
         repository.record_core_coverage(
@@ -198,12 +221,24 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
                 finalized_at_ms: 705,
             },
         )?;
-        repository.seal_scan_stage(&run.guard, ScanStage::ExactVerification, 1, 128, 710)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::ExactVerification, 2, 256, 710)?;
         Ok(group)
     })?;
 
     let preterminal_summary = store.verified_time_scope_summary(&run.guard, &core_session_id)?;
     assert_eq!(preterminal_summary.expected_group_count, 1);
+    let preterminal_state = capture_database_logical_state(&database_path)?;
+    let preterminal_reader = EvidenceReader::open_existing_read_only(&database_path)
+        .expect("open preterminal read-only evidence");
+    assert!(preterminal_reader
+        .list_scan_history_page(None, 64)?
+        .items
+        .is_empty());
+    assert_eq!(
+        capture_database_logical_state(&database_path)?,
+        preterminal_state,
+        "read-only history open changed preterminal schema or evidence rows"
+    );
     assert!(matches!(
         store.time_evidence_guard(run.guard, core_session_id),
         Err(StoreError::ConcurrencyConflict { .. })
@@ -223,6 +258,43 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         )?;
         Ok(())
     })?;
+    preterminal_reader.revalidate_source_identity()?;
+    let concurrently_completed = preterminal_reader.list_scan_history_page(None, 64)?;
+    assert_eq!(concurrently_completed.items.len(), 1);
+    assert_eq!(concurrently_completed.items[0].scan_run_id, run.run_id);
+    assert_eq!(
+        concurrently_completed.items[0].time_outcome.state,
+        "not_run"
+    );
+    preterminal_reader.close()?;
+    let no_time_reader = EvidenceReader::open_existing_read_only(&database_path)?;
+    let no_time_page = no_time_reader.list_scan_history_page(None, 64)?;
+    assert_eq!(no_time_page.items.len(), 1);
+    assert_eq!(no_time_page.items[0].time_outcome.state, "not_run");
+    assert!(no_time_page.items[0]
+        .time_outcome
+        .expected_group_count
+        .is_none());
+    assert_eq!(
+        no_time_reader
+            .get_scan_history_entry(run.run_id)?
+            .expect("point history without a time session"),
+        no_time_page.items[0]
+    );
+    let no_time_context = no_time_reader
+        .resolve_scan_history_entry(run.run_id)?
+        .expect("D1 history context without time session");
+    assert_eq!(
+        no_time_reader
+            .list_duplicate_groups_page(&no_time_context, None, 10)?
+            .items,
+        vec![group.clone()]
+    );
+    assert!(matches!(
+        no_time_reader.list_capture_time_group_summaries_page(&no_time_context, None, 10),
+        Err(StoreError::ConcurrencyConflict { .. })
+    ));
+    no_time_reader.close()?;
     let time_guard = store.time_evidence_guard(run.guard, core_session_id)?;
     assert_eq!(
         store.verified_time_scope_summary_for_time(&time_guard)?,
@@ -230,14 +302,14 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
     );
     let probe_page = store.list_verified_time_probe_scopes_page(&time_guard, None, 1)?;
     assert_eq!(probe_page.items.len(), 1);
-    assert_eq!(probe_page.items[0].probes.len(), 2);
+    assert_eq!(probe_page.items[0].probes.len(), 3);
     assert_eq!(probe_page.items[0].group, group);
     assert!(matches!(
         store.list_verified_time_probe_scopes_page(&time_guard, None, 257),
         Err(StoreError::InvalidInput { .. })
     ));
 
-    let budget = TimeSessionBudget::new(1_024, 2, 128, 16, 128, 8, 8)?;
+    let budget = TimeSessionBudget::new(1_024, 3, 128, 16, 128, 8, 8)?;
     let begin_session = BeginTimeSessionInput::new(
         TimeSessionKey::from_runtime_evidence([100; 32]),
         preterminal_summary.expected_group_count,
@@ -269,6 +341,70 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         );
         Ok(id)
     })?;
+    let draft_state = capture_database_logical_state(&database_path)?;
+    let draft_reader = EvidenceReader::open_existing_read_only(&database_path)
+        .expect("open draft read-only evidence");
+    let draft_page = draft_reader.list_scan_history_page(None, 64)?;
+    assert_eq!(draft_page.items.len(), 1);
+    assert_eq!(draft_page.items[0].time_outcome.state, "unavailable");
+    assert!(draft_page.items[0]
+        .time_outcome
+        .expected_group_count
+        .is_none());
+    let draft_context = draft_reader
+        .resolve_scan_history_entry(run.run_id)?
+        .expect("D1 history context hides draft time rows");
+    assert!(matches!(
+        draft_reader.list_capture_time_group_summaries_page(&draft_context, None, 10),
+        Err(StoreError::ConcurrencyConflict { .. })
+    ));
+    draft_reader.close()?;
+    assert_eq!(
+        capture_database_logical_state(&database_path)?,
+        draft_state,
+        "read-only history open changed draft schema or evidence rows"
+    );
+
+    let abandoned_path = temporary.path().join("v7-abandoned-time-history.sqlite3");
+    store.backup_to(&abandoned_path)?;
+    let abandoned_connection = Connection::open(&abandoned_path)?;
+    abandoned_connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+    abandoned_connection.execute(
+        "UPDATE scan_time_sessions \
+         SET state = 'abandoned', abandon_reason_code = 'test_abandoned', \
+             finalized_at_ms = 901 \
+         WHERE id = ?1",
+        [time_session_id],
+    )?;
+    abandoned_connection.close().map_err(|(_, error)| error)?;
+    let abandoned_state = capture_database_logical_state(&abandoned_path)?;
+    let abandoned_reader = EvidenceReader::open_existing_read_only(&abandoned_path)?;
+    let abandoned_page = abandoned_reader.list_scan_history_page(None, 64)?;
+    assert_eq!(abandoned_page.items.len(), 1);
+    assert_eq!(abandoned_page.items[0].time_outcome.state, "failed");
+    assert!(abandoned_page.items[0]
+        .time_outcome
+        .expected_group_count
+        .is_none());
+    let abandoned_context = abandoned_reader
+        .resolve_scan_history_entry(run.run_id)?
+        .expect("D1 history survives an abandoned optional time session");
+    assert_eq!(
+        abandoned_reader
+            .list_duplicate_groups_page(&abandoned_context, None, 10)?
+            .items,
+        vec![group.clone()]
+    );
+    assert!(matches!(
+        abandoned_reader.list_capture_time_group_summaries_page(&abandoned_context, None, 10),
+        Err(StoreError::ConcurrencyConflict { .. })
+    ));
+    abandoned_reader.close()?;
+    assert_eq!(
+        capture_database_logical_state(&abandoned_path)?,
+        abandoned_state,
+        "read-only history open changed abandoned schema or evidence rows"
+    );
 
     let probe = &probe_page.items[0].probes[0];
     let exact_material =
@@ -729,7 +865,7 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         5,
         1,
         0,
-        2,
+        3,
         1,
         940,
     )?;
@@ -950,14 +1086,14 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         let digest = repository.finalize_time_session(
             &time_guard,
             time_session_id,
-            TimeSessionOutcome::Complete,
+            TimeSessionOutcome::Partial,
             960,
         )?;
         assert_eq!(
             repository.finalize_time_session(
                 &time_guard,
                 time_session_id,
-                TimeSessionOutcome::Complete,
+                TimeSessionOutcome::Partial,
                 960,
             )?,
             digest
@@ -1011,8 +1147,133 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         .items
         .is_empty());
 
+    let later_history_run = complete_empty_history_run(&mut store, "later-history", 8, 81)?;
     let old_guard = time_guard;
     store.close()?;
+    let closed_state = capture_database_logical_state(&database_path)?;
+    let pagination_reader = EvidenceReader::open_existing_read_only(&database_path)?;
+    let first_history_page = pagination_reader.list_scan_history_page(None, 1)?;
+    assert_eq!(first_history_page.items.len(), 1);
+    assert_eq!(
+        first_history_page.items[0].scan_run_id,
+        later_history_run.run_id
+    );
+    let history_cursor = first_history_page
+        .next_cursor
+        .expect("two history entries require a continuation cursor");
+    pagination_reader.close()?;
+    let history = EvidenceReader::open_existing_read_only(&database_path)
+        .expect("open terminal read-only evidence");
+    let second_history_page = history.list_scan_history_page(Some(&history_cursor), 1)?;
+    assert_eq!(second_history_page.items.len(), 1);
+    assert_eq!(second_history_page.items[0].scan_run_id, run.run_id);
+    assert!(second_history_page.next_cursor.is_none());
+    let history_page = history.list_scan_history_page(None, 64)?;
+    assert_eq!(history_page.items.len(), 2);
+    assert!(history_page.next_cursor.is_none());
+    let history_summary = history_page
+        .items
+        .iter()
+        .find(|record| record.scan_run_id == run.run_id)
+        .expect("original completed history entry");
+    assert_eq!(history_summary.scan_run_id, run.run_id);
+    assert_eq!(history_summary.root_display_path, "DCIM");
+    assert_eq!(history_summary.coverage_status, "complete");
+    assert_eq!(history_summary.observed_file_count, 3);
+    assert_eq!(history_summary.verified_group_count, 1);
+    assert_eq!(history_summary.verified_member_count, 3);
+    assert_eq!(history_summary.redundant_copy_count, 1);
+    assert_eq!(history_summary.logical_reclaimable_bytes, 128);
+    assert_eq!(history_summary.time_outcome.state, "partial");
+    assert_eq!(history_summary.time_outcome.evidence_group_count, Some(1));
+    assert_eq!(
+        history_summary.time_outcome.sealed_report_read_bytes,
+        Some(256)
+    );
+    assert_eq!(
+        history_summary.time_outcome.sealed_report_read_operations,
+        Some(4)
+    );
+    assert_eq!(
+        history.get_scan_history_entry(run.run_id)?.as_ref(),
+        Some(history_summary)
+    );
+    history.revalidate_source_identity()?;
+    assert!(matches!(
+        history.list_scan_history_page(None, 65),
+        Err(StoreError::InvalidInput { .. })
+    ));
+    let history_context = history
+        .resolve_scan_history_entry(run.run_id)?
+        .expect("completed sealed history context");
+    assert_eq!(history_context.scan_run_id(), run.run_id);
+    let history_groups = history.list_duplicate_groups_page(&history_context, None, 10)?;
+    assert_eq!(history_groups.items, vec![group.clone()]);
+    assert!(history
+        .list_scan_issues_page(&history_context, None, 10)?
+        .items
+        .is_empty());
+    let history_group = history
+        .resolve_scan_history_group(&history_context, group.build_id)?
+        .expect("terminal group history context");
+    assert_eq!(history_group.time_outcome(), Some("evidence"));
+    assert_eq!(history_group.analysis_build_id(), Some(analysis_id));
+    assert_eq!(
+        history
+            .get_capture_time_group_summary(&history_group)?
+            .expect("point capture-time history summary")
+            .analysis_build_id,
+        analysis_id
+    );
+    assert_eq!(
+        history
+            .list_duplicate_group_members_page(&history_group, None, 10)?
+            .items
+            .len(),
+        3
+    );
+    assert_eq!(
+        history
+            .list_capture_time_candidates_page(&history_group, None, 10)?
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        history
+            .list_capture_time_members_page(&history_group, None, 10)?
+            .items
+            .len(),
+        3
+    );
+    assert!(history
+        .list_capture_time_issues_page(&history_group, None, 10)?
+        .items
+        .is_empty());
+    assert_eq!(
+        history
+            .list_capture_time_metadata_reports_page(&history_group, None, 10)?
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        history
+            .list_capture_time_metadata_fields_page(&history_group, 0, report_id, None, 10)?
+            .items
+            .len(),
+        5
+    );
+    let history_raw = history
+        .get_capture_time_metadata_field_raw_detail(&history_group, 0, report_id, 0, field_ids[0])?
+        .expect("history raw detail");
+    assert_eq!(history_raw.raw_bytes, raw_field);
+    history.close()?;
+    assert_eq!(
+        capture_database_logical_state(&database_path)?,
+        closed_state,
+        "read-only history queries changed terminal schema or evidence rows"
+    );
     let reopened = Store::open_existing(&database_path)?;
     assert!(matches!(
         reopened.list_verified_time_probe_scopes_page(&old_guard, None, 1),
@@ -1047,6 +1308,10 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
     decision_connection.close().map_err(|(_, error)| error)?;
     assert!(matches!(
         Store::open_existing(&decision_tamper_path),
+        Err(StoreError::MigrationHistoryMismatch(_))
+    ));
+    assert!(matches!(
+        EvidenceReader::open_existing_read_only(&decision_tamper_path),
         Err(StoreError::MigrationHistoryMismatch(_))
     ));
 
@@ -1089,7 +1354,7 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
     let session_state_connection = Connection::open(&session_state_tamper_path)?;
     session_state_connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
     session_state_connection.execute(
-        "UPDATE scan_time_sessions SET state = 'partial' WHERE id = ?1",
+        "UPDATE scan_time_sessions SET state = 'complete' WHERE id = ?1",
         [time_session_id],
     )?;
     session_state_connection
@@ -1240,6 +1505,38 @@ fn v7_source_v2_and_lineage_v1_domains_are_stable_and_separated(
     Ok(())
 }
 
+#[test]
+fn long_lived_evidence_reader_observes_later_writer_commit_and_wal_rotation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let database_path = temporary.path().join("v7-live-history-reader.sqlite3");
+    let mut writer = Store::open_or_create(&database_path)?;
+    let run = prepare_empty_exact_sealed_run(&mut writer, "live-reader", 9, 91)?;
+
+    let reader = EvidenceReader::open_existing_read_only(&database_path)?;
+    assert!(reader.list_scan_history_page(None, 64)?.items.is_empty());
+
+    finish_empty_history_run(&mut writer, &run, 1_060)?;
+    reader.revalidate_source_identity()?;
+    let committed_page = reader.list_scan_history_page(None, 64)?;
+    assert_eq!(committed_page.items.len(), 1);
+    assert_eq!(committed_page.items[0].scan_run_id, run.run_id);
+    assert_eq!(committed_page.items[0].time_outcome.state, "not_run");
+
+    writer.close()?;
+    let committed_state = capture_database_logical_state(&database_path)?;
+    reader.revalidate_source_identity()?;
+    let after_writer_close = reader.list_scan_history_page(None, 64)?;
+    assert_eq!(after_writer_close.items, committed_page.items);
+    assert_eq!(
+        capture_database_logical_state(&database_path)?,
+        committed_state,
+        "long-lived read-only history query changed schema or evidence after WAL rotation"
+    );
+    reader.close()?;
+    Ok(())
+}
+
 fn create_running_run(
     store: &mut Store,
     prefix: &str,
@@ -1318,6 +1615,87 @@ fn create_running_run(
             run_id,
             guard,
         })
+    })
+}
+
+fn complete_empty_history_run(
+    store: &mut Store,
+    prefix: &str,
+    session_byte: u8,
+    core_byte: u8,
+) -> Result<RunningRun, StoreError> {
+    let run = prepare_empty_exact_sealed_run(store, prefix, session_byte, core_byte)?;
+    finish_empty_history_run(store, &run, 1_060)?;
+    Ok(run)
+}
+
+fn prepare_empty_exact_sealed_run(
+    store: &mut Store,
+    prefix: &str,
+    session_byte: u8,
+    core_byte: u8,
+) -> Result<RunningRun, StoreError> {
+    let run = create_running_run(store, prefix, session_byte)?;
+    let core_session_id = CoreSessionId::from_runtime_evidence([core_byte; 32]);
+    store.write_transaction(|repository| {
+        repository.bind_core_session(
+            &run.guard,
+            &CoreSessionInput {
+                core_session_id,
+                root_object_signature: RootObjectSignature::from_volume_adapter([14; 32]),
+                root_source_signature: SourceSignature::from_runtime_evidence([core_byte + 1; 32]),
+                bound_at_ms: 1_000,
+            },
+        )?;
+        repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 0, 0, 1_010)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::Sampling, 0, 0, 1_020)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::FullHash, 0, 0, 1_030)?;
+        repository.record_core_coverage(
+            &run.guard,
+            &core_session_id,
+            &CoverageOutcomeInput {
+                status: CoverageStatus::Complete,
+                directory_count: 0,
+                replayed_count: 0,
+                stable_count: 0,
+                failed_count: 0,
+                core_manifest_digest: Some(CoreDirectoryManifest::from_core_evidence(
+                    [core_byte + 2; 32],
+                )),
+                core_seal_digest: Some(CoreCoverageSealDigest::from_core_evidence(
+                    [core_byte + 3; 32],
+                )),
+                volume_verification_manifest: Some(VolumeCoverageManifest::from_volume_adapter(
+                    [core_byte + 4; 32],
+                )),
+                finalized_at_ms: 1_040,
+            },
+        )?;
+        repository.seal_scan_stage(&run.guard, ScanStage::ExactVerification, 0, 0, 1_050)?;
+        Ok(())
+    })?;
+    Ok(run)
+}
+
+fn finish_empty_history_run(
+    store: &mut Store,
+    run: &RunningRun,
+    finished_at_ms: i64,
+) -> Result<(), StoreError> {
+    store.write_transaction(|repository| {
+        repository.transition_bound_scan_job_and_run(
+            &run.guard,
+            run.job_id,
+            "running",
+            1,
+            "running",
+            1,
+            "completed",
+            "completed",
+            finished_at_ms,
+            None,
+        )?;
+        Ok(())
     })
 }
 
@@ -1404,4 +1782,117 @@ fn hex32(bytes: [u8; 32]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+fn capture_database_logical_state(
+    database_path: &std::path::Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let canonical_path = std::fs::canonicalize(database_path)?;
+    let connection = Connection::open_with_flags(
+        canonical_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    let mut state = vec![format!(
+        "pragma:{}:{}:{}",
+        connection.pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))?,
+        connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+        connection.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))?,
+    )];
+    let projections = [
+        (
+            "migration",
+            "SELECT quote(version) || '|' || quote(checksum) || '|' || quote(applied_at_ms) \
+             FROM guiying_schema_migrations ORDER BY version",
+        ),
+        (
+            "job",
+            "SELECT quote(id) || '|' || quote(state) || '|' || quote(state_version) || '|' \
+                    || quote(active_scan_run_id) || '|' || quote(updated_at_ms) \
+             FROM scan_jobs ORDER BY id",
+        ),
+        (
+            "run",
+            "SELECT quote(id) || '|' || quote(state) || '|' || quote(state_version) || '|' \
+                    || quote(discovered_count) || '|' || quote(fingerprinted_count) || '|' \
+                    || quote(error_count) || '|' || quote(logical_bytes_seen) || '|' \
+                    || quote(started_at_ms) || '|' || quote(finished_at_ms) \
+             FROM scan_runs ORDER BY id",
+        ),
+        (
+            "seal",
+            "SELECT quote(scan_run_id) || '|' || quote(stage) || '|' || quote(item_count) \
+                    || '|' || quote(logical_bytes) || '|' || quote(sealed_at_ms) \
+             FROM scan_stage_seals ORDER BY scan_run_id, stage",
+        ),
+        (
+            "coverage",
+            "SELECT quote(scan_run_id) || '|' || quote(status) || '|' \
+                    || quote(directory_count) || '|' || quote(replayed_count) || '|' \
+                    || quote(stable_count) || '|' || quote(failed_count) || '|' \
+                    || quote(finalized_at_ms) \
+             FROM scan_coverage_outcomes ORDER BY scan_run_id",
+        ),
+        (
+            "exact",
+            "SELECT quote(id) || '|' || quote(state) || '|' || quote(expected_member_count) \
+                    || '|' || quote(independent_file_count) || '|' \
+                    || quote(logical_reclaimable_bytes) || '|' \
+                    || quote(hex(expected_manifest_digest)) || '|' \
+                    || quote(hex(group_key)) || '|' || quote(finalized_at_ms) \
+             FROM exact_group_builds ORDER BY id",
+        ),
+        (
+            "time",
+            "SELECT quote(id) || '|' || quote(state) || '|' || quote(expected_group_count) \
+                    || '|' || quote(evidence_group_count) || '|' \
+                    || quote(unavailable_group_count) || '|' || quote(failed_group_count) \
+                    || '|' || quote(hex(expected_manifest_digest)) || '|' \
+                    || quote(hex(sealed_manifest_digest)) || '|' \
+                    || quote(hex(sealed_outcome_manifest_digest)) || '|' \
+                    || quote(finalized_at_ms) \
+             FROM scan_time_sessions ORDER BY id",
+        ),
+        (
+            "report",
+            "SELECT quote(id) || '|' || quote(state) || '|' || quote(usage_bytes_read) \
+                    || '|' || quote(usage_read_operations) || '|' \
+                    || quote(hex(expected_manifest_digest)) || '|' \
+                    || quote(hex(sealed_manifest_digest)) || '|' || quote(finalized_at_ms) \
+             FROM metadata_extraction_reports ORDER BY id",
+        ),
+        (
+            "analysis",
+            "SELECT quote(id) || '|' || quote(state) || '|' || quote(decision) || '|' \
+                    || quote(selected_candidate_ordinal) || '|' \
+                    || quote(hex(expected_manifest_digest)) || '|' \
+                    || quote(hex(sealed_manifest_digest)) || '|' || quote(finalized_at_ms) \
+             FROM capture_time_analysis_builds ORDER BY id",
+        ),
+        (
+            "outcome",
+            "SELECT quote(time_session_id) || '|' || quote(exact_group_build_id) || '|' \
+                    || quote(outcome) || '|' || quote(analysis_build_id) || '|' \
+                    || quote(created_at_ms) \
+             FROM capture_time_group_outcomes ORDER BY time_session_id, exact_group_build_id",
+        ),
+        (
+            "counts",
+            "SELECT quote((SELECT count(*) FROM media_observation_snapshots)) || '|' \
+                    || quote((SELECT count(*) FROM exact_group_build_members)) || '|' \
+                    || quote((SELECT count(*) FROM scan_issues)) || '|' \
+                    || quote((SELECT count(*) FROM metadata_extraction_fields)) || '|' \
+                    || quote((SELECT count(*) FROM capture_time_candidates)) || '|' \
+                    || quote((SELECT count(*) FROM capture_time_member_assessments)) || '|' \
+                    || quote((SELECT count(*) FROM capture_time_policy_issues))",
+        ),
+    ];
+    for (label, sql) in projections {
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            state.push(format!("{label}:{}", row?));
+        }
+    }
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(state)
 }

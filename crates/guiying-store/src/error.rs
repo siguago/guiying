@@ -42,6 +42,19 @@ pub enum StoreError {
     #[error("database initialization left an unpublished SQLite sidecar: {0:?}")]
     DatabaseInitializationSidecarPresent(PathBuf),
 
+    #[error(
+        "read-only WAL access requires WAL and shared-memory sidecars to be both present or both absent: {0:?}"
+    )]
+    ReadOnlyWalSidecarMismatch(PathBuf),
+
+    #[error("read-only evidence open refuses a rollback journal sidecar: {0:?}")]
+    ReadOnlyJournalPresent(PathBuf),
+
+    #[error(
+        "read-only evidence database family requires {bytes} bytes, above the safety limit {limit}"
+    )]
+    ReadOnlyDatabaseFamilyLimit { bytes: u64, limit: u64 },
+
     #[error("Windows database path is a reparse point and is not accepted: {0:?}")]
     WindowsReparsePoint(PathBuf),
 

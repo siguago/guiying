@@ -197,6 +197,37 @@ Safety properties:
   Every version-7 recommendation is constrained to `evidence_only = 1` and
   `write_authorized = 0`. Keeper/donor policy and every media mutation remain
   intentionally unimplemented;
+- `EvidenceReader::open_existing_read_only` is the separate v7 historical-read
+  boundary. It requires an existing absolute regular database path and opens a
+  persistent SQLite `READ_ONLY | NOFOLLOW` connection with `query_only=1`; it
+  never calls backup, migration, stale-session reconciliation, WAL
+  configuration, checkpoint, optimize, or any repository mutator. Opening a
+  normal read-only connection may create or maintain SQLite WAL/SHM
+  bookkeeping, so the contract is that application schema and evidence rows do
+  not change, not that sidecar names or bytes remain frozen. A hot rollback
+  journal, a nonempty WAL without SHM (or an orphan SHM) observed before open,
+  unsafe family member, or a family/logical size above 64 GiB fails closed. A
+  zero-length WAL left by normal SQLite bookkeeping is accepted;
+- the historical reader validates the application id, exact v7 user version,
+  migration registry, actual schema manifest, runtime/evidence manifests,
+  capability hashes, `quick_check`, and foreign keys in one read transaction.
+  A long-lived trusted grant can reuse that validated connection and call the
+  cheap `revalidate_source_identity` check before each command rather than
+  repeating whole-database validation. `EvidenceDatabaseScope` is a
+  non-serializable canonical-file identity that remains stable across reopen
+  and changes when the database file is replaced;
+- the history catalog admits only completed active jobs/runs carrying an
+  exact-verification seal and terminal `complete` or `partial` coverage. Its
+  optional capture-time state is `complete`, `partial`, `not_run`, `failed`, or
+  `unavailable`: only sealed complete/partial time sessions expose counts,
+  budgets, reconstructable sealed-report usage, group outcomes, reports,
+  fields, or raw detail. Missing, draft, or abandoned time work never hides the
+  already-verified duplicate groups, members, or scan issues. Root text is
+  display-only and no native/raw path, job control key, or volume authority is
+  returned; `historyEntryId` is only the decimal scan-run selector used for a
+  fresh typed resolve. Catalog pages use a database-bound descending
+  `(finished_at_ms, scan_run_id)` cursor, at most 64 records, and the common
+  16 MiB aggregate read budget;
 - exact duplicate groups begin as drafts. The repository derives every member
   leaf from current database evidence, requires a full verification edge for
   each non-representative member, streams and recomputes the canonical manifest,

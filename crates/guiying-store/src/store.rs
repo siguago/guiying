@@ -12,7 +12,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 #[cfg(windows)]
 use std::fs::OpenOptions;
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
@@ -51,12 +55,13 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 const SQLITE_MAX_VALUE_BYTES: i32 = 32 * 1024 * 1024;
 const SQLITE_MAX_SQL_BYTES: i32 = 2 * 1024 * 1024;
-const MAX_PAGE_RESULT_BYTES: i64 = 16 * 1024 * 1024;
+pub(crate) const MAX_PAGE_RESULT_BYTES: i64 = 16 * 1024 * 1024;
 const SQLITE_MAX_COLUMNS: i32 = 512;
 const SQLITE_MAX_VARIABLES: i32 = 2_048;
 const SQLITE_MAX_TRIGGER_DEPTH: i32 = 64;
 const MAX_INTEGRITY_MESSAGES: usize = 1_024;
 const KEYSET_CURSOR_VERSION: i64 = 1;
+pub(crate) const MAX_READ_ONLY_DATABASE_FAMILY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 static STORE_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// A single configured connection to Guiying's local application database.
@@ -67,6 +72,7 @@ pub struct Store {
     pub(crate) connection: Connection,
     pub(crate) database_path: PathBuf,
     security_snapshot: DatabaseSecuritySnapshot,
+    read_only_evidence: bool,
     settings: StoreSettings,
     store_instance_key: [u8; 32],
     live_core_sessions: HashSet<(i64, [u8; 32])>,
@@ -172,7 +178,10 @@ impl Store {
         })
     }
 
-    fn consistent_read<T>(&self, callback: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn consistent_read<T>(
+        &self,
+        callback: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
         self.verify_bound_database()?;
         let transaction = self.connection.unchecked_transaction()?;
         let value = callback(&transaction)?;
@@ -3328,6 +3337,103 @@ impl Store {
         )
     }
 
+    /// Constructs the private read facade used by `EvidenceReader`.
+    ///
+    /// This path deliberately does not call the backup, migration, stale
+    /// session reconciliation, WAL configuration, checkpoint, or optimize
+    /// code used by a writable `Store` open.
+    pub(crate) fn open_evidence_read_only(path: &Path) -> Result<Self> {
+        let prepared = prepare_database_path(path, false, false)?;
+        debug_assert!(prepared.existed);
+        let resolved_path = prepared.path;
+        let security_snapshot = capture_database_security(&resolved_path)?;
+        validate_read_only_database_family(&resolved_path, true)?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let connection = Connection::open_with_flags(&resolved_path, flags)?;
+        verify_database_security(&resolved_path, &security_snapshot)?;
+        validate_read_only_database_family(&resolved_path, false)?;
+        configure_preflight_connection(&connection)?;
+        connection.pragma_update(None, "query_only", true)?;
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
+        let query_only: i64 =
+            connection.pragma_query_value(None, "query_only", |row| row.get(0))?;
+        verify_integer_setting("query_only", 1, query_only)?;
+        {
+            let transaction = connection.unchecked_transaction()?;
+            validate_read_only_database_logical_size(&transaction)?;
+            let integrity = integrity_check_connection(&transaction, IntegrityCheckKind::Quick)?;
+            if !integrity.is_healthy() {
+                return Err(StoreError::IntegrityCheckFailed {
+                    details: integrity.failure_details(),
+                });
+            }
+            migrations::validate_current_schema(&transaction)?;
+            transaction.commit()?;
+        }
+        verify_database_security(&resolved_path, &security_snapshot)?;
+        validate_read_only_database_family(&resolved_path, false)?;
+
+        // `settings` is private to this facade and is never exposed through
+        // `EvidenceReader`. These are the connection-local controls actually
+        // enforced above; no journal or synchronous mode was changed.
+        let settings = StoreSettings {
+            foreign_keys: true,
+            busy_timeout_ms: BUSY_TIMEOUT.as_millis() as u64,
+            synchronous: "unchanged-read-only".into(),
+            journal_mode: "unchanged-read-only".into(),
+            trusted_schema: false,
+            wal_autocheckpoint_pages: 0,
+            defensive: true,
+            dqs_ddl: false,
+            dqs_dml: false,
+        };
+        Ok(Self {
+            connection,
+            database_path: resolved_path,
+            security_snapshot,
+            read_only_evidence: true,
+            settings,
+            store_instance_key: fresh_store_instance_key(),
+            live_core_sessions: HashSet::new(),
+        })
+    }
+
+    pub(crate) const fn evidence_reader_instance_key(&self) -> [u8; 32] {
+        self.store_instance_key
+    }
+
+    pub(crate) fn evidence_database_scope_digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"guiying.evidence-database-scope.v1\0");
+        hasher.update(&migrations::APPLICATION_ID.to_le_bytes());
+        hasher.update(&migrations::LATEST_SCHEMA_VERSION.to_le_bytes());
+
+        #[cfg(unix)]
+        {
+            let path = self.database_path.as_os_str().as_bytes();
+            hasher.update(&(path.len() as u64).to_le_bytes());
+            hasher.update(path);
+            hasher.update(&self.security_snapshot.file.device.to_le_bytes());
+            hasher.update(&self.security_snapshot.file.inode.to_le_bytes());
+            hasher.update(&self.security_snapshot.file.owner.to_le_bytes());
+        }
+        #[cfg(windows)]
+        {
+            let path = self
+                .database_path
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>();
+            hasher.update(&(path.len() as u64).to_le_bytes());
+            for unit in path {
+                hasher.update(&unit.to_le_bytes());
+            }
+            hasher.update(&self.security_snapshot.file.volume_serial.to_le_bytes());
+            hasher.update(&self.security_snapshot.file.file_index.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     fn open_inner_with_operations(
         path: &Path,
         create: bool,
@@ -3419,6 +3525,7 @@ impl Store {
                 connection,
                 database_path: resolved_path.clone(),
                 security_snapshot: read_write_snapshot,
+                read_only_evidence: false,
                 settings,
                 store_instance_key: fresh_store_instance_key(),
                 live_core_sessions: HashSet::new(),
@@ -3435,8 +3542,110 @@ impl Store {
     }
 
     pub(crate) fn verify_bound_database(&self) -> Result<()> {
-        verify_database_security(&self.database_path, &self.security_snapshot)
+        verify_database_security(&self.database_path, &self.security_snapshot)?;
+        if self.read_only_evidence {
+            validate_read_only_database_family(&self.database_path, false)?;
+        }
+        Ok(())
     }
+}
+
+fn validate_read_only_database_family(database: &Path, require_open_safe_pair: bool) -> Result<()> {
+    let journal_path = database_sidecar_path(database, "-journal");
+    match fs::symlink_metadata(&journal_path) {
+        Ok(_) => return Err(StoreError::ReadOnlyJournalPresent(journal_path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(StoreError::io(
+                "checking read-only rollback journal",
+                journal_path,
+                error,
+            ));
+        }
+    }
+
+    let main_bytes = read_database_family_member_size(database)?;
+    let wal_path = database_sidecar_path(database, "-wal");
+    let shared_memory_path = database_sidecar_path(database, "-shm");
+    let wal = read_optional_database_family_member_size(&wal_path)?;
+    let shared_memory = read_optional_database_family_member_size(&shared_memory_path)?;
+    let has_unsafe_open_pair = match (wal, shared_memory) {
+        (Some(0), None) => false,
+        (Some(_), None) | (None, Some(_)) => true,
+        (Some(_), Some(_)) | (None, None) => false,
+    };
+    if require_open_safe_pair && has_unsafe_open_pair {
+        return Err(StoreError::ReadOnlyWalSidecarMismatch(
+            database.to_path_buf(),
+        ));
+    }
+
+    let family_bytes = [main_bytes, wal.unwrap_or(0), shared_memory.unwrap_or(0)]
+        .into_iter()
+        .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .ok_or(StoreError::ReadOnlyDatabaseFamilyLimit {
+            bytes: u64::MAX,
+            limit: MAX_READ_ONLY_DATABASE_FAMILY_BYTES,
+        })?;
+    if family_bytes > MAX_READ_ONLY_DATABASE_FAMILY_BYTES {
+        return Err(StoreError::ReadOnlyDatabaseFamilyLimit {
+            bytes: family_bytes,
+            limit: MAX_READ_ONLY_DATABASE_FAMILY_BYTES,
+        });
+    }
+
+    Ok(())
+}
+
+fn read_optional_database_family_member_size(path: &Path) -> Result<Option<u64>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.len())),
+        Ok(_) => Err(StoreError::DatabaseIsNotRegularFile(path.to_path_buf())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(StoreError::io(
+            "reading read-only SQLite family metadata",
+            path,
+            error,
+        )),
+    }
+}
+
+fn read_database_family_member_size(path: &Path) -> Result<u64> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| StoreError::io("reading read-only SQLite family metadata", path, error))?;
+    if !metadata.file_type().is_file() {
+        return Err(StoreError::DatabaseIsNotRegularFile(path.to_path_buf()));
+    }
+    Ok(metadata.len())
+}
+
+fn database_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut name = database.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn validate_read_only_database_logical_size(connection: &Connection) -> Result<()> {
+    let page_count: i64 = connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    let page_size: i64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let logical_bytes = u64::try_from(page_count)
+        .ok()
+        .and_then(|count| {
+            u64::try_from(page_size)
+                .ok()
+                .and_then(|size| count.checked_mul(size))
+        })
+        .ok_or(StoreError::ReadOnlyDatabaseFamilyLimit {
+            bytes: u64::MAX,
+            limit: MAX_READ_ONLY_DATABASE_FAMILY_BYTES,
+        })?;
+    if logical_bytes > MAX_READ_ONLY_DATABASE_FAMILY_BYTES {
+        return Err(StoreError::ReadOnlyDatabaseFamilyLimit {
+            bytes: logical_bytes,
+            limit: MAX_READ_ONLY_DATABASE_FAMILY_BYTES,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn integrity_check_connection(
@@ -6304,7 +6513,7 @@ fn fixed_32_bytes(field: &'static str, bytes: Vec<u8>) -> Result<[u8; 32]> {
     })
 }
 
-fn keyset_page_from_items<T, C>(
+pub(crate) fn keyset_page_from_items<T, C>(
     mut items: Vec<T>,
     limit: u32,
     cursor: impl Fn(&T) -> C,
@@ -6377,7 +6586,7 @@ fn page_from_items<T>(mut items: Vec<T>, limit: u32, id: impl Fn(&T) -> i64) -> 
     Ok(Page { items, next_cursor })
 }
 
-fn enforce_read_budget(kind: &'static str, bytes: i64, limit: i64) -> Result<()> {
+pub(crate) fn enforce_read_budget(kind: &'static str, bytes: i64, limit: i64) -> Result<()> {
     if bytes < 0 || bytes > limit {
         return Err(StoreError::ReadResultLimit { kind, bytes, limit });
     }
@@ -6400,7 +6609,7 @@ fn validate_lookup_key(field: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_positive_read_id(field: &'static str, value: i64) -> Result<()> {
+pub(crate) fn validate_positive_read_id(field: &'static str, value: i64) -> Result<()> {
     if value <= 0 {
         return Err(StoreError::invalid_input(field, "value must be positive"));
     }

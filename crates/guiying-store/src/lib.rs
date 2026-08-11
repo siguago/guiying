@@ -6,12 +6,14 @@
 
 mod backup;
 mod error;
+mod history;
 mod migrations;
 mod model;
 mod repository;
 mod store;
 
 pub use error::{Result, StoreError};
+pub use history::EvidenceReader;
 pub use model::{
     BeginCaptureTimeAnalysisInput, BeginExactGroupInput, BeginMetadataReportInput,
     BeginTimeSessionInput, BuildKey, CandidateBucketRecord, CapabilityProfileInput,
@@ -28,31 +30,32 @@ pub use model::{
     CoreFileObservationInput, CoreSessionId, CoreSessionInput, CoverageOutcomeInput,
     CoverageStatus, DirectoryObjectSignature, DirectoryTicketCursor, DirectoryTicketRecord,
     DuplicateGroupCursor, DuplicateGroupMemberCursor, DuplicateGroupMemberRecord,
-    EvidenceParserIdentity, ExactDigestBucketCursor, ExactGroupKey, ExactGroupManifestMember,
-    ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey, FileTicketCursor,
-    FileTicketRecord, FileTimeRelation, FileTimestampParts, FingerprintBucketRecord,
-    FingerprintFileTicketCursor, FingerprintFileTicketRecord, FingerprintHintRecord,
-    FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind, IntegrityCheckKind,
-    IntegrityReport, KeysetPage, ManifestDigest, MediaFileInput, MediaFileRecord,
-    MetadataDetectedFormat, MetadataExtractionIssueInput, MetadataExtractionLimitsInput,
-    MetadataExtractionStatus, MetadataExtractionUsageInput, MetadataFieldCursor,
-    MetadataFieldInput, MetadataFieldRawLocator, MetadataLocatorInput, MetadataReportCursor,
-    MetadataReportDigest, MetadataReportManifestPlan, MetadataSourceRevalidationInput,
-    MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue,
-    NewScanJob, NewScanReport, NewScanRun, NewScopedScanJob, NormalizedCaptureTime,
-    ObservationCursor, ObservationInput, ObservationRecord, Page, ParametersHash, PathKey,
-    RecordTimeGroupOutcomeInput, RootObjectSignature, RootScopeKey, RunEvidenceGuard,
-    SampleBucketCursor, ScanCheckpointInput, ScanCheckpointRecord, ScanIssueCursor,
-    ScanIssueRecord, ScanJobRecord, ScanReportRecord, ScanRunRecord, ScanStage, SizeBucketCursor,
-    SizeFileTicketCursor, SizeMemberCursor, SourceSignature, StablePathKey, StoreSettings,
-    StoredMetadataContainerKind, StoredMetadataEncoding, StoredMetadataFieldKind,
-    StoredMetadataIssueCode, StoredTiffByteOrder, TicketSortKey, TimeDonorEligibility,
-    TimeEvidenceGuard, TimeEvidenceManifestDigest, TimeExactFingerprintMaterial,
-    TimeGroupNonEvidenceOutcome, TimeLineageKey, TimePolicyContextDigest, TimeSessionBudget,
-    TimeSessionKey, TimeSessionOutcome, TimeSourceKey, TimeSourceKeyMaterial, VerifiedExactGroup,
-    VerifiedTimeProbeMemberRecord, VerifiedTimeProbeScopeCursor, VerifiedTimeProbeScopeRecord,
-    VerifiedTimeScopeSummary, VolumeCoverageManifest, VolumeInput, MAX_PAGE_SIZE,
-    MAX_SCAN_REPORT_JSON_BYTES,
+    EvidenceDatabaseScope, EvidenceParserIdentity, ExactDigestBucketCursor, ExactGroupKey,
+    ExactGroupManifestMember, ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey,
+    FileTicketCursor, FileTicketRecord, FileTimeRelation, FileTimestampParts,
+    FingerprintBucketRecord, FingerprintFileTicketCursor, FingerprintFileTicketRecord,
+    FingerprintHintRecord, FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind,
+    IntegrityCheckKind, IntegrityReport, KeysetPage, ManifestDigest, MediaFileInput,
+    MediaFileRecord, MetadataDetectedFormat, MetadataExtractionIssueInput,
+    MetadataExtractionLimitsInput, MetadataExtractionStatus, MetadataExtractionUsageInput,
+    MetadataFieldCursor, MetadataFieldInput, MetadataFieldRawLocator, MetadataLocatorInput,
+    MetadataReportCursor, MetadataReportDigest, MetadataReportManifestPlan,
+    MetadataSourceRevalidationInput, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey,
+    NewBoundScanRun, NewScanIssue, NewScanJob, NewScanReport, NewScanRun, NewScopedScanJob,
+    NormalizedCaptureTime, ObservationCursor, ObservationInput, ObservationRecord, Page,
+    ParametersHash, PathKey, RecordTimeGroupOutcomeInput, RootObjectSignature, RootScopeKey,
+    RunEvidenceGuard, SampleBucketCursor, ScanCheckpointInput, ScanCheckpointRecord,
+    ScanHistoryContext, ScanHistoryCursor, ScanHistoryGroupContext, ScanHistoryRecord,
+    ScanHistoryTimeOutcomeRecord, ScanIssueCursor, ScanIssueRecord, ScanJobRecord,
+    ScanReportRecord, ScanRunRecord, ScanStage, SizeBucketCursor, SizeFileTicketCursor,
+    SizeMemberCursor, SourceSignature, StablePathKey, StoreSettings, StoredMetadataContainerKind,
+    StoredMetadataEncoding, StoredMetadataFieldKind, StoredMetadataIssueCode, StoredTiffByteOrder,
+    TicketSortKey, TimeDonorEligibility, TimeEvidenceGuard, TimeEvidenceManifestDigest,
+    TimeExactFingerprintMaterial, TimeGroupNonEvidenceOutcome, TimeLineageKey,
+    TimePolicyContextDigest, TimeSessionBudget, TimeSessionKey, TimeSessionOutcome, TimeSourceKey,
+    TimeSourceKeyMaterial, VerifiedExactGroup, VerifiedTimeProbeMemberRecord,
+    VerifiedTimeProbeScopeCursor, VerifiedTimeProbeScopeRecord, VerifiedTimeScopeSummary,
+    VolumeCoverageManifest, VolumeInput, MAX_PAGE_SIZE, MAX_SCAN_REPORT_JSON_BYTES,
 };
 pub use repository::{
     compute_capability_profile_hash, compute_capture_time_analysis_manifest,
