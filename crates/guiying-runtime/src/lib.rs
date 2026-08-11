@@ -13,20 +13,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use guiying_core::{
-    DirectoryObservation, FileObservation, FileObservationTicket, FreshFingerprintEvidence,
-    FreshReadOrigin, MediaKind, PathEncoding, PathRef, ScanControl, ScanIssue, ScanIssueCode,
-    ScanOptions, ScanProgress, Scanner, StageBatchOutcome, StreamBatchStatus, StreamEvent,
-    StreamLimits, StreamRootKind, StreamRootObservation, StreamTrustScope,
-    StreamingEnumerationOutcome, StreamingScanSession, StreamingScanSink,
+    CoverageSeal, DirectoryObservation, DirectoryObservationTicket, FileObservation,
+    FileObservationTicket, FreshFingerprintEvidence, FreshReadOrigin, MediaKind, PathEncoding,
+    PathRef, ScanControl, ScanIssue, ScanIssueCode, ScanOptions, ScanProgress, Scanner,
+    StageBatchOutcome, StreamBatchStatus, StreamEvent, StreamLimits, StreamRootKind,
+    StreamRootObservation, StreamTrustScope, StreamingEnumerationOutcome, StreamingScanSession,
+    StreamingScanSink,
 };
 use guiying_store::{
-    CapabilityProfileInput, CoreDirectoryObservationInput, CoreFileObservationInput, CoreSessionId,
-    CoreSessionInput, DirectoryObjectSignature, FileObjectKey, FileTicketRecord,
-    FileTimestampParts, FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind,
-    MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue,
-    NewScopedScanJob, ObservationInput, ParametersHash, RootObjectSignature, RootScopeKey,
-    RunEvidenceGuard, SampleBucketCursor, ScanStage, SizeBucketCursor, SourceSignature,
-    StablePathKey, Store, StoreError, TicketSortKey, VolumeInput,
+    CapabilityProfileInput, CoreCoverageSealDigest, CoreDirectoryManifest,
+    CoreDirectoryObservationInput, CoreFileObservationInput, CoreSessionId, CoreSessionInput,
+    CoverageOutcomeInput, CoverageStatus, DirectoryObjectSignature, DirectoryTicketCursor,
+    DirectoryTicketRecord, FileObjectKey, FileTicketRecord, FileTimestampParts,
+    FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind, MountSessionKey,
+    NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue, NewScopedScanJob,
+    ObservationInput, ParametersHash, RootObjectSignature, RootScopeKey, RunEvidenceGuard,
+    SampleBucketCursor, ScanStage, SizeBucketCursor, SourceSignature, StablePathKey, Store,
+    StoreError, TicketSortKey, VolumeCoverageManifest, VolumeInput,
 };
 use guiying_volume::{
     BoundMediaPath, BoundVolumeSession, CaseBehaviorObservation, FileObjectIdentity,
@@ -107,6 +110,16 @@ pub struct FingerprintSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverageSummary {
+    pub status: StreamBatchStatus,
+    pub directory_count: u64,
+    pub replayed_count: u64,
+    pub stable_count: u64,
+    pub failed_count: u64,
+    pub issues: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FingerprintSpec {
     algorithm: String,
     algorithm_version: i64,
@@ -135,6 +148,7 @@ pub struct ActiveReadOnlyScan {
     run_state_version: i64,
     enumeration: Option<EnumerationSummary>,
     fingerprint_analysis: Option<FingerprintAnalysisState>,
+    coverage: Option<CoverageSummary>,
     issues_recorded: u64,
     files_fingerprinted: u64,
 }
@@ -167,6 +181,7 @@ impl ActiveReadOnlyScan {
             run_state_version: setup.run_state_version,
             enumeration: None,
             fingerprint_analysis: None,
+            coverage: None,
             issues_recorded: 0,
             files_fingerprinted: 0,
         })
@@ -196,6 +211,10 @@ impl ActiveReadOnlyScan {
         self.fingerprint_analysis
             .as_ref()
             .map(|analysis| &analysis.summary)
+    }
+
+    pub const fn coverage_summary(&self) -> Option<&CoverageSummary> {
+        self.coverage.as_ref()
     }
 
     /// Enumerates once with synchronous storage backpressure. Every root,
@@ -693,6 +712,317 @@ impl ActiveReadOnlyScan {
         })
     }
 
+    /// Replays every authenticated directory ticket in canonical order while
+    /// independently bracketing it with the live volume session. Only a full
+    /// core seal plus a full volume manifest can produce complete coverage.
+    pub fn verify_coverage(
+        &mut self,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<CoverageSummary, RuntimeError> {
+        if self.fingerprint_analysis.is_none() {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "full hashing must be sealed before directory coverage",
+            ));
+        }
+        if self.coverage.is_some() {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "coverage verification is allowed exactly once per runtime attempt",
+            ));
+        }
+        match self.verify_coverage_inner(control, observer) {
+            Ok(summary) => {
+                let terminal = match summary.status {
+                    StreamBatchStatus::Completed => None,
+                    StreamBatchStatus::Partial => Some((
+                        "CORE_COVERAGE_PARTIAL",
+                        "目录枚举并不完整，确定重复证据已保持锁定。",
+                    )),
+                    StreamBatchStatus::Interrupted => Some((
+                        "CORE_COVERAGE_INTERRUPTED",
+                        "目录或扫描根在覆盖复核期间发生变化，确定重复证据已保持锁定。",
+                    )),
+                    StreamBatchStatus::Cancelled => None,
+                };
+                self.coverage = Some(summary.clone());
+                if let Some((code, message)) = terminal {
+                    self.transition_terminal("failed", "interrupted", Some((code, message)))?;
+                }
+                Ok(summary)
+            }
+            Err(error @ RuntimeError::StageCancelled(_)) => {
+                self.transition_terminal("cancelled", "cancelled", None)?;
+                Err(error)
+            }
+            Err(error) => Err(self.interrupt_for_failure("RUNTIME_COVERAGE_FAILED", error)),
+        }
+    }
+
+    fn verify_coverage_inner(
+        &mut self,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<CoverageSummary, RuntimeError> {
+        let directory_count = self
+            .enumeration
+            .as_ref()
+            .ok_or(RuntimeError::UnsupportedEvidence(
+                "enumeration summary disappeared",
+            ))?
+            .directory_observations;
+        let mut volume_manifest = blake3::Hasher::new();
+        volume_manifest.update(b"guiying.runtime.volume-coverage.v1\0");
+        volume_manifest.update(self.volume.observation().mount_session_key().as_bytes());
+        volume_manifest.update(self.volume.observation().root_scope_key().as_bytes());
+        let mut cursor: Option<DirectoryTicketCursor> = None;
+        let mut replayed_count = 0_u64;
+        let mut stable_count = 0_u64;
+        let mut failed_count = 0_u64;
+
+        loop {
+            let page = self.store.list_directory_tickets_page(
+                &self.guard,
+                &self.core_session_id,
+                cursor.as_ref(),
+                STORE_PAGE_LIMIT,
+            )?;
+            if page.items.is_empty() {
+                if page.next_cursor.is_some() {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "directory ticket page advanced without records".to_owned(),
+                    ));
+                }
+                break;
+            }
+            self.volume.revalidate()?;
+            let bound = page
+                .items
+                .into_iter()
+                .map(|record| bind_directory_ticket(&self.volume, record))
+                .collect::<Result<Vec<_>, _>>()?;
+            let tickets = bound
+                .iter()
+                .map(|directory| directory.ticket.clone())
+                .collect::<Vec<_>>();
+            let mut sink = CoverageSink::new(tickets.len(), false, observer);
+            let core_result = self
+                .core
+                .revalidate_directory_batch(&tickets, &mut sink, control);
+            for directory in &bound {
+                let after = self.volume.verify_directory(&directory.path)?;
+                if after != directory.identity
+                    || directory_object_signature(after)
+                        != directory.record.directory_object_signature
+                {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "directory changed across core coverage replay".to_owned(),
+                    ));
+                }
+            }
+            self.volume.revalidate()?;
+            let outcome = core_result.map_err(|error| RuntimeError::Stream(error.to_string()))?;
+            validate_stage_counts(tickets.len(), &outcome)?;
+            self.persist_stage_issues("coverage", &sink.issues, now_ms()?)?;
+            replayed_count = checked_add_u64(
+                "replayed directory count",
+                replayed_count,
+                outcome
+                    .completed
+                    .checked_add(outcome.failed)
+                    .ok_or(RuntimeError::NumericRange("directory outcome count"))?,
+            )?;
+            stable_count =
+                checked_add_u64("stable directory count", stable_count, outcome.completed)?;
+            failed_count = checked_add_u64("failed directory count", failed_count, outcome.failed)?;
+            for directory in &bound {
+                update_volume_coverage_manifest(&mut volume_manifest, directory)?;
+            }
+            if outcome.status == StreamBatchStatus::Cancelled {
+                let finalized_at_ms = now_ms()?;
+                self.persist_coverage_outcome(
+                    CoverageStatus::Partial,
+                    directory_count,
+                    replayed_count,
+                    stable_count,
+                    failed_count,
+                    None,
+                    None,
+                    finalized_at_ms,
+                )?;
+                return Err(RuntimeError::StageCancelled("directory coverage"));
+            }
+            if outcome.status != StreamBatchStatus::Completed {
+                return Err(RuntimeError::StageIncomplete {
+                    stage: "directory coverage replay",
+                    failed: outcome.failed,
+                });
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        if replayed_count != directory_count {
+            return Err(RuntimeError::EvidenceMismatch(
+                "persisted directory ticket count differs from enumeration summary".to_owned(),
+            ));
+        }
+
+        self.volume.revalidate()?;
+        let mut sink = CoverageSink::new(0, true, observer);
+        let core_result = self.core.finalize_coverage(&mut sink, control);
+        self.volume.revalidate()?;
+        let outcome = core_result.map_err(|error| RuntimeError::Stream(error.to_string()))?;
+        self.persist_stage_issues("coverage", &sink.issues, now_ms()?)?;
+        if outcome.status == StreamBatchStatus::Cancelled {
+            let finalized_at_ms = now_ms()?;
+            self.persist_coverage_outcome(
+                CoverageStatus::Partial,
+                directory_count,
+                replayed_count,
+                stable_count,
+                failed_count,
+                None,
+                None,
+                finalized_at_ms,
+            )?;
+            return Err(RuntimeError::StageCancelled("directory coverage"));
+        }
+
+        let seal = validate_coverage_seal(
+            self.core.session_id().as_bytes(),
+            directory_count,
+            &outcome,
+            sink.seal.as_ref(),
+        )?;
+        let (coverage_status, volume_manifest) = match outcome.status {
+            StreamBatchStatus::Completed => {
+                if failed_count != 0 || stable_count != directory_count {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "core completed coverage after a failed directory replay".to_owned(),
+                    ));
+                }
+                volume_manifest.update(&directory_count.to_le_bytes());
+                (
+                    CoverageStatus::Complete,
+                    Some(VolumeCoverageManifest::from_volume_adapter(
+                        *volume_manifest.finalize().as_bytes(),
+                    )),
+                )
+            }
+            StreamBatchStatus::Partial => (CoverageStatus::Partial, None),
+            StreamBatchStatus::Interrupted => (CoverageStatus::Interrupted, None),
+            StreamBatchStatus::Cancelled => {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "cancelled coverage escaped its terminal handler".to_owned(),
+                ));
+            }
+        };
+        let finalized_at_ms = now_ms()?;
+        self.persist_coverage_outcome(
+            coverage_status,
+            directory_count,
+            replayed_count,
+            stable_count,
+            failed_count,
+            seal,
+            volume_manifest,
+            finalized_at_ms,
+        )?;
+        Ok(CoverageSummary {
+            status: outcome.status,
+            directory_count,
+            replayed_count,
+            stable_count,
+            failed_count,
+            issues: self.issues_recorded,
+        })
+    }
+
+    fn persist_stage_issues(
+        &mut self,
+        stage: &'static str,
+        issues: &[ScanIssue],
+        occurred_at_ms: i64,
+    ) -> Result<(), RuntimeError> {
+        if issues.is_empty() {
+            return Ok(());
+        }
+        let mut next_issue_count = self.issues_recorded;
+        let inputs = issues
+            .iter()
+            .map(|issue| {
+                next_issue_count = next_issue_count
+                    .checked_add(1)
+                    .ok_or(RuntimeError::NumericRange("issue count"))?;
+                Ok(issue_input(
+                    self.ids.volume_id,
+                    self.guard,
+                    next_issue_count,
+                    stage,
+                    issue,
+                    occurred_at_ms,
+                ))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        let enumeration = self
+            .enumeration
+            .as_ref()
+            .ok_or(RuntimeError::UnsupportedEvidence(
+                "enumeration summary disappeared",
+            ))?;
+        self.store.write_transaction(|repository| {
+            for issue in &inputs {
+                repository.record_bound_scan_issue(&self.guard, issue)?;
+            }
+            repository.update_bound_scan_progress(
+                &self.guard,
+                checked_i64("media file count", enumeration.media_files)
+                    .map_err(runtime_store_error)?,
+                checked_i64("fingerprinted file count", self.files_fingerprinted)
+                    .map_err(runtime_store_error)?,
+                checked_i64("issue count", next_issue_count).map_err(runtime_store_error)?,
+                checked_i64("logical byte count", enumeration.logical_bytes)
+                    .map_err(runtime_store_error)?,
+                occurred_at_ms,
+            )
+        })?;
+        self.issues_recorded = next_issue_count;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_coverage_outcome(
+        &mut self,
+        status: CoverageStatus,
+        directory_count: u64,
+        replayed_count: u64,
+        stable_count: u64,
+        failed_count: u64,
+        seal: Option<&CoverageSeal>,
+        volume_manifest: Option<VolumeCoverageManifest>,
+        finalized_at_ms: i64,
+    ) -> Result<(), RuntimeError> {
+        let input = CoverageOutcomeInput {
+            status,
+            directory_count: checked_i64("directory count", directory_count)?,
+            replayed_count: checked_i64("replayed directory count", replayed_count)?,
+            stable_count: checked_i64("stable directory count", stable_count)?,
+            failed_count: checked_i64("failed directory count", failed_count)?,
+            core_manifest_digest: seal.map(|proof| {
+                CoreDirectoryManifest::from_core_evidence(*proof.directory_manifest_digest())
+            }),
+            core_seal_digest: seal
+                .map(|proof| CoreCoverageSealDigest::from_core_evidence(*proof.seal_digest())),
+            volume_verification_manifest: volume_manifest,
+            finalized_at_ms,
+        };
+        self.store.write_transaction(|repository| {
+            repository.record_core_coverage(&self.guard, &self.core_session_id, &input)
+        })?;
+        Ok(())
+    }
+
     /// Explicitly closes an unfinished read-only attempt without authorizing
     /// any media action.
     pub fn interrupt(mut self, code: &str, message: &str) -> Result<(), RuntimeError> {
@@ -741,6 +1071,13 @@ struct BoundFileTicket {
     ticket: FileObservationTicket,
     path: BoundMediaPath,
     file: ReadOnlyFile,
+}
+
+struct BoundDirectoryTicket {
+    record: DirectoryTicketRecord,
+    ticket: DirectoryObservationTicket,
+    path: BoundMediaPath,
+    identity: RootObjectIdentity,
 }
 
 struct FingerprintBatchResult {
@@ -822,6 +1159,78 @@ impl StreamingScanSink for FingerprintSink<'_> {
     }
 }
 
+struct CoverageSink<'a> {
+    allow_seal: bool,
+    maximum_events: usize,
+    events_seen: usize,
+    issues: Vec<ScanIssue>,
+    seal: Option<CoverageSeal>,
+    observer: &'a mut dyn RuntimeObserver,
+}
+
+impl<'a> CoverageSink<'a> {
+    fn new(input_count: usize, allow_seal: bool, observer: &'a mut dyn RuntimeObserver) -> Self {
+        Self {
+            allow_seal,
+            maximum_events: input_count.saturating_mul(2).saturating_add(8),
+            events_seen: 0,
+            issues: Vec::new(),
+            seal: None,
+            observer,
+        }
+    }
+}
+
+impl StreamingScanSink for CoverageSink<'_> {
+    type Error = RuntimeError;
+
+    fn write_batch(&mut self, events: &[StreamEvent]) -> Result<(), Self::Error> {
+        if events.len() > STORE_BATCH_LIMIT {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core coverage event batch exceeds the adapter limit".to_owned(),
+            ));
+        }
+        self.events_seen = self
+            .events_seen
+            .checked_add(events.len())
+            .ok_or(RuntimeError::NumericRange("coverage event count"))?;
+        if self.events_seen > self.maximum_events {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core emitted too many events for one coverage operation".to_owned(),
+            ));
+        }
+        for event in events {
+            match event {
+                StreamEvent::CoverageVerified(seal) if self.allow_seal => {
+                    if self.seal.replace(seal.clone()).is_some() {
+                        return Err(RuntimeError::EvidenceMismatch(
+                            "core emitted more than one coverage seal".to_owned(),
+                        ));
+                    }
+                }
+                StreamEvent::CoverageVerified(_) => {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "coverage seal appeared during directory replay".to_owned(),
+                    ));
+                }
+                StreamEvent::Issue(issue) => self.issues.push(issue.clone()),
+                StreamEvent::Progress(progress) => self.observer.on_progress(progress),
+                StreamEvent::RootObservation(_)
+                | StreamEvent::FileObservation(_)
+                | StreamEvent::DirectoryObservation(_)
+                | StreamEvent::FreshFingerprint(_)
+                | StreamEvent::ExactComparison(_)
+                | StreamEvent::EnumerationFinished(_) => {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "non-coverage evidence appeared in a coverage sink".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn bind_file_ticket(
     volume: &BoundVolumeSession,
     record: FileTicketRecord,
@@ -869,6 +1278,94 @@ fn bind_file_ticket(
         path,
         file,
     })
+}
+
+fn bind_directory_ticket(
+    volume: &BoundVolumeSession,
+    record: DirectoryTicketRecord,
+) -> Result<BoundDirectoryTicket, RuntimeError> {
+    if record.ticket_format_version != 1 {
+        return Err(RuntimeError::UnsupportedEvidence(
+            "unsupported core directory-ticket format",
+        ));
+    }
+    if record.path_encoding != native_encoding(volume.path_semantics().encoding()) {
+        return Err(RuntimeError::EvidenceMismatch(
+            "stored directory-ticket encoding differs from the volume session".to_owned(),
+        ));
+    }
+    let ticket = DirectoryObservationTicket::from_bytes(&record.ticket_blob)
+        .map_err(|error| RuntimeError::Stream(format!("invalid directory ticket: {error:?}")))?;
+    if ticket.sort_key() != record.ticket_sort_key.as_bytes() {
+        return Err(RuntimeError::EvidenceMismatch(
+            "stored directory-ticket bytes and sort key disagree".to_owned(),
+        ));
+    }
+    let path = volume.relative_path(record.root_relative_path_raw.clone())?;
+    let identity = volume.verify_directory(&path)?;
+    if directory_object_signature(identity) != record.directory_object_signature {
+        return Err(RuntimeError::EvidenceMismatch(
+            "stored directory identity differs from the live volume descriptor".to_owned(),
+        ));
+    }
+    Ok(BoundDirectoryTicket {
+        record,
+        ticket,
+        path,
+        identity,
+    })
+}
+
+fn update_volume_coverage_manifest(
+    hasher: &mut blake3::Hasher,
+    directory: &BoundDirectoryTicket,
+) -> Result<(), RuntimeError> {
+    let path_len = u64::try_from(directory.record.root_relative_path_raw.len())
+        .map_err(|_| RuntimeError::NumericRange("directory path length"))?;
+    hasher.update(directory.ticket.sort_key());
+    hasher.update(directory.record.directory_object_signature.as_bytes());
+    hasher.update(&path_len.to_le_bytes());
+    hasher.update(&directory.record.root_relative_path_raw);
+    Ok(())
+}
+
+fn validate_coverage_seal<'a>(
+    core_session_id: &[u8; 32],
+    directory_count: u64,
+    outcome: &StageBatchOutcome,
+    seal: Option<&'a CoverageSeal>,
+) -> Result<Option<&'a CoverageSeal>, RuntimeError> {
+    match outcome.status {
+        StreamBatchStatus::Completed => {
+            let proof = seal.ok_or_else(|| {
+                RuntimeError::EvidenceMismatch(
+                    "completed core coverage omitted its sealed proof".to_owned(),
+                )
+            })?;
+            if proof.session_id().as_bytes() != core_session_id
+                || proof.trust_scope() != StreamTrustScope::CurrentCoreSessionOnly
+                || proof.directory_observations() != directory_count
+                || outcome.completed != directory_count
+                || outcome.failed != 0
+            {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "core coverage seal does not match the replayed directory set".to_owned(),
+                ));
+            }
+            Ok(Some(proof))
+        }
+        StreamBatchStatus::Partial | StreamBatchStatus::Interrupted => {
+            if seal.is_some() {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "incomplete core coverage carried a complete seal".to_owned(),
+                ));
+            }
+            Ok(None)
+        }
+        StreamBatchStatus::Cancelled => Err(RuntimeError::EvidenceMismatch(
+            "cancelled coverage escaped its terminal handler".to_owned(),
+        )),
+    }
 }
 
 fn translate_fingerprint_evidence(
@@ -1901,6 +2398,13 @@ mod tests {
         assert_eq!(summary.full_hash_bytes_read, (duplicate.len() * 2) as u64);
         assert_eq!(summary.issues, 0);
 
+        let coverage = runtime.verify_coverage(&NoopScanControl, &mut ())?;
+        assert_eq!(coverage.status, StreamBatchStatus::Completed);
+        assert_eq!(coverage.directory_count, 1);
+        assert_eq!(coverage.replayed_count, 1);
+        assert_eq!(coverage.stable_count, 1);
+        assert_eq!(coverage.failed_count, 0);
+
         let full_spec = runtime
             .fingerprint_analysis
             .as_ref()
@@ -1930,6 +2434,83 @@ mod tests {
             "TEST_FINISHED",
             "fingerprint integration test closed the read-only attempt",
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn directory_change_after_hashing_interrupts_before_complete_coverage(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let first = media.path().join("first.jpg");
+        let second = media.path().join("second.jpg");
+        fs::write(&first, b"duplicate")?;
+        fs::write(&second, b"duplicate")?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        runtime.enumerate(&NoopScanControl, &mut ())?;
+        runtime.fingerprint_candidates(&NoopScanControl, &mut ())?;
+        fs::write(
+            media.path().join("arrived-during-scan.txt"),
+            b"external change",
+        )?;
+
+        let error = runtime
+            .verify_coverage(&NoopScanControl, &mut ())
+            .expect_err("changed directory unexpectedly received complete coverage");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::EvidenceMismatch(_) | RuntimeError::Volume(_)
+            ),
+            "unexpected coverage failure: {error:?}"
+        );
+        assert!(runtime
+            .store()
+            .list_active_scan_jobs_page(None, 10)?
+            .items
+            .is_empty());
+        assert_eq!(fs::read(&first)?, b"duplicate");
+        assert_eq!(fs::read(&second)?, b"duplicate");
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_directory_replay_persists_partial_coverage_and_closes_the_attempt(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let first = media.path().join("first.jpg");
+        let second = media.path().join("second.jpg");
+        fs::write(&first, b"same-size-a")?;
+        fs::write(&second, b"same-size-b")?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        runtime.enumerate(&NoopScanControl, &mut ())?;
+        runtime.fingerprint_candidates(&NoopScanControl, &mut ())?;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = runtime
+            .verify_coverage(&cancellation, &mut ())
+            .expect_err("cancelled directory replay unexpectedly completed");
+        assert!(matches!(
+            error,
+            RuntimeError::StageCancelled("directory coverage")
+        ));
+        assert!(runtime
+            .store()
+            .list_active_scan_jobs_page(None, 10)?
+            .items
+            .is_empty());
+        assert_eq!(fs::read(&first)?, b"same-size-a");
+        assert_eq!(fs::read(&second)?, b"same-size-b");
         Ok(())
     }
 
