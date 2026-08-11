@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::export_target::{
+    write_history_export, BoundExportTarget, ExportCancellation, ExportFormat, ExportTargetError,
+};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use guiying_core::{
-    CancellationToken, PathEncoding, PathRef, ProgressStage, ScanControl, ScanOptions,
-    ScanProgress, StreamBatchStatus,
+    PathEncoding, PathRef, ProgressStage, ScanControl, ScanDirective, ScanOptions, ScanProgress,
+    StreamBatchStatus,
 };
 use guiying_runtime::{
     ActiveReadOnlyScan, CaptureTimeStageFailureCode, CaptureTimeStageStatus,
@@ -23,11 +26,11 @@ use guiying_store::{
     CaptureTimeMetadataReportRecord, CaptureTimeOffsetKind, CaptureTimeSemanticKind,
     CaptureTimeSummaryCursor, DuplicateGroupCursor, DuplicateGroupMemberCursor,
     DuplicateGroupMemberRecord, EvidenceDatabaseScope, EvidenceReader, FileTimeRelation,
-    KeysetPage, MetadataDetectedFormat, MetadataExtractionStatus, MetadataFieldCursor,
-    MetadataFieldRawLocator, MetadataReportCursor, ScanHistoryContext, ScanHistoryCursor,
-    ScanHistoryRecord, ScanIssueCursor, ScanIssueRecord, StoredMetadataContainerKind,
-    StoredMetadataEncoding, StoredMetadataFieldKind, StoredTiffByteOrder, TimeDonorEligibility,
-    VerifiedExactGroup,
+    HistoryExportProjection, HistoryExportRequest, HistoryExportScope, KeysetPage,
+    MetadataDetectedFormat, MetadataExtractionStatus, MetadataFieldCursor, MetadataFieldRawLocator,
+    MetadataReportCursor, ScanHistoryContext, ScanHistoryCursor, ScanHistoryRecord,
+    ScanIssueCursor, ScanIssueRecord, StoredMetadataContainerKind, StoredMetadataEncoding,
+    StoredMetadataFieldKind, StoredTiffByteOrder, TimeDonorEligibility, VerifiedExactGroup,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -70,6 +73,11 @@ const RESULT_READ_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_RESULT_READ_TOKENS: usize = 32;
 const MAX_RESULT_READ_TOKENS_PER_OWNER: usize = 8;
 const MAX_RESULT_READ_TOKEN_GENERATION_ATTEMPTS: usize = 8;
+const HISTORY_EXPORT_TOKEN_PREFIX: &str = "export-";
+const HISTORY_EXPORT_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_HISTORY_EXPORTS: usize = 4;
+const MAX_HISTORY_EXPORTS_PER_OWNER: usize = 1;
+const MAX_HISTORY_EXPORT_TOKEN_GENERATION_ATTEMPTS: usize = 8;
 static NEXT_SCAN_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -198,6 +206,139 @@ impl AppError {
         )
     }
 
+    fn invalid_history_export_token() -> Self {
+        Self::new(
+            "INVALID_HISTORY_EXPORT_TOKEN",
+            "历史导出授权不存在、已撤销、已使用或格式无效；请重新选择导出位置。",
+            None,
+        )
+    }
+
+    fn history_export_owner_mismatch() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_TOKEN_OWNER_MISMATCH",
+            "该历史导出授权不属于当前窗口，已拒绝使用。",
+            None,
+        )
+    }
+
+    fn history_export_expired() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_TOKEN_EXPIRED",
+            "历史导出授权已过期，请重新选择导出位置。",
+            None,
+        )
+    }
+
+    fn history_export_registry_full() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_REGISTRY_FULL",
+            "历史导出已达到安全并发上限；请等待现有导出结束。",
+            None,
+        )
+    }
+
+    fn history_export_selection(message: impl Into<String>) -> Self {
+        Self::new("HISTORY_EXPORT_SELECTION_FAILED", message, None)
+    }
+
+    fn history_export_invalid_option(field: &'static str) -> Self {
+        Self::new(
+            "INVALID_HISTORY_EXPORT_OPTION",
+            format!("历史导出的 {field} 选项无效。"),
+            None,
+        )
+    }
+
+    fn history_export_blocked_by_scan(job_id: String) -> Self {
+        Self::new(
+            "HISTORY_EXPORT_BLOCKED_BY_SCAN",
+            "扫描正在运行；请等待扫描完成后再导出封存结果。",
+            Some(job_id),
+        )
+    }
+
+    fn scan_blocked_by_history_export() -> Self {
+        Self::new(
+            "SCAN_BLOCKED_BY_HISTORY_EXPORT",
+            "历史结果正在导出；请等待导出结束后再开始扫描。",
+            None,
+        )
+    }
+
+    fn history_export_cancelled() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_CANCELLED",
+            "历史导出已取消，未发布目标文件。",
+            None,
+        )
+    }
+
+    fn history_export_deadline() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_DEADLINE_EXCEEDED",
+            "历史导出超过安全时限，未发布目标文件。",
+            None,
+        )
+    }
+
+    fn history_export_limit() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_LIMIT_EXCEEDED",
+            "历史导出超过安全大小或记录数上限，未发布目标文件。",
+            None,
+        )
+    }
+
+    fn history_export_target_exists() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_TARGET_EXISTS",
+            "所选文件名已存在；为避免覆盖，请重新选择一个新文件名。",
+            None,
+        )
+    }
+
+    fn history_export_target() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_TARGET_UNSAFE",
+            "所选导出位置不可安全使用；请重新选择本地目录中的新文件名。",
+            None,
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn history_export_platform_unsupported() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_PLATFORM_UNSUPPORTED",
+            "当前平台尚未提供基于持久目录句柄的安全导出发布；已拒绝创建目标文件。",
+            None,
+        )
+    }
+
+    fn history_export_write() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_WRITE_FAILED",
+            "历史导出写入或持久化失败，未覆盖任何已有文件。",
+            None,
+        )
+    }
+
+    fn history_export_store() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_STORE_FAILED",
+            "封存证据在导出期间不再满足只读一致性约束。",
+            None,
+        )
+    }
+
+    fn history_export_task() -> Self {
+        Self::new(
+            "HISTORY_EXPORT_TASK_FAILED",
+            "历史导出工作线程未能安全完成。",
+            None,
+        )
+    }
+
     fn root_selection(message: impl Into<String>) -> Self {
         Self::new("SCAN_ROOT_SELECTION_FAILED", message, None)
     }
@@ -232,6 +373,14 @@ impl AppError {
             "该扫描任务不属于当前窗口，已拒绝访问。",
             Some(job_id),
         )
+    }
+
+    fn pause_unavailable(job_id: String, message: impl Into<String>) -> Self {
+        Self::new("SCAN_PAUSE_UNAVAILABLE", message, Some(job_id))
+    }
+
+    fn resume_unavailable(job_id: String, message: impl Into<String>) -> Self {
+        Self::new("SCAN_RESUME_UNAVAILABLE", message, Some(job_id))
     }
 
     fn invalid_cursor(_result_scope: String, message: impl Into<String>) -> Self {
@@ -302,6 +451,9 @@ fn progress_stage_name(stage: ProgressStage) -> &'static str {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ScanJobPhase {
     Running,
+    Pausing,
+    Paused,
+    Resuming,
     Cancelling,
     Completed,
     Cancelled,
@@ -534,6 +686,7 @@ pub(crate) struct ScanJobManager {
     root_tokens: Arc<StdMutex<ScanRootTokenRegistry>>,
     result_reads: Arc<Mutex<ResultReadRegistry>>,
     result_owners: Arc<StdMutex<HashMap<String, ResultOwnerState>>>,
+    history_exports: Arc<StdMutex<HistoryExportRegistry>>,
     history_reader: Arc<StdMutex<Option<SharedEvidenceReader>>>,
     history_reads: Arc<StdMutex<HistoryReadGate>>,
     database_path: Arc<OnceLock<PathBuf>>,
@@ -546,6 +699,7 @@ impl Default for ScanJobManager {
             root_tokens: Arc::new(StdMutex::new(ScanRootTokenRegistry::default())),
             result_reads: Arc::new(Mutex::new(ResultReadRegistry::default())),
             result_owners: Arc::new(StdMutex::new(HashMap::new())),
+            history_exports: Arc::new(StdMutex::new(HistoryExportRegistry::default())),
             history_reader: Arc::new(StdMutex::new(None)),
             history_reads: Arc::new(StdMutex::new(HistoryReadGate::default())),
             database_path: Arc::new(OnceLock::new()),
@@ -590,6 +744,166 @@ struct ScanRootGrant {
     owner_window_label: String,
     root: PathBuf,
     expires_at: Instant,
+}
+
+#[derive(Default)]
+struct HistoryExportRegistry {
+    pending_selections: HashMap<u64, PendingHistoryExportSelection>,
+    grants: HashMap<String, HistoryExportGrant>,
+    running: HashMap<String, RunningHistoryExport>,
+    next_selection_sequence: u64,
+    next_generation: u64,
+}
+
+#[derive(Clone)]
+struct ResultExportBinding {
+    result_read_token: String,
+    owner_window_label: String,
+    owner_epoch: u64,
+    result_generation: u64,
+    database_path: PathBuf,
+    database_scope: EvidenceDatabaseScope,
+    reader: SharedEvidenceReader,
+    context: ResultReadContext,
+    scan_run_id: i64,
+}
+
+struct PendingHistoryExportSelection {
+    binding: ResultExportBinding,
+    format: ExportFormat,
+    scope: HistoryExportScope,
+    projection: HistoryExportProjection,
+}
+
+struct HistoryExportSelectionPermit {
+    registry: Arc<StdMutex<HistoryExportRegistry>>,
+    sequence: u64,
+    binding: ResultExportBinding,
+    format: ExportFormat,
+    scope: HistoryExportScope,
+    projection: HistoryExportProjection,
+    consumed: bool,
+}
+
+impl Drop for HistoryExportSelectionPermit {
+    fn drop(&mut self) {
+        if self.consumed {
+            return;
+        }
+        let mut registry = match self.registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.pending_selections.remove(&self.sequence);
+    }
+}
+
+struct HistoryExportGrant {
+    binding: ResultExportBinding,
+    format: ExportFormat,
+    scope: HistoryExportScope,
+    projection: HistoryExportProjection,
+    target: BoundExportTarget,
+    generation: u64,
+    cancellation: Arc<ExportCancellation>,
+    expires_at: Instant,
+}
+
+struct RunningHistoryExport {
+    owner_window_label: String,
+    owner_epoch: u64,
+    result_read_token: String,
+    result_generation: u64,
+    generation: u64,
+    cancellation: Arc<ExportCancellation>,
+}
+
+struct HistoryExportRunLease {
+    binding: ResultExportBinding,
+    format: ExportFormat,
+    request: HistoryExportRequest,
+    target: BoundExportTarget,
+    cancellation: Arc<ExportCancellation>,
+    result_lease: ResultReadLease,
+    _cleanup: Arc<HistoryExportRunCleanup>,
+}
+
+impl std::fmt::Debug for HistoryExportRunLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HistoryExportRunLease")
+            .field("token", &"<redacted>")
+            .field("owner_window_label", &self.binding.owner_window_label)
+            .field("scan_run_id", &self.binding.scan_run_id)
+            .field("format", &self.format)
+            .field("scope", &self.request.scope())
+            .finish_non_exhaustive()
+    }
+}
+
+struct HistoryExportRunCleanup {
+    registry: Arc<StdMutex<HistoryExportRegistry>>,
+    token: String,
+    generation: u64,
+    completed: AtomicBool,
+}
+
+impl Drop for HistoryExportRunCleanup {
+    fn drop(&mut self) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut registry = match self.registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if registry
+            .running
+            .get(&self.token)
+            .is_some_and(|running| running.generation == self.generation)
+        {
+            registry.running.remove(&self.token);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SelectHistoryExportTargetResponse {
+    export_token: Option<String>,
+    file_name: Option<String>,
+    expires_at_unix_ms: Option<String>,
+}
+
+impl SelectHistoryExportTargetResponse {
+    fn cancelled() -> Self {
+        Self {
+            export_token: None,
+            file_name: None,
+            expires_at_unix_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExportScanHistoryResponse {
+    file_name: String,
+    format: &'static str,
+    scope: &'static str,
+    path_policy: &'static str,
+    bytes_written: String,
+    record_count: String,
+    digest_algorithm: &'static str,
+    logical_digest: String,
+    publication_status: &'static str,
+    warning_code: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CancelHistoryExportResponse {
+    cancelled: bool,
 }
 
 #[derive(Default)]
@@ -795,16 +1109,146 @@ struct ScanJobRegistry {
 struct ActiveScanJob {
     status: ScanJobStatus,
     owner_window_label: String,
-    cancellation: CancellationToken,
+    stage: ScanWorkerStage,
+    control: ScanWorkerControl,
 }
 
 #[derive(Debug)]
 struct JobReservation {
     job_id: String,
-    cancellation: CancellationToken,
+    control: ScanWorkerControl,
     status: ScanJobStatus,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanWorkerStage {
+    Enumeration,
+    Fingerprinting,
+    ExactVerification,
+    CaptureTime,
+    Finished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerDirective {
+    Continue,
+    Pause,
+    Cancel,
+}
+
+#[derive(Debug)]
+struct WorkerControlState {
+    directive: WorkerDirective,
+    enumeration_active: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ScanWorkerControl {
+    shared: Arc<(StdMutex<WorkerControlState>, Condvar)>,
+}
+
+impl ScanWorkerControl {
+    fn new() -> Self {
+        Self {
+            shared: Arc::new((
+                StdMutex::new(WorkerControlState {
+                    directive: WorkerDirective::Continue,
+                    enumeration_active: true,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn request_pause(&self) -> bool {
+        let (lock, _) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.enumeration_active && state.directive != WorkerDirective::Cancel {
+            state.directive = WorkerDirective::Pause;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_enumeration(&self) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.enumeration_active = false;
+        if state.directive == WorkerDirective::Pause {
+            state.directive = WorkerDirective::Continue;
+            wake.notify_all();
+        }
+    }
+
+    fn request_resume(&self) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.directive == WorkerDirective::Pause {
+            state.directive = WorkerDirective::Continue;
+            wake.notify_all();
+        }
+    }
+
+    fn cancel(&self) -> bool {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = state.directive != WorkerDirective::Cancel;
+        state.directive = WorkerDirective::Cancel;
+        wake.notify_all();
+        changed
+    }
+
+    fn is_cancelled(&self) -> bool {
+        let (lock, _) = &*self.shared;
+        lock.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .directive
+            == WorkerDirective::Cancel
+    }
+
+    fn wait_while_paused(&self) -> PausedWorkerAction {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.directive == WorkerDirective::Pause {
+            state = wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if state.directive == WorkerDirective::Cancel {
+            PausedWorkerAction::Cancel
+        } else {
+            PausedWorkerAction::Resume
+        }
+    }
+}
+
+impl ScanControl for ScanWorkerControl {
+    fn is_cancelled(&self) -> bool {
+        ScanWorkerControl::is_cancelled(self)
+    }
+
+    fn directive(&self) -> ScanDirective {
+        let (lock, _) = &*self.shared;
+        match lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .directive
+        {
+            WorkerDirective::Continue => ScanDirective::Continue,
+            WorkerDirective::Pause => ScanDirective::Pause,
+            WorkerDirective::Cancel => ScanDirective::Cancel,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PausedWorkerAction {
+    Resume,
+    Cancel,
+}
+
+#[derive(Debug)]
 struct CancelOutcome {
     status: ScanJobStatus,
     changed: bool,
@@ -1177,10 +1621,16 @@ impl ScanJobManager {
                     expires_at,
                 },
             );
-            return Ok(IssuedResultReadToken {
+            let issued = IssuedResultReadToken {
                 result_read_token: token,
                 expires_at_unix_ms: expires_at_unix_ms.to_string(),
-            });
+            };
+            drop(owners);
+            drop(registry);
+            for replaced in &replaced_tokens {
+                self.revoke_history_exports_for_result_token(replaced);
+            }
+            return Ok(issued);
         }
         Err(AppError::result_read_token_unavailable(
             "结果查看授权令牌发生重复，已安全终止签发。",
@@ -1383,9 +1833,12 @@ impl ScanJobManager {
                 return Err(AppError::result_read_token_owner_mismatch());
             }
         }
-        Ok(CloseResultReadResponse {
-            revoked: registry.grants.remove(token).is_some(),
-        })
+        let revoked = registry.grants.remove(token).is_some();
+        drop(registry);
+        if revoked {
+            self.revoke_history_exports_for_result_token(token);
+        }
+        Ok(CloseResultReadResponse { revoked })
     }
 
     async fn revoke_result_read_lease(&self, lease: &ResultReadLease) {
@@ -1432,6 +1885,418 @@ impl ScanJobManager {
     #[cfg(test)]
     async fn pending_result_read_count(&self) -> usize {
         self.result_reads.lock().await.grants.len()
+    }
+
+    async fn snapshot_result_export_binding(
+        &self,
+        owner_window_label: &str,
+        result_read_token: &str,
+    ) -> Result<ResultExportBinding, AppError> {
+        if !is_canonical_result_read_token(result_read_token) {
+            return Err(AppError::invalid_result_read_token());
+        }
+        let mut registry = self.result_reads.lock().await;
+        let owners = self
+            .result_owners
+            .lock()
+            .map_err(|_| AppError::invalid_result_read_token())?;
+        let Some(grant) = registry.grants.get(result_read_token) else {
+            return Err(AppError::invalid_result_read_token());
+        };
+        if grant.owner_window_label != owner_window_label {
+            return Err(AppError::result_read_token_owner_mismatch());
+        }
+        let owner_state = owners.get(owner_window_label).copied().unwrap_or_default();
+        if owner_state.closed || owner_state.epoch != grant.owner_epoch {
+            return Err(AppError::invalid_result_read_token());
+        }
+        if Instant::now() >= grant.expires_at {
+            registry.grants.remove(result_read_token);
+            return Err(AppError::result_read_token_expired());
+        }
+        Ok(ResultExportBinding {
+            result_read_token: result_read_token.to_owned(),
+            owner_window_label: owner_window_label.to_owned(),
+            owner_epoch: grant.owner_epoch,
+            result_generation: grant.generation,
+            database_path: grant.database_path.clone(),
+            database_scope: grant.database_scope,
+            reader: Arc::clone(&grant.reader),
+            context: grant.context.clone(),
+            scan_run_id: grant.scan_run_id,
+        })
+    }
+
+    async fn validate_result_export_binding(
+        &self,
+        binding: &ResultExportBinding,
+    ) -> Result<(), AppError> {
+        let current = self
+            .snapshot_result_export_binding(&binding.owner_window_label, &binding.result_read_token)
+            .await?;
+        if same_result_export_binding(&current, binding) {
+            Ok(())
+        } else {
+            Err(AppError::result_context_unavailable())
+        }
+    }
+
+    async fn begin_history_export_selection(
+        &self,
+        owner_window_label: &str,
+        result_read_token: &str,
+        format: ExportFormat,
+        scope: HistoryExportScope,
+        projection: HistoryExportProjection,
+    ) -> Result<HistoryExportSelectionPermit, AppError> {
+        {
+            let scan_registry = self.registry.lock().await;
+            if let Some(active) = &scan_registry.active {
+                return Err(AppError::history_export_blocked_by_scan(
+                    active.status.job_id.clone(),
+                ));
+            }
+        }
+        let binding = self
+            .snapshot_result_export_binding(owner_window_label, result_read_token)
+            .await?;
+        let mut registry = self
+            .history_exports
+            .lock()
+            .map_err(|_| AppError::history_export_registry_full())?;
+        prune_expired_history_export_grants(&mut registry, Instant::now());
+        let total = history_export_registry_len(&registry);
+        let owner_total = history_export_owner_len(&registry, owner_window_label);
+        if total >= MAX_HISTORY_EXPORTS || owner_total >= MAX_HISTORY_EXPORTS_PER_OWNER {
+            return Err(AppError::history_export_registry_full());
+        }
+        let sequence = registry
+            .next_selection_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                AppError::history_export_selection("历史导出选择序列号已耗尽；请重启应用。")
+            })?;
+        registry.next_selection_sequence = sequence;
+        registry.pending_selections.insert(
+            sequence,
+            PendingHistoryExportSelection {
+                binding: binding.clone(),
+                format,
+                scope,
+                projection,
+            },
+        );
+        Ok(HistoryExportSelectionPermit {
+            registry: Arc::clone(&self.history_exports),
+            sequence,
+            binding,
+            format,
+            scope,
+            projection,
+            consumed: false,
+        })
+    }
+
+    async fn finish_history_export_selection(
+        &self,
+        permit: &mut HistoryExportSelectionPermit,
+        target: Option<BoundExportTarget>,
+    ) -> Result<SelectHistoryExportTargetResponse, AppError> {
+        let Some(target) = target else {
+            let mut registry = self
+                .history_exports
+                .lock()
+                .map_err(|_| AppError::history_export_selection("历史导出授权注册表不可用。"))?;
+            if registry
+                .pending_selections
+                .remove(&permit.sequence)
+                .is_none()
+            {
+                return Err(AppError::history_export_selection(
+                    "窗口已关闭或导出选择已撤销。",
+                ));
+            }
+            permit.consumed = true;
+            return Ok(SelectHistoryExportTargetResponse::cancelled());
+        };
+
+        self.validate_result_export_binding(&permit.binding).await?;
+        {
+            let scan_registry = self.registry.lock().await;
+            if let Some(active) = &scan_registry.active {
+                return Err(AppError::history_export_blocked_by_scan(
+                    active.status.job_id.clone(),
+                ));
+            }
+        }
+        let now = Instant::now();
+        let expires_at = now
+            .checked_add(HISTORY_EXPORT_TOKEN_TTL)
+            .ok_or_else(AppError::history_export_deadline)?;
+        let ttl_ms = u64::try_from(HISTORY_EXPORT_TOKEN_TTL.as_millis())
+            .map_err(|_| AppError::history_export_deadline())?;
+        let expires_at_unix_ms = unix_time_ms()
+            .checked_add(ttl_ms)
+            .ok_or_else(AppError::history_export_deadline)?;
+        let mut registry = self
+            .history_exports
+            .lock()
+            .map_err(|_| AppError::history_export_registry_full())?;
+        let pending_matches = registry
+            .pending_selections
+            .get(&permit.sequence)
+            .is_some_and(|pending| {
+                same_result_export_binding(&pending.binding, &permit.binding)
+                    && pending.format == permit.format
+                    && pending.scope == permit.scope
+                    && pending.projection == permit.projection
+            });
+        if !pending_matches {
+            return Err(AppError::history_export_selection(
+                "窗口已关闭或导出选择已撤销。",
+            ));
+        }
+        let generation = registry.next_generation.checked_add(1).ok_or_else(|| {
+            AppError::history_export_selection("历史导出授权代际编号已耗尽；请重启应用。")
+        })?;
+        for _ in 0..MAX_HISTORY_EXPORT_TOKEN_GENERATION_ATTEMPTS {
+            let mut entropy = [0_u8; 32];
+            getrandom::fill(&mut entropy).map_err(|_| {
+                AppError::history_export_selection(
+                    "操作系统安全随机数源不可用，未签发历史导出授权。",
+                )
+            })?;
+            let token = format!("{HISTORY_EXPORT_TOKEN_PREFIX}{}", hex(&entropy));
+            if registry.grants.contains_key(&token) || registry.running.contains_key(&token) {
+                continue;
+            }
+            let file_name = target.display_file_name().to_owned();
+            registry.pending_selections.remove(&permit.sequence);
+            registry.next_generation = generation;
+            registry.grants.insert(
+                token.clone(),
+                HistoryExportGrant {
+                    binding: permit.binding.clone(),
+                    format: permit.format,
+                    scope: permit.scope,
+                    projection: permit.projection,
+                    target,
+                    generation,
+                    cancellation: Arc::new(ExportCancellation::new()),
+                    expires_at,
+                },
+            );
+            permit.consumed = true;
+            return Ok(SelectHistoryExportTargetResponse {
+                export_token: Some(token),
+                file_name: Some(file_name),
+                expires_at_unix_ms: Some(expires_at_unix_ms.to_string()),
+            });
+        }
+        Err(AppError::history_export_selection(
+            "历史导出授权令牌发生重复，已安全终止签发。",
+        ))
+    }
+
+    async fn begin_history_export(
+        &self,
+        owner_window_label: &str,
+        token: &str,
+    ) -> Result<HistoryExportRunLease, AppError> {
+        if !is_canonical_history_export_token(token) {
+            return Err(AppError::invalid_history_export_token());
+        }
+        let scan_registry = self.registry.lock().await;
+        if let Some(active) = &scan_registry.active {
+            return Err(AppError::history_export_blocked_by_scan(
+                active.status.job_id.clone(),
+            ));
+        }
+        let (binding, generation, scope, projection) = {
+            let mut registry = self
+                .history_exports
+                .lock()
+                .map_err(|_| AppError::invalid_history_export_token())?;
+            let Some(grant) = registry.grants.get(token) else {
+                return Err(AppError::invalid_history_export_token());
+            };
+            if grant.binding.owner_window_label != owner_window_label {
+                return Err(AppError::history_export_owner_mismatch());
+            }
+            if Instant::now() >= grant.expires_at {
+                registry.grants.remove(token);
+                return Err(AppError::history_export_expired());
+            }
+            (
+                grant.binding.clone(),
+                grant.generation,
+                grant.scope,
+                grant.projection,
+            )
+        };
+        let request = HistoryExportRequest::new(scope, projection, 128)
+            .map_err(|_| AppError::history_export_store())?;
+        let result_lease = self
+            .begin_result_read(owner_window_label, &binding.result_read_token)
+            .await?;
+        if !result_lease_matches_export_binding(&result_lease, &binding) {
+            return Err(AppError::result_context_unavailable());
+        }
+        let grant = {
+            let mut registry = self
+                .history_exports
+                .lock()
+                .map_err(|_| AppError::invalid_history_export_token())?;
+            let valid = registry.grants.get(token).is_some_and(|grant| {
+                grant.generation == generation
+                    && !grant.cancellation.is_cancelled()
+                    && Instant::now() < grant.expires_at
+                    && same_result_export_binding(&grant.binding, &binding)
+            });
+            if !valid {
+                return Err(AppError::invalid_history_export_token());
+            }
+            let grant = registry
+                .grants
+                .remove(token)
+                .ok_or_else(AppError::invalid_history_export_token)?;
+            registry.running.insert(
+                token.to_owned(),
+                RunningHistoryExport {
+                    owner_window_label: owner_window_label.to_owned(),
+                    owner_epoch: binding.owner_epoch,
+                    result_read_token: binding.result_read_token.clone(),
+                    result_generation: binding.result_generation,
+                    generation,
+                    cancellation: Arc::clone(&grant.cancellation),
+                },
+            );
+            grant
+        };
+        drop(scan_registry);
+        let cleanup = Arc::new(HistoryExportRunCleanup {
+            registry: Arc::clone(&self.history_exports),
+            token: token.to_owned(),
+            generation,
+            completed: AtomicBool::new(false),
+        });
+        Ok(HistoryExportRunLease {
+            binding,
+            format: grant.format,
+            request,
+            target: grant.target,
+            cancellation: grant.cancellation,
+            result_lease,
+            _cleanup: cleanup,
+        })
+    }
+
+    fn cancel_history_export(
+        &self,
+        owner_window_label: &str,
+        token: &str,
+    ) -> Result<CancelHistoryExportResponse, AppError> {
+        if !is_canonical_history_export_token(token) {
+            return Err(AppError::invalid_history_export_token());
+        }
+        let mut registry = self
+            .history_exports
+            .lock()
+            .map_err(|_| AppError::invalid_history_export_token())?;
+        if let Some(grant) = registry.grants.get(token) {
+            if grant.binding.owner_window_label != owner_window_label {
+                return Err(AppError::history_export_owner_mismatch());
+            }
+            let changed = grant.cancellation.cancel();
+            registry.grants.remove(token);
+            return Ok(CancelHistoryExportResponse { cancelled: changed });
+        }
+        if let Some(running) = registry.running.get(token) {
+            if running.owner_window_label != owner_window_label {
+                return Err(AppError::history_export_owner_mismatch());
+            }
+            let owner_state = self
+                .result_owners
+                .lock()
+                .map_err(|_| AppError::invalid_history_export_token())?
+                .get(owner_window_label)
+                .copied()
+                .unwrap_or_default();
+            if owner_state.closed
+                || owner_state.epoch != running.owner_epoch
+                || running.result_generation == 0
+            {
+                return Err(AppError::invalid_history_export_token());
+            }
+            let changed = running.cancellation.cancel();
+            return Ok(CancelHistoryExportResponse { cancelled: changed });
+        }
+        Ok(CancelHistoryExportResponse { cancelled: false })
+    }
+
+    fn revoke_history_exports_for_owner(&self, owner_window_label: &str) {
+        let mut registry = match self.history_exports.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry
+            .pending_selections
+            .retain(|_, pending| pending.binding.owner_window_label != owner_window_label);
+        registry.grants.retain(|_, grant| {
+            let keep = grant.binding.owner_window_label != owner_window_label;
+            if !keep {
+                grant.cancellation.cancel();
+            }
+            keep
+        });
+        for running in registry.running.values() {
+            if running.owner_window_label == owner_window_label {
+                running.cancellation.cancel();
+            }
+        }
+    }
+
+    fn revoke_history_exports_for_result_token(&self, result_read_token: &str) {
+        let mut registry = match self.history_exports.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry
+            .pending_selections
+            .retain(|_, pending| pending.binding.result_read_token != result_read_token);
+        registry.grants.retain(|_, grant| {
+            let keep = grant.binding.result_read_token != result_read_token;
+            if !keep {
+                grant.cancellation.cancel();
+            }
+            keep
+        });
+        for running in registry.running.values() {
+            if running.result_read_token == result_read_token {
+                running.cancellation.cancel();
+            }
+        }
+    }
+
+    fn ensure_no_running_history_export(&self) -> Result<(), AppError> {
+        let registry = self
+            .history_exports
+            .lock()
+            .map_err(|_| AppError::scan_blocked_by_history_export())?;
+        if registry.running.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::scan_blocked_by_history_export())
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_history_export_count(&self) -> usize {
+        let registry = match self.history_exports.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        history_export_registry_len(&registry)
     }
 
     #[cfg(test)]
@@ -1589,6 +2454,7 @@ impl ScanJobManager {
     async fn reserve(&self, owner_window_label: String) -> Result<JobReservation, AppError> {
         let mut registry = self.registry.lock().await;
         ensure_scan_start_available(&registry)?;
+        self.ensure_no_running_history_export()?;
         Ok(reserve_job(&mut registry, owner_window_label))
     }
 
@@ -1601,6 +2467,7 @@ impl ScanJobManager {
         // concurrent starts cannot both pass the gate and burn the loser.
         let mut registry = self.registry.lock().await;
         ensure_scan_start_available(&registry)?;
+        self.ensure_no_running_history_export()?;
         let root = self.consume_scan_root(&owner_window_label, root_token)?;
         let reservation = reserve_job(&mut registry, owner_window_label);
         Ok((root, reservation))
@@ -1610,8 +2477,8 @@ impl ScanJobManager {
         let mut registry = self.registry.lock().await;
         if let Some(active) = registry.active.as_mut() {
             if active.status.job_id == job_id {
-                active.cancellation.cancel();
-                let changed = active.status.phase == ScanJobPhase::Running;
+                active.control.cancel();
+                let changed = !matches!(active.status.phase, ScanJobPhase::Cancelling);
                 if changed {
                     active.status.phase = ScanJobPhase::Cancelling;
                 }
@@ -1630,6 +2497,111 @@ impl ScanJobManager {
             }
         }
         Err(AppError::job_not_found(job_id.to_owned()))
+    }
+
+    async fn pause_for_owner(
+        &self,
+        owner_window_label: &str,
+        job_id: &str,
+    ) -> Result<CancelOutcome, AppError> {
+        let mut registry = self.registry.lock().await;
+        let Some(active) = registry.active.as_mut() else {
+            return Err(AppError::job_not_found(job_id.to_owned()));
+        };
+        if active.status.job_id != job_id {
+            return Err(AppError::job_not_found(job_id.to_owned()));
+        }
+        if active.owner_window_label != owner_window_label {
+            return Err(AppError::job_owner_mismatch(job_id.to_owned()));
+        }
+        if active.stage != ScanWorkerStage::Enumeration {
+            return Err(AppError::pause_unavailable(
+                job_id.to_owned(),
+                "只有目录枚举阶段可以暂停；内容读取阶段请使用停止扫描。",
+            ));
+        }
+        let changed = match active.status.phase {
+            ScanJobPhase::Running => {
+                if !active.control.request_pause() {
+                    return Err(AppError::pause_unavailable(
+                        job_id.to_owned(),
+                        "目录枚举已经结束；内容读取阶段不能暂停。",
+                    ));
+                }
+                active.status.phase = ScanJobPhase::Pausing;
+                true
+            }
+            ScanJobPhase::Pausing | ScanJobPhase::Paused => false,
+            ScanJobPhase::Resuming => {
+                return Err(AppError::pause_unavailable(
+                    job_id.to_owned(),
+                    "扫描正在恢复枚举；请等待恢复完成后再请求暂停。",
+                ))
+            }
+            ScanJobPhase::Cancelling
+            | ScanJobPhase::Completed
+            | ScanJobPhase::Cancelled
+            | ScanJobPhase::Failed => {
+                return Err(AppError::pause_unavailable(
+                    job_id.to_owned(),
+                    "扫描已在停止或终态，不能再暂停。",
+                ))
+            }
+        };
+        Ok(CancelOutcome {
+            status: active.status.clone(),
+            changed,
+        })
+    }
+
+    async fn resume_for_owner(
+        &self,
+        owner_window_label: &str,
+        job_id: &str,
+    ) -> Result<CancelOutcome, AppError> {
+        let mut registry = self.registry.lock().await;
+        let Some(active) = registry.active.as_mut() else {
+            return Err(AppError::job_not_found(job_id.to_owned()));
+        };
+        if active.status.job_id != job_id {
+            return Err(AppError::job_not_found(job_id.to_owned()));
+        }
+        if active.owner_window_label != owner_window_label {
+            return Err(AppError::job_owner_mismatch(job_id.to_owned()));
+        }
+        if active.stage != ScanWorkerStage::Enumeration {
+            return Err(AppError::resume_unavailable(
+                job_id.to_owned(),
+                "目录枚举已经结束，没有可继续的同进程暂停点。",
+            ));
+        }
+        let changed = match active.status.phase {
+            ScanJobPhase::Paused => {
+                active.status.phase = ScanJobPhase::Resuming;
+                active.control.request_resume();
+                true
+            }
+            ScanJobPhase::Resuming | ScanJobPhase::Running => false,
+            ScanJobPhase::Pausing => {
+                return Err(AppError::resume_unavailable(
+                    job_id.to_owned(),
+                    "暂停尚未到达安全点；请等待状态变为已暂停。",
+                ))
+            }
+            ScanJobPhase::Cancelling
+            | ScanJobPhase::Completed
+            | ScanJobPhase::Cancelled
+            | ScanJobPhase::Failed => {
+                return Err(AppError::resume_unavailable(
+                    job_id.to_owned(),
+                    "扫描已在停止或终态，不能继续。",
+                ))
+            }
+        };
+        Ok(CancelOutcome {
+            status: active.status.clone(),
+            changed,
+        })
     }
 
     async fn cancel_for_owner(&self, owner_window_label: &str) -> Option<ScanJobStatus> {
@@ -1739,6 +2711,28 @@ impl ScanJobManager {
         }
     }
 
+    fn record_worker_phase(&self, job_id: &str, phase: ScanJobPhase) -> Option<ScanJobStatus> {
+        let mut registry = self.registry.blocking_lock();
+        let active = registry.active.as_mut()?;
+        if active.status.job_id != job_id {
+            return None;
+        }
+        if active.status.phase == ScanJobPhase::Cancelling && phase != ScanJobPhase::Cancelling {
+            return Some(active.status.clone());
+        }
+        active.status.phase = phase;
+        Some(active.status.clone())
+    }
+
+    fn record_worker_stage(&self, job_id: &str, stage: ScanWorkerStage) {
+        let mut registry = self.registry.blocking_lock();
+        if let Some(active) = registry.active.as_mut() {
+            if active.status.job_id == job_id {
+                active.stage = stage;
+            }
+        }
+    }
+
     async fn finish(&self, job_id: &str, outcome: &ScanOutcome) -> Option<ScanJobStatusEvent> {
         let mut registry = self.registry.lock().await;
         if registry
@@ -1798,7 +2792,7 @@ fn reserve_job(registry: &mut ScanJobRegistry, owner_window_label: String) -> Jo
     let sequence = NEXT_SCAN_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let raw_job_id = (u128::from(unix_time_ms()) << 64) | u128::from(sequence);
     let job_id = format!("scan-{}", Uuid::from_u128(raw_job_id));
-    let cancellation = CancellationToken::new();
+    let control = ScanWorkerControl::new();
     let status = ScanJobStatus {
         job_id: job_id.clone(),
         phase: ScanJobPhase::Running,
@@ -1813,11 +2807,12 @@ fn reserve_job(registry: &mut ScanJobRegistry, owner_window_label: String) -> Jo
     registry.active = Some(ActiveScanJob {
         status: status.clone(),
         owner_window_label,
-        cancellation: cancellation.clone(),
+        stage: ScanWorkerStage::Enumeration,
+        control: control.clone(),
     });
     JobReservation {
         job_id,
-        cancellation,
+        control,
         status,
     }
 }
@@ -1895,17 +2890,143 @@ fn is_canonical_result_read_token(value: &str) -> bool {
         })
 }
 
+fn is_canonical_history_export_token(value: &str) -> bool {
+    value
+        .strip_prefix(HISTORY_EXPORT_TOKEN_PREFIX)
+        .is_some_and(|body| {
+            body.len() == 64
+                && body
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}
+
+fn same_result_export_binding(left: &ResultExportBinding, right: &ResultExportBinding) -> bool {
+    left.result_read_token == right.result_read_token
+        && left.owner_window_label == right.owner_window_label
+        && left.owner_epoch == right.owner_epoch
+        && left.result_generation == right.result_generation
+        && left.database_path == right.database_path
+        && left.database_scope == right.database_scope
+        && Arc::ptr_eq(&left.reader, &right.reader)
+        && left.context == right.context
+        && left.scan_run_id == right.scan_run_id
+}
+
+fn result_lease_matches_export_binding(
+    lease: &ResultReadLease,
+    binding: &ResultExportBinding,
+) -> bool {
+    lease.token == binding.result_read_token
+        && lease.owner_window_label == binding.owner_window_label
+        && lease.owner_epoch == binding.owner_epoch
+        && lease.generation == binding.result_generation
+        && lease.database_path == binding.database_path
+        && lease.database_scope == binding.database_scope
+        && Arc::ptr_eq(&lease.reader, &binding.reader)
+        && lease.context == binding.context
+        && lease.scan_run_id == binding.scan_run_id
+}
+
+fn history_export_registry_len(registry: &HistoryExportRegistry) -> usize {
+    registry
+        .pending_selections
+        .len()
+        .saturating_add(registry.grants.len())
+        .saturating_add(registry.running.len())
+}
+
+fn history_export_owner_len(registry: &HistoryExportRegistry, owner: &str) -> usize {
+    registry
+        .pending_selections
+        .values()
+        .filter(|pending| pending.binding.owner_window_label == owner)
+        .count()
+        .saturating_add(
+            registry
+                .grants
+                .values()
+                .filter(|grant| grant.binding.owner_window_label == owner)
+                .count(),
+        )
+        .saturating_add(
+            registry
+                .running
+                .values()
+                .filter(|running| running.owner_window_label == owner)
+                .count(),
+        )
+}
+
+fn prune_expired_history_export_grants(registry: &mut HistoryExportRegistry, now: Instant) {
+    registry.grants.retain(|_, grant| now < grant.expires_at);
+}
+
+fn history_export_scope_name(scope: HistoryExportScope) -> &'static str {
+    match scope {
+        HistoryExportScope::Summary => "summary",
+        HistoryExportScope::CompleteEvidence => "complete_evidence",
+    }
+}
+
+fn history_export_projection_name(projection: HistoryExportProjection) -> &'static str {
+    match projection {
+        HistoryExportProjection::Redacted => "redacted",
+        HistoryExportProjection::Display => "display",
+    }
+}
+
+fn parse_history_export_scope(value: &str) -> Result<HistoryExportScope, AppError> {
+    match value {
+        "summary" => Ok(HistoryExportScope::Summary),
+        "complete_evidence" => Ok(HistoryExportScope::CompleteEvidence),
+        _ => Err(AppError::history_export_invalid_option("scope")),
+    }
+}
+
+fn parse_history_export_projection(value: &str) -> Result<HistoryExportProjection, AppError> {
+    match value {
+        "redacted" => Ok(HistoryExportProjection::Redacted),
+        "display" => Ok(HistoryExportProjection::Display),
+        _ => Err(AppError::history_export_invalid_option("pathPolicy")),
+    }
+}
+
+fn map_export_target_error(error: ExportTargetError) -> AppError {
+    match error {
+        #[cfg(not(unix))]
+        ExportTargetError::UnsupportedPlatform => AppError::history_export_platform_unsupported(),
+        ExportTargetError::InvalidSelection
+        | ExportTargetError::UnsafeTarget
+        | ExportTargetError::OpenFailed => AppError::history_export_target(),
+        ExportTargetError::TargetExists => AppError::history_export_target_exists(),
+        ExportTargetError::RandomUnavailable => {
+            AppError::history_export_selection("操作系统安全随机数源不可用，无法创建私有导出文件。")
+        }
+        ExportTargetError::Cancelled => AppError::history_export_cancelled(),
+        ExportTargetError::DeadlineExceeded => AppError::history_export_deadline(),
+        ExportTargetError::OutputLimitExceeded => AppError::history_export_limit(),
+        ExportTargetError::StoreFailed => AppError::history_export_store(),
+        ExportTargetError::EncodeFailed
+        | ExportTargetError::WriteFailed
+        | ExportTargetError::PublishFailed => AppError::history_export_write(),
+    }
+}
+
 fn cancel_active_for_owner(
     registry: &mut ScanJobRegistry,
     owner_window_label: &str,
 ) -> Option<ScanJobStatus> {
     let active = registry.active.as_mut()?;
     if active.owner_window_label != owner_window_label
-        || active.status.phase != ScanJobPhase::Running
+        || matches!(
+            active.status.phase,
+            ScanJobPhase::Completed | ScanJobPhase::Cancelled | ScanJobPhase::Failed
+        )
     {
         return None;
     }
-    active.cancellation.cancel();
+    active.control.cancel();
     active.status.phase = ScanJobPhase::Cancelling;
     Some(active.status.clone())
 }
@@ -1944,15 +3065,12 @@ impl ProgressGate {
     }
 }
 
-struct CancellationControl {
-    cancellation: CancellationToken,
+trait ScanWorkerObserver: RuntimeObserver {
+    fn on_worker_phase(&mut self, _phase: ScanJobPhase) {}
+    fn on_worker_stage(&mut self, _stage: ScanWorkerStage) {}
 }
 
-impl ScanControl for CancellationControl {
-    fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
-    }
-}
+impl ScanWorkerObserver for () {}
 
 struct TauriRuntimeObserver {
     app: AppHandle,
@@ -1998,6 +3116,27 @@ impl RuntimeObserver for TauriRuntimeObserver {
             emit_progress(&self.app, &self.owner_window_label, &event);
         }
     }
+
+    fn on_enumeration_resumed(&mut self) {
+        if let Some(status) = self
+            .manager
+            .record_worker_phase(&self.job_id, ScanJobPhase::Running)
+        {
+            emit_status(&self.app, &self.owner_window_label, &status);
+        }
+    }
+}
+
+impl ScanWorkerObserver for TauriRuntimeObserver {
+    fn on_worker_phase(&mut self, phase: ScanJobPhase) {
+        if let Some(status) = self.manager.record_worker_phase(&self.job_id, phase) {
+            emit_status(&self.app, &self.owner_window_label, &status);
+        }
+    }
+
+    fn on_worker_stage(&mut self, stage: ScanWorkerStage) {
+        self.manager.record_worker_stage(&self.job_id, stage);
+    }
 }
 
 pub(crate) async fn select_scan_root(
@@ -2035,6 +3174,121 @@ pub(crate) async fn select_scan_root(
     manager.finish_scan_root_selection(&owner_window_label, selection_sequence, root)
 }
 
+pub(crate) async fn select_history_export_target(
+    window: WebviewWindow,
+    manager: &ScanJobManager,
+    result_read_token: &str,
+    format: &str,
+    scope: &str,
+    path_policy: &str,
+) -> Result<SelectHistoryExportTargetResponse, AppError> {
+    let format = ExportFormat::parse(format)
+        .ok_or_else(|| AppError::history_export_invalid_option("format"))?;
+    let scope = parse_history_export_scope(scope)?;
+    let projection = parse_history_export_projection(path_policy)?;
+    let owner_window_label = window.label().to_owned();
+    let mut permit = manager
+        .begin_history_export_selection(
+            &owner_window_label,
+            result_read_token,
+            format,
+            scope,
+            projection,
+        )
+        .await?;
+    let default_name = format!("guiying-history-export.{}", format.extension());
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("导出封存扫描结果")
+        .add_filter(format.as_str().to_ascii_uppercase(), &[format.extension()])
+        .set_file_name(default_name)
+        .save_file(move |selection| {
+            let _send_result = sender.send(selection);
+        });
+    let selection = receiver
+        .await
+        .map_err(|_| AppError::history_export_selection("原生文件保存选择器未能返回结果。"))?;
+    let selected_path = match selection {
+        Some(FilePath::Path(path)) => Some(path),
+        Some(FilePath::Url(_)) => {
+            return Err(AppError::history_export_selection(
+                "原生文件保存选择器返回了非本地文件系统位置。",
+            ));
+        }
+        None => None,
+    };
+    let target = match selected_path {
+        Some(path) => Some(
+            tauri::async_runtime::spawn_blocking(move || BoundExportTarget::bind(path, format))
+                .await
+                .map_err(|_| AppError::history_export_task())?
+                .map_err(map_export_target_error)?,
+        ),
+        None => None,
+    };
+    manager
+        .finish_history_export_selection(&mut permit, target)
+        .await
+}
+
+pub(crate) async fn export_scan_history(
+    manager: &ScanJobManager,
+    owner_window_label: &str,
+    export_token: &str,
+) -> Result<ExportScanHistoryResponse, AppError> {
+    let lease = manager
+        .begin_history_export(owner_window_label, export_token)
+        .await?;
+    let worker = tauri::async_runtime::spawn_blocking(move || {
+        let result = {
+            let reader = lock_evidence_reader(&lease.binding.reader)?;
+            let context = lease.binding.context.validated()?;
+            write_history_export(
+                &reader,
+                context,
+                lease.request,
+                lease.format,
+                &lease.target,
+                Arc::clone(&lease.cancellation),
+            )
+            .map_err(map_export_target_error)
+        };
+        Ok::<_, AppError>((lease, result))
+    })
+    .await
+    .map_err(|_| AppError::history_export_task())??;
+    let (lease, result) = worker;
+    let finish_result = manager.finish_result_read(&lease.result_lease).await;
+    let response = result.map(|artifact| ExportScanHistoryResponse {
+        file_name: artifact.file_name,
+        format: lease.format.as_str(),
+        scope: history_export_scope_name(lease.request.scope()),
+        path_policy: history_export_projection_name(lease.request.projection()),
+        bytes_written: artifact.bytes_written.to_string(),
+        record_count: artifact.record_count.to_string(),
+        digest_algorithm: "blake3",
+        logical_digest: artifact.logical_digest,
+        publication_status: artifact.publication_status,
+        warning_code: artifact.warning_code,
+    });
+    drop(lease);
+    if response.is_ok() && finish_result.is_err() {
+        log::warn!("result-read grant changed after a committed history export");
+    }
+    response
+}
+
+pub(crate) fn cancel_history_export(
+    manager: &ScanJobManager,
+    owner_window_label: &str,
+    export_token: &str,
+) -> Result<CancelHistoryExportResponse, AppError> {
+    manager.cancel_history_export(owner_window_label, export_token)
+}
+
 pub(crate) async fn launch_scan(
     app: AppHandle,
     manager: ScanJobManager,
@@ -2051,9 +3305,7 @@ pub(crate) async fn launch_scan(
     let worker_manager = manager.clone();
     let finish_manager = manager.clone();
     let worker_owner_window_label = owner_window_label.clone();
-    let control = CancellationControl {
-        cancellation: reservation.cancellation,
-    };
+    let control = reservation.control;
     let mut observer = TauriRuntimeObserver::new(
         app.clone(),
         owner_window_label,
@@ -2087,21 +3339,43 @@ pub(crate) async fn launch_scan(
     Ok(StartScanResponse { job_id })
 }
 
-fn run_persistent_scan(
+fn run_persistent_scan<O: ScanWorkerObserver>(
     database_path: PathBuf,
     root: PathBuf,
     job_id: &str,
     manager: &ScanJobManager,
-    control: &dyn ScanControl,
-    observer: &mut dyn RuntimeObserver,
+    control: &ScanWorkerControl,
+    observer: &mut O,
 ) -> ScanOutcome {
     let mut runtime = ActiveReadOnlyScan::start(&database_path, &root, ScanOptions::default())
         .map_err(|error| AppError::scan(job_id.to_owned(), error.to_string()))?;
     manager.record_scan_run(job_id, runtime.ids().scan_run_id);
 
-    let enumeration = runtime
+    let mut enumeration = runtime
         .enumerate(control, observer)
         .map_err(|error| AppError::scan(job_id.to_owned(), error.to_string()))?;
+    while enumeration.status == StreamBatchStatus::Paused {
+        observer.on_worker_phase(ScanJobPhase::Paused);
+        match control.wait_while_paused() {
+            PausedWorkerAction::Resume => {
+                enumeration = runtime
+                    .resume_enumeration(control, observer)
+                    .map_err(|error| AppError::scan(job_id.to_owned(), error.to_string()))?;
+            }
+            PausedWorkerAction::Cancel => {
+                enumeration = runtime
+                    .resume_enumeration(control, observer)
+                    .map_err(|error| AppError::scan(job_id.to_owned(), error.to_string()))?;
+            }
+        }
+    }
+    control.finish_enumeration();
+    if matches!(
+        enumeration.status,
+        StreamBatchStatus::Completed | StreamBatchStatus::Partial
+    ) {
+        observer.on_worker_phase(ScanJobPhase::Running);
+    }
     match enumeration.status {
         StreamBatchStatus::Cancelled => {
             return Ok(WorkerCompletion::Cancelled(result_summary(
@@ -2118,8 +3392,15 @@ fn run_persistent_scan(
             ));
         }
         StreamBatchStatus::Completed | StreamBatchStatus::Partial => {}
+        StreamBatchStatus::InProgress | StreamBatchStatus::Paused => {
+            return Err(AppError::scan(
+                job_id.to_owned(),
+                "目录枚举离开了受支持的暂停状态机。",
+            ));
+        }
     }
 
+    observer.on_worker_stage(ScanWorkerStage::Fingerprinting);
     if let Err(error) = runtime.fingerprint_candidates(control, observer) {
         if matches!(error, RuntimeError::StageCancelled(_)) {
             return Ok(WorkerCompletion::Cancelled(result_summary(
@@ -2131,6 +3412,7 @@ fn run_persistent_scan(
         }
         return Err(AppError::scan(job_id.to_owned(), error.to_string()));
     }
+    observer.on_worker_stage(ScanWorkerStage::ExactVerification);
     if let Err(error) = runtime.verify_exact_duplicates(control, observer) {
         if matches!(error, RuntimeError::StageCancelled(_)) {
             return Ok(WorkerCompletion::Cancelled(result_summary(
@@ -2148,12 +3430,10 @@ fn run_persistent_scan(
     } else {
         ResultCompleteness::Complete
     };
-    Ok(completed_with_capture_time(
-        &mut runtime,
-        &root,
-        completeness,
-        control,
-    ))
+    observer.on_worker_stage(ScanWorkerStage::CaptureTime);
+    let completion = completed_with_capture_time(&mut runtime, &root, completeness, control);
+    observer.on_worker_stage(ScanWorkerStage::Finished);
+    Ok(completion)
 }
 
 fn completed_with_capture_time(
@@ -2258,6 +3538,32 @@ pub(crate) async fn cancel_scan(
     Ok(ScanJobStatusEvent::from(&outcome.status))
 }
 
+pub(crate) async fn pause_scan(
+    app: AppHandle,
+    owner_window_label: &str,
+    manager: &ScanJobManager,
+    job_id: &str,
+) -> Result<ScanJobStatusEvent, AppError> {
+    let outcome = manager.pause_for_owner(owner_window_label, job_id).await?;
+    if outcome.changed {
+        emit_status(&app, owner_window_label, &outcome.status);
+    }
+    Ok(ScanJobStatusEvent::from(&outcome.status))
+}
+
+pub(crate) async fn resume_scan(
+    app: AppHandle,
+    owner_window_label: &str,
+    manager: &ScanJobManager,
+    job_id: &str,
+) -> Result<ScanJobStatusEvent, AppError> {
+    let outcome = manager.resume_for_owner(owner_window_label, job_id).await?;
+    if outcome.changed {
+        emit_status(&app, owner_window_label, &outcome.status);
+    }
+    Ok(ScanJobStatusEvent::from(&outcome.status))
+}
+
 pub(crate) fn cancel_for_window_close(
     app: AppHandle,
     owner_window_label: String,
@@ -2268,6 +3574,7 @@ pub(crate) fn cancel_for_window_close(
     // if the async registry is contended, no queued or in-flight invoke can
     // mint or deliver a token for the destroyed label after this returns.
     manager.mark_result_owner_closed(&owner_window_label);
+    manager.revoke_history_exports_for_owner(&owner_window_label);
     if !manager.try_remove_result_reads_for_owner(&owner_window_label) {
         let cleanup_manager = manager.clone();
         let cleanup_owner = owner_window_label.clone();
@@ -4559,7 +5866,7 @@ fn emit_status_event(app: &AppHandle, owner_window_label: &str, status: &ScanJob
 #[cfg(test)]
 mod tests {
     use super::*;
-    use guiying_core::NoopScanControl;
+    use guiying_core::{CancellationToken, NoopScanControl};
 
     fn result(scan_run_id: i64) -> ScanResultSummary {
         ScanResultSummary {
@@ -4756,6 +6063,141 @@ mod tests {
                 .await
                 .expect("unchanged lease should finish");
             assert_eq!(manager.pending_result_read_count().await, 1);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_export_token_is_owner_bound_one_shot_and_cancellable() {
+        tauri::async_runtime::block_on(async {
+            let (fixture, manager) = configured_result_read_manager();
+            let result = manager
+                .issue_result_read_for_test("main", 7)
+                .await
+                .expect("result token");
+            let mut selection = manager
+                .begin_history_export_selection(
+                    "main",
+                    &result.result_read_token,
+                    ExportFormat::Json,
+                    HistoryExportScope::Summary,
+                    HistoryExportProjection::Redacted,
+                )
+                .await
+                .expect("export selection");
+            let target =
+                BoundExportTarget::bind(fixture.path().join("history.json"), ExportFormat::Json)
+                    .expect("bound export target");
+            let issued = manager
+                .finish_history_export_selection(&mut selection, Some(target))
+                .await
+                .expect("export token");
+            let token = issued.export_token.expect("opaque export token");
+            assert!(is_canonical_history_export_token(&token));
+            assert!(!token.contains(fixture.path().to_string_lossy().as_ref()));
+
+            let wrong_owner = manager
+                .begin_history_export("settings", &token)
+                .await
+                .expect_err("wrong owner must not consume export token");
+            assert_eq!(wrong_owner.code, "HISTORY_EXPORT_TOKEN_OWNER_MISMATCH");
+            let lease = manager
+                .begin_history_export("main", &token)
+                .await
+                .expect("owner consumes export token");
+            let replay = manager
+                .begin_history_export("main", &token)
+                .await
+                .expect_err("export token replay must fail");
+            assert_eq!(replay.code, "INVALID_HISTORY_EXPORT_TOKEN");
+            let cancelled = manager
+                .cancel_history_export("main", &token)
+                .expect("running export cancellation");
+            assert!(cancelled.cancelled);
+            assert!(lease.cancellation.is_cancelled());
+            manager
+                .finish_result_read(&lease.result_lease)
+                .await
+                .expect("release result single-flight");
+            drop(lease);
+            assert_eq!(manager.pending_history_export_count(), 0);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_export_response_never_serializes_the_selected_parent_path() {
+        tauri::async_runtime::block_on(async {
+            let (fixture, manager) = configured_result_read_manager();
+            let result = manager
+                .issue_result_read_for_test("main", 8)
+                .await
+                .expect("result token");
+            let mut selection = manager
+                .begin_history_export_selection(
+                    "main",
+                    &result.result_read_token,
+                    ExportFormat::Csv,
+                    HistoryExportScope::CompleteEvidence,
+                    HistoryExportProjection::Display,
+                )
+                .await
+                .expect("export selection");
+            let target =
+                BoundExportTarget::bind(fixture.path().join("public-name.csv"), ExportFormat::Csv)
+                    .expect("bound target");
+            let response = manager
+                .finish_history_export_selection(&mut selection, Some(target))
+                .await
+                .expect("export grant");
+            let json = serde_json::to_string(&response).expect("response JSON");
+            assert!(json.contains("public-name.csv"));
+            assert!(!json.contains(fixture.path().to_string_lossy().as_ref()));
+            assert!(!json.contains("path"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_result_revokes_its_unused_export_grant() {
+        tauri::async_runtime::block_on(async {
+            let (fixture, manager) = configured_result_read_manager();
+            let result = manager
+                .issue_result_read_for_test("main", 9)
+                .await
+                .expect("result token");
+            let mut selection = manager
+                .begin_history_export_selection(
+                    "main",
+                    &result.result_read_token,
+                    ExportFormat::Json,
+                    HistoryExportScope::Summary,
+                    HistoryExportProjection::Redacted,
+                )
+                .await
+                .expect("export selection");
+            let target =
+                BoundExportTarget::bind(fixture.path().join("revoked.json"), ExportFormat::Json)
+                    .expect("bound target");
+            let response = manager
+                .finish_history_export_selection(&mut selection, Some(target))
+                .await
+                .expect("export grant");
+            let token = response.export_token.expect("export token");
+            assert_eq!(manager.pending_history_export_count(), 1);
+            manager
+                .close_result_read("main", &result.result_read_token)
+                .await
+                .expect("close result");
+            assert_eq!(manager.pending_history_export_count(), 0);
+            assert_eq!(
+                manager
+                    .begin_history_export("main", &token)
+                    .await
+                    .expect_err("revoked token")
+                    .code,
+                "INVALID_HISTORY_EXPORT_TOKEN"
+            );
         });
     }
 
@@ -5477,13 +6919,126 @@ mod tests {
                 .await
                 .expect("job should cancel");
             assert!(first.changed);
-            assert!(reservation.cancellation.is_cancelled());
+            assert!(reservation.control.is_cancelled());
             let repeated = manager
                 .cancel(&reservation.job_id)
                 .await
                 .expect("repeat cancel should succeed");
             assert!(!repeated.changed);
         });
+    }
+
+    #[test]
+    fn enumeration_pause_resume_is_owner_scoped_and_idempotent() {
+        let manager = ScanJobManager::default();
+        let reservation = tauri::async_runtime::block_on(manager.reserve("main".to_owned()))
+            .expect("job should reserve");
+
+        let wrong_owner = tauri::async_runtime::block_on(
+            manager.pause_for_owner("settings", &reservation.job_id),
+        )
+        .expect_err("another window must not pause the job");
+        assert_eq!(wrong_owner.code, "SCAN_JOB_OWNER_MISMATCH");
+        let stale = tauri::async_runtime::block_on(manager.pause_for_owner("main", "scan-stale"))
+            .expect_err("a stale job id must not control the live worker");
+        assert_eq!(stale.code, "SCAN_JOB_NOT_FOUND");
+
+        let pausing =
+            tauri::async_runtime::block_on(manager.pause_for_owner("main", &reservation.job_id))
+                .expect("pause should be accepted");
+        assert!(pausing.changed);
+        assert_eq!(pausing.status.phase, ScanJobPhase::Pausing);
+        let repeated =
+            tauri::async_runtime::block_on(manager.pause_for_owner("main", &reservation.job_id))
+                .expect("repeat pause should be idempotent");
+        assert!(!repeated.changed);
+
+        manager.record_worker_phase(&reservation.job_id, ScanJobPhase::Paused);
+        let wrong_resume_owner = tauri::async_runtime::block_on(
+            manager.resume_for_owner("settings", &reservation.job_id),
+        )
+        .expect_err("another window must not resume the job");
+        assert_eq!(wrong_resume_owner.code, "SCAN_JOB_OWNER_MISMATCH");
+        let resuming =
+            tauri::async_runtime::block_on(manager.resume_for_owner("main", &reservation.job_id))
+                .expect("resume should be accepted");
+        assert!(resuming.changed);
+        assert_eq!(resuming.status.phase, ScanJobPhase::Resuming);
+        let repeated =
+            tauri::async_runtime::block_on(manager.resume_for_owner("main", &reservation.job_id))
+                .expect("repeat resume should be idempotent");
+        assert!(!repeated.changed);
+
+        manager.record_worker_phase(&reservation.job_id, ScanJobPhase::Running);
+        let second_pause =
+            tauri::async_runtime::block_on(manager.pause_for_owner("main", &reservation.job_id))
+                .expect("a resumed live enumeration should accept another pause");
+        assert!(second_pause.changed);
+        assert_eq!(second_pause.status.phase, ScanJobPhase::Pausing);
+    }
+
+    #[test]
+    fn cancel_dominates_resuming_before_the_runtime_acknowledges_resume() {
+        let manager = ScanJobManager::default();
+        let reservation = tauri::async_runtime::block_on(manager.reserve("main".to_owned()))
+            .expect("job should reserve");
+        tauri::async_runtime::block_on(manager.pause_for_owner("main", &reservation.job_id))
+            .expect("pause should be accepted");
+        manager.record_worker_phase(&reservation.job_id, ScanJobPhase::Paused);
+        let resuming =
+            tauri::async_runtime::block_on(manager.resume_for_owner("main", &reservation.job_id))
+                .expect("resume should wake the paused worker");
+        assert_eq!(resuming.status.phase, ScanJobPhase::Resuming);
+
+        let cancelled = match manager.try_cancel_for_owner("main") {
+            ImmediateOwnerCancel::Cancelled(status) => status,
+            ImmediateOwnerCancel::NoAction | ImmediateOwnerCancel::Contended => {
+                panic!("cancel must dominate before the runtime resume ack")
+            }
+        };
+        assert_eq!(cancelled.phase, ScanJobPhase::Cancelling);
+        assert!(reservation.control.is_cancelled());
+        assert_eq!(
+            reservation.control.wait_while_paused(),
+            PausedWorkerAction::Cancel
+        );
+    }
+
+    #[test]
+    fn pause_is_rejected_after_enumeration_and_window_close_cancel_wakes_a_paused_worker() {
+        let manager = ScanJobManager::default();
+        let reservation = tauri::async_runtime::block_on(manager.reserve("main".to_owned()))
+            .expect("job should reserve");
+        manager.record_worker_stage(&reservation.job_id, ScanWorkerStage::Fingerprinting);
+        reservation.control.finish_enumeration();
+        let rejected =
+            tauri::async_runtime::block_on(manager.pause_for_owner("main", &reservation.job_id))
+                .expect_err("fingerprinting must not accept pause");
+        assert_eq!(rejected.code, "SCAN_PAUSE_UNAVAILABLE");
+
+        let close_manager = ScanJobManager::default();
+        let close_reservation =
+            tauri::async_runtime::block_on(close_manager.reserve("close-owner".to_owned()))
+                .expect("close fixture should reserve");
+        tauri::async_runtime::block_on(
+            close_manager.pause_for_owner("close-owner", &close_reservation.job_id),
+        )
+        .expect("close fixture should enter pausing");
+        close_manager.record_worker_phase(&close_reservation.job_id, ScanJobPhase::Paused);
+        let waiter = close_reservation.control.clone();
+        let joined = std::thread::spawn(move || waiter.wait_while_paused());
+        let close_status = match close_manager.try_cancel_for_owner("close-owner") {
+            ImmediateOwnerCancel::Cancelled(status) => status,
+            ImmediateOwnerCancel::NoAction | ImmediateOwnerCancel::Contended => {
+                panic!("window-close path must cancel its paused worker")
+            }
+        };
+        assert_eq!(close_status.phase, ScanJobPhase::Cancelling);
+        assert!(close_reservation.control.is_cancelled());
+        assert_eq!(
+            joined.join().expect("paused worker should wake"),
+            PausedWorkerAction::Cancel
+        );
     }
 
     #[test]
@@ -6113,7 +7668,7 @@ mod tests {
             root.clone(),
             &reservation.job_id,
             &manager,
-            &NoopScanControl,
+            &reservation.control,
             &mut observer,
         );
         let summary = match &outcome {

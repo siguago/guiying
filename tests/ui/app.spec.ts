@@ -1,7 +1,189 @@
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test } from '@playwright/test'
+import type { Page } from '@playwright/test'
 
 const evidenceDir = 'docs/ui-delivery/evidence'
+
+type HistoryExportFixtureMode =
+  | 'warning'
+  | 'held_export'
+  | 'held_export_cancel_false'
+  | 'late_cancel_false'
+  | 'late_selection'
+  | 'queued'
+  | 'queued_cancelled'
+  | 'leaking_selection'
+  | 'wrong_extension'
+  | 'zero_complete'
+
+async function installHistoryExportFixture(page: Page, mode: HistoryExportFixtureMode) {
+  await page.addInitScript((fixtureMode) => {
+    const calls: Array<{ command: string; payload: Record<string, unknown> }> = []
+    let selectedFormat = 'json'
+    let selectedScope = 'summary'
+    let selectedPathPolicy = 'redacted'
+    let releaseSelection: (() => void) | undefined
+    let releaseExport: (() => void) | undefined
+    let rejectExport: ((reason: unknown) => void) | undefined
+    let releaseCancelFalse: (() => void) | undefined
+    let releaseQueuedRead: (() => void) | undefined
+    const exportToken = `export-${'e'.repeat(64)}`
+    const resultReadToken = `result-${'7'.repeat(64)}`
+    const historyItem = {
+      historyEntryId: '17',
+      rootDisplay: 'Archive/Export',
+      scanMode: 'full',
+      startedAtUnixMs: '1000',
+      finishedAtUnixMs: '2000',
+      durationMs: '1000',
+      coverageStatus: 'complete',
+      observedFiles: '4',
+      logicalBytes: '512',
+      verifiedGroups: fixtureMode === 'queued' || fixtureMode === 'queued_cancelled' ? '1' : '0',
+      verifiedMembers: '0',
+      redundantCopies: '0',
+      logicalReclaimableBytes: '0',
+      issues: '0',
+      unresolvedIssues: '0',
+      captureTime: {
+        status: 'not_run',
+        expectedGroups: '0',
+        evidenceGroups: '0',
+        unavailableGroups: '0',
+        failedGroups: '0',
+        sealedReportReadBytes: '0',
+        sealedReportReadOperations: '0',
+      },
+    }
+    const exportResponse = () => ({
+      fileName: selectedFormat === 'csv' ? 'sealed-report.csv' : 'sealed-report.json',
+      format: selectedFormat,
+      scope: selectedScope,
+      pathPolicy: selectedPathPolicy,
+      bytesWritten: fixtureMode === 'zero_complete' ? '0' : '512',
+      recordCount: fixtureMode === 'zero_complete'
+        ? '0'
+        : selectedScope === 'summary' ? '1' : '4',
+      digestAlgorithm: 'blake3',
+      logicalDigest: 'a'.repeat(64),
+      publicationStatus: fixtureMode === 'warning' ? 'committed_with_warning' : 'committed',
+      warningCode: fixtureMode === 'warning'
+        ? 'TEMP_CLEANUP_AND_DIRECTORY_SYNC_UNAVAILABLE'
+        : null,
+    })
+    const fixture = {
+      calls,
+      releaseSelection: () => releaseSelection?.(),
+      releaseExport: () => releaseExport?.(),
+      rejectExport: (code = 'HISTORY_EXPORT_CANCELLED') => rejectExport?.({
+        code,
+        message: code === 'HISTORY_EXPORT_CANCELLED' ? 'cancelled' : 'write failed',
+      }),
+      releaseCancelFalse: () => releaseCancelFalse?.(),
+      releaseQueuedRead: () => releaseQueuedRead?.(),
+    }
+    Object.assign(window, {
+      isTauri: true,
+      __HISTORY_EXPORT_FIXTURE__: fixture,
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
+          calls.push({ command, payload })
+          if (command === 'list_scan_history') {
+            return { schemaVersion: 1, items: [historyItem], nextCursor: null }
+          }
+          if (command === 'open_scan_history') {
+            return {
+              schemaVersion: 1,
+              historyEntryId: '17',
+              resultReadToken,
+              expiresAtUnixMs: '9999999999999',
+              summary: historyItem,
+            }
+          }
+          if (command === 'list_duplicate_groups') {
+            if (
+              (fixtureMode === 'queued' || fixtureMode === 'queued_cancelled')
+              && payload.cursor === 'groups-2'
+            ) {
+              return new Promise((resolve) => {
+                releaseQueuedRead = () => resolve({ items: [], nextCursor: null })
+              })
+            }
+            return {
+              items: [],
+              nextCursor: fixtureMode === 'queued' || fixtureMode === 'queued_cancelled'
+                ? 'groups-2'
+                : null,
+            }
+          }
+          if (command === 'select_history_export_target') {
+            selectedFormat = String(payload.format)
+            selectedScope = String(payload.scope)
+            selectedPathPolicy = String(payload.pathPolicy)
+            const selection = {
+              exportToken,
+              fileName: selectedFormat === 'csv' ? 'sealed-report.csv' : 'sealed-report.json',
+              expiresAtUnixMs: '9999999999999',
+            }
+            if (fixtureMode === 'leaking_selection') {
+              return { ...selection, parentPath: '/Users/private/export' }
+            }
+            if (fixtureMode === 'wrong_extension') {
+              return { ...selection, fileName: 'sealed-report.csv' }
+            }
+            if (fixtureMode === 'late_selection') {
+              return new Promise((resolve) => {
+                releaseSelection = () => resolve(selection)
+              })
+            }
+            return selection
+          }
+          if (command === 'export_scan_history') {
+            if (fixtureMode === 'queued_cancelled') {
+              throw {
+                code: 'INVALID_HISTORY_EXPORT_TOKEN',
+                message: 'invalid export token fixture',
+              }
+            }
+            if (
+              fixtureMode === 'held_export'
+              || fixtureMode === 'held_export_cancel_false'
+              || fixtureMode === 'late_cancel_false'
+            ) {
+              return new Promise((resolve, reject) => {
+                releaseExport = () => resolve(exportResponse())
+                rejectExport = reject
+              })
+            }
+            return exportResponse()
+          }
+          if (command === 'cancel_history_export') {
+            if (fixtureMode === 'held_export_cancel_false') {
+              return { cancelled: false }
+            }
+            if (fixtureMode === 'late_cancel_false') {
+              return new Promise((resolve) => {
+                releaseCancelFalse = () => resolve({ cancelled: false })
+              })
+            }
+            return { cancelled: true }
+          }
+          if (command === 'close_result_read') return { revoked: true }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  }, mode)
+}
+
+async function openHistoryExportPanel(page: Page) {
+  await page.goto('/')
+  await page.getByRole('button', { name: '查看历史报告' }).click()
+  await page.getByRole('button', { name: '打开 Archive/Export 的封存报告' }).click()
+  await expect(page.getByRole('heading', { name: '导出封存报告' })).toBeVisible()
+}
 
 test('landing page communicates the read-only boundary', async ({ page }) => {
   await page.goto('/')
@@ -186,6 +368,323 @@ test('a transient native status failure keeps cancellation control and recovers'
   await expect(page.getByText(/暂时无法确认扫描状态/)).toBeVisible()
   await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
   await expect(page.getByText('/Volumes/Test Photos').first()).toBeVisible()
+})
+
+test('enumeration pause is same-open only, resumes, and remains cancellable while paused', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fixture = {
+      phase: 'running',
+      pauseCalls: 0,
+      resumeCalls: 0,
+      cancelCalls: 0,
+    }
+    const terminalResult = {
+      schemaVersion: 1,
+      scanRunId: '11',
+      root: '/Volumes/Pause Photos',
+      status: 'cancelled',
+      mediaFiles: '4',
+      logicalBytes: '128',
+      candidateSizeBuckets: '0',
+      sampledFiles: '0',
+      sampledBytesRead: '0',
+      fullHashedFiles: '0',
+      fullHashBytesRead: '0',
+      verifiedGroups: '0',
+      verifiedMembers: '0',
+      redundantIndependentFiles: '0',
+      comparedPairs: '0',
+      comparedBytes: '0',
+      logicalReclaimableBytes: '0',
+      issues: '0',
+    }
+    const status = () => ({
+      jobId: 'scan-pause-fixture',
+      phase: fixture.phase,
+      startedAtUnixMs: 1_000,
+      finishedAtUnixMs: fixture.phase === 'cancelled' ? 1_500 : null,
+      scanRunId: '11',
+      historyEntryId: null,
+      progress: null,
+      result: fixture.phase === 'cancelled' ? terminalResult : null,
+      error: null,
+    })
+    Object.assign(window, {
+      isTauri: true,
+      __PAUSE_FIXTURE__: fixture,
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string) => {
+          if (command === 'plugin:event|listen') return 1
+          if (command === 'plugin:event|unlisten') return undefined
+          if (command === 'select_scan_root') return { rootToken: `root-${'b'.repeat(64)}` }
+          if (command === 'start_scan') return { jobId: 'scan-pause-fixture' }
+          if (command === 'pause_scan') {
+            fixture.pauseCalls += 1
+            fixture.phase = 'pausing'
+            return status()
+          }
+          if (command === 'resume_scan') {
+            fixture.resumeCalls += 1
+            fixture.phase = 'resuming'
+            return status()
+          }
+          if (command === 'cancel_scan') {
+            fixture.cancelCalls += 1
+            fixture.phase = 'cancelling'
+            return status()
+          }
+          if (command === 'get_scan_status') {
+            if (fixture.phase === 'pausing') fixture.phase = 'paused'
+            else if (fixture.phase === 'resuming') fixture.phase = 'running'
+            else if (fixture.phase === 'cancelling') fixture.phase = 'cancelled'
+            return status()
+          }
+          if (command === 'acknowledge_scan') return { released: true }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '选择照片目录' }).click()
+  await page.getByRole('button', { name: '开始只读扫描' }).click()
+  await expect(page.getByText('仅本次打开期间可继续；退出后需重新扫描')).toBeVisible()
+
+  await page.getByRole('button', { name: '暂停扫描' }).click()
+  await expect(page.getByRole('button', { name: '继续扫描' })).toBeVisible()
+  await expect(page.getByText('目录枚举已暂停')).toBeVisible()
+  await expect(page.getByRole('button', { name: '停止扫描' })).toBeEnabled()
+
+  await page.getByRole('button', { name: '继续扫描' }).click()
+  await expect(page.getByRole('button', { name: '暂停扫描' })).toBeVisible()
+  await page.getByRole('button', { name: '暂停扫描' }).click()
+  await expect(page.getByRole('button', { name: '继续扫描' })).toBeVisible()
+  await page.getByRole('button', { name: '停止扫描' }).click()
+  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+
+  const calls = await page.evaluate(() => (
+    window as Window & {
+      __PAUSE_FIXTURE__: { pauseCalls: number; resumeCalls: number; cancelCalls: number }
+    }
+  ).__PAUSE_FIXTURE__)
+  expect(calls).toMatchObject({ pauseCalls: 2, resumeCalls: 1, cancelCalls: 1 })
+})
+
+for (const delayedControl of ['pause', 'resume'] as const) {
+  test(`a late ${delayedControl} response cannot overwrite cancel dominance`, async ({ page }) => {
+    await page.addInitScript((delayed) => {
+      let phase = 'running'
+      let blocked = false
+      let allowTerminal = false
+      let releaseDelayed: (() => void) | undefined
+      const terminalResult = {
+        schemaVersion: 1, scanRunId: '12', root: '/Volumes/Race Photos', status: 'cancelled',
+        mediaFiles: '1', logicalBytes: '16', candidateSizeBuckets: '0', sampledFiles: '0',
+        sampledBytesRead: '0', fullHashedFiles: '0', fullHashBytesRead: '0',
+        verifiedGroups: '0', verifiedMembers: '0', redundantIndependentFiles: '0',
+        comparedPairs: '0', comparedBytes: '0', logicalReclaimableBytes: '0', issues: '0',
+      }
+      const status = (overridePhase = phase) => ({
+        jobId: 'scan-race-fixture',
+        phase: overridePhase,
+        startedAtUnixMs: 1_000,
+        finishedAtUnixMs: overridePhase === 'cancelled' ? 1_600 : null,
+        scanRunId: '12',
+        historyEntryId: null,
+        progress: null,
+        result: overridePhase === 'cancelled' ? terminalResult : null,
+        error: null,
+      })
+      Object.assign(window, {
+        isTauri: true,
+        __SCAN_CONTROL_RACE_FIXTURE__: {
+          releaseDelayed: () => releaseDelayed?.(),
+          allowTerminal: () => { allowTerminal = true },
+        },
+        __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
+        __TAURI_INTERNALS__: {
+          transformCallback: () => 1,
+          unregisterCallback: () => undefined,
+          invoke: async (command: string) => {
+            if (command === 'plugin:event|listen') return 1
+            if (command === 'plugin:event|unlisten') return undefined
+            if (command === 'select_scan_root') return { rootToken: `root-${'c'.repeat(64)}` }
+            if (command === 'start_scan') return { jobId: 'scan-race-fixture' }
+            if (command === 'pause_scan') {
+              phase = 'pausing'
+              if (delayed === 'pause') {
+                blocked = true
+                return new Promise((resolve) => {
+                  releaseDelayed = () => {
+                    blocked = false
+                    resolve(status('pausing'))
+                  }
+                })
+              }
+              return status()
+            }
+            if (command === 'resume_scan') {
+              phase = 'resuming'
+              if (delayed === 'resume') {
+                blocked = true
+                return new Promise((resolve) => {
+                  releaseDelayed = () => {
+                    blocked = false
+                    resolve(status('resuming'))
+                  }
+                })
+              }
+              return status()
+            }
+            if (command === 'cancel_scan') {
+              phase = 'cancelling'
+              return status()
+            }
+            if (command === 'get_scan_status') {
+              if (phase === 'pausing' && !blocked) phase = 'paused'
+              else if (phase === 'resuming' && !blocked) phase = 'running'
+              else if (phase === 'cancelling' && allowTerminal) phase = 'cancelled'
+              return status()
+            }
+            if (command === 'acknowledge_scan') return { released: true }
+            throw new Error(`unexpected fixture command: ${command}`)
+          },
+        },
+      })
+    }, delayedControl)
+
+    await page.goto('/')
+    await page.getByRole('button', { name: '选择照片目录' }).click()
+    await page.getByRole('button', { name: '开始只读扫描' }).click()
+    if (delayedControl === 'resume') {
+      await page.getByRole('button', { name: '暂停扫描' }).click()
+      await expect(page.getByRole('button', { name: '继续扫描' })).toBeVisible()
+      await page.getByRole('button', { name: '继续扫描' }).click()
+    } else {
+      await page.getByRole('button', { name: '暂停扫描' }).click()
+    }
+
+    await page.getByRole('button', { name: '停止扫描' }).click()
+    await page.evaluate(() => (
+      window as Window & {
+        __SCAN_CONTROL_RACE_FIXTURE__: { releaseDelayed: () => void }
+      }
+    ).__SCAN_CONTROL_RACE_FIXTURE__.releaseDelayed())
+    await expect(page.getByRole('button', { name: '停止请求已发送' })).toBeVisible()
+    await expect(page.getByText('正在暂停')).toHaveCount(0)
+    await expect(page.getByText('正在继续')).toHaveCount(0)
+
+    await page.evaluate(() => (
+      window as Window & {
+        __SCAN_CONTROL_RACE_FIXTURE__: { allowTerminal: () => void }
+      }
+    ).__SCAN_CONTROL_RACE_FIXTURE__.allowTerminal())
+    await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  })
+}
+
+test('enumeration completion clears a concurrent pausing state and advances the UI stage', async ({ page }) => {
+  await page.addInitScript(() => {
+    let callbackId = 0
+    let pauseRequested = false
+    let progressEmitted = false
+    let phase: 'running' | 'cancelling' | 'cancelled' = 'running'
+    let releasePause: (() => void) | undefined
+    const callbacks = new Map<number, (...args: unknown[]) => void>()
+    const terminalResult = {
+      schemaVersion: 1, scanRunId: '13', root: '/Volumes/Enumeration Race', status: 'cancelled',
+      mediaFiles: '2', logicalBytes: '32', candidateSizeBuckets: '0', sampledFiles: '0',
+      sampledBytesRead: '0', fullHashedFiles: '0', fullHashBytesRead: '0',
+      verifiedGroups: '0', verifiedMembers: '0', redundantIndependentFiles: '0',
+      comparedPairs: '0', comparedBytes: '0', logicalReclaimableBytes: '0', issues: '0',
+    }
+    const status = (overridePhase: string = phase) => ({
+      jobId: 'scan-enumeration-race',
+      phase: overridePhase,
+      startedAtUnixMs: 1_000,
+      finishedAtUnixMs: overridePhase === 'cancelled' ? 1_700 : null,
+      scanRunId: '13',
+      historyEntryId: null,
+      progress: null,
+      result: overridePhase === 'cancelled' ? terminalResult : null,
+      error: null,
+    })
+    Object.assign(window, {
+      isTauri: true,
+      __PAUSE_ENUMERATION_RACE_FIXTURE__: {
+        releasePause: () => releasePause?.(),
+      },
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
+      __TAURI_INTERNALS__: {
+        transformCallback: (callback: (...args: unknown[]) => void) => {
+          callbackId += 1
+          callbacks.set(callbackId, callback)
+          return callbackId
+        },
+        unregisterCallback: (id: number) => callbacks.delete(id),
+        invoke: async (command: string) => {
+          if (command === 'plugin:event|listen') return 1
+          if (command === 'plugin:event|unlisten') return undefined
+          if (command === 'select_scan_root') return { rootToken: `root-${'d'.repeat(64)}` }
+          if (command === 'start_scan') return { jobId: 'scan-enumeration-race' }
+          if (command === 'pause_scan') {
+            pauseRequested = true
+            return new Promise((resolve) => {
+              releasePause = () => resolve(status('pausing'))
+            })
+          }
+          if (command === 'cancel_scan') {
+            phase = 'cancelling'
+            return undefined
+          }
+          if (command === 'get_scan_status') {
+            if (pauseRequested && !progressEmitted) {
+              progressEmitted = true
+              for (const callback of callbacks.values()) {
+                callback({
+                  event: 'scan-progress',
+                  id: 1,
+                  payload: {
+                    jobId: 'scan-enumeration-race',
+                    stage: 'sampling',
+                    completed: 0,
+                    total: null,
+                    currentPath: null,
+                  },
+                })
+              }
+            }
+            if (phase === 'cancelling') phase = 'cancelled'
+            return status()
+          }
+          if (command === 'acknowledge_scan') return { released: true }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '选择照片目录' }).click()
+  await page.getByRole('button', { name: '开始只读扫描' }).click()
+  await page.getByRole('button', { name: '暂停扫描' }).click()
+
+  await expect(page.getByRole('heading', { name: '筛选候选' })).toBeVisible()
+  await expect(page.getByText('正在暂停')).toHaveCount(0)
+  await page.evaluate(() => (
+    window as Window & {
+      __PAUSE_ENUMERATION_RACE_FIXTURE__: { releasePause: () => void }
+    }
+  ).__PAUSE_ENUMERATION_RACE_FIXTURE__.releasePause())
+  await expect(page.getByRole('heading', { name: '筛选候选' })).toBeVisible()
+  await expect(page.getByText('正在暂停')).toHaveCount(0)
+
+  await page.getByRole('button', { name: '停止扫描' }).click()
+  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
 })
 
 test('webview rejects a path-shaped root authority instead of starting a scan', async ({ page }) => {
@@ -1448,4 +1947,257 @@ test('cancelled work exposes no unsealed duplicate or issue pages', async ({ pag
     window as Window & { __CANCELLED_FIXTURE__: { resultPageCalls: number } }
   ).__CANCELLED_FIXTURE__.resultPageCalls)
   expect(resultPageCalls).toBe(0)
+})
+
+test('history export sends only strict token payloads and surfaces commit warnings without a path', async ({ page }) => {
+  await installHistoryExportFixture(page, 'warning')
+  await openHistoryExportPanel(page)
+
+  await page.getByLabel('CSV').check()
+  await page.getByLabel('完整重复证据').check()
+  await page.getByLabel('包含显示路径').check()
+  await expect(page.getByText(/扫描问题的阶段、代码和消息/)).toBeVisible()
+  await expect(page.getByText(/问题消息都可能含个人目录名称/)).toBeVisible()
+  await expect(page.getByText(/不含拍摄时间明细、原始元数据或定位器/)).toBeVisible()
+  await expect(page.getByText(/可能含个人目录名称/)).toBeVisible()
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+
+  const status = page.locator('.history-export-status')
+  await expect(status).toContainText('sealed-report.csv 已生成')
+  await expect(status).toContainText('临时文件清理延后，且目录持久化确认不可用')
+  const calls = await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: {
+        calls: Array<{ command: string; payload: Record<string, unknown> }>
+      }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls)
+  expect(calls.find((call) => call.command === 'select_history_export_target')?.payload).toEqual({
+    resultReadToken: `result-${'7'.repeat(64)}`,
+    format: 'csv',
+    scope: 'complete_evidence',
+    pathPolicy: 'display',
+  })
+  expect(calls.find((call) => call.command === 'export_scan_history')?.payload).toEqual({
+    exportToken: `export-${'e'.repeat(64)}`,
+  })
+  expect(await page.locator('body').innerText()).not.toContain('/Users/private/export')
+  const accessibility = await new AxeBuilder({ page }).analyze()
+  expect(accessibility.violations).toEqual([])
+})
+
+test('history export waits behind the result read queue while cancellation bypasses it', async ({ page }) => {
+  await installHistoryExportFixture(page, 'queued')
+  await openHistoryExportPanel(page)
+
+  await page.getByLabel('确定重复组分页').getByRole('button', { name: '下一页' }).click()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
+    call.command === 'list_duplicate_groups'
+  )).length)).toBe(2)
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await expect(page.locator('.history-export-status')).toContainText('正在生成 sealed-report.json')
+  expect(await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.some((call) => call.command === 'export_scan_history'))).toBe(false)
+  await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { releaseQueuedRead: () => void }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.releaseQueuedRead())
+  await expect(page.locator('.history-export-status')).toContainText('sealed-report.json 已生成')
+})
+
+test('a confirmed cancel invalidates an export still waiting in the result queue', async ({ page }) => {
+  await installHistoryExportFixture(page, 'queued_cancelled')
+  await openHistoryExportPanel(page)
+
+  await page.getByLabel('确定重复组分页').getByRole('button', { name: '下一页' }).click()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
+    call.command === 'list_duplicate_groups'
+  )).length)).toBe(2)
+
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await expect(page.locator('.history-export-status')).toContainText('正在生成 sealed-report.json')
+  expect(await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.some((call) => call.command === 'export_scan_history'))).toBe(false)
+
+  await page.getByRole('button', { name: '取消导出' }).click()
+  await expect(page.locator('.history-export-status')).toContainText('导出已取消')
+  await expect(page.getByRole('button', { name: '选择文件并导出' })).toBeEnabled()
+
+  await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { releaseQueuedRead: () => void }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.releaseQueuedRead())
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
+    call.command === 'export_scan_history'
+  )).length)).toBe(1)
+  await expect(page.locator('.history-export-status')).toContainText('导出已取消')
+  await expect(page.locator('.history-export-status')).not.toContainText('invalid export token fixture')
+  await expect(page.locator('.history-export-status')).not.toContainText('INVALID_HISTORY_EXPORT_TOKEN')
+})
+
+test('history export cancel reaches native code before the queued export settles', async ({ page }) => {
+  await installHistoryExportFixture(page, 'held_export')
+  await openHistoryExportPanel(page)
+
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await expect(page.getByRole('button', { name: '取消导出' })).toBeVisible()
+  await page.getByRole('button', { name: '取消导出' }).click()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.some((call) => call.command === 'cancel_history_export'))).toBe(true)
+  await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { rejectExport: () => void }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.rejectExport())
+  await expect(page.locator('.history-export-status')).toContainText('导出已取消')
+})
+
+test('a write failure racing cancel remains a write error unless native returns the cancel code', async ({ page }) => {
+  await installHistoryExportFixture(page, 'held_export_cancel_false')
+  await openHistoryExportPanel(page)
+
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await page.getByRole('button', { name: '取消导出' }).click()
+  await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { rejectExport: (code?: string) => void }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.rejectExport('HISTORY_EXPORT_WRITE_FAILED'))
+  await expect(page.locator('.history-export-status')).toContainText('write failed')
+  await expect(page.locator('.history-export-status')).not.toContainText('导出已取消')
+})
+
+test('a late cancel-false response cannot overwrite an already completed export', async ({ page }) => {
+  await installHistoryExportFixture(page, 'late_cancel_false')
+  await openHistoryExportPanel(page)
+
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await page.getByRole('button', { name: '取消导出' }).click()
+  await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { releaseExport: () => void }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.releaseExport())
+  await expect(page.locator('.history-export-status')).toContainText('sealed-report.json 已生成')
+  await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { releaseCancelFalse: () => void }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.releaseCancelFalse())
+  await expect(page.locator('.history-export-status')).toContainText('sealed-report.json 已生成')
+  await expect(page.locator('.history-export-status')).not.toContainText('未确认停止请求')
+})
+
+test('a late history export selection is revoked and cannot overwrite the exited view', async ({ page }) => {
+  await installHistoryExportFixture(page, 'late_selection')
+  await openHistoryExportPanel(page)
+
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await expect(page.getByText('请在系统窗口中选择新文件名。')).toBeVisible()
+  await page.getByRole('button', { name: '返回历史报告' }).click()
+  await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { releaseSelection: () => void }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.releaseSelection())
+  await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
+    call.command === 'cancel_history_export'
+  )).length)).toBe(1)
+  expect(await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.some((call) => call.command === 'export_scan_history'))).toBe(false)
+})
+
+test('leaving a running history export cancels it and ignores a late completion', async ({ page }) => {
+  await installHistoryExportFixture(page, 'held_export')
+  await openHistoryExportPanel(page)
+
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await expect(page.getByRole('button', { name: '取消导出' })).toBeVisible()
+  await page.getByRole('button', { name: '返回历史报告' }).click()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
+    call.command === 'cancel_history_export'
+  )).length)).toBe(1)
+  await page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { releaseExport: () => void }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.releaseExport())
+  await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
+  await expect(page.getByText('sealed-report.json')).toHaveCount(0)
+})
+
+test('history export adapter rejects any native response that adds a parent path', async ({ page }) => {
+  await installHistoryExportFixture(page, 'leaking_selection')
+  await openHistoryExportPanel(page)
+
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await expect(page.locator('.history-export-status')).toContainText('未知或缺失字段')
+  expect(await page.locator('body').innerText()).not.toContain('/Users/private/export')
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
+    call.command === 'cancel_history_export'
+  )).length)).toBe(1)
+})
+
+test('history export adapter revokes a canonical grant whose file extension is wrong', async ({ page }) => {
+  await installHistoryExportFixture(page, 'wrong_extension')
+  await openHistoryExportPanel(page)
+
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await expect(page.locator('.history-export-status')).toContainText('扩展名与所选格式不一致')
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
+    }
+  ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
+    call.command === 'cancel_history_export'
+  )).length)).toBe(1)
+})
+
+test('complete history export rejects a zero-byte zero-record response', async ({ page }) => {
+  await installHistoryExportFixture(page, 'zero_complete')
+  await openHistoryExportPanel(page)
+
+  await page.getByLabel('完整重复证据').check()
+  await page.getByRole('button', { name: '选择文件并导出' }).click()
+  await expect(page.locator('.history-export-status')).toContainText('不符合桌面端范围约束')
+  await expect(page.locator('.history-export-status')).not.toContainText('已生成')
 })

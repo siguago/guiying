@@ -15,6 +15,7 @@ import {
   Layers3,
   LoaderCircle,
   LockKeyhole,
+  Pause,
   Play,
   RotateCcw,
   ScanSearch,
@@ -40,13 +41,19 @@ import type {
   CaptureTimeStageStatus,
   Confidence,
   DuplicateGroup,
+  HistoryExportFormat,
+  HistoryExportPathPolicy,
+  HistoryExportResult,
+  HistoryExportScope,
   ScanErrorShape,
+  ScanJobPhase,
   ScanReport,
   ScanHistoryItem,
 } from './domain'
 import { fileNameFromPath, formatBytes } from './domain'
 import {
   chooseScanDirectory,
+  cancelHistoryExport,
   cancelDirectoryScanReadOnly,
   isDesktopRuntime,
   closeResultRead,
@@ -62,8 +69,12 @@ import {
   loadScanIssuePage,
   loadScanHistoryPage,
   openScanHistoryResult,
+  pauseDirectoryScanReadOnly,
+  exportScanHistory,
   retryScanAcknowledgement,
+  resumeDirectoryScanReadOnly,
   runSyntheticScan,
+  selectHistoryExportTarget,
   startDirectoryScanReadOnly,
 } from './lib/backend'
 
@@ -596,7 +607,10 @@ function ScanningWorkspace({
   isCancelling,
   cancelError,
   statusWarning,
+  jobPhase,
   onCancel,
+  onPause,
+  onResume,
 }: {
   source: string
   stageIndex: number
@@ -604,10 +618,27 @@ function ScanningWorkspace({
   isCancelling: boolean
   cancelError: string | null
   statusWarning: string | null
+  jobPhase: ScanJobPhase
   onCancel: () => Promise<void>
+  onPause: () => Promise<void>
+  onResume: () => Promise<void>
 }) {
+  const isPaused = jobPhase === 'paused'
+  const isPausing = jobPhase === 'pausing'
+  const isResuming = jobPhase === 'resuming'
+  const canPause = canCancel && stageIndex === 0 && jobPhase === 'running'
+  const canResume = canCancel && stageIndex === 0 && isPaused
+  const liveLabel = isCancelling
+    ? '等待当前读取返回并安全停止…'
+    : isPausing
+      ? '正在到达枚举安全点…'
+      : isPaused
+        ? '目录枚举已暂停'
+        : isResuming
+          ? '正在继续目录枚举…'
+          : scanStages[stageIndex]?.label
   return (
-    <main aria-busy="true" className="workspace workspace--scan">
+    <main aria-busy={!isPaused} className="workspace workspace--scan">
       <header className="workspace-header">
         <div>
           <span className="section-kicker">只读扫描进行中</span>
@@ -615,10 +646,34 @@ function ScanningWorkspace({
           <p title={source}>{source}</p>
         </div>
         <div className="scan-actions">
-          <div aria-live="polite" className="scan-live">
-            <LoaderCircle aria-hidden="true" className="spin" size={22} />
-            {isCancelling ? '等待当前读取返回并安全停止…' : scanStages[stageIndex]?.label}
+          <div
+            aria-live="polite"
+            className={`scan-live${isPaused ? ' scan-live--paused' : ''}`}
+          >
+            {isPaused
+              ? <Pause aria-hidden="true" size={20} />
+              : <LoaderCircle aria-hidden="true" className="spin" size={22} />}
+            {liveLabel}
           </div>
+          {canPause || isPausing || canResume || isResuming ? (
+            <button
+              className="button button--quiet"
+              disabled={isCancelling || isPausing || isResuming}
+              onClick={() => void (canResume ? onResume() : onPause())}
+              type="button"
+            >
+              {canResume
+                ? <Play aria-hidden="true" size={14} fill="currentColor" />
+                : <Pause aria-hidden="true" size={14} fill="currentColor" />}
+              {isPausing
+                ? '正在暂停'
+                : isResuming
+                  ? '正在继续'
+                  : canResume
+                    ? '继续扫描'
+                    : '暂停扫描'}
+            </button>
+          ) : null}
           {canCancel ? (
             <button className="button button--quiet" disabled={isCancelling} onClick={() => void onCancel()} type="button">
               <Square aria-hidden="true" size={13} fill="currentColor" />
@@ -650,7 +705,9 @@ function ScanningWorkspace({
 
       <div className="scan-note" role={cancelError || statusWarning ? 'alert' : undefined}>
         {cancelError || statusWarning ? <TriangleAlert aria-hidden="true" size={16} /> : <LockKeyhole aria-hidden="true" size={16} />}
-        {cancelError ?? statusWarning ?? '停止请求会在当前系统读取返回后的安全检查点生效；不会触发移动、改名或改时，文件系统仍可能记录 atime。'}
+        {cancelError ?? statusWarning ?? (stageIndex === 0
+          ? '暂停只在目录枚举安全点生效；仅本次打开期间可继续；退出后需重新扫描。停止扫描始终可用。'
+          : '停止请求会在当前系统读取返回后的安全检查点生效；不会触发移动、改名或改时，文件系统仍可能记录 atime。')}
       </div>
     </main>
   )
@@ -1837,6 +1894,258 @@ function IssueDisclosure({ report }: { report: ScanReport }) {
   )
 }
 
+type HistoryExportPhase =
+  | 'idle'
+  | 'selecting'
+  | 'exporting'
+  | 'cancelling'
+  | 'cancelled'
+  | 'complete'
+  | 'warning'
+  | 'error'
+
+function historyExportWarningLabel(warningCode: string | null): string | null {
+  switch (warningCode) {
+    case 'DIRECTORY_SYNC_UNAVAILABLE': return '目录持久化确认不可用'
+    case 'TEMP_CLEANUP_DEFERRED': return '临时文件清理延后'
+    case 'TEMP_CLEANUP_AND_DIRECTORY_SYNC_UNAVAILABLE': return '临时文件清理延后，且目录持久化确认不可用'
+    case 'TARGET_IDENTITY_UNCERTAIN': return '目标文件身份确认不确定'
+    case 'TARGET_REVALIDATION_UNCERTAIN': return '目标文件最终复核不确定'
+    default: return null
+  }
+}
+
+function HistoryExportPanel({ resultReadToken }: { resultReadToken: string }) {
+  const [format, setFormat] = useState<HistoryExportFormat>('json')
+  const [scope, setScope] = useState<HistoryExportScope>('summary')
+  const [pathPolicy, setPathPolicy] = useState<HistoryExportPathPolicy>('redacted')
+  const [phase, setPhase] = useState<HistoryExportPhase>('idle')
+  const [fileName, setFileName] = useState<string | null>(null)
+  const [result, setResult] = useState<HistoryExportResult | null>(null)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const activeExportTokenRef = useRef<string | null>(null)
+  const operationGenerationRef = useRef(0)
+  const operationBusyRef = useRef(false)
+  const isBusy = phase === 'selecting' || phase === 'exporting' || phase === 'cancelling'
+
+  useEffect(() => {
+    operationGenerationRef.current += 1
+    operationBusyRef.current = false
+    activeExportTokenRef.current = null
+    setPhase('idle')
+    setFileName(null)
+    setResult(null)
+    setStatusMessage(null)
+    setActionError(null)
+    return () => {
+      operationGenerationRef.current += 1
+      const exportToken = activeExportTokenRef.current
+      activeExportTokenRef.current = null
+      if (exportToken) {
+        void cancelHistoryExport(exportToken).catch(() => undefined)
+      }
+    }
+  }, [resultReadToken])
+
+  async function beginExport() {
+    if (operationBusyRef.current) return
+    operationBusyRef.current = true
+    const requestGeneration = operationGenerationRef.current + 1
+    operationGenerationRef.current = requestGeneration
+    setPhase('selecting')
+    setFileName(null)
+    setResult(null)
+    setStatusMessage('请在系统窗口中选择新文件名。')
+    setActionError(null)
+
+    try {
+      const selection = await selectHistoryExportTarget(
+        resultReadToken,
+        format,
+        scope,
+        pathPolicy,
+      )
+      if (operationGenerationRef.current !== requestGeneration) {
+        if (selection.exportToken) {
+          void cancelHistoryExport(selection.exportToken).catch(() => undefined)
+        }
+        return
+      }
+      if (!selection.exportToken || !selection.fileName) {
+        operationBusyRef.current = false
+        setPhase('idle')
+        setStatusMessage('没有选择导出文件。')
+        return
+      }
+
+      activeExportTokenRef.current = selection.exportToken
+      setFileName(selection.fileName)
+      setPhase('exporting')
+      setStatusMessage(`正在生成 ${selection.fileName}…`)
+      const exportResult = await exportScanHistory(resultReadToken, selection.exportToken)
+      if (operationGenerationRef.current !== requestGeneration) return
+      activeExportTokenRef.current = null
+      operationBusyRef.current = false
+      setActionError(null)
+      if (
+        exportResult.fileName !== selection.fileName
+        || exportResult.format !== format
+        || exportResult.scope !== scope
+        || exportResult.pathPolicy !== pathPolicy
+      ) {
+        throw new Error('导出结果与本次授权范围不一致；请不要依据该响应判断文件状态。')
+      }
+      setResult(exportResult)
+      setFileName(exportResult.fileName)
+      if (exportResult.publicationStatus === 'committed') {
+        setPhase('complete')
+        setStatusMessage(`${exportResult.fileName} 已生成。`)
+      } else if (exportResult.publicationStatus === 'committed_with_warning') {
+        setPhase('warning')
+        setStatusMessage(`${exportResult.fileName} 已生成，但持久化或临时文件清理需要留意。`)
+      } else {
+        setPhase('warning')
+        setStatusMessage(`${exportResult.fileName} 可能已生成，但最终目标身份复核不确定；请在系统文件管理器中确认。`)
+      }
+    } catch (exportError) {
+      if (operationGenerationRef.current !== requestGeneration) return
+      activeExportTokenRef.current = null
+      operationBusyRef.current = false
+      const failure = asScanError(exportError)
+      if (failure.code === 'HISTORY_EXPORT_CANCELLED') {
+        setPhase('cancelled')
+        setStatusMessage('导出已取消；未发布完成的临时文件会由原生层清理。')
+        setActionError(null)
+      } else {
+        setPhase('error')
+        setStatusMessage(null)
+        setActionError(failure.message)
+      }
+    }
+  }
+
+  async function cancelExport() {
+    const exportToken = activeExportTokenRef.current
+    if (!exportToken || phase === 'cancelling') return
+    setPhase('cancelling')
+    setStatusMessage(`正在停止 ${fileName ?? '导出'}…`)
+    setActionError(null)
+    try {
+      const cancellation = await cancelHistoryExport(exportToken)
+      if (activeExportTokenRef.current !== exportToken) return
+      if (cancellation.cancelled) {
+        activeExportTokenRef.current = null
+        operationBusyRef.current = false
+        operationGenerationRef.current += 1
+        setPhase('cancelled')
+        setStatusMessage('导出已取消；未发布完成的临时文件会由原生层清理。')
+        setActionError(null)
+        return
+      }
+      setStatusMessage('原生层未确认停止请求；正在等待当前导出给出最终状态。')
+    } catch (cancelError) {
+      if (activeExportTokenRef.current !== exportToken) return
+      setPhase('exporting')
+      setStatusMessage(`仍在生成 ${fileName ?? '导出文件'}…`)
+      setActionError(`停止请求未送达：${asScanError(cancelError).message}`)
+    }
+  }
+
+  return (
+    <section aria-labelledby="history-export-title" className="history-export-panel">
+      <div className="history-export-panel__heading">
+        <div>
+          <span className="section-kicker">本地副本</span>
+          <h2 id="history-export-title">导出封存报告</h2>
+          <p>由系统选择目标；界面只接收文件名，不接收或显示目标目录。</p>
+        </div>
+        <Archive aria-hidden="true" size={20} />
+      </div>
+
+      <div className="history-export-options">
+        <fieldset disabled={isBusy}>
+          <legend>格式</legend>
+          <label><input checked={format === 'json'} name="history-export-format" onChange={() => setFormat('json')} type="radio" /> JSON</label>
+          <label><input checked={format === 'csv'} name="history-export-format" onChange={() => setFormat('csv')} type="radio" /> CSV</label>
+        </fieldset>
+        <fieldset
+          aria-describedby={scope === 'complete_evidence' ? 'history-export-complete-note' : undefined}
+          disabled={isBusy}
+        >
+          <legend>内容范围</legend>
+          <label><input checked={scope === 'summary'} name="history-export-scope" onChange={() => setScope('summary')} type="radio" /> 摘要</label>
+          <label><input checked={scope === 'complete_evidence'} name="history-export-scope" onChange={() => setScope('complete_evidence')} type="radio" /> 完整重复证据</label>
+        </fieldset>
+        <fieldset
+          aria-describedby={pathPolicy === 'display' ? 'history-export-display-note' : undefined}
+          disabled={isBusy}
+        >
+          <legend>路径文本</legend>
+          <label><input checked={pathPolicy === 'redacted'} name="history-export-path" onChange={() => setPathPolicy('redacted')} type="radio" /> 隐去（默认）</label>
+          <label><input checked={pathPolicy === 'display'} name="history-export-path" onChange={() => setPathPolicy('display')} type="radio" /> 包含显示路径</label>
+        </fieldset>
+      </div>
+
+      {scope === 'complete_evidence' ? (
+        <p className="history-export-scope-note" id="history-export-complete-note">
+          包含重复组、重复成员和扫描问题；不含拍摄时间明细、原始元数据或定位器。
+        </p>
+      ) : null}
+
+      {pathPolicy === 'display' ? (
+        <div className="history-export-privacy-note" id="history-export-display-note">
+          <TriangleAlert aria-hidden="true" size={15} />
+          <span>文件会包含报告中封存的显示路径，以及扫描问题的阶段、代码和消息；路径和问题消息都可能含个人目录名称。不会导出原生路径字节或文件权限。</span>
+        </div>
+      ) : null}
+
+      <div className="history-export-actions">
+        <button
+          className="button button--quiet"
+          disabled={isBusy}
+          onClick={() => void beginExport()}
+          type="button"
+        >
+          {phase === 'selecting' ? <LoaderCircle aria-hidden="true" className="is-spinning" size={15} /> : <Archive aria-hidden="true" size={15} />}
+          {phase === 'selecting' ? '等待系统选择…' : '选择文件并导出'}
+        </button>
+        {(phase === 'exporting' || phase === 'cancelling') ? (
+          <button
+            className="button button--quiet"
+            disabled={phase === 'cancelling'}
+            onClick={() => void cancelExport()}
+            type="button"
+          >
+            <Square aria-hidden="true" size={13} />
+            {phase === 'cancelling' ? '正在停止…' : '取消导出'}
+          </button>
+        ) : null}
+        <div
+          className={`history-export-status history-export-status--${phase}`}
+          role={phase === 'error' || actionError ? 'alert' : 'status'}
+        >
+          {statusMessage ? (
+            <span>{statusMessage}</span>
+          ) : (
+            <span>
+              当前设置：{format.toUpperCase()} · {scope === 'summary' ? '摘要' : '完整重复证据'} · {pathPolicy === 'redacted' ? '隐去路径文本' : '包含显示路径'}
+            </span>
+          )}
+          {fileName ? <strong title={fileName}>{fileName}</strong> : null}
+          {result ? (
+            <small>
+              {result.recordCount} 条记录 · {formatBytes(Number(result.bytesWritten))} · BLAKE3 {result.logicalDigest.slice(0, 12)}…
+              {historyExportWarningLabel(result.warningCode) ? ` · ${historyExportWarningLabel(result.warningCode)}` : ''}
+            </small>
+          ) : null}
+          {actionError ? <small>{actionError}</small> : null}
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function ResultsWorkspace({
   report,
   onReset,
@@ -2137,6 +2446,13 @@ function ResultsWorkspace({
 
       {report.dataMode === 'live' ? <CaptureTimeStageNotice report={report} /> : null}
 
+      {report.resultReadToken ? (
+        <HistoryExportPanel
+          key={report.resultReadToken}
+          resultReadToken={report.resultReadToken}
+        />
+      ) : null}
+
       <IssueDisclosure report={report} />
 
       <section aria-label="扫描摘要" className="metrics-strip">
@@ -2245,10 +2561,35 @@ function App() {
   const [isChoosing, setIsChoosing] = useState(false)
   const [activeScanJobId, setActiveScanJobId] = useState<string | null>(null)
   const [isCancelling, setIsCancelling] = useState(false)
+  const [scanJobPhase, setScanJobPhase] = useState<ScanJobPhase>('running')
   const [scanActionError, setScanActionError] = useState<string | null>(null)
   const [scanStatusWarning, setScanStatusWarning] = useState<string | null>(null)
   const chooseButtonRef = useRef<HTMLButtonElement>(null)
   const scanAttemptRef = useRef(false)
+  const activeScanJobIdRef = useRef<string | null>(null)
+  const scanJobPhaseRef = useRef<ScanJobPhase>('running')
+  const scanControlGenerationRef = useRef(0)
+
+  function updateScanJobPhase(nextPhase: ScanJobPhase) {
+    scanJobPhaseRef.current = nextPhase
+    setScanJobPhase(nextPhase)
+  }
+
+  function observeScanJobPhase(nextPhase: ScanJobPhase) {
+    const currentPhase = scanJobPhaseRef.current
+    const terminal = ['completed', 'cancelled', 'failed'].includes(nextPhase)
+    if (
+      !terminal
+      && currentPhase === 'cancelling'
+      && nextPhase !== 'cancelling'
+    ) {
+      return
+    }
+    if (terminal) {
+      scanControlGenerationRef.current += 1
+    }
+    updateScanJobPhase(nextPhase)
+  }
 
   useEffect(() => {
     const resultReadToken = report?.resultReadToken
@@ -2286,6 +2627,7 @@ function App() {
     setError(null)
     setScanActionError(null)
     setScanStatusWarning(null)
+    updateScanJobPhase('running')
     setPhase('scanning')
     try {
       const session = await startDirectoryScanReadOnly(
@@ -2301,8 +2643,10 @@ function App() {
           setStageIndex(nextStage)
         },
         setScanStatusWarning,
+        observeScanJobPhase,
       )
       setActiveScanJobId(session.jobId)
+      activeScanJobIdRef.current = session.jobId
       // The native root grant is one-shot and has already been consumed by
       // start_scan. Never keep presenting it as reusable authority while the
       // worker runs or after an error.
@@ -2321,21 +2665,92 @@ function App() {
     } finally {
       scanAttemptRef.current = false
       setActiveScanJobId(null)
+      activeScanJobIdRef.current = null
+      scanControlGenerationRef.current += 1
       setIsCancelling(false)
+      updateScanJobPhase('running')
       setScanStatusWarning(null)
     }
   }
 
   async function handleCancelScan() {
     if (!activeScanJobId || isCancelling) return
+    const jobId = activeScanJobId
+    const previousPhase = scanJobPhaseRef.current
+    const generation = scanControlGenerationRef.current + 1
+    scanControlGenerationRef.current = generation
     setIsCancelling(true)
+    updateScanJobPhase('cancelling')
     setScanActionError(null)
     setScanStatusWarning(null)
     try {
-      await cancelDirectoryScanReadOnly(activeScanJobId)
+      await cancelDirectoryScanReadOnly(jobId)
     } catch (cancelError) {
-      setIsCancelling(false)
-      setScanActionError(`停止请求未送达：${asScanError(cancelError).message}`)
+      if (
+        scanControlGenerationRef.current === generation
+        && activeScanJobIdRef.current === jobId
+        && scanJobPhaseRef.current === 'cancelling'
+      ) {
+        setIsCancelling(false)
+        updateScanJobPhase(previousPhase)
+        setScanActionError(`停止请求未送达：${asScanError(cancelError).message}`)
+      }
+    }
+  }
+
+  async function handlePauseScan() {
+    if (!activeScanJobId || scanJobPhase !== 'running' || stageIndex !== 0) return
+    const jobId = activeScanJobId
+    const generation = scanControlGenerationRef.current + 1
+    scanControlGenerationRef.current = generation
+    setScanActionError(null)
+    updateScanJobPhase('pausing')
+    try {
+      const nextPhase = await pauseDirectoryScanReadOnly(jobId)
+      if (
+        scanControlGenerationRef.current === generation
+        && activeScanJobIdRef.current === jobId
+        && scanJobPhaseRef.current === 'pausing'
+      ) {
+        updateScanJobPhase(nextPhase)
+      }
+    } catch (pauseError) {
+      if (
+        scanControlGenerationRef.current === generation
+        && activeScanJobIdRef.current === jobId
+        && scanJobPhaseRef.current === 'pausing'
+      ) {
+        updateScanJobPhase('running')
+        setScanActionError(`暂停请求未送达：${asScanError(pauseError).message}`)
+      }
+    }
+  }
+
+  async function handleResumeScan() {
+    if (!activeScanJobId || scanJobPhase !== 'paused') return
+    const jobId = activeScanJobId
+    const generation = scanControlGenerationRef.current + 1
+    scanControlGenerationRef.current = generation
+    setScanActionError(null)
+    updateScanJobPhase('resuming')
+    try {
+      const nextPhase = await resumeDirectoryScanReadOnly(jobId)
+      if (
+        scanControlGenerationRef.current === generation
+        && activeScanJobIdRef.current === jobId
+        && scanJobPhaseRef.current === 'resuming'
+      ) {
+        updateScanJobPhase(nextPhase)
+      }
+    } catch (resumeError) {
+      if (
+        scanControlGenerationRef.current === generation
+        && activeScanJobIdRef.current === jobId
+        && scanJobPhaseRef.current === 'resuming'
+      ) {
+        updateScanJobPhase('paused')
+        setScanActionError(`继续请求未送达：${asScanError(resumeError).message}`)
+      }
     }
   }
 
@@ -2349,6 +2764,7 @@ function App() {
     setError(null)
     setScanActionError(null)
     setScanStatusWarning(null)
+    updateScanJobPhase('running')
     setPhase('scanning')
     try {
       const demo = await runSyntheticScan((progress) => {
@@ -2373,6 +2789,7 @@ function App() {
     setError(null)
     setScanActionError(null)
     setScanStatusWarning(null)
+    updateScanJobPhase('running')
     setPhase('history')
   }
 
@@ -2393,7 +2810,10 @@ function App() {
     setError(null)
     setStageIndex(0)
     setActiveScanJobId(null)
+    activeScanJobIdRef.current = null
+    scanControlGenerationRef.current += 1
     setIsCancelling(false)
+    updateScanJobPhase('running')
     setScanActionError(null)
     setScanStatusWarning(null)
     scanAttemptRef.current = false
@@ -2460,7 +2880,10 @@ function App() {
             canCancel={activeScanJobId !== null}
             cancelError={scanActionError}
             isCancelling={isCancelling}
+            jobPhase={scanJobPhase}
             onCancel={handleCancelScan}
+            onPause={handlePauseScan}
+            onResume={handleResumeScan}
             source={source}
             stageIndex={stageIndex}
             statusWarning={scanStatusWarning}

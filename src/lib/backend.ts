@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { createDemoReport } from '../demo'
 import { fileNameFromPath } from '../domain'
 import type {
+  CancelHistoryExportResult,
   CaptureTimeCandidate,
   CaptureTimeGroupSummary,
   CaptureTimeIssue,
@@ -16,8 +17,14 @@ import type {
   CaptureTimeMetadataReport,
   CaptureTimeStageSummary,
   DuplicateGroup,
+  HistoryExportFormat,
+  HistoryExportPathPolicy,
+  HistoryExportResult,
+  HistoryExportScope,
+  HistoryExportTargetSelection,
   NativePathRef,
   ScanHistoryItem,
+  ScanJobPhase,
   ScanReport,
 } from '../domain'
 
@@ -31,10 +38,9 @@ interface ResultReadQueue {
 
 const resultReadQueues = new Map<string, ResultReadQueue>()
 
-async function invokeResultRead<T>(
-  command: string,
+async function runInResultReadQueue<T>(
   resultReadToken: string,
-  payload: Record<string, unknown>,
+  operation: () => Promise<T>,
 ): Promise<T> {
   const token = requireResultReadToken(resultReadToken)
   let queue = resultReadQueues.get(token)
@@ -56,7 +62,7 @@ async function invokeResultRead<T>(
   await previous
 
   try {
-    return await invoke<T>(command, { ...payload, resultReadToken: token })
+    return await operation()
   } finally {
     releaseTurn?.()
     queue.depth -= 1
@@ -64,6 +70,17 @@ async function invokeResultRead<T>(
       resultReadQueues.delete(token)
     }
   }
+}
+
+async function invokeResultRead<T>(
+  command: string,
+  resultReadToken: string,
+  payload: Record<string, unknown>,
+): Promise<T> {
+  const token = requireResultReadToken(resultReadToken)
+  return runInResultReadQueue(token, () => (
+    invoke<T>(command, { ...payload, resultReadToken: token })
+  ))
 }
 
 export interface ScanProgress {
@@ -82,7 +99,7 @@ interface CoreAppError {
 
 interface CoreScanJobStatus {
   jobId: string
-  phase: 'running' | 'cancelling' | 'completed' | 'cancelled' | 'failed'
+  phase: ScanJobPhase
   startedAtUnixMs: number
   finishedAtUnixMs: number | null
   scanRunId: string | null
@@ -417,6 +434,29 @@ interface CoreOpenScanHistoryResult {
   resultReadToken: string
   expiresAtUnixMs: string
   summary: CoreScanHistoryItem
+}
+
+interface CoreSelectHistoryExportTargetResponse {
+  exportToken: unknown
+  fileName: unknown
+  expiresAtUnixMs: unknown
+}
+
+interface CoreExportScanHistoryResponse {
+  fileName: unknown
+  format: unknown
+  scope: unknown
+  pathPolicy: unknown
+  bytesWritten: unknown
+  recordCount: unknown
+  digestAlgorithm: unknown
+  logicalDigest: unknown
+  publicationStatus: unknown
+  warningCode: unknown
+}
+
+interface CoreCancelHistoryExportResponse {
+  cancelled: unknown
 }
 
 const RESULT_PAGE_SIZE = 64
@@ -774,6 +814,233 @@ function requireResultReadToken(value: string): string {
     throw new Error('结果读取 token 格式无效；请重新打开封存报告。')
   }
   return value
+}
+
+function requireHistoryExportToken(value: string): string {
+  if (typeof value !== 'string' || !/^export-[0-9a-f]{64}$/.test(value)) {
+    throw new Error('导出授权 token 格式无效；请重新选择导出文件。')
+  }
+  return value
+}
+
+function requireStrictDto(
+  value: unknown,
+  keys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`${label}响应结构无效。`)
+  }
+  const receivedKeys = Object.keys(value)
+  if (
+    receivedKeys.length !== keys.length
+    || receivedKeys.some((key) => !keys.includes(key))
+    || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
+  ) {
+    throw new Error(`${label}响应包含未知或缺失字段；为避免路径或权限信息泄露，已拒绝接收。`)
+  }
+  return value as Record<string, unknown>
+}
+
+function requireHistoryExportFileName(value: unknown): string {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value === '.'
+    || value === '..'
+    || value.includes('/')
+    || value.includes('\\')
+    || [...value].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint === 0
+        || codePoint <= 31
+        || (codePoint >= 127 && codePoint <= 159)
+        || (codePoint >= 0xd800 && codePoint <= 0xdfff)
+    })
+    || new TextEncoder().encode(value).byteLength > 1024
+  ) {
+    throw new Error('导出响应没有提供安全的单一文件名；为避免暴露目标目录，已拒绝接收。')
+  }
+  return value
+}
+
+function hasExactHistoryExportExtension(
+  fileName: string,
+  format: HistoryExportFormat,
+): boolean {
+  const extensionSeparator = fileName.lastIndexOf('.')
+  return extensionSeparator > 0 && fileName.slice(extensionSeparator + 1) === format
+}
+
+function extractCanonicalHistoryExportToken(value: unknown): string | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  let descriptor: PropertyDescriptor | undefined
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, 'exportToken')
+  } catch {
+    return null
+  }
+  if (!descriptor || !('value' in descriptor) || typeof descriptor.value !== 'string') {
+    return null
+  }
+  return /^export-[0-9a-f]{64}$/.test(descriptor.value) ? descriptor.value : null
+}
+
+const HISTORY_EXPORT_FORMATS = ['json', 'csv'] as const
+const HISTORY_EXPORT_SCOPES = ['summary', 'complete_evidence'] as const
+const HISTORY_EXPORT_PATH_POLICIES = ['redacted', 'display'] as const
+const HISTORY_EXPORT_PUBLICATION_STATUSES = [
+  'committed',
+  'committed_with_warning',
+  'commit_uncertain',
+] as const
+
+function adaptHistoryExportTargetSelection(
+  value: unknown,
+  format: HistoryExportFormat,
+): HistoryExportTargetSelection {
+  const response = requireStrictDto(
+    value,
+    ['exportToken', 'fileName', 'expiresAtUnixMs'],
+    '导出文件选择',
+  ) as unknown as CoreSelectHistoryExportTargetResponse
+  if (
+    response.exportToken === null
+    && response.fileName === null
+    && response.expiresAtUnixMs === null
+  ) {
+    return { exportToken: null, fileName: null, expiresAtUnixMs: null }
+  }
+  if (
+    typeof response.exportToken !== 'string'
+    || typeof response.expiresAtUnixMs !== 'string'
+  ) {
+    throw new Error('导出文件选择响应不完整；本次授权已拒绝接收。')
+  }
+  const expiresAt = requireUnsignedI64Decimal(
+    response.expiresAtUnixMs,
+    '导出授权到期时间',
+    true,
+  )
+  if (expiresAt <= BigInt(Date.now())) {
+    throw new Error('导出授权已经过期；请重新选择导出文件。')
+  }
+  const fileName = requireHistoryExportFileName(response.fileName)
+  if (!hasExactHistoryExportExtension(fileName, format)) {
+    throw new Error('导出文件名扩展名与所选格式不一致；本次授权已拒绝接收。')
+  }
+  return {
+    exportToken: requireHistoryExportToken(response.exportToken),
+    fileName,
+    expiresAtUnixMs: response.expiresAtUnixMs,
+  }
+}
+
+function adaptHistoryExportResult(value: unknown): HistoryExportResult {
+  const response = requireStrictDto(
+    value,
+    [
+      'fileName', 'format', 'scope', 'pathPolicy', 'bytesWritten', 'recordCount',
+      'digestAlgorithm', 'logicalDigest', 'publicationStatus', 'warningCode',
+    ],
+    '历史报告导出',
+  ) as unknown as CoreExportScanHistoryResponse
+  if (
+    typeof response.format !== 'string'
+    || typeof response.scope !== 'string'
+    || typeof response.pathPolicy !== 'string'
+    || typeof response.publicationStatus !== 'string'
+  ) {
+    throw new Error('历史报告导出的枚举字段结构无效；结果已拒绝接收。')
+  }
+  const format = requireEnumValue(
+    response.format,
+    HISTORY_EXPORT_FORMATS,
+    '历史报告导出格式',
+  )
+  const scope = requireEnumValue(
+    response.scope,
+    HISTORY_EXPORT_SCOPES,
+    '历史报告导出范围',
+  )
+  const pathPolicy = requireEnumValue(
+    response.pathPolicy,
+    HISTORY_EXPORT_PATH_POLICIES,
+    '历史报告导出路径策略',
+  )
+  const publicationStatus = requireEnumValue(
+    response.publicationStatus,
+    HISTORY_EXPORT_PUBLICATION_STATUSES,
+    '历史报告导出发布状态',
+  )
+  if (response.digestAlgorithm !== 'blake3') {
+    throw new Error('历史报告导出摘要算法未知；结果已拒绝接收。')
+  }
+  if (typeof response.bytesWritten !== 'string' || typeof response.recordCount !== 'string') {
+    throw new Error('历史报告导出统计不是规范十进制字符串；结果已拒绝接收。')
+  }
+  const bytesWritten = requireUnsignedI64Decimal(response.bytesWritten, '历史报告导出字节数')
+  const recordCount = requireUnsignedI64Decimal(response.recordCount, '历史报告导出记录数')
+  const byteLimit = scope === 'summary' ? 2n * 1024n * 1024n : 256n * 1024n * 1024n
+  if (
+    bytesWritten > byteLimit
+    || (scope === 'summary' ? recordCount !== 1n : recordCount > 250_000n)
+    || (scope === 'complete_evidence' && (bytesWritten === 0n || recordCount === 0n))
+  ) {
+    throw new Error('历史报告导出统计不符合桌面端范围约束；结果已拒绝接收。')
+  }
+  const warningCodes = publicationStatus === 'committed_with_warning'
+    ? [
+        'DIRECTORY_SYNC_UNAVAILABLE',
+        'TEMP_CLEANUP_DEFERRED',
+        'TEMP_CLEANUP_AND_DIRECTORY_SYNC_UNAVAILABLE',
+      ] as const
+    : ['TARGET_IDENTITY_UNCERTAIN', 'TARGET_REVALIDATION_UNCERTAIN'] as const
+  let warningCode: HistoryExportResult['warningCode'] = null
+  if (publicationStatus === 'committed') {
+    if (response.warningCode !== null) {
+      throw new Error('历史报告导出成功状态携带了未知警告；结果已拒绝接收。')
+    }
+  } else {
+    if (
+      typeof response.warningCode !== 'string'
+      || !(warningCodes as readonly string[]).includes(response.warningCode)
+    ) {
+      throw new Error('历史报告导出发布警告未知；结果已拒绝接收。')
+    }
+    warningCode = response.warningCode
+  }
+  const fileName = requireHistoryExportFileName(response.fileName)
+  if (!hasExactHistoryExportExtension(fileName, format)) {
+    throw new Error('历史报告导出文件名扩展名与格式不一致；结果已拒绝接收。')
+  }
+  return {
+    fileName,
+    format,
+    scope,
+    pathPolicy,
+    bytesWritten: response.bytesWritten,
+    recordCount: response.recordCount,
+    digestAlgorithm: 'blake3',
+    logicalDigest: requireDigestHex(
+      typeof response.logicalDigest === 'string' ? response.logicalDigest : '',
+      '历史报告导出逻辑摘要',
+    ),
+    publicationStatus,
+    warningCode,
+  }
+}
+
+function adaptCancelHistoryExportResult(value: unknown): CancelHistoryExportResult {
+  const response = requireStrictDto(
+    value,
+    ['cancelled'],
+    '取消历史报告导出',
+  ) as unknown as CoreCancelHistoryExportResponse
+  if (typeof response.cancelled !== 'boolean') {
+    throw new Error('取消历史报告导出的响应结构无效。')
+  }
+  return { cancelled: response.cancelled }
 }
 
 function adaptScanHistoryItem(item: CoreScanHistoryItem): ScanHistoryItem {
@@ -2153,6 +2420,71 @@ export async function closeResultRead(resultReadToken: string): Promise<void> {
   await invoke('close_result_read', { resultReadToken })
 }
 
+export async function selectHistoryExportTarget(
+  resultReadToken: string,
+  format: HistoryExportFormat,
+  scope: HistoryExportScope,
+  pathPolicy: HistoryExportPathPolicy,
+): Promise<HistoryExportTargetSelection> {
+  const token = requireResultReadToken(resultReadToken)
+  const checkedFormat = requireEnumValue(format, HISTORY_EXPORT_FORMATS, '历史报告导出格式')
+  const checkedScope = requireEnumValue(scope, HISTORY_EXPORT_SCOPES, '历史报告导出范围')
+  const checkedPathPolicy = requireEnumValue(
+    pathPolicy,
+    HISTORY_EXPORT_PATH_POLICIES,
+    '历史报告导出路径策略',
+  )
+  const response = await invoke<unknown>('select_history_export_target', {
+    resultReadToken: token,
+    format: checkedFormat,
+    scope: checkedScope,
+    pathPolicy: checkedPathPolicy,
+  })
+  try {
+    return adaptHistoryExportTargetSelection(response, checkedFormat)
+  } catch (adaptationError) {
+    const exportToken = extractCanonicalHistoryExportToken(response)
+    if (exportToken) {
+      try {
+        await invoke('cancel_history_export', { exportToken })
+      } catch {
+        // Preserve the strict adaptation error. Native grants are also
+        // owner-bound and expire after an absolute five-minute TTL.
+      }
+    }
+    throw adaptationError
+  }
+}
+
+export async function exportScanHistory(
+  resultReadToken: string,
+  exportToken: string,
+): Promise<HistoryExportResult> {
+  const resultToken = requireResultReadToken(resultReadToken)
+  const targetToken = requireHistoryExportToken(exportToken)
+  return runInResultReadQueue(resultToken, async () => {
+    // The result token is deliberately used only as the local queue key. The
+    // one-shot native export grant already binds the result generation, and no
+    // result token is sent in this invoke payload.
+    const response = await invoke<unknown>('export_scan_history', {
+      exportToken: targetToken,
+    })
+    return adaptHistoryExportResult(response)
+  })
+}
+
+export async function cancelHistoryExport(
+  exportToken: string,
+): Promise<CancelHistoryExportResult> {
+  const targetToken = requireHistoryExportToken(exportToken)
+  // Cancellation must bypass the per-result queue so it can interrupt the
+  // export that currently owns that queue.
+  const response = await invoke<unknown>('cancel_history_export', {
+    exportToken: targetToken,
+  })
+  return adaptCancelHistoryExportResult(response)
+}
+
 export function isDesktopRuntime(): boolean {
   return isTauri()
 }
@@ -2183,6 +2515,7 @@ export async function startDirectoryScanReadOnly(
   rootToken: string,
   onProgress?: (progress: ScanProgress) => void,
   onStatusWarning?: (warning: string | null) => void,
+  onPhase?: (phase: ScanJobPhase) => void,
 ): Promise<ReadOnlyScanSession> {
   if (!isTauri()) {
     throw new Error('浏览器预览不能读取本地目录；请运行桌面应用，或使用明确标注的合成数据演示。')
@@ -2207,13 +2540,25 @@ export async function startDirectoryScanReadOnly(
     if (progressBeforeStartResponse?.jobId === expectedJobId) {
       onProgress?.(progressBeforeStartResponse)
     }
-    const result = waitForScanResult(response.jobId, startedAt, unlisten, onStatusWarning)
+    const result = waitForScanResult(
+      response.jobId,
+      startedAt,
+      unlisten,
+      onStatusWarning,
+      onPhase,
+    )
     return { jobId: response.jobId, result }
   } catch (error) {
     const existingJobId = recoverableExistingJobId(error)
     if (existingJobId) {
       expectedJobId = existingJobId
-      const result = waitForScanResult(existingJobId, startedAt, unlisten, onStatusWarning)
+      const result = waitForScanResult(
+        existingJobId,
+        startedAt,
+        unlisten,
+        onStatusWarning,
+        onPhase,
+      )
       return { jobId: existingJobId, result }
     }
     unlisten()
@@ -2228,18 +2573,35 @@ export async function cancelDirectoryScanReadOnly(jobId: string): Promise<void> 
   await invoke('cancel_scan', { jobId })
 }
 
+export async function pauseDirectoryScanReadOnly(jobId: string): Promise<ScanJobPhase> {
+  if (!isTauri()) {
+    throw new Error('浏览器预览中没有可暂停的本地扫描任务。')
+  }
+  const response = await invoke<unknown>('pause_scan', { jobId })
+  return adaptScanJobStatusEvent(response, jobId).phase
+}
+
+export async function resumeDirectoryScanReadOnly(jobId: string): Promise<ScanJobPhase> {
+  if (!isTauri()) {
+    throw new Error('浏览器预览中没有可继续的本地扫描任务。')
+  }
+  const response = await invoke<unknown>('resume_scan', { jobId })
+  return adaptScanJobStatusEvent(response, jobId).phase
+}
+
 async function waitForScanResult(
   jobId: string,
   startedAt: number,
   unlisten: () => void,
   onStatusWarning?: (warning: string | null) => void,
+  onPhase?: (phase: ScanJobPhase) => void,
 ): Promise<ScanReport> {
   let consecutiveStatusFailures = 0
   try {
     for (;;) {
-      let status: CoreScanJobStatus
+      let rawStatus: unknown
       try {
-        status = await invoke<CoreScanJobStatus>('get_scan_status', { jobId })
+        rawStatus = await invoke<unknown>('get_scan_status', { jobId })
       } catch (error) {
         if (errorCode(error) === 'SCAN_JOB_NOT_FOUND') throw error
         consecutiveStatusFailures += 1
@@ -2249,11 +2611,13 @@ async function waitForScanResult(
         await wait(Math.min(2_000, 200 * 2 ** Math.min(consecutiveStatusFailures - 1, 4)))
         continue
       }
+      const status = adaptCoreScanJobStatus(rawStatus, jobId)
 
       if (consecutiveStatusFailures > 0) {
         consecutiveStatusFailures = 0
         onStatusWarning?.(null)
       }
+      onPhase?.(status.phase)
 
       if (status.phase === 'completed' || status.phase === 'cancelled') {
         const measuredDuration = status.finishedAtUnixMs === null
@@ -2299,6 +2663,82 @@ async function waitForScanResult(
     }
   } finally {
     unlisten()
+  }
+}
+
+const SCAN_JOB_PHASES: readonly ScanJobPhase[] = [
+  'running',
+  'pausing',
+  'paused',
+  'resuming',
+  'cancelling',
+  'completed',
+  'cancelled',
+  'failed',
+]
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function requireScanJobPhase(value: unknown): ScanJobPhase {
+  if (typeof value !== 'string' || !SCAN_JOB_PHASES.includes(value as ScanJobPhase)) {
+    throw new Error('扫描任务返回了未知状态；为避免错误控制任务，已拒绝该响应。')
+  }
+  return value as ScanJobPhase
+}
+
+function requireFiniteTimestamp(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label}不是安全的非负整数。`)
+  }
+  return value
+}
+
+function adaptScanJobStatusEvent(
+  value: unknown,
+  expectedJobId: string,
+): Pick<CoreScanJobStatus, 'jobId' | 'phase'> {
+  if (!isRecord(value) || value.jobId !== expectedJobId) {
+    throw new Error('扫描控制响应不属于当前任务；已拒绝更新界面状态。')
+  }
+  return { jobId: expectedJobId, phase: requireScanJobPhase(value.phase) }
+}
+
+function adaptCoreScanJobStatus(value: unknown, expectedJobId: string): CoreScanJobStatus {
+  if (!isRecord(value) || value.jobId !== expectedJobId) {
+    throw new Error('扫描状态响应不属于当前任务；已拒绝展示。')
+  }
+  const finishedAtUnixMs = value.finishedAtUnixMs === null
+    ? null
+    : requireFiniteTimestamp(value.finishedAtUnixMs, '扫描结束时间')
+  if (value.scanRunId !== null && typeof value.scanRunId !== 'string') {
+    throw new Error('扫描运行编号格式无效。')
+  }
+  if (value.historyEntryId !== undefined
+    && value.historyEntryId !== null
+    && typeof value.historyEntryId !== 'string') {
+    throw new Error('扫描历史编号格式无效。')
+  }
+  if (value.progress !== null && !isRecord(value.progress)) {
+    throw new Error('扫描进度格式无效。')
+  }
+  if (value.result !== null && !isRecord(value.result)) {
+    throw new Error('扫描终态摘要格式无效。')
+  }
+  if (value.error !== null && !isRecord(value.error)) {
+    throw new Error('扫描错误格式无效。')
+  }
+  return {
+    jobId: expectedJobId,
+    phase: requireScanJobPhase(value.phase),
+    startedAtUnixMs: requireFiniteTimestamp(value.startedAtUnixMs, '扫描开始时间'),
+    finishedAtUnixMs,
+    scanRunId: value.scanRunId as string | null,
+    historyEntryId: value.historyEntryId as string | null | undefined,
+    progress: value.progress as ScanProgress | null,
+    result: value.result as CoreScanResultSummary | null,
+    error: value.error as CoreAppError | null,
   }
 }
 

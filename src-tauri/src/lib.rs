@@ -1,15 +1,17 @@
+mod export_target;
 mod runtime_lock;
 mod scan_service;
 
 use std::path::PathBuf;
 
 use scan_service::{
-    AcknowledgeScanResponse, AppError, CaptureTimeCandidatePage, CaptureTimeGroupSummaryItem,
-    CaptureTimeGroupSummaryPage, CaptureTimeIssuePage, CaptureTimeMemberPage,
-    CaptureTimeMetadataFieldPage, CaptureTimeMetadataFieldRawDetailItem,
+    AcknowledgeScanResponse, AppError, CancelHistoryExportResponse, CaptureTimeCandidatePage,
+    CaptureTimeGroupSummaryItem, CaptureTimeGroupSummaryPage, CaptureTimeIssuePage,
+    CaptureTimeMemberPage, CaptureTimeMetadataFieldPage, CaptureTimeMetadataFieldRawDetailItem,
     CaptureTimeMetadataReportPage, CloseResultReadResponse, DuplicateGroupMemberPage,
-    DuplicateGroupPage, OpenScanHistoryResult, ScanHistoryPage, ScanIssuePage, ScanJobManager,
-    ScanJobStatus, ScanJobStatusEvent, SelectScanRootResponse, StartScanResponse,
+    DuplicateGroupPage, ExportScanHistoryResponse, OpenScanHistoryResult, ScanHistoryPage,
+    ScanIssuePage, ScanJobManager, ScanJobStatus, ScanJobStatusEvent,
+    SelectHistoryExportTargetResponse, SelectScanRootResponse, StartScanResponse,
 };
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
@@ -45,6 +47,26 @@ async fn cancel_scan(
     job_id: String,
 ) -> Result<ScanJobStatusEvent, AppError> {
     scan_service::cancel_scan(app, window.label(), state.inner(), &job_id).await
+}
+
+#[tauri::command]
+async fn pause_scan(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, ScanJobManager>,
+    job_id: String,
+) -> Result<ScanJobStatusEvent, AppError> {
+    scan_service::pause_scan(app, window.label(), state.inner(), &job_id).await
+}
+
+#[tauri::command]
+async fn resume_scan(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, ScanJobManager>,
+    job_id: String,
+) -> Result<ScanJobStatusEvent, AppError> {
+    scan_service::resume_scan(app, window.label(), state.inner(), &job_id).await
 }
 
 #[tauri::command]
@@ -93,6 +115,44 @@ async fn close_result_read(
     result_read_token: String,
 ) -> Result<CloseResultReadResponse, AppError> {
     scan_service::close_result_read(state.inner(), window.label(), &result_read_token).await
+}
+
+#[tauri::command]
+async fn select_history_export_target(
+    window: WebviewWindow,
+    state: State<'_, ScanJobManager>,
+    result_read_token: String,
+    format: String,
+    scope: String,
+    path_policy: String,
+) -> Result<SelectHistoryExportTargetResponse, AppError> {
+    scan_service::select_history_export_target(
+        window,
+        state.inner(),
+        &result_read_token,
+        &format,
+        &scope,
+        &path_policy,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn export_scan_history(
+    window: WebviewWindow,
+    state: State<'_, ScanJobManager>,
+    export_token: String,
+) -> Result<ExportScanHistoryResponse, AppError> {
+    scan_service::export_scan_history(state.inner(), window.label(), &export_token).await
+}
+
+#[tauri::command]
+async fn cancel_history_export(
+    window: WebviewWindow,
+    state: State<'_, ScanJobManager>,
+    export_token: String,
+) -> Result<CancelHistoryExportResponse, AppError> {
+    scan_service::cancel_history_export(state.inner(), window.label(), &export_token)
 }
 
 #[tauri::command]
@@ -397,12 +457,17 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             select_scan_root,
             start_scan,
+            pause_scan,
+            resume_scan,
             cancel_scan,
             acknowledge_scan,
             get_scan_status,
             list_scan_history,
             open_scan_history,
             close_result_read,
+            select_history_export_target,
+            export_scan_history,
+            cancel_history_export,
             list_duplicate_groups,
             list_duplicate_group_members,
             list_scan_issues,

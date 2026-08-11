@@ -326,6 +326,47 @@ export interface ScanReport {
   duplicateGroups: DuplicateGroup[]
 }
 
+export type ScanJobPhase =
+  | 'running'
+  | 'pausing'
+  | 'paused'
+  | 'resuming'
+  | 'cancelling'
+  | 'completed'
+  | 'cancelled'
+  | 'failed'
+
+export type HistoryExportFormat = 'json' | 'csv'
+export type HistoryExportScope = 'summary' | 'complete_evidence'
+export type HistoryExportPathPolicy = 'redacted' | 'display'
+export type HistoryExportPublicationStatus =
+  | 'committed'
+  | 'committed_with_warning'
+  | 'commit_uncertain'
+
+export interface HistoryExportTargetSelection {
+  exportToken: string | null
+  fileName: string | null
+  expiresAtUnixMs: string | null
+}
+
+export interface HistoryExportResult {
+  fileName: string
+  format: HistoryExportFormat
+  scope: HistoryExportScope
+  pathPolicy: HistoryExportPathPolicy
+  bytesWritten: string
+  recordCount: string
+  digestAlgorithm: 'blake3'
+  logicalDigest: string
+  publicationStatus: HistoryExportPublicationStatus
+  warningCode: string | null
+}
+
+export interface CancelHistoryExportResult {
+  cancelled: boolean
+}
+
 export interface ScanErrorShape {
   code?: string
   message: string

@@ -860,6 +860,12 @@
   font-weight: 700;
 }
 
+.scan-live--paused {
+  color: var(--semantic-text-primary);
+  background: var(--semantic-surface-primary);
+  border-color: var(--semantic-border-strong);
+}
+
 .scan-actions {
   display: flex;
   flex: 0 0 auto;
@@ -1050,6 +1056,182 @@
   border-bottom: 1px solid var(--semantic-border-default);
   font-size: 10px;
   line-height: 1.5;
+}
+
+.history-export-panel {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.7fr) minmax(360px, 1.3fr);
+  gap: 14px 24px;
+  padding: 15px 22px;
+  background: var(--semantic-surface-primary);
+  border-bottom: 1px solid var(--semantic-border-default);
+}
+
+.history-export-panel__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.history-export-panel__heading > svg {
+  flex: 0 0 auto;
+  color: var(--semantic-text-positive);
+}
+
+.history-export-panel__heading h2,
+.history-export-panel__heading p {
+  margin: 0;
+}
+
+.history-export-panel__heading h2 {
+  margin-top: 6px;
+  color: var(--semantic-text-primary);
+  font-size: 16px;
+}
+
+.history-export-panel__heading p {
+  max-width: 330px;
+  margin-top: 5px;
+  color: var(--semantic-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.history-export-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  align-items: flex-start;
+}
+
+.history-export-options fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.history-export-options legend {
+  width: 100%;
+  margin-bottom: 4px;
+  color: var(--semantic-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.history-export-options label {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  color: var(--semantic-text-primary);
+  background: var(--semantic-surface-canvas);
+  border: 1px solid var(--semantic-border-default);
+  border-radius: var(--semantic-radius-control);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.history-export-options label:has(input:checked) {
+  color: var(--semantic-text-positive);
+  background: var(--semantic-surface-selected);
+  border-color: var(--semantic-action-primary);
+}
+
+.history-export-options input {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: var(--semantic-action-primary);
+}
+
+.history-export-options fieldset:disabled label {
+  cursor: not-allowed;
+  opacity: 0.64;
+}
+
+.history-export-privacy-note,
+.history-export-scope-note {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  color: var(--semantic-text-warning);
+  background: var(--semantic-surface-warning);
+  border-radius: var(--semantic-radius-control);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.history-export-scope-note {
+  margin: 0;
+  color: var(--semantic-text-secondary);
+  background: var(--semantic-surface-secondary);
+}
+
+.history-export-privacy-note svg {
+  flex: 0 0 auto;
+}
+
+.history-export-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--semantic-border-default);
+}
+
+.history-export-actions .button {
+  min-height: 38px;
+  padding-inline: 11px;
+  font-size: 12px;
+}
+
+.history-export-status {
+  display: grid;
+  min-width: 0;
+  margin-left: 4px;
+  color: var(--semantic-text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.history-export-status strong,
+.history-export-status small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-export-status small {
+  font-size: 12px;
+}
+
+.history-export-status strong {
+  color: var(--semantic-text-primary);
+  font-family: var(--semantic-font-numeric);
+}
+
+.history-export-status--complete {
+  color: var(--semantic-text-positive);
+}
+
+.history-export-status--warning,
+.history-export-status--cancelling {
+  color: var(--semantic-text-warning);
+}
+
+.history-export-status--error {
+  color: var(--semantic-text-danger);
 }
 
 .report-notice--synthetic {
@@ -2335,6 +2517,24 @@
 
   .safety-sheet {
     max-width: none;
+  }
+
+  .history-export-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .history-export-actions,
+  .history-export-privacy-note {
+    grid-column: 1;
+  }
+
+  .history-export-actions {
+    flex-wrap: wrap;
+  }
+
+  .history-export-status {
+    width: 100%;
+    margin-left: 0;
   }
 
   .results-layout {
