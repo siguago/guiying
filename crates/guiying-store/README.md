@@ -139,7 +139,11 @@ Safety properties:
   retry poisons and rolls back the whole write transaction. File and directory
   ticket pages use bounded keyset cursors and additionally require the current
   run, capability, mount-session, and core-session guards, so stale rows cannot
-  be paged as live read authority after restart;
+  be paged as live read authority after restart. Separate bounded endpoints
+  return tickets for one sealed size bucket or one exact sample/full-hash
+  fingerprint bucket; each cursor embeds the full query context, and every
+  record includes its stable path key and physical-file identity for runtime
+  revalidation before another read;
 - filesystem timestamp precision is nullable in version 6. The nanosecond
   representation unit is stored separately from actual filesystem granularity,
   so an unknown APFS/exFAT/NTFS/SMB precision stays unknown and disables cache

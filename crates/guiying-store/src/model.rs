@@ -271,6 +271,29 @@ pub struct FileTicketCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeFileTicketCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub size_bytes: i64,
+    pub last_ticket_sort_key: TicketSortKey,
+    pub last_observation_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FingerprintFileTicketCursor {
+    pub cursor_version: i64,
+    pub scan_run_id: i64,
+    pub fingerprint_kind: FreshFingerprintKind,
+    pub algorithm: String,
+    pub algorithm_version: i64,
+    pub parameters_hash: ParametersHash,
+    pub observed_size_bytes: i64,
+    pub digest: Vec<u8>,
+    pub last_ticket_sort_key: TicketSortKey,
+    pub last_observation_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryTicketCursor {
     pub cursor_version: i64,
     pub scan_run_id: i64,
@@ -281,14 +304,23 @@ pub struct DirectoryTicketCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTicketRecord {
     pub observation_id: i64,
+    pub stable_path_key: StablePathKey,
+    pub mount_relative_path_raw: Vec<u8>,
     pub root_relative_path_raw: Vec<u8>,
     pub path_encoding: String,
     pub display_path: String,
     pub source_signature: SourceSignature,
+    pub file_object_key: Option<FileObjectKey>,
     pub size_bytes: i64,
     pub ticket_format_version: i64,
     pub ticket_blob: Vec<u8>,
     pub ticket_sort_key: TicketSortKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FingerprintFileTicketRecord {
+    pub fingerprint_id: i64,
+    pub ticket: FileTicketRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -23,12 +23,13 @@ use crate::model::{
     CandidateBucketRecord, CoreSessionId, DirectoryObjectSignature, DirectoryTicketCursor,
     DirectoryTicketRecord, DuplicateGroupCursor, DuplicateGroupMemberCursor,
     DuplicateGroupMemberRecord, ExactDigestBucketCursor, ExactGroupKey, FileTicketCursor,
-    FileTicketRecord, FileTimestampParts, FingerprintBucketRecord, FingerprintHintRecord,
-    ForeignKeyViolation, FreshFingerprintKind, IntegrityCheckKind, IntegrityReport, KeysetPage,
-    ManifestDigest, MediaFileRecord, ObservationCursor, ObservationRecord, Page, ParametersHash,
-    RunEvidenceGuard, SampleBucketCursor, ScanCheckpointRecord, ScanIssueCursor, ScanIssueRecord,
-    ScanJobRecord, ScanReportRecord, ScanRunRecord, SizeBucketCursor, SizeMemberCursor,
-    StoreSettings, TicketSortKey, VerifiedExactGroup, MAX_PAGE_SIZE,
+    FileTicketRecord, FileTimestampParts, FingerprintBucketRecord, FingerprintFileTicketCursor,
+    FingerprintFileTicketRecord, FingerprintHintRecord, ForeignKeyViolation, FreshFingerprintKind,
+    IntegrityCheckKind, IntegrityReport, KeysetPage, ManifestDigest, MediaFileRecord,
+    ObservationCursor, ObservationRecord, Page, ParametersHash, RunEvidenceGuard,
+    SampleBucketCursor, ScanCheckpointRecord, ScanIssueCursor, ScanIssueRecord, ScanJobRecord,
+    ScanReportRecord, ScanRunRecord, SizeBucketCursor, SizeFileTicketCursor, SizeMemberCursor,
+    StablePathKey, StoreSettings, TicketSortKey, VerifiedExactGroup, MAX_PAGE_SIZE,
 };
 use crate::repository::RepositoryTx;
 
@@ -350,17 +351,25 @@ impl Store {
                 .unwrap_or((None, 0));
             let page_bytes = connection.query_row(
                 "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
-                     SELECT 1024 + length(observation.root_relative_path_raw) \
+                     SELECT 1024 + length(namespace_path.stable_path_key) \
+                                 + length(namespace_path.mount_relative_path_raw) \
+                                 + length(observation.root_relative_path_raw) \
                                  + length(CAST(observation.path_encoding AS BLOB)) \
                                  + length(CAST(observation.display_path AS BLOB)) \
                                  + length(ticket.source_signature) \
+                                 + COALESCE(length(observation.file_object_key), 0) \
                                  + length(ticket.ticket_blob) \
                                  + length(ticket.ticket_sort_key) AS row_bytes \
                      FROM scan_file_tickets AS ticket \
                      JOIN media_observation_snapshots AS observation \
-                       ON observation.volume_id = ticket.volume_id \
-                      AND observation.scan_run_id = ticket.scan_run_id \
-                      AND observation.id = ticket.media_observation_snapshot_id \
+                      ON observation.volume_id = ticket.volume_id \
+                     AND observation.scan_run_id = ticket.scan_run_id \
+                     AND observation.id = ticket.media_observation_snapshot_id \
+                     JOIN media_namespace_paths AS namespace_path \
+                       ON namespace_path.volume_id = observation.volume_id \
+                      AND namespace_path.id = observation.media_namespace_path_id \
+                      AND namespace_path.media_file_id = observation.media_file_id \
+                      AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
                      WHERE ticket.scan_run_id = ?1 \
                        AND (?2 IS NULL OR ticket.ticket_sort_key > ?2 \
                             OR (ticket.ticket_sort_key = ?2 \
@@ -373,16 +382,22 @@ impl Store {
             )?;
             enforce_read_budget("file ticket page", page_bytes, MAX_PAGE_RESULT_BYTES)?;
             let mut statement = connection.prepare(
-                "SELECT ticket.media_observation_snapshot_id, \
+                "SELECT ticket.media_observation_snapshot_id, namespace_path.stable_path_key, \
+                        namespace_path.mount_relative_path_raw, \
                         observation.root_relative_path_raw, observation.path_encoding, \
                         observation.display_path, ticket.source_signature, \
-                        observation.size_bytes, ticket.ticket_format_version, \
-                        ticket.ticket_blob, ticket.ticket_sort_key \
+                        observation.file_object_key, observation.size_bytes, \
+                        ticket.ticket_format_version, ticket.ticket_blob, ticket.ticket_sort_key \
                  FROM scan_file_tickets AS ticket \
                  JOIN media_observation_snapshots AS observation \
                    ON observation.volume_id = ticket.volume_id \
                   AND observation.scan_run_id = ticket.scan_run_id \
                   AND observation.id = ticket.media_observation_snapshot_id \
+                 JOIN media_namespace_paths AS namespace_path \
+                   ON namespace_path.volume_id = observation.volume_id \
+                  AND namespace_path.id = observation.media_namespace_path_id \
+                  AND namespace_path.media_file_id = observation.media_file_id \
+                  AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
                  WHERE ticket.scan_run_id = ?1 \
                    AND (?2 IS NULL OR ticket.ticket_sort_key > ?2 \
                         OR (ticket.ticket_sort_key = ?2 \
@@ -397,13 +412,16 @@ impl Store {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, Vec<u8>>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
-                            row.get::<_, Vec<u8>>(7)?,
-                            row.get::<_, Vec<u8>>(8)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, Option<Vec<u8>>>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, Vec<u8>>(10)?,
+                            row.get::<_, Vec<u8>>(11)?,
                         ))
                     },
                 )?
@@ -413,10 +431,13 @@ impl Store {
                 .map(
                     |(
                         observation_id,
+                        stable_path_key,
+                        mount_relative_path_raw,
                         root_relative_path_raw,
                         path_encoding,
                         display_path,
                         source_signature,
+                        file_object_key,
                         size_bytes,
                         ticket_format_version,
                         ticket_blob,
@@ -424,12 +445,21 @@ impl Store {
                     )| {
                         Ok(FileTicketRecord {
                             observation_id,
+                            stable_path_key: StablePathKey::from_volume_adapter(fixed_32_bytes(
+                                "stable_path_key",
+                                stable_path_key,
+                            )?),
+                            mount_relative_path_raw,
                             root_relative_path_raw,
                             path_encoding,
                             display_path,
                             source_signature: crate::model::SourceSignature::from_runtime_evidence(
                                 fixed_32_bytes("source_signature", source_signature)?,
                             ),
+                            file_object_key: file_object_key
+                                .map(|value| fixed_32_bytes("file_object_key", value))
+                                .transpose()?
+                                .map(crate::model::FileObjectKey::from_runtime_evidence),
                             size_bytes,
                             ticket_format_version,
                             ticket_blob,
@@ -446,6 +476,300 @@ impl Store {
                 scan_run_id,
                 last_ticket_sort_key: record.ticket_sort_key,
                 last_observation_id: record.observation_id,
+            })
+        })
+    }
+
+    /// Lists authenticated tickets only from one sealed duplicate-size
+    /// candidate bucket. The current core and mount session remain mandatory.
+    pub fn list_file_tickets_for_size_page(
+        &self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        size_bytes: i64,
+        cursor: Option<&SizeFileTicketCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<FileTicketRecord, SizeFileTicketCursor>> {
+        let scan_run_id = guard.scan_run_id;
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        if size_bytes < 0 {
+            return Err(StoreError::invalid_input(
+                "size_bytes",
+                "candidate size must be non-negative",
+            ));
+        }
+        let after = validate_size_file_ticket_cursor(scan_run_id, size_bytes, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_current_core_session(connection, guard, core_session_id)?;
+            require_stage_sealed(connection, scan_run_id, "enumeration")?;
+            let (after_key, after_id) = after
+                .map(|(key, id)| (Some(key.as_bytes().to_vec()), id))
+                .unwrap_or((None, 0));
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+                     SELECT 1024 + length(namespace_path.stable_path_key) \
+                                 + length(namespace_path.mount_relative_path_raw) \
+                                 + length(observation.root_relative_path_raw) \
+                                 + length(CAST(observation.path_encoding AS BLOB)) \
+                                 + length(CAST(observation.display_path AS BLOB)) \
+                                 + length(ticket.source_signature) \
+                                 + COALESCE(length(observation.file_object_key), 0) \
+                                 + length(ticket.ticket_blob) + length(ticket.ticket_sort_key) \
+                                 AS row_bytes \
+                     FROM scan_file_tickets AS ticket \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.volume_id = ticket.volume_id \
+                      AND observation.scan_run_id = ticket.scan_run_id \
+                      AND observation.id = ticket.media_observation_snapshot_id \
+                     JOIN media_namespace_paths AS namespace_path \
+                       ON namespace_path.volume_id = observation.volume_id \
+                      AND namespace_path.id = observation.media_namespace_path_id \
+                      AND namespace_path.media_file_id = observation.media_file_id \
+                      AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+                     WHERE ticket.scan_run_id = ?1 AND observation.size_bytes = ?2 \
+                       AND EXISTS ( \
+                           SELECT 1 FROM media_observation_snapshots AS candidate \
+                           WHERE candidate.scan_run_id = ?1 AND candidate.size_bytes = ?2 \
+                           GROUP BY candidate.size_bytes HAVING count(*) >= 2 \
+                       ) \
+                       AND (?3 IS NULL OR ticket.ticket_sort_key > ?3 \
+                            OR (ticket.ticket_sort_key = ?3 \
+                                AND ticket.media_observation_snapshot_id > ?4)) \
+                     ORDER BY ticket.ticket_sort_key, ticket.media_observation_snapshot_id \
+                     LIMIT ?5 \
+                 )",
+                rusqlite::params![scan_run_id, size_bytes, after_key, after_id, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget("size file-ticket page", page_bytes, MAX_PAGE_RESULT_BYTES)?;
+            let mut statement = connection.prepare(
+                "SELECT ticket.media_observation_snapshot_id, namespace_path.stable_path_key, \
+                        namespace_path.mount_relative_path_raw, \
+                        observation.root_relative_path_raw, observation.path_encoding, \
+                        observation.display_path, ticket.source_signature, \
+                        observation.file_object_key, observation.size_bytes, \
+                        ticket.ticket_format_version, ticket.ticket_blob, ticket.ticket_sort_key \
+                 FROM scan_file_tickets AS ticket \
+                 JOIN media_observation_snapshots AS observation \
+                   ON observation.volume_id = ticket.volume_id \
+                  AND observation.scan_run_id = ticket.scan_run_id \
+                  AND observation.id = ticket.media_observation_snapshot_id \
+                 JOIN media_namespace_paths AS namespace_path \
+                   ON namespace_path.volume_id = observation.volume_id \
+                  AND namespace_path.id = observation.media_namespace_path_id \
+                  AND namespace_path.media_file_id = observation.media_file_id \
+                  AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+                 WHERE ticket.scan_run_id = ?1 AND observation.size_bytes = ?2 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM media_observation_snapshots AS candidate \
+                       WHERE candidate.scan_run_id = ?1 AND candidate.size_bytes = ?2 \
+                       GROUP BY candidate.size_bytes HAVING count(*) >= 2 \
+                   ) \
+                   AND (?3 IS NULL OR ticket.ticket_sort_key > ?3 \
+                        OR (ticket.ticket_sort_key = ?3 \
+                            AND ticket.media_observation_snapshot_id > ?4)) \
+                 ORDER BY ticket.ticket_sort_key, ticket.media_observation_snapshot_id \
+                 LIMIT ?5",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![scan_run_id, size_bytes, after_key, after_id, fetch_limit],
+                |row| raw_file_ticket_from_row(row, 0),
+            )?;
+            let items = rows
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(file_ticket_record_from_raw)
+                .collect::<Result<Vec<_>>>()?;
+            keyset_page_from_items(items, limit, |record| SizeFileTicketCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                size_bytes,
+                last_ticket_sort_key: record.ticket_sort_key,
+                last_observation_id: record.observation_id,
+            })
+        })
+    }
+
+    /// Lists tickets whose current-run fresh fingerprint matches one sealed
+    /// sample or full-hash bucket. Historical hints are never eligible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_file_tickets_for_fingerprint_page(
+        &self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+        fingerprint_kind: FreshFingerprintKind,
+        algorithm: &str,
+        algorithm_version: i64,
+        parameters_hash: &ParametersHash,
+        observed_size_bytes: i64,
+        digest: &[u8],
+        cursor: Option<&FingerprintFileTicketCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<FingerprintFileTicketRecord, FingerprintFileTicketCursor>> {
+        let scan_run_id = guard.scan_run_id;
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_fingerprint_query(algorithm, algorithm_version)?;
+        validate_fingerprint_cursor_key(observed_size_bytes, digest)?;
+        let after = validate_fingerprint_file_ticket_cursor(
+            scan_run_id,
+            fingerprint_kind,
+            algorithm,
+            algorithm_version,
+            parameters_hash,
+            observed_size_bytes,
+            digest,
+            cursor,
+        )?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        let stage = match fingerprint_kind {
+            FreshFingerprintKind::Sample => "sampling",
+            FreshFingerprintKind::ExactBytes => "full_hash",
+        };
+        let read_origin = match fingerprint_kind {
+            FreshFingerprintKind::Sample => "sample_read",
+            FreshFingerprintKind::ExactBytes => "full_hash_read",
+        };
+        self.consistent_read(|connection| {
+            require_current_core_session(connection, guard, core_session_id)?;
+            require_stage_sealed(connection, scan_run_id, stage)?;
+            let (after_key, after_id) = after
+                .map(|(key, id)| (Some(key.as_bytes().to_vec()), id))
+                .unwrap_or((None, 0));
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(row_bytes), 0) FROM ( \
+                     SELECT 1536 + length(namespace_path.stable_path_key) \
+                                 + length(namespace_path.mount_relative_path_raw) \
+                                 + length(observation.root_relative_path_raw) \
+                                 + length(CAST(observation.path_encoding AS BLOB)) \
+                                 + length(CAST(observation.display_path AS BLOB)) \
+                                 + length(ticket.source_signature) \
+                                 + COALESCE(length(observation.file_object_key), 0) \
+                                 + length(ticket.ticket_blob) + length(ticket.ticket_sort_key) \
+                                 + length(fingerprint.digest) AS row_bytes \
+                     FROM observation_fingerprints AS fingerprint \
+                     JOIN scan_file_tickets AS ticket \
+                       ON ticket.volume_id = fingerprint.volume_id \
+                      AND ticket.scan_run_id = fingerprint.scan_run_id \
+                      AND ticket.media_observation_snapshot_id = \
+                          fingerprint.media_observation_snapshot_id \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.volume_id = fingerprint.volume_id \
+                      AND observation.scan_run_id = fingerprint.scan_run_id \
+                      AND observation.id = fingerprint.media_observation_snapshot_id \
+                     JOIN media_namespace_paths AS namespace_path \
+                       ON namespace_path.volume_id = observation.volume_id \
+                      AND namespace_path.id = observation.media_namespace_path_id \
+                      AND namespace_path.media_file_id = observation.media_file_id \
+                      AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+                     WHERE fingerprint.scan_run_id = ?1 \
+                       AND fingerprint.fingerprint_kind = ?2 \
+                       AND fingerprint.read_origin = ?3 \
+                       AND fingerprint.algorithm = ?4 \
+                       AND fingerprint.algorithm_version = ?5 \
+                       AND fingerprint.parameters_hash = ?6 \
+                       AND fingerprint.observed_size_bytes = ?7 \
+                       AND fingerprint.digest = ?8 \
+                       AND (?9 IS NULL OR ticket.ticket_sort_key > ?9 \
+                            OR (ticket.ticket_sort_key = ?9 \
+                                AND ticket.media_observation_snapshot_id > ?10)) \
+                     ORDER BY ticket.ticket_sort_key, ticket.media_observation_snapshot_id \
+                     LIMIT ?11 \
+                 )",
+                rusqlite::params![
+                    scan_run_id,
+                    fingerprint_kind.as_storage_str(),
+                    read_origin,
+                    algorithm,
+                    algorithm_version,
+                    parameters_hash.as_bytes().as_slice(),
+                    observed_size_bytes,
+                    digest,
+                    after_key,
+                    after_id,
+                    fetch_limit,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "fingerprint file-ticket page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT fingerprint.id, ticket.media_observation_snapshot_id, \
+                        namespace_path.stable_path_key, namespace_path.mount_relative_path_raw, \
+                        observation.root_relative_path_raw, observation.path_encoding, \
+                        observation.display_path, ticket.source_signature, \
+                        observation.file_object_key, observation.size_bytes, \
+                        ticket.ticket_format_version, ticket.ticket_blob, ticket.ticket_sort_key \
+                 FROM observation_fingerprints AS fingerprint \
+                 JOIN scan_file_tickets AS ticket \
+                   ON ticket.volume_id = fingerprint.volume_id \
+                  AND ticket.scan_run_id = fingerprint.scan_run_id \
+                  AND ticket.media_observation_snapshot_id = \
+                      fingerprint.media_observation_snapshot_id \
+                 JOIN media_observation_snapshots AS observation \
+                   ON observation.volume_id = fingerprint.volume_id \
+                  AND observation.scan_run_id = fingerprint.scan_run_id \
+                  AND observation.id = fingerprint.media_observation_snapshot_id \
+                 JOIN media_namespace_paths AS namespace_path \
+                   ON namespace_path.volume_id = observation.volume_id \
+                  AND namespace_path.id = observation.media_namespace_path_id \
+                  AND namespace_path.media_file_id = observation.media_file_id \
+                  AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+                 WHERE fingerprint.scan_run_id = ?1 \
+                   AND fingerprint.fingerprint_kind = ?2 \
+                   AND fingerprint.read_origin = ?3 \
+                   AND fingerprint.algorithm = ?4 \
+                   AND fingerprint.algorithm_version = ?5 \
+                   AND fingerprint.parameters_hash = ?6 \
+                   AND fingerprint.observed_size_bytes = ?7 \
+                   AND fingerprint.digest = ?8 \
+                   AND (?9 IS NULL OR ticket.ticket_sort_key > ?9 \
+                        OR (ticket.ticket_sort_key = ?9 \
+                            AND ticket.media_observation_snapshot_id > ?10)) \
+                 ORDER BY ticket.ticket_sort_key, ticket.media_observation_snapshot_id \
+                 LIMIT ?11",
+            )?;
+            let raw = statement
+                .query_map(
+                    rusqlite::params![
+                        scan_run_id,
+                        fingerprint_kind.as_storage_str(),
+                        read_origin,
+                        algorithm,
+                        algorithm_version,
+                        parameters_hash.as_bytes().as_slice(),
+                        observed_size_bytes,
+                        digest,
+                        after_key,
+                        after_id,
+                        fetch_limit,
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, raw_file_ticket_from_row(row, 1)?)),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let items = raw
+                .into_iter()
+                .map(|(fingerprint_id, raw)| {
+                    Ok(FingerprintFileTicketRecord {
+                        fingerprint_id,
+                        ticket: file_ticket_record_from_raw(raw)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            keyset_page_from_items(items, limit, |record| FingerprintFileTicketCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                fingerprint_kind,
+                algorithm: algorithm.to_owned(),
+                algorithm_version,
+                parameters_hash: *parameters_hash,
+                observed_size_bytes,
+                digest: digest.to_vec(),
+                last_ticket_sort_key: record.ticket.ticket_sort_key,
+                last_observation_id: record.ticket.observation_id,
             })
         })
     }
@@ -2496,6 +2820,71 @@ fn query_observations_page(
     Ok(items)
 }
 
+struct RawFileTicketRecord {
+    observation_id: i64,
+    stable_path_key: Vec<u8>,
+    mount_relative_path_raw: Vec<u8>,
+    root_relative_path_raw: Vec<u8>,
+    path_encoding: String,
+    display_path: String,
+    source_signature: Vec<u8>,
+    file_object_key: Option<Vec<u8>>,
+    size_bytes: i64,
+    ticket_format_version: i64,
+    ticket_blob: Vec<u8>,
+    ticket_sort_key: Vec<u8>,
+}
+
+fn raw_file_ticket_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<RawFileTicketRecord> {
+    Ok(RawFileTicketRecord {
+        observation_id: row.get(offset)?,
+        stable_path_key: row.get(offset + 1)?,
+        mount_relative_path_raw: row.get(offset + 2)?,
+        root_relative_path_raw: row.get(offset + 3)?,
+        path_encoding: row.get(offset + 4)?,
+        display_path: row.get(offset + 5)?,
+        source_signature: row.get(offset + 6)?,
+        file_object_key: row.get(offset + 7)?,
+        size_bytes: row.get(offset + 8)?,
+        ticket_format_version: row.get(offset + 9)?,
+        ticket_blob: row.get(offset + 10)?,
+        ticket_sort_key: row.get(offset + 11)?,
+    })
+}
+
+fn file_ticket_record_from_raw(raw: RawFileTicketRecord) -> Result<FileTicketRecord> {
+    Ok(FileTicketRecord {
+        observation_id: raw.observation_id,
+        stable_path_key: StablePathKey::from_volume_adapter(fixed_32_bytes(
+            "stable_path_key",
+            raw.stable_path_key,
+        )?),
+        mount_relative_path_raw: raw.mount_relative_path_raw,
+        root_relative_path_raw: raw.root_relative_path_raw,
+        path_encoding: raw.path_encoding,
+        display_path: raw.display_path,
+        source_signature: crate::model::SourceSignature::from_runtime_evidence(fixed_32_bytes(
+            "source_signature",
+            raw.source_signature,
+        )?),
+        file_object_key: raw
+            .file_object_key
+            .map(|value| fixed_32_bytes("file_object_key", value))
+            .transpose()?
+            .map(crate::model::FileObjectKey::from_runtime_evidence),
+        size_bytes: raw.size_bytes,
+        ticket_format_version: raw.ticket_format_version,
+        ticket_blob: raw.ticket_blob,
+        ticket_sort_key: TicketSortKey::from_core_evidence(fixed_32_bytes(
+            "ticket_sort_key",
+            raw.ticket_sort_key,
+        )?),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn query_fingerprint_buckets_page(
     connection: &Connection,
@@ -2797,6 +3186,72 @@ fn validate_file_ticket_cursor(
         Some(cursor) if cursor.last_observation_id <= 0 => Err(StoreError::invalid_input(
             "cursor",
             "file-ticket cursor observation id must be positive",
+        )),
+        Some(cursor) => Ok(Some((
+            cursor.last_ticket_sort_key,
+            cursor.last_observation_id,
+        ))),
+    }
+}
+
+fn validate_size_file_ticket_cursor(
+    scan_run_id: i64,
+    size_bytes: i64,
+    cursor: Option<&SizeFileTicketCursor>,
+) -> Result<Option<(TicketSortKey, i64)>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id || cursor.size_bytes != size_bytes => {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "size file-ticket cursor belongs to a different run or size bucket",
+            ))
+        }
+        Some(cursor) if cursor.last_observation_id <= 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "size file-ticket cursor observation id must be positive",
+        )),
+        Some(cursor) => Ok(Some((
+            cursor.last_ticket_sort_key,
+            cursor.last_observation_id,
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_fingerprint_file_ticket_cursor(
+    scan_run_id: i64,
+    fingerprint_kind: FreshFingerprintKind,
+    algorithm: &str,
+    algorithm_version: i64,
+    parameters_hash: &ParametersHash,
+    observed_size_bytes: i64,
+    digest: &[u8],
+    cursor: Option<&FingerprintFileTicketCursor>,
+) -> Result<Option<(TicketSortKey, i64)>> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor)
+            if cursor.cursor_version != KEYSET_CURSOR_VERSION
+                || cursor.scan_run_id != scan_run_id
+                || cursor.fingerprint_kind != fingerprint_kind
+                || cursor.algorithm != algorithm
+                || cursor.algorithm_version != algorithm_version
+                || cursor.parameters_hash != *parameters_hash
+                || cursor.observed_size_bytes != observed_size_bytes
+                || cursor.digest != digest =>
+        {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "fingerprint file-ticket cursor belongs to a different bucket query",
+            ))
+        }
+        Some(cursor) if cursor.last_observation_id <= 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "fingerprint file-ticket cursor observation id must be positive",
         )),
         Some(cursor) => Ok(Some((
             cursor.last_ticket_sort_key,

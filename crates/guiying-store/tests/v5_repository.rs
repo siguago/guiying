@@ -133,7 +133,7 @@ fn v6_core_ticket_coverage_is_required_before_exact_seal() -> Result<(), Box<dyn
             observed_at_ms: 173,
         },
     ];
-    store.write_transaction(|repository| {
+    let observation_ids = store.write_transaction(|repository| {
         repository.bind_core_session(&run.guard, &session)?;
         repository.bind_core_session(&run.guard, &session)?;
         let first_ids =
@@ -146,7 +146,7 @@ fn v6_core_ticket_coverage_is_required_before_exact_seal() -> Result<(), Box<dyn
         let repeated_directories =
             repository.record_core_directory_batch(&run.guard, &core_session_id, &directories)?;
         assert_eq!(first_directories, repeated_directories);
-        Ok(())
+        Ok(first_ids)
     })?;
     let mut conflicting_files = files.clone();
     conflicting_files[0].ticket_blob[0] ^= 1;
@@ -161,10 +161,99 @@ fn v6_core_ticket_coverage_is_required_before_exact_seal() -> Result<(), Box<dyn
         .expect_err("changed opaque ticket was treated as an idempotent retry");
     assert!(matches!(conflict, StoreError::IdempotencyConflict { .. }));
     store.write_transaction(|repository| {
-        repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 2, 20, 200)?;
-        repository.seal_scan_stage(&run.guard, ScanStage::Sampling, 0, 0, 210)?;
-        repository.seal_scan_stage(&run.guard, ScanStage::FullHash, 0, 0, 220)?;
-        Ok(())
+        repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 2, 20, 200)
+    })?;
+    let first_size_page =
+        store.list_file_tickets_for_size_page(&run.guard, &core_session_id, 10, None, 1)?;
+    assert_eq!(first_size_page.items.len(), 1);
+    let second_size_page = store.list_file_tickets_for_size_page(
+        &run.guard,
+        &core_session_id,
+        10,
+        first_size_page.next_cursor.as_ref(),
+        1,
+    )?;
+    assert_eq!(second_size_page.items.len(), 1);
+    let sample_parameters = ParametersHash::from_runtime_evidence([91; 32]);
+    let sample_fingerprints = observation_ids
+        .iter()
+        .enumerate()
+        .map(|(index, observation_id)| FreshFingerprintInput {
+            observation_id: *observation_id,
+            fingerprint_kind: FreshFingerprintKind::Sample,
+            algorithm: ALGORITHM.into(),
+            algorithm_version: 1,
+            parameters_hash: sample_parameters,
+            read_origin: FingerprintReadOrigin::SampleRead,
+            source_signature_before: files[index].observation.source_signature,
+            source_signature_after: files[index].observation.source_signature,
+            digest: vec![92; 32],
+            observed_size_bytes: 10,
+            bytes_read: 4,
+            reached_expected_eof: false,
+            completed_at_ms: 205 + i64::try_from(index).expect("small fixture index"),
+            created_at_ms: 205 + i64::try_from(index).expect("small fixture index"),
+        })
+        .collect::<Vec<_>>();
+    store.write_transaction(|repository| {
+        repository.record_fingerprint_fresh_batch(&run.guard, &sample_fingerprints)?;
+        repository.seal_scan_stage(&run.guard, ScanStage::Sampling, 2, 8, 210)
+    })?;
+    let first_sample_page = store.list_file_tickets_for_fingerprint_page(
+        &run.guard,
+        &core_session_id,
+        FreshFingerprintKind::Sample,
+        ALGORITHM,
+        1,
+        &sample_parameters,
+        10,
+        &[92; 32],
+        None,
+        1,
+    )?;
+    assert_eq!(first_sample_page.items.len(), 1);
+    let second_sample_page = store.list_file_tickets_for_fingerprint_page(
+        &run.guard,
+        &core_session_id,
+        FreshFingerprintKind::Sample,
+        ALGORITHM,
+        1,
+        &sample_parameters,
+        10,
+        &[92; 32],
+        first_sample_page.next_cursor.as_ref(),
+        1,
+    )?;
+    assert_eq!(second_sample_page.items.len(), 1);
+    assert_ne!(
+        first_sample_page.items[0].fingerprint_id,
+        second_sample_page.items[0].fingerprint_id
+    );
+    let mut wrong_sample_cursor = first_sample_page
+        .next_cursor
+        .clone()
+        .ok_or("first sample ticket page lacked a continuation cursor")?;
+    wrong_sample_cursor.digest[0] ^= 1;
+    let wrong_sample_error = store
+        .list_file_tickets_for_fingerprint_page(
+            &run.guard,
+            &core_session_id,
+            FreshFingerprintKind::Sample,
+            ALGORITHM,
+            1,
+            &sample_parameters,
+            10,
+            &[92; 32],
+            Some(&wrong_sample_cursor),
+            1,
+        )
+        .expect_err("fingerprint ticket page accepted a cursor from another digest");
+    assert!(matches!(
+        wrong_sample_error,
+        StoreError::InvalidInput { .. }
+    ));
+    store.write_transaction(|repository| {
+        repository.seal_scan_stage(&run.guard, ScanStage::FullHash, 0, 0, 220)
     })?;
     let first_file_page = store.list_file_tickets_page(&run.guard, &core_session_id, None, 1)?;
     assert_eq!(first_file_page.items.len(), 1);
