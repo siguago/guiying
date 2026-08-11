@@ -16,12 +16,16 @@ the independently bound volume session before a short Store transaction can
 persist the event batch. Filesystem I/O is never performed while a SQLite write
 transaction is open.
 
-The macOS runtime now also implements the first three read-only evidence stages:
+The macOS runtime now implements the complete read-only D1 evidence pipeline:
 
 1. sample only files in an enumeration-sealed duplicate-size bucket;
 2. fully hash only files in a sampling-sealed collision bucket;
-3. replay every directory ticket in canonical order, bracketed by the current
-   volume mount, before accepting the core coverage seal.
+3. compare every full-hash candidate byte-for-byte through authenticated core
+   tickets and independently held volume descriptors;
+4. build bounded, invisible Store drafts and publish a group only when every
+   member, comparison edge, source signature, digest, and manifest agrees;
+5. replay every directory ticket in canonical order, bracketed by the current
+   volume mount, then seal the exact stage and complete the run.
 
 Before either core read starts, the adapter opens the same lossless locator
 through the bound volume session and matches its stable path, physical file
@@ -34,7 +38,9 @@ Complete coverage requires both the core directory-set digest and a separate
 volume manifest derived from lossless directory locators, object identities,
 root scope, and mount session. Partial enumeration, a changed directory, a
 changed root, cancellation, or a mismatched count cannot unlock exact groups.
+Coverage intentionally runs after all file reads so it brackets the entire
+analysis. A cryptographic hash collision abandons that whole hash bucket rather
+than guessing at a subgroup; other verified buckets can still complete.
 
-Byte-for-byte groups, metadata/time, and quarantine executors remain
-unavailable until their own proof adapters and fault-injection gates are
-implemented.
+Metadata/time and quarantine executors remain unavailable until their own proof
+adapters and fault-injection gates are implemented.

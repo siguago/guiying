@@ -13,23 +13,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use guiying_core::{
-    CoverageSeal, DirectoryObservation, DirectoryObservationTicket, FileObservation,
-    FileObservationTicket, FreshFingerprintEvidence, FreshReadOrigin, MediaKind, PathEncoding,
-    PathRef, ScanControl, ScanIssue, ScanIssueCode, ScanOptions, ScanProgress, Scanner,
-    StageBatchOutcome, StreamBatchStatus, StreamEvent, StreamLimits, StreamRootKind,
-    StreamRootObservation, StreamTrustScope, StreamingEnumerationOutcome, StreamingScanSession,
-    StreamingScanSink,
+    CoverageSeal, DirectoryObservation, DirectoryObservationTicket, ExactCandidatePair,
+    ExactComparisonEvidence, FileObservation, FileObservationTicket, FreshFingerprintEvidence,
+    FreshReadOrigin, MediaKind, PathEncoding, PathRef, ScanControl, ScanIssue, ScanIssueCode,
+    ScanOptions, ScanProgress, Scanner, StageBatchOutcome, StreamBatchStatus, StreamEvent,
+    StreamLimits, StreamRootKind, StreamRootObservation, StreamTrustScope,
+    StreamingEnumerationOutcome, StreamingScanSession, StreamingScanSink,
 };
 use guiying_store::{
-    CapabilityProfileInput, CoreCoverageSealDigest, CoreDirectoryManifest,
-    CoreDirectoryObservationInput, CoreFileObservationInput, CoreSessionId, CoreSessionInput,
-    CoverageOutcomeInput, CoverageStatus, DirectoryObjectSignature, DirectoryTicketCursor,
-    DirectoryTicketRecord, FileObjectKey, FileTicketRecord, FileTimestampParts,
-    FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind, MountSessionKey,
+    compute_exact_group_member_leaf, BeginExactGroupInput, BuildKey, CapabilityProfileInput,
+    CoreCoverageSealDigest, CoreDirectoryManifest, CoreDirectoryObservationInput,
+    CoreFileObservationInput, CoreSessionId, CoreSessionInput, CoverageOutcomeInput,
+    CoverageStatus, DirectoryObjectSignature, DirectoryTicketCursor, DirectoryTicketRecord,
+    ExactDigestBucketCursor, ExactGroupManifestMember, ExactGroupMemberInput,
+    ExactVerificationEdgeInput, FileObjectKey, FileTicketRecord, FileTimestampParts,
+    FingerprintBucketRecord, FingerprintFileTicketRecord, FingerprintReadOrigin,
+    FreshFingerprintInput, FreshFingerprintKind, ManifestDigest, MountSessionKey,
     NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue, NewScopedScanJob,
     ObservationInput, ParametersHash, RootObjectSignature, RootScopeKey, RunEvidenceGuard,
     SampleBucketCursor, ScanStage, SizeBucketCursor, SourceSignature, StablePathKey, Store,
-    StoreError, TicketSortKey, VolumeCoverageManifest, VolumeInput,
+    StoreError, TicketSortKey, VerifiedExactGroup, VolumeCoverageManifest, VolumeInput,
 };
 use guiying_volume::{
     BoundMediaPath, BoundVolumeSession, CaseBehaviorObservation, FileObjectIdentity,
@@ -120,6 +123,20 @@ pub struct CoverageSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactDuplicateSummary {
+    pub candidate_buckets: u64,
+    pub verified_groups: u64,
+    pub verified_members: u64,
+    pub compared_pairs: u64,
+    pub compared_bytes: u64,
+    pub persisted_identical_edges: u64,
+    pub persisted_identical_edge_bytes: u64,
+    pub logical_reclaimable_bytes: u64,
+    pub hash_collision_buckets: u64,
+    pub issues: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FingerprintSpec {
     algorithm: String,
     algorithm_version: i64,
@@ -149,6 +166,7 @@ pub struct ActiveReadOnlyScan {
     enumeration: Option<EnumerationSummary>,
     fingerprint_analysis: Option<FingerprintAnalysisState>,
     coverage: Option<CoverageSummary>,
+    exact_duplicates: Option<ExactDuplicateSummary>,
     issues_recorded: u64,
     files_fingerprinted: u64,
 }
@@ -182,6 +200,7 @@ impl ActiveReadOnlyScan {
             enumeration: None,
             fingerprint_analysis: None,
             coverage: None,
+            exact_duplicates: None,
             issues_recorded: 0,
             files_fingerprinted: 0,
         })
@@ -215,6 +234,10 @@ impl ActiveReadOnlyScan {
 
     pub const fn coverage_summary(&self) -> Option<&CoverageSummary> {
         self.coverage.as_ref()
+    }
+
+    pub const fn exact_duplicate_summary(&self) -> Option<&ExactDuplicateSummary> {
+        self.exact_duplicates.as_ref()
     }
 
     /// Enumerates once with synchronous storage backpressure. Every root,
@@ -381,7 +404,6 @@ impl ActiveReadOnlyScan {
         let mut candidate_size_buckets = 0_u64;
         let mut sampled_files = 0_u64;
         let mut sampled_bytes_read = 0_u64;
-        let mut sampled_logical_bytes = 0_u64;
         let mut sample_specs = BTreeMap::<i64, FingerprintSpec>::new();
         let mut size_cursor: Option<SizeBucketCursor> = None;
 
@@ -429,11 +451,6 @@ impl ActiveReadOnlyScan {
                         sampled_bytes_read,
                         result.bytes_read,
                     )?;
-                    sampled_logical_bytes = checked_add_u64(
-                        "sample logical bytes",
-                        sampled_logical_bytes,
-                        result.logical_bytes,
-                    )?;
                     if let Some(spec) = result.spec {
                         if let Some(existing) = sample_specs.get(&bucket.observed_size_bytes) {
                             if existing != &spec {
@@ -464,7 +481,7 @@ impl ActiveReadOnlyScan {
                 &self.guard,
                 ScanStage::Sampling,
                 checked_i64("sampled file count", sampled_files).map_err(runtime_store_error)?,
-                checked_i64("sample logical bytes", sampled_logical_bytes)
+                checked_i64("sample bytes read", sampled_bytes_read)
                     .map_err(runtime_store_error)?,
                 now_ms().map_err(runtime_store_error)?,
             )
@@ -473,7 +490,6 @@ impl ActiveReadOnlyScan {
         let mut sample_collision_buckets = 0_u64;
         let mut full_hashed_files = 0_u64;
         let mut full_hash_bytes_read = 0_u64;
-        let mut full_hash_logical_bytes = 0_u64;
         let mut full_hash_spec = None;
         for sample_spec in sample_specs.values() {
             let mut bucket_cursor: Option<SampleBucketCursor> = None;
@@ -534,11 +550,6 @@ impl ActiveReadOnlyScan {
                             full_hash_bytes_read,
                             result.bytes_read,
                         )?;
-                        full_hash_logical_bytes = checked_add_u64(
-                            "full-hash logical bytes",
-                            full_hash_logical_bytes,
-                            result.logical_bytes,
-                        )?;
                         if let Some(spec) = result.spec {
                             if full_hash_spec.as_ref().is_some_and(|value| value != &spec) {
                                 return Err(RuntimeError::EvidenceMismatch(
@@ -567,7 +578,7 @@ impl ActiveReadOnlyScan {
                 ScanStage::FullHash,
                 checked_i64("full-hashed file count", full_hashed_files)
                     .map_err(runtime_store_error)?,
-                checked_i64("full-hash logical bytes", full_hash_logical_bytes)
+                checked_i64("full-hash bytes read", full_hash_bytes_read)
                     .map_err(runtime_store_error)?,
                 now_ms().map_err(runtime_store_error)?,
             )
@@ -634,7 +645,7 @@ impl ActiveReadOnlyScan {
         validate_stage_counts(tickets.len(), &outcome)?;
 
         let completed_at_ms = now_ms()?;
-        let (inputs, bytes_read, logical_bytes, spec) = translate_fingerprint_evidence(
+        let (inputs, bytes_read, spec) = translate_fingerprint_evidence(
             self.core.session_id().as_bytes(),
             origin,
             &bound,
@@ -707,57 +718,13 @@ impl ActiveReadOnlyScan {
         Ok(FingerprintBatchResult {
             outcome,
             bytes_read,
-            logical_bytes,
             spec,
         })
     }
 
     /// Replays every authenticated directory ticket in canonical order while
-    /// independently bracketing it with the live volume session. Only a full
-    /// core seal plus a full volume manifest can produce complete coverage.
-    pub fn verify_coverage(
-        &mut self,
-        control: &dyn ScanControl,
-        observer: &mut dyn RuntimeObserver,
-    ) -> Result<CoverageSummary, RuntimeError> {
-        if self.fingerprint_analysis.is_none() {
-            return Err(RuntimeError::UnsupportedEvidence(
-                "full hashing must be sealed before directory coverage",
-            ));
-        }
-        if self.coverage.is_some() {
-            return Err(RuntimeError::UnsupportedEvidence(
-                "coverage verification is allowed exactly once per runtime attempt",
-            ));
-        }
-        match self.verify_coverage_inner(control, observer) {
-            Ok(summary) => {
-                let terminal = match summary.status {
-                    StreamBatchStatus::Completed => None,
-                    StreamBatchStatus::Partial => Some((
-                        "CORE_COVERAGE_PARTIAL",
-                        "目录枚举并不完整，确定重复证据已保持锁定。",
-                    )),
-                    StreamBatchStatus::Interrupted => Some((
-                        "CORE_COVERAGE_INTERRUPTED",
-                        "目录或扫描根在覆盖复核期间发生变化，确定重复证据已保持锁定。",
-                    )),
-                    StreamBatchStatus::Cancelled => None,
-                };
-                self.coverage = Some(summary.clone());
-                if let Some((code, message)) = terminal {
-                    self.transition_terminal("failed", "interrupted", Some((code, message)))?;
-                }
-                Ok(summary)
-            }
-            Err(error @ RuntimeError::StageCancelled(_)) => {
-                self.transition_terminal("cancelled", "cancelled", None)?;
-                Err(error)
-            }
-            Err(error) => Err(self.interrupt_for_failure("RUNTIME_COVERAGE_FAILED", error)),
-        }
-    }
-
+    /// independently bracketing it with the live volume session. It runs only
+    /// after exact comparisons, so the final coverage seal brackets all reads.
     fn verify_coverage_inner(
         &mut self,
         control: &dyn ScanControl,
@@ -1023,6 +990,626 @@ impl ActiveReadOnlyScan {
         Ok(())
     }
 
+    /// Converts fresh full-hash buckets into visible duplicate groups only
+    /// after byte-for-byte comparison of every non-representative member.
+    /// Drafts remain invisible and are explicitly abandoned on collisions,
+    /// cancellation, or any failed comparison.
+    pub fn verify_exact_duplicates(
+        &mut self,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<ExactDuplicateSummary, RuntimeError> {
+        if self.fingerprint_analysis.is_none() {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "full hashing must be sealed before exact verification",
+            ));
+        }
+        if self.exact_duplicates.is_some() {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "exact duplicate verification is allowed exactly once per runtime attempt",
+            ));
+        }
+        match self.verify_exact_duplicates_and_coverage_inner(control, observer) {
+            Ok(summary) => {
+                self.transition_terminal("completed", "completed", None)?;
+                self.exact_duplicates = Some(summary.clone());
+                Ok(summary)
+            }
+            Err(error @ RuntimeError::StageCancelled(_)) => {
+                self.transition_terminal("cancelled", "cancelled", None)?;
+                Err(error)
+            }
+            Err(error) => {
+                Err(self.interrupt_for_failure("RUNTIME_EXACT_VERIFICATION_FAILED", error))
+            }
+        }
+    }
+
+    fn verify_exact_duplicates_and_coverage_inner(
+        &mut self,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<ExactDuplicateSummary, RuntimeError> {
+        let mut summary = self.verify_exact_duplicates_inner(control, observer)?;
+        let coverage = self.verify_coverage_inner(control, observer)?;
+        let coverage_status = coverage.status;
+        let coverage_failed = coverage.failed_count;
+        self.coverage = Some(coverage);
+        match coverage_status {
+            StreamBatchStatus::Completed => {}
+            StreamBatchStatus::Cancelled => {
+                return Err(RuntimeError::StageCancelled("directory coverage"));
+            }
+            StreamBatchStatus::Partial | StreamBatchStatus::Interrupted => {
+                return Err(RuntimeError::StageIncomplete {
+                    stage: "directory coverage",
+                    failed: coverage_failed,
+                });
+            }
+        }
+        summary.issues = self.issues_recorded;
+        self.store.write_transaction(|repository| {
+            repository.seal_scan_stage(
+                &self.guard,
+                ScanStage::ExactVerification,
+                checked_i64(
+                    "persisted identical edge count",
+                    summary.persisted_identical_edges,
+                )
+                .map_err(runtime_store_error)?,
+                checked_i64(
+                    "persisted identical edge bytes",
+                    summary.persisted_identical_edge_bytes,
+                )
+                .map_err(runtime_store_error)?,
+                now_ms().map_err(runtime_store_error)?,
+            )
+        })?;
+        Ok(summary)
+    }
+
+    fn verify_exact_duplicates_inner(
+        &mut self,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<ExactDuplicateSummary, RuntimeError> {
+        let full_hash_spec = self
+            .fingerprint_analysis
+            .as_ref()
+            .ok_or(RuntimeError::UnsupportedEvidence(
+                "fingerprint analysis disappeared",
+            ))?
+            .full_hash_spec
+            .clone();
+        let mut summary = ExactDuplicateSummary {
+            candidate_buckets: 0,
+            verified_groups: 0,
+            verified_members: 0,
+            compared_pairs: 0,
+            compared_bytes: 0,
+            persisted_identical_edges: 0,
+            persisted_identical_edge_bytes: 0,
+            logical_reclaimable_bytes: 0,
+            hash_collision_buckets: 0,
+            issues: self.issues_recorded,
+        };
+        if let Some(spec) = full_hash_spec {
+            let mut cursor: Option<ExactDigestBucketCursor> = None;
+            loop {
+                let page = self.store.list_exact_digest_buckets_page(
+                    self.ids.scan_run_id,
+                    &spec.algorithm,
+                    spec.algorithm_version,
+                    &spec.parameters_hash,
+                    cursor.as_ref(),
+                    STORE_PAGE_LIMIT,
+                )?;
+                for bucket in page.items {
+                    summary.candidate_buckets = checked_add_u64(
+                        "exact candidate bucket count",
+                        summary.candidate_buckets,
+                        1,
+                    )?;
+                    let result = self.verify_exact_bucket(&spec, &bucket, control, observer)?;
+                    summary.compared_pairs = checked_add_u64(
+                        "exact compared pair count",
+                        summary.compared_pairs,
+                        result.compared_pairs,
+                    )?;
+                    summary.compared_bytes = checked_add_u64(
+                        "exact compared bytes",
+                        summary.compared_bytes,
+                        result.compared_bytes,
+                    )?;
+                    summary.persisted_identical_edges = checked_add_u64(
+                        "persisted identical edge count",
+                        summary.persisted_identical_edges,
+                        result.persisted_identical_edges,
+                    )?;
+                    summary.persisted_identical_edge_bytes = checked_add_u64(
+                        "persisted identical edge bytes",
+                        summary.persisted_identical_edge_bytes,
+                        result.persisted_identical_edge_bytes,
+                    )?;
+                    if result.hash_collision {
+                        summary.hash_collision_buckets = checked_add_u64(
+                            "hash collision bucket count",
+                            summary.hash_collision_buckets,
+                            1,
+                        )?;
+                    } else {
+                        let verified = result.verified.ok_or_else(|| {
+                            RuntimeError::EvidenceMismatch(
+                                "exact bucket completed without a verified group".to_owned(),
+                            )
+                        })?;
+                        summary.verified_groups = checked_add_u64(
+                            "verified duplicate group count",
+                            summary.verified_groups,
+                            1,
+                        )?;
+                        summary.verified_members = checked_add_u64(
+                            "verified duplicate member count",
+                            summary.verified_members,
+                            u64::try_from(verified.member_count)
+                                .map_err(|_| RuntimeError::NumericRange("group member count"))?,
+                        )?;
+                        summary.logical_reclaimable_bytes = checked_add_u64(
+                            "logical reclaimable bytes",
+                            summary.logical_reclaimable_bytes,
+                            u64::try_from(verified.logical_reclaimable_bytes).map_err(|_| {
+                                RuntimeError::NumericRange("logical reclaimable bytes")
+                            })?,
+                        )?;
+                    }
+                }
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    fn verify_exact_bucket(
+        &mut self,
+        spec: &FingerprintSpec,
+        bucket: &FingerprintBucketRecord,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<ExactBucketResult, RuntimeError> {
+        let plan = self.plan_exact_bucket(spec, bucket)?;
+        let created_at_ms = now_ms()?;
+        let build_key = exact_build_key(self.ids.scan_run_id, spec, bucket, plan.manifest_digest);
+        let build_id = self.store.write_transaction(|repository| {
+            repository.begin_exact_group(
+                &self.guard,
+                &BeginExactGroupInput {
+                    build_key,
+                    representative_observation_id: plan.representative.ticket.observation_id,
+                    representative_fingerprint_id: plan.representative.fingerprint_id,
+                    expected_member_count: plan.member_count,
+                    expected_manifest_digest: plan.manifest_digest,
+                    created_at_ms,
+                },
+            )
+        })?;
+        let result =
+            self.verify_exact_bucket_build(build_id, &plan, spec, bucket, control, observer);
+        match result {
+            Ok(mut result) if result.hash_collision => {
+                self.persist_runtime_issue(
+                    "exact_verification",
+                    "HASH_COLLISION_DETECTED",
+                    "完整哈希相同的候选在逐字节比较时不同；整个哈希桶保持未定案。",
+                    json!({
+                        "algorithm": spec.algorithm,
+                        "algorithmVersion": spec.algorithm_version,
+                        "observedSizeBytes": bucket.observed_size_bytes,
+                        "digestHex": hex(&bucket.digest),
+                        "memberCount": bucket.member_count,
+                    }),
+                    now_ms()?,
+                )?;
+                self.abandon_exact_build(
+                    build_id,
+                    "HASH_COLLISION_DETECTED",
+                    "完整哈希相同的候选在逐字节比较时不同；整个哈希桶保持未定案。",
+                )?;
+                result.verified = None;
+                Ok(result)
+            }
+            Ok(mut result) => {
+                let verified = self.store.write_transaction(|repository| {
+                    repository.finalize_exact_group(
+                        &self.guard,
+                        build_id,
+                        now_ms().map_err(runtime_store_error)?,
+                    )
+                })?;
+                result.verified = Some(verified);
+                Ok(result)
+            }
+            Err(primary) => {
+                let message = primary.to_string();
+                match self.abandon_exact_build(
+                    build_id,
+                    "EXACT_GROUP_INCOMPLETE",
+                    &message,
+                ) {
+                    Ok(()) => Err(primary),
+                    Err(abandon) => Err(RuntimeError::Stream(format!(
+                        "{primary}; additionally failed to abandon exact draft {build_id}: {abandon}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn plan_exact_bucket(
+        &self,
+        spec: &FingerprintSpec,
+        bucket: &FingerprintBucketRecord,
+    ) -> Result<ExactBucketPlan, RuntimeError> {
+        let member_count = bucket.member_count;
+        if member_count < 2 {
+            return Err(RuntimeError::EvidenceMismatch(
+                "exact candidate bucket has fewer than two members".to_owned(),
+            ));
+        }
+        let member_count_u64 = u64::try_from(member_count)
+            .map_err(|_| RuntimeError::NumericRange("exact member count"))?;
+        let mut manifest = blake3::Hasher::new();
+        manifest.update(b"guiying.exact-group-manifest.v1\0");
+        manifest.update(&member_count_u64.to_le_bytes());
+        let mut representative = None;
+        let mut ordinal = 0_u64;
+        let mut cursor = None;
+        loop {
+            let page = self.store.list_file_tickets_for_fingerprint_page(
+                &self.guard,
+                &self.core_session_id,
+                FreshFingerprintKind::ExactBytes,
+                &spec.algorithm,
+                spec.algorithm_version,
+                &spec.parameters_hash,
+                bucket.observed_size_bytes,
+                &bucket.digest,
+                cursor.as_ref(),
+                STORE_PAGE_LIMIT,
+            )?;
+            if page.items.is_empty() {
+                if page.next_cursor.is_some() {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "exact member page advanced without records".to_owned(),
+                    ));
+                }
+                break;
+            }
+            for record in page.items {
+                representative.get_or_insert_with(|| record.clone());
+                let member = exact_manifest_member(ordinal, spec, bucket, &record)?;
+                let leaf = compute_exact_group_member_leaf(&member)?;
+                manifest.update(leaf.as_bytes());
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(RuntimeError::NumericRange("exact member ordinal"))?;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        if ordinal != member_count_u64 {
+            return Err(RuntimeError::EvidenceMismatch(
+                "exact bucket count changed after full-hash sealing".to_owned(),
+            ));
+        }
+        Ok(ExactBucketPlan {
+            representative: representative.ok_or_else(|| {
+                RuntimeError::EvidenceMismatch("exact bucket contains no representative".to_owned())
+            })?,
+            member_count,
+            manifest_digest: ManifestDigest::from_runtime_evidence(*manifest.finalize().as_bytes()),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_exact_bucket_build(
+        &mut self,
+        build_id: i64,
+        plan: &ExactBucketPlan,
+        spec: &FingerprintSpec,
+        bucket: &FingerprintBucketRecord,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<ExactBucketResult, RuntimeError> {
+        let mut ordinal = 0_u64;
+        let mut compared_pairs = 0_u64;
+        let mut compared_bytes = 0_u64;
+        let mut persisted_identical_edges = 0_u64;
+        let mut persisted_identical_edge_bytes = 0_u64;
+        let mut cursor = None;
+        loop {
+            let page = self.store.list_file_tickets_for_fingerprint_page(
+                &self.guard,
+                &self.core_session_id,
+                FreshFingerprintKind::ExactBytes,
+                &spec.algorithm,
+                spec.algorithm_version,
+                &spec.parameters_hash,
+                bucket.observed_size_bytes,
+                &bucket.digest,
+                cursor.as_ref(),
+                STORE_PAGE_LIMIT,
+            )?;
+            if page.items.is_empty() {
+                if page.next_cursor.is_some() {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "exact member replay advanced without records".to_owned(),
+                    ));
+                }
+                break;
+            }
+            let mut member_inputs = Vec::with_capacity(page.items.len());
+            let mut compared_members = Vec::new();
+            for record in page.items {
+                let current_ordinal = ordinal;
+                member_inputs.push(ExactGroupMemberInput {
+                    ordinal: checked_i64("exact member ordinal", current_ordinal)?,
+                    observation_id: record.ticket.observation_id,
+                    fingerprint_id: record.fingerprint_id,
+                    sort_rank: checked_i64("exact member sort rank", current_ordinal)?,
+                });
+                if current_ordinal == 0 {
+                    if record != plan.representative {
+                        return Err(RuntimeError::EvidenceMismatch(
+                            "exact representative changed between planning and replay".to_owned(),
+                        ));
+                    }
+                } else {
+                    compared_members.push(record);
+                }
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(RuntimeError::NumericRange("exact member ordinal"))?;
+            }
+            self.store.write_transaction(|repository| {
+                repository.append_exact_group_members(&self.guard, build_id, &member_inputs)
+            })?;
+            if !compared_members.is_empty() {
+                let result = self.run_exact_compare_batch(
+                    build_id,
+                    &plan.representative,
+                    compared_members,
+                    spec,
+                    bucket,
+                    control,
+                    observer,
+                )?;
+                compared_pairs = checked_add_u64(
+                    "exact compared pair count",
+                    compared_pairs,
+                    result.outcome.completed,
+                )?;
+                compared_bytes = checked_add_u64(
+                    "exact compared bytes",
+                    compared_bytes,
+                    result.compared_bytes,
+                )?;
+                persisted_identical_edges = checked_add_u64(
+                    "persisted identical edge count",
+                    persisted_identical_edges,
+                    result.persisted_identical_edges,
+                )?;
+                persisted_identical_edge_bytes = checked_add_u64(
+                    "persisted identical edge bytes",
+                    persisted_identical_edge_bytes,
+                    result.persisted_identical_edge_bytes,
+                )?;
+                ensure_stage_batch_complete("exact comparison", &result.outcome)?;
+                if result.hash_collision {
+                    return Ok(ExactBucketResult {
+                        compared_pairs,
+                        compared_bytes,
+                        persisted_identical_edges,
+                        persisted_identical_edge_bytes,
+                        hash_collision: true,
+                        verified: None,
+                    });
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        if ordinal
+            != u64::try_from(plan.member_count)
+                .map_err(|_| RuntimeError::NumericRange("exact member count"))?
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "exact member replay count differs from the planned manifest".to_owned(),
+            ));
+        }
+        Ok(ExactBucketResult {
+            compared_pairs,
+            compared_bytes,
+            persisted_identical_edges,
+            persisted_identical_edge_bytes,
+            hash_collision: false,
+            verified: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_exact_compare_batch(
+        &mut self,
+        build_id: i64,
+        representative: &FingerprintFileTicketRecord,
+        members: Vec<FingerprintFileTicketRecord>,
+        spec: &FingerprintSpec,
+        bucket: &FingerprintBucketRecord,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<ExactComparisonBatchResult, RuntimeError> {
+        if members.is_empty() || members.len() > STORE_BATCH_LIMIT {
+            return Err(RuntimeError::EvidenceMismatch(
+                "exact comparison batch is empty or exceeds the adapter limit".to_owned(),
+            ));
+        }
+        self.volume.revalidate()?;
+        let representative = bind_file_ticket(&self.volume, representative.ticket.clone())?;
+        let members = members
+            .into_iter()
+            .map(|record| {
+                let fingerprint_id = record.fingerprint_id;
+                bind_file_ticket(&self.volume, record.ticket).map(|ticket| (fingerprint_id, ticket))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let pairs = members
+            .iter()
+            .map(|(_, member)| {
+                ExactCandidatePair::new(representative.ticket.clone(), member.ticket.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut sink = ExactComparisonSink::new(pairs.len(), observer);
+        let core_result = self.core.exact_compare_batch(&pairs, &mut sink, control);
+        if !representative
+            .file
+            .verify_unchanged(&self.volume, &representative.path)?
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "exact representative changed across byte comparison".to_owned(),
+            ));
+        }
+        for (_, member) in &members {
+            if !member.file.verify_unchanged(&self.volume, &member.path)? {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "exact member changed across byte comparison".to_owned(),
+                ));
+            }
+        }
+        self.volume.revalidate()?;
+        let outcome = core_result.map_err(|error| RuntimeError::Stream(error.to_string()))?;
+        validate_stage_counts(pairs.len(), &outcome)?;
+        let verified_at_ms = now_ms()?;
+        let (edges, compared_bytes, hash_collision) = translate_exact_evidence(
+            self.core.session_id().as_bytes(),
+            &representative,
+            &members,
+            spec,
+            bucket,
+            &sink.comparisons,
+            verified_at_ms,
+        )?;
+        let persisted_identical_edges = u64::try_from(edges.len())
+            .map_err(|_| RuntimeError::NumericRange("persisted identical edge count"))?;
+        let persisted_identical_edge_bytes = edges.iter().try_fold(0_u64, |total, edge| {
+            checked_add_u64(
+                "persisted identical edge bytes",
+                total,
+                u64::try_from(edge.compared_bytes)
+                    .map_err(|_| RuntimeError::NumericRange("exact edge byte count"))?,
+            )
+        })?;
+        if sink.comparisons.len()
+            != usize::try_from(outcome.completed)
+                .map_err(|_| RuntimeError::NumericRange("exact completion count"))?
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core exact count differs from its sealed comparison events".to_owned(),
+            ));
+        }
+        if !edges.is_empty() {
+            self.store.write_transaction(|repository| {
+                repository.append_exact_verification_edges(&self.guard, build_id, &edges)
+            })?;
+        }
+        self.persist_stage_issues("exact_verification", &sink.issues, verified_at_ms)?;
+        Ok(ExactComparisonBatchResult {
+            outcome,
+            compared_bytes,
+            persisted_identical_edges,
+            persisted_identical_edge_bytes,
+            hash_collision,
+        })
+    }
+
+    fn abandon_exact_build(
+        &mut self,
+        build_id: i64,
+        reason_code: &str,
+        reason_message: &str,
+    ) -> Result<(), RuntimeError> {
+        self.store.write_transaction(|repository| {
+            repository.abandon_exact_group_draft(
+                &self.guard,
+                build_id,
+                now_ms().map_err(runtime_store_error)?,
+                reason_code,
+                Some(reason_message),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn persist_runtime_issue(
+        &mut self,
+        stage: &'static str,
+        code: &'static str,
+        message: &'static str,
+        details: serde_json::Value,
+        occurred_at_ms: i64,
+    ) -> Result<(), RuntimeError> {
+        let next_issue_count = self
+            .issues_recorded
+            .checked_add(1)
+            .ok_or(RuntimeError::NumericRange("issue count"))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"guiying.runtime.issue.v1\0");
+        hasher.update(&self.guard.scan_run_id.to_le_bytes());
+        hasher.update(&next_issue_count.to_le_bytes());
+        hasher.update(stage.as_bytes());
+        hasher.update(code.as_bytes());
+        hasher.update(message.as_bytes());
+        let issue = NewScanIssue {
+            issue_key: format!("runtime-issue-{}", hex(hasher.finalize().as_bytes())),
+            volume_id: self.ids.volume_id,
+            scan_run_id: self.guard.scan_run_id,
+            media_file_id: None,
+            severity: "warning".to_owned(),
+            stage: stage.to_owned(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+            details: Some(details),
+            occurred_at_ms,
+        };
+        let enumeration = self
+            .enumeration
+            .as_ref()
+            .ok_or(RuntimeError::UnsupportedEvidence(
+                "enumeration summary disappeared",
+            ))?;
+        self.store.write_transaction(|repository| {
+            repository.record_bound_scan_issue(&self.guard, &issue)?;
+            repository.update_bound_scan_progress(
+                &self.guard,
+                checked_i64("media file count", enumeration.media_files)
+                    .map_err(runtime_store_error)?,
+                checked_i64("fingerprinted file count", self.files_fingerprinted)
+                    .map_err(runtime_store_error)?,
+                checked_i64("issue count", next_issue_count).map_err(runtime_store_error)?,
+                checked_i64("logical byte count", enumeration.logical_bytes)
+                    .map_err(runtime_store_error)?,
+                occurred_at_ms,
+            )
+        })?;
+        self.issues_recorded = next_issue_count;
+        Ok(())
+    }
+
     /// Explicitly closes an unfinished read-only attempt without authorizing
     /// any media action.
     pub fn interrupt(mut self, code: &str, message: &str) -> Result<(), RuntimeError> {
@@ -1080,10 +1667,32 @@ struct BoundDirectoryTicket {
     identity: RootObjectIdentity,
 }
 
+struct ExactBucketPlan {
+    representative: FingerprintFileTicketRecord,
+    member_count: i64,
+    manifest_digest: ManifestDigest,
+}
+
+struct ExactBucketResult {
+    compared_pairs: u64,
+    compared_bytes: u64,
+    persisted_identical_edges: u64,
+    persisted_identical_edge_bytes: u64,
+    hash_collision: bool,
+    verified: Option<VerifiedExactGroup>,
+}
+
+struct ExactComparisonBatchResult {
+    outcome: StageBatchOutcome,
+    compared_bytes: u64,
+    persisted_identical_edges: u64,
+    persisted_identical_edge_bytes: u64,
+    hash_collision: bool,
+}
+
 struct FingerprintBatchResult {
     outcome: StageBatchOutcome,
     bytes_read: u64,
-    logical_bytes: u64,
     spec: Option<FingerprintSpec>,
 }
 
@@ -1231,6 +1840,67 @@ impl StreamingScanSink for CoverageSink<'_> {
     }
 }
 
+struct ExactComparisonSink<'a> {
+    maximum_events: usize,
+    events_seen: usize,
+    comparisons: Vec<ExactComparisonEvidence>,
+    issues: Vec<ScanIssue>,
+    observer: &'a mut dyn RuntimeObserver,
+}
+
+impl<'a> ExactComparisonSink<'a> {
+    fn new(input_count: usize, observer: &'a mut dyn RuntimeObserver) -> Self {
+        Self {
+            maximum_events: input_count.saturating_mul(3).saturating_add(4),
+            events_seen: 0,
+            comparisons: Vec::with_capacity(input_count),
+            issues: Vec::new(),
+            observer,
+        }
+    }
+}
+
+impl StreamingScanSink for ExactComparisonSink<'_> {
+    type Error = RuntimeError;
+
+    fn write_batch(&mut self, events: &[StreamEvent]) -> Result<(), Self::Error> {
+        if events.len() > STORE_BATCH_LIMIT {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core exact event batch exceeds the adapter limit".to_owned(),
+            ));
+        }
+        self.events_seen = self
+            .events_seen
+            .checked_add(events.len())
+            .ok_or(RuntimeError::NumericRange("exact event count"))?;
+        if self.events_seen > self.maximum_events {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core emitted too many events for one exact batch".to_owned(),
+            ));
+        }
+        for event in events {
+            match event {
+                StreamEvent::ExactComparison(evidence) => {
+                    self.comparisons.push(evidence.clone());
+                }
+                StreamEvent::Issue(issue) => self.issues.push(issue.clone()),
+                StreamEvent::Progress(progress) => self.observer.on_progress(progress),
+                StreamEvent::RootObservation(_)
+                | StreamEvent::FileObservation(_)
+                | StreamEvent::DirectoryObservation(_)
+                | StreamEvent::FreshFingerprint(_)
+                | StreamEvent::EnumerationFinished(_)
+                | StreamEvent::CoverageVerified(_) => {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "non-exact evidence appeared in an exact comparison sink".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn bind_file_ticket(
     volume: &BoundVolumeSession,
     record: FileTicketRecord,
@@ -1368,21 +2038,167 @@ fn validate_coverage_seal<'a>(
     }
 }
 
+fn exact_manifest_member(
+    ordinal: u64,
+    spec: &FingerprintSpec,
+    bucket: &FingerprintBucketRecord,
+    record: &FingerprintFileTicketRecord,
+) -> Result<ExactGroupManifestMember, RuntimeError> {
+    Ok(ExactGroupManifestMember {
+        ordinal,
+        observation_id: u64::try_from(record.ticket.observation_id)
+            .map_err(|_| RuntimeError::NumericRange("exact observation id"))?,
+        fingerprint_id: u64::try_from(record.fingerprint_id)
+            .map_err(|_| RuntimeError::NumericRange("exact fingerprint id"))?,
+        sort_rank: ordinal,
+        stable_path_key: record.ticket.stable_path_key,
+        source_signature: record.ticket.source_signature,
+        size_bytes: u64::try_from(record.ticket.size_bytes)
+            .map_err(|_| RuntimeError::NumericRange("exact file size"))?,
+        algorithm: spec.algorithm.clone(),
+        algorithm_version: u32::try_from(spec.algorithm_version)
+            .map_err(|_| RuntimeError::NumericRange("fingerprint algorithm version"))?,
+        parameters_hash: spec.parameters_hash,
+        digest: bucket.digest.clone(),
+        file_object_key: record.ticket.file_object_key,
+    })
+}
+
+fn exact_build_key(
+    scan_run_id: i64,
+    spec: &FingerprintSpec,
+    bucket: &FingerprintBucketRecord,
+    manifest: ManifestDigest,
+) -> BuildKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.runtime.exact-build.v1\0");
+    hasher.update(&scan_run_id.to_le_bytes());
+    hasher.update(&(spec.algorithm.len() as u64).to_le_bytes());
+    hasher.update(spec.algorithm.as_bytes());
+    hasher.update(&spec.algorithm_version.to_le_bytes());
+    hasher.update(spec.parameters_hash.as_bytes());
+    hasher.update(&bucket.observed_size_bytes.to_le_bytes());
+    hasher.update(&(bucket.digest.len() as u64).to_le_bytes());
+    hasher.update(&bucket.digest);
+    hasher.update(manifest.as_bytes());
+    BuildKey::from_runtime_evidence(*hasher.finalize().as_bytes())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn translate_exact_evidence(
+    core_session_id: &[u8; 32],
+    representative: &BoundFileTicket,
+    members: &[(i64, BoundFileTicket)],
+    spec: &FingerprintSpec,
+    bucket: &FingerprintBucketRecord,
+    evidence: &[ExactComparisonEvidence],
+    verified_at_ms: i64,
+) -> Result<(Vec<ExactVerificationEdgeInput>, u64, bool), RuntimeError> {
+    let by_ticket = members
+        .iter()
+        .map(|(fingerprint_id, member)| (*member.ticket.sort_key(), (*fingerprint_id, member)))
+        .collect::<BTreeMap<_, _>>();
+    if by_ticket.len() != members.len() {
+        return Err(RuntimeError::EvidenceMismatch(
+            "exact input repeated an authenticated member ticket".to_owned(),
+        ));
+    }
+    let representative_length = u64::try_from(representative.record.size_bytes)
+        .map_err(|_| RuntimeError::NumericRange("representative file size"))?;
+    let mut seen = BTreeSet::new();
+    let mut edges = Vec::with_capacity(evidence.len());
+    let mut compared_bytes = 0_u64;
+    let mut hash_collision = false;
+    for proof in evidence {
+        if proof.session_id().as_bytes() != core_session_id
+            || proof.trust_scope() != StreamTrustScope::CurrentCoreSessionOnly
+            || proof.left_observation_ticket_id() != representative.ticket.sort_key()
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "exact proof is not bound to the active representative and session".to_owned(),
+            ));
+        }
+        let member_ticket_id = *proof.right_observation_ticket_id();
+        if !seen.insert(member_ticket_id) {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core emitted more than one comparison for one exact member".to_owned(),
+            ));
+        }
+        let (fingerprint_id, member) = by_ticket.get(&member_ticket_id).ok_or_else(|| {
+            RuntimeError::EvidenceMismatch(
+                "core emitted an exact proof outside the requested pair set".to_owned(),
+            )
+        })?;
+        let member_length = u64::try_from(member.record.size_bytes)
+            .map_err(|_| RuntimeError::NumericRange("exact member file size"))?;
+        if representative_length != member_length
+            || proof.left_expected_length() != representative_length
+            || proof.right_expected_length() != member_length
+            || proof.left_before_source_signature()
+                != representative.record.source_signature.as_bytes()
+            || proof.left_after_source_signature()
+                != representative.record.source_signature.as_bytes()
+            || proof.right_before_source_signature() != member.record.source_signature.as_bytes()
+            || proof.right_after_source_signature() != member.record.source_signature.as_bytes()
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "exact proof does not match its immutable observations".to_owned(),
+            ));
+        }
+        if proof.digest_algorithm() != spec.algorithm
+            || i64::from(proof.digest_algorithm_version()) != spec.algorithm_version
+            || proof.digest_parameters_hash() != spec.parameters_hash.as_bytes()
+            || proof.bytes_compared() > representative_length
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "exact proof uses unexpected digest material or byte count".to_owned(),
+            ));
+        }
+        compared_bytes = checked_add_u64(
+            "exact compared bytes",
+            compared_bytes,
+            proof.bytes_compared(),
+        )?;
+        if proof.identical() {
+            if !proof.eof_verified()
+                || proof.bytes_compared() != representative_length
+                || proof.left_digest().map(<[u8; 32]>::as_slice) != Some(bucket.digest.as_slice())
+                || proof.right_digest().map(<[u8; 32]>::as_slice) != Some(bucket.digest.as_slice())
+            {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "identical exact proof lacks full EOF and digest agreement".to_owned(),
+                ));
+            }
+            edges.push(ExactVerificationEdgeInput {
+                member_observation_id: member.record.observation_id,
+                member_fingerprint_id: *fingerprint_id,
+                representative_source_signature: representative.record.source_signature,
+                member_source_signature: member.record.source_signature,
+                compared_bytes: checked_i64("exact compared bytes", proof.bytes_compared())?,
+                verified_at_ms,
+            });
+        } else {
+            if proof.eof_verified()
+                || proof.left_digest().is_some()
+                || proof.right_digest().is_some()
+            {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "non-identical exact proof carried a complete digest claim".to_owned(),
+                ));
+            }
+            hash_collision = true;
+        }
+    }
+    Ok((edges, compared_bytes, hash_collision))
+}
+
 fn translate_fingerprint_evidence(
     core_session_id: &[u8; 32],
     expected_origin: FreshReadOrigin,
     bound: &[BoundFileTicket],
     evidence: &[FreshFingerprintEvidence],
     completed_at_ms: i64,
-) -> Result<
-    (
-        Vec<FreshFingerprintInput>,
-        u64,
-        u64,
-        Option<FingerprintSpec>,
-    ),
-    RuntimeError,
-> {
+) -> Result<(Vec<FreshFingerprintInput>, u64, Option<FingerprintSpec>), RuntimeError> {
     let by_ticket = bound
         .iter()
         .map(|candidate| (*candidate.ticket.sort_key(), candidate))
@@ -1395,7 +2211,6 @@ fn translate_fingerprint_evidence(
     let mut seen = BTreeSet::new();
     let mut inputs = Vec::with_capacity(evidence.len());
     let mut bytes_read = 0_u64;
-    let mut logical_bytes = 0_u64;
     let mut common_spec = None;
     for proof in evidence {
         if proof.session_id().as_bytes() != core_session_id
@@ -1459,11 +2274,6 @@ fn translate_fingerprint_evidence(
         }
         common_spec.get_or_insert_with(|| spec.clone());
         bytes_read = checked_add_u64("fingerprint bytes read", bytes_read, proof.bytes_read())?;
-        logical_bytes = checked_add_u64(
-            "fingerprint logical bytes",
-            logical_bytes,
-            proof.expected_length(),
-        )?;
         inputs.push(FreshFingerprintInput {
             observation_id: candidate.record.observation_id,
             fingerprint_kind: match expected_origin {
@@ -1491,7 +2301,7 @@ fn translate_fingerprint_evidence(
             created_at_ms: completed_at_ms,
         });
     }
-    Ok((inputs, bytes_read, logical_bytes, common_spec))
+    Ok((inputs, bytes_read, common_spec))
 }
 
 fn validate_stage_counts(
@@ -2269,6 +3079,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
 
     use guiying_core::{CancellationToken, NoopScanControl};
     use tempfile::TempDir;
@@ -2382,7 +3193,7 @@ mod tests {
         let third_modified = fs::metadata(&third)?.modified()?;
 
         let mut runtime = ActiveReadOnlyScan::start(
-            database,
+            &database,
             fs::canonicalize(media.path())?,
             ScanOptions::default(),
         )?;
@@ -2398,7 +3209,19 @@ mod tests {
         assert_eq!(summary.full_hash_bytes_read, (duplicate.len() * 2) as u64);
         assert_eq!(summary.issues, 0);
 
-        let coverage = runtime.verify_coverage(&NoopScanControl, &mut ())?;
+        let exact = runtime.verify_exact_duplicates(&NoopScanControl, &mut ())?;
+        assert_eq!(exact.candidate_buckets, 1);
+        assert_eq!(exact.verified_groups, 1);
+        assert_eq!(exact.verified_members, 2);
+        assert_eq!(exact.compared_pairs, 1);
+        assert_eq!(exact.compared_bytes, duplicate.len() as u64);
+        assert_eq!(exact.persisted_identical_edges, 1);
+        assert_eq!(exact.persisted_identical_edge_bytes, duplicate.len() as u64);
+        assert_eq!(exact.logical_reclaimable_bytes, duplicate.len() as u64);
+        assert_eq!(exact.hash_collision_buckets, 0);
+        let coverage = runtime
+            .coverage_summary()
+            .ok_or("coverage summary missing after exact verification")?;
         assert_eq!(coverage.status, StreamBatchStatus::Completed);
         assert_eq!(coverage.directory_count, 1);
         assert_eq!(coverage.replayed_count, 1);
@@ -2421,6 +3244,25 @@ mod tests {
         assert_eq!(buckets.items.len(), 1);
         assert_eq!(buckets.items[0].member_count, 2);
         assert_eq!(buckets.items[0].digest, blake3::hash(duplicate).as_bytes());
+        let groups =
+            runtime
+                .store()
+                .list_duplicate_groups_page(runtime.ids().scan_run_id, None, 10)?;
+        assert_eq!(groups.items.len(), 1);
+        assert_eq!(groups.items[0].member_count, 2);
+        assert_eq!(groups.items[0].edge_count, 1);
+        let members = runtime.store().list_duplicate_group_members_page(
+            runtime.ids().scan_run_id,
+            groups.items[0].build_id,
+            None,
+            10,
+        )?;
+        assert_eq!(members.items.len(), 2);
+        assert!(runtime
+            .store()
+            .list_active_scan_jobs_page(None, 10)?
+            .items
+            .is_empty());
 
         assert_eq!(fs::read(&first)?, duplicate);
         assert_eq!(fs::read(&second)?, duplicate);
@@ -2430,10 +3272,13 @@ mod tests {
         assert_eq!(fs::metadata(&third)?.modified()?, third_modified);
         assert_eq!(directory_names(media.path())?, names_before);
 
-        runtime.interrupt(
-            "TEST_FINISHED",
-            "fingerprint integration test closed the read-only attempt",
-        )?;
+        let completed_run_id = runtime.ids().scan_run_id;
+        drop(runtime);
+        let reopened = Store::open_existing(&database)?;
+        let reopened_groups = reopened.list_duplicate_groups_page(completed_run_id, None, 10)?;
+        assert_eq!(reopened_groups.items.len(), 1);
+        assert_eq!(reopened_groups.items[0].member_count, 2);
+
         Ok(())
     }
 
@@ -2459,7 +3304,7 @@ mod tests {
         )?;
 
         let error = runtime
-            .verify_coverage(&NoopScanControl, &mut ())
+            .verify_exact_duplicates(&NoopScanControl, &mut ())
             .expect_err("changed directory unexpectedly received complete coverage");
         assert!(
             matches!(
@@ -2498,7 +3343,7 @@ mod tests {
         cancellation.cancel();
 
         let error = runtime
-            .verify_coverage(&cancellation, &mut ())
+            .verify_exact_duplicates(&cancellation, &mut ())
             .expect_err("cancelled directory replay unexpectedly completed");
         assert!(matches!(
             error,
@@ -2511,6 +3356,146 @@ mod tests {
             .is_empty());
         assert_eq!(fs::read(&first)?, b"same-size-a");
         assert_eq!(fs::read(&second)?, b"same-size-b");
+        Ok(())
+    }
+
+    #[test]
+    fn no_exact_digest_bucket_completes_with_an_empty_verified_result(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let first = media.path().join("first.jpg");
+        let second = media.path().join("second.jpg");
+        fs::write(&first, b"same-size-a")?;
+        fs::write(&second, b"same-size-b")?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        runtime.enumerate(&NoopScanControl, &mut ())?;
+        runtime.fingerprint_candidates(&NoopScanControl, &mut ())?;
+
+        let exact = runtime.verify_exact_duplicates(&NoopScanControl, &mut ())?;
+        assert_eq!(exact.candidate_buckets, 0);
+        assert_eq!(exact.verified_groups, 0);
+        assert_eq!(exact.verified_members, 0);
+        assert_eq!(exact.logical_reclaimable_bytes, 0);
+        assert_eq!(
+            runtime.coverage_summary().map(|value| value.status),
+            Some(StreamBatchStatus::Completed)
+        );
+        assert!(runtime
+            .store()
+            .list_duplicate_groups_page(runtime.ids().scan_run_id, None, 10)?
+            .items
+            .is_empty());
+        assert!(runtime
+            .store()
+            .list_active_scan_jobs_page(None, 10)?
+            .items
+            .is_empty());
+        assert_eq!(fs::read(&first)?, b"same-size-a");
+        assert_eq!(fs::read(&second)?, b"same-size-b");
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_paths_never_inflate_logical_reclaimable_bytes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let first = media.path().join("first.jpg");
+        let alias = media.path().join("alias.jpg");
+        fs::write(&first, b"one-physical-file")?;
+        fs::hard_link(&first, &alias)?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        runtime.enumerate(&NoopScanControl, &mut ())?;
+        runtime.fingerprint_candidates(&NoopScanControl, &mut ())?;
+
+        let exact = runtime.verify_exact_duplicates(&NoopScanControl, &mut ())?;
+        assert_eq!(exact.verified_groups, 1);
+        assert_eq!(exact.verified_members, 2);
+        assert_eq!(exact.persisted_identical_edges, 1);
+        assert_eq!(exact.logical_reclaimable_bytes, 0);
+        let groups =
+            runtime
+                .store()
+                .list_duplicate_groups_page(runtime.ids().scan_run_id, None, 10)?;
+        assert_eq!(groups.items.len(), 1);
+        assert_eq!(groups.items[0].independent_file_count, 1);
+        assert_eq!(groups.items[0].logical_reclaimable_bytes, 0);
+        assert_eq!(fs::read(&first)?, b"one-physical-file");
+        assert_eq!(fs::read(&alias)?, b"one-physical-file");
+        Ok(())
+    }
+
+    #[test]
+    fn medium_files_use_non_overlapping_samples_accepted_by_store(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let payload = vec![0x5a; 100_000];
+        fs::write(media.path().join("first.jpg"), &payload)?;
+        fs::write(media.path().join("second.jpg"), &payload)?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        runtime.enumerate(&NoopScanControl, &mut ())?;
+
+        let summary = runtime.fingerprint_candidates(&NoopScanControl, &mut ())?;
+        assert_eq!(summary.sampled_files, 2);
+        assert!(summary.sampled_bytes_read <= (payload.len() * 2) as u64);
+        assert_eq!(summary.full_hashed_files, 2);
+        assert_eq!(summary.full_hash_bytes_read, (payload.len() * 2) as u64);
+        assert_eq!(fs::read(media.path().join("first.jpg"))?, payload);
+        runtime.interrupt(
+            "TEST_FINISHED",
+            "medium sample integration test closed the read-only attempt",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_exact_comparison_abandons_the_invisible_draft_and_closes_the_attempt(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let first = media.path().join("first.jpg");
+        let second = media.path().join("second.jpg");
+        fs::write(&first, b"duplicate")?;
+        fs::write(&second, b"duplicate")?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        runtime.enumerate(&NoopScanControl, &mut ())?;
+        runtime.fingerprint_candidates(&NoopScanControl, &mut ())?;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = runtime
+            .verify_exact_duplicates(&cancellation, &mut ())
+            .expect_err("cancelled exact comparison unexpectedly completed");
+        assert!(matches!(
+            error,
+            RuntimeError::StageCancelled("exact comparison")
+        ));
+        assert!(runtime
+            .store()
+            .list_active_scan_jobs_page(None, 10)?
+            .items
+            .is_empty());
+        assert!(runtime.exact_duplicate_summary().is_none());
+        assert_eq!(fs::read(&first)?, b"duplicate");
+        assert_eq!(fs::read(&second)?, b"duplicate");
         Ok(())
     }
 
@@ -2596,12 +3581,7 @@ mod tests {
 
     fn directory_names(path: &Path) -> Result<Vec<Vec<u8>>, std::io::Error> {
         let mut names = fs::read_dir(path)?
-            .map(|entry| {
-                entry.map(|entry| {
-                    use std::os::unix::ffi::OsStrExt;
-                    entry.file_name().as_os_str().as_bytes().to_vec()
-                })
-            })
+            .map(|entry| entry.map(|entry| entry.file_name().as_os_str().as_bytes().to_vec()))
             .collect::<Result<Vec<_>, _>>()?;
         names.sort();
         Ok(names)
