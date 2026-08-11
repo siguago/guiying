@@ -223,10 +223,12 @@
       "capability": "image_inspection",
       "result": "passed",
       "evidence_ids": [
-        "native-landing-capture"
+        "native-landing-capture",
+        "paged-results-capture",
+        "raw-metadata-review-capture"
       ],
       "limitation_id": null,
-      "notes": "The native raster was decoded and inspected at original Retina resolution; browser captures were also reviewed at original size."
+      "notes": "The native raster was decoded at original Retina resolution; current paged-result and expanded raw-metadata browser captures were also reviewed at original size."
     },
     {
       "id": "desktop-system-entrypoint-desktop-zh-cn-visual",
@@ -269,7 +271,7 @@
       "path": "evidence/frontend-qa.txt",
       "captured_at": "2026-08-11T01:02:04+08:00",
       "tool": "Playwright, axe-core, Vite, Oxlint",
-      "version": "Playwright 1.62.1; axe-core 4.12.1; Vite 8.2.1; Oxlint 1.75.0",
+      "version": "Playwright 1.62.1; axe-core 4.12.1; Vite 8.2.1; Oxlint 1.78.0",
       "command": "pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui",
       "exit_code": 0,
       "target_ids": [
@@ -278,7 +280,7 @@
         "desktop-product-entrypoint-desktop-zh-cn-keyboard",
         "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
       ],
-      "notes": "Five tests pass, including a mocked native scenario with two transient status-query failures that retains cancellation control, shows an uncertain-state warning, and recovers. Native cancellation semantics are covered separately by Rust tests."
+      "notes": "Eleven tests pass, covering token-only root authority, paged duplicate evidence, exact retry and stale-response behavior, terminal acknowledgement, cancelled-result locking, three-level raw-metadata review, and axe checks on the expanded raw state. Native cancellation semantics are covered separately by Rust tests."
     },
     {
       "id": "core-rust-test-log",
@@ -392,6 +394,34 @@
         "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
       ],
       "notes": "The 1280x820 evidence workspace shows group ordering, synthetic notice, exact-byte proof, and weak time evidence without overlap."
+    },
+    {
+      "id": "paged-results-capture",
+      "kind": "screenshot",
+      "path": "evidence/results-paged-1280x820.png",
+      "captured_at": "2026-08-11T16:19:16+08:00",
+      "tool": "Playwright Chromium and full-size image inspection",
+      "version": "Playwright 1.62.1",
+      "command": "pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The current 1280x820 synthetic result shows bounded group/member/issue pagination without accumulating previous pages; SHA-256 f9dd8a5297468526eb6091c4768d4ab644cb18ad0fffb97443ba435210343f37."
+    },
+    {
+      "id": "raw-metadata-review-capture",
+      "kind": "screenshot",
+      "path": "evidence/results-raw-metadata-1280x820.png",
+      "captured_at": "2026-08-11T16:19:16+08:00",
+      "tool": "Playwright Chromium, axe-core and full-size image inspection",
+      "version": "Playwright 1.62.1; axe-core 4.12.1",
+      "command": "pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The 1280x820 synthetic inspector shows report to field to byte-exact raw detail, contains no PII, and passed axe; SHA-256 49df988344ac1d8c0452d582fa91b5edab85708c7c3680765d296054113110d5."
     },
     {
       "id": "system-direction-artifact",

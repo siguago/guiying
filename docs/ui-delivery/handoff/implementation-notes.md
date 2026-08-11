@@ -28,15 +28,19 @@ pnpm tauri:dev
 pnpm exec tauri build --debug
 ```
 
-Rust 验证命令记录于仓库根 README。Tauri webview capability 只开放 core 默认能力和目录打开对话框，未开放 fs、shell 或 HTTP 插件；这不是对 Rust command 的 OS 沙箱，安全性还依赖 command 代码审计与只读核心 API。
+Rust 验证命令记录于仓库根 README。Tauri WebView capability 只开放
+`core:event:allow-listen` 与 `core:event:allow-unlisten`；目录选择由受审计的
+Rust command 调用原生对话框并签发窗口绑定的一次性令牌，WebView 没有 dialog、
+fs、shell、HTTP 或 image-from-path capability。这不是对 Rust command 的 OS 沙箱，
+安全性仍依赖 command 代码审计与只读核心 API。
 
 逐目标结果、证据与限制的双向映射以 `qa-evidence.json` 为唯一机器记录；本说明不替代该文件。
 
 ## 当前约束
 
-- 当前阶段尚未在桌面主链接入 EXIF、QuickTime、XMP、AAE、Google Takeout JSON 或 Live Photo 配对关系。
-- 结果中的 keeper 仅按稳定路径顺序暂定，并明确标注不能作为删除依据。
-- 组内成员已展示扫描快照中的文件 birth/mtime 与精度说明；它们是低可信文件系统线索，不能代替尚未接入主链的内嵌拍摄时间。
+- 桌面主链已展示受支持容器中的封印拍摄时间候选、成员判断、问题账本和按需原始元数据字段；尚未实现 AAE、Google Takeout JSON、Live Photo 等跨文件关系推断。
+- UI 不按路径或成员顺序推断 keeper。当前阶段没有 keeper 或 donor 决策，也没有任何写授权。
+- 组内成员同时展示扫描快照中的 birth/mtime 与精度说明；文件系统时间始终作为独立、低可信线索，不会替代内嵌拍摄时间证据。
 - SQLite 只读扫描证据已接入 UI；未来文件动作表仍 dormant，不构成执行授权。
 - 安装包已使用 `design-system/assets/guiying-app-icon.svg` 生成的归影品牌图标；16/32/64 px 在深浅背景下均保留照片叠层与确认标记，导出位图不应手工编辑。
 - 浏览器 E2E 覆盖合成数据流程；真实外置卷和系统目录对话框仍需人工验收矩阵。

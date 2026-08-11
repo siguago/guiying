@@ -23,11 +23,20 @@ import {
   Video,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { RefObject } from 'react'
+import type { ReactNode, RefObject } from 'react'
 import './App.css'
 import { BrandMark } from './components/BrandMark'
 import { createDemoReport } from './demo'
 import type {
+  CaptureTimeCandidate,
+  CaptureTimeGroupSummary,
+  CaptureTimeIssue,
+  CaptureTimeMemberAssessment,
+  CaptureTimeMetadataField,
+  CaptureTimeMetadataFieldRawDetail,
+  CaptureTimeMetadataLocator,
+  CaptureTimeMetadataReport,
+  CaptureTimeStageStatus,
   Confidence,
   DuplicateGroup,
   ScanErrorShape,
@@ -38,9 +47,17 @@ import {
   chooseScanDirectory,
   cancelDirectoryScanReadOnly,
   isDesktopRuntime,
+  loadCaptureTimeCandidatePage,
+  loadCaptureTimeGroupSummary,
+  loadCaptureTimeIssuePage,
+  loadCaptureTimeMemberPage,
+  loadCaptureTimeMetadataFieldPage,
+  loadCaptureTimeMetadataFieldRawDetail,
+  loadCaptureTimeMetadataReportPage,
   loadDuplicateGroupMemberPage,
   loadDuplicateGroupPage,
   loadScanIssuePage,
+  retryScanAcknowledgement,
   runSyntheticScan,
   startDirectoryScanReadOnly,
 } from './lib/backend'
@@ -55,6 +72,8 @@ const scanStages = [
   { label: '逐字节确认', description: '将同哈希候选逐字节比较后再组成确定重复组' },
   { label: '生成证据报告', description: '形成重复组，本阶段不移动任何文件' },
 ]
+
+const AUTHORIZED_SOURCE_LABEL = '已通过系统选择器授权的照片目录'
 
 const workflow = [
   { id: 'source', label: '扫描范围', detail: '选择一个普通目录', icon: FolderOpen },
@@ -349,6 +368,7 @@ function GroupRow({
 }) {
   const MediaIcon = group.mediaKind === 'video' ? Video : group.mediaKind === 'asset' ? Layers3 : ImageIcon
   const timeConfidence = group.evidence[0]?.confidence ?? 'low'
+  const timeEvidencePending = group.evidence[0]?.value === '选择该组后按需读取封印证据'
 
   return (
     <button
@@ -364,9 +384,13 @@ function GroupRow({
       </span>
       <span className="group-row__proofs">
         <span className="content-proof"><CheckCircle2 aria-hidden="true" size={12} /> D1 · 逐字节确认</span>
-        <span className={`confidence confidence--${timeConfidence}`}>
-          时间：{confidenceLabel(timeConfidence)}
-        </span>
+        {timeEvidencePending ? (
+          <span className="confidence confidence--low">时间：按需审阅</span>
+        ) : (
+          <span className={`confidence confidence--${timeConfidence}`}>
+            时间：{confidenceLabel(timeConfidence)}
+          </span>
+        )}
       </span>
       <span className="group-row__saving">
         <strong>{formatBytes(group.reclaimableBytes)}</strong>
@@ -377,9 +401,826 @@ function GroupRow({
   )
 }
 
-function GroupInspector({
+type EvidencePageDirection = 'initial' | 'next' | 'previous'
+
+interface EvidencePageView<T> {
+  items: T[]
+  cursor: string | null
+  nextCursor: string | null
+  history: Array<string | null>
+  isLoading: boolean
+  hasLoaded: boolean
+  error: string | null
+  failed: {
+    cursor: string | null
+    direction: EvidencePageDirection
+    baseCursor: string | null
+  } | null
+}
+
+function CursorEvidencePage<T>({
+  emptyCopy,
+  itemKey,
+  label,
+  loadPage,
+  renderItem,
+}: {
+  emptyCopy: string
+  itemKey: (item: T) => string
+  label: string
+  loadPage: (cursor: string | null) => Promise<{ items: T[]; nextCursor: string | null }>
+  renderItem: (item: T) => ReactNode
+}) {
+  const [view, setView] = useState<EvidencePageView<T>>({
+    items: [],
+    cursor: null,
+    nextCursor: null,
+    history: [],
+    isLoading: false,
+    hasLoaded: false,
+    error: null,
+    failed: null,
+  })
+  const viewRef = useRef(view)
+  const loadPageRef = useRef(loadPage)
+  const requestRef = useRef(0)
+  const busyRef = useRef(false)
+  viewRef.current = view
+  loadPageRef.current = loadPage
+
+  const perform = useCallback(async (
+    targetCursor: string | null,
+    direction: EvidencePageDirection,
+    retryBaseCursor?: string | null,
+  ) => {
+    if (busyRef.current) return
+    busyRef.current = true
+    const requestId = requestRef.current + 1
+    requestRef.current = requestId
+    const baseCursor = retryBaseCursor === undefined
+      ? viewRef.current.cursor
+      : retryBaseCursor
+    setView((current) => ({ ...current, isLoading: true, error: null }))
+    try {
+      const page = await loadPageRef.current(targetCursor)
+      if (requestRef.current !== requestId) return
+      setView((current) => {
+        let history = current.history
+        if (direction === 'next') history = [...current.history, baseCursor]
+        if (direction === 'previous') history = current.history.slice(0, -1)
+        if (direction === 'initial') history = []
+        return {
+          items: page.items,
+          cursor: targetCursor,
+          nextCursor: page.nextCursor,
+          history,
+          isLoading: false,
+          hasLoaded: true,
+          error: null,
+          failed: null,
+        }
+      })
+    } catch (pageError) {
+      if (requestRef.current !== requestId) return
+      setView((current) => ({
+        ...current,
+        isLoading: false,
+        error: asScanError(pageError).message,
+        failed: { cursor: targetCursor, direction, baseCursor },
+      }))
+    } finally {
+      if (requestRef.current === requestId) busyRef.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    // Deferring one tick avoids issuing the same read twice when React's
+    // development StrictMode probes an effect with an immediate setup/cleanup.
+    const initialRequest = window.setTimeout(() => void perform(null, 'initial'), 0)
+    return () => {
+      window.clearTimeout(initialRequest)
+      requestRef.current += 1
+      busyRef.current = false
+    }
+  }, [perform])
+
+  const previousCursor = view.history.at(-1)
+  return (
+    <div aria-busy={view.isLoading} className="capture-time-page">
+      {view.isLoading && !view.hasLoaded ? (
+        <div className="inline-load-state" role="status">
+          <LoaderCircle aria-hidden="true" className="is-spinning" size={15} /> 正在读取{label}…
+        </div>
+      ) : null}
+      {view.error ? (
+        <div className="inline-load-state inline-load-state--error" role="alert">
+          <TriangleAlert aria-hidden="true" size={15} />
+          <span>{view.error}</span>
+          <button
+            onClick={() => {
+              const failed = view.failed
+              if (failed) void perform(failed.cursor, failed.direction, failed.baseCursor)
+            }}
+            type="button"
+          >
+            重试失败页
+          </button>
+        </div>
+      ) : null}
+      {view.items.length > 0 ? (
+        <div className="capture-time-page__items">
+          {view.items.map((item) => <div key={itemKey(item)}>{renderItem(item)}</div>)}
+        </div>
+      ) : view.hasLoaded && !view.error ? <p className="capture-time-empty">{emptyCopy}</p> : null}
+      {view.hasLoaded && (view.history.length > 0 || view.nextCursor !== null) ? (
+        <nav aria-label={`${label}分页`} className="pagination-bar pagination-bar--compact">
+          <button
+            disabled={previousCursor === undefined || view.isLoading}
+            onClick={() => {
+              if (previousCursor !== undefined) void perform(previousCursor, 'previous')
+            }}
+            type="button"
+          >
+            <ChevronLeft aria-hidden="true" size={14} /> 上一页
+          </button>
+          <span>{view.isLoading ? '正在读取…' : `第 ${view.history.length + 1} 页`}</span>
+          <button
+            disabled={view.nextCursor === null || view.isLoading}
+            onClick={() => {
+              if (view.nextCursor !== null) void perform(view.nextCursor, 'next')
+            }}
+            type="button"
+          >
+            下一页 <ChevronRight aria-hidden="true" size={14} />
+          </button>
+        </nav>
+      ) : null}
+    </div>
+  )
+}
+
+const captureDecisionCopy: Record<CaptureTimeGroupSummary['decision'], string> = {
+  no_usable_evidence: '没有可用的内嵌时间证据',
+  review_required: '时间证据需要人工审阅',
+  evidence_eligible: '存在符合证据资格的候选',
+  conflict: '时间证据存在冲突',
+}
+
+const captureBlockerCopy: Record<string, string> = {
+  confidence_below_high: '置信度未达到高可信',
+  no_utc_instant: '缺少可比较的 UTC 瞬间',
+  evidence_conflict: '证据之间存在冲突',
+  sentinel_value: '命中哨兵时间',
+  obvious_future: '时间明显位于未来',
+  outside_automatic_range: '超出自动证据时间范围',
+  quicktime_epoch_semantic_uncertainty: 'QuickTime 纪元语义不确定',
+  invalid_evidence_present: '存在无效证据',
+  extraction_report_untrusted: '提取报告未通过信任门',
+  source_not_revalidated: '来源未完成二次复核',
+  multiple_strong_values_within_tolerance: '容差内存在多个强值',
+}
+
+const captureEvidenceKindCopy: Record<string, string> = {
+  exif_date_time_original: 'EXIF 原始拍摄时间',
+  exif_create_date: 'EXIF 创建时间',
+  exif_modify_date: 'EXIF 修改时间',
+  quicktime_metadata_creation_date: 'QuickTime 元数据创建时间',
+  quicktime_movie_header_creation_time: 'QuickTime 影片头创建时间',
+}
+
+const captureAnomalyCopy: Record<string, string> = {
+  missing_offset: '缺少时区偏移',
+  sentinel_value: '命中哨兵时间',
+  obvious_future: '明显位于未来',
+  outside_automatic_range: '超出自动证据范围',
+  quicktime_epoch_semantic_uncertainty: 'QuickTime 纪元语义不确定',
+  invalid_companion: '伴随字段无效',
+}
+
+const fileTimeRelationCopy: Record<string, string> = {
+  matches: '在已知精度内一致',
+  differs: '超出已知精度容差',
+  unavailable: '卷未提供该时间',
+  not_compared: '未比较',
+  review_fs_precision_unknown: '文件系统实际精度未知，需人工审阅',
+}
+
+const donorEligibilityCopy: Record<string, string> = {
+  ineligible: '不可作为时间供体',
+  eligible: '具备证据资格（仍不授权写入）',
+  review_required: '需要人工审阅，当前不可作为供体',
+}
+
+function captureOffsetLabel(candidate: CaptureTimeCandidate): string {
+  if (candidate.offsetKind === 'quicktime_epoch_assumed_utc') {
+    return 'QuickTime 纪元按 UTC 解释'
+  }
+  if (candidate.utcOffsetMinutes === null) return '无明确时区偏移'
+  const totalMinutes = Number(BigInt(candidate.utcOffsetMinutes))
+  const sign = totalMinutes < 0 ? '-' : '+'
+  const absolute = Math.abs(totalMinutes)
+  return `显式偏移 UTC${sign}${Math.floor(absolute / 60).toString().padStart(2, '0')}:${(absolute % 60).toString().padStart(2, '0')}`
+}
+
+function CaptureTimeCandidateCard({
+  candidate,
+  isSelected,
+}: {
+  candidate: CaptureTimeCandidate
+  isSelected: boolean
+}) {
+  return (
+    <article className="capture-time-candidate">
+      <div className="capture-time-candidate__heading">
+        <strong>候选 {candidate.ordinal}</strong>
+        <span className={`confidence confidence--${candidate.confidence}`}>
+          {confidenceLabel(candidate.confidence)}
+        </span>
+        <span className={candidate.evidenceEligible ? 'capture-gate capture-gate--eligible' : 'capture-gate'}>
+          {candidate.evidenceEligible ? '仅证据资格' : '已阻断'}
+        </span>
+        {isSelected ? <span className="capture-selected">封印分析选中</span> : null}
+      </div>
+      <time>{candidate.wallTime}</time>
+      {candidate.utcInstant ? <code>{candidate.utcInstant}</code> : null}
+      <small>
+        {captureOffsetLabel(candidate)} · 精度 {candidate.precisionNs.toLocaleString('zh-CN')} ns · {candidate.sourceCount} 个来源 ·
+        {candidate.supportingObservationCount} 条支撑观察
+      </small>
+      {candidate.evidenceKinds.length > 0 ? (
+        <p>来源字段：{candidate.evidenceKinds.map((kind) => captureEvidenceKindCopy[kind] ?? kind).join('、')}</p>
+      ) : null}
+      {candidate.evidenceBlockers.length > 0 ? (
+        <ul className="capture-time-blockers">
+          {candidate.evidenceBlockers.map((blocker) => (
+            <li key={blocker}>{captureBlockerCopy[blocker] ?? blocker}</li>
+          ))}
+        </ul>
+      ) : null}
+      {candidate.anomalies.length > 0 ? (
+        <p>异常标记：{candidate.anomalies.map((anomaly) => captureAnomalyCopy[anomaly] ?? anomaly).join('、')}</p>
+      ) : null}
+    </article>
+  )
+}
+
+function CaptureTimeMemberCard({
+  assessment,
   group,
+}: {
+  assessment: CaptureTimeMemberAssessment
+  group: DuplicateGroup
+}) {
+  const file = group.files.find((member) => member.id === assessment.observationId)
+  return (
+    <article className="capture-time-member">
+      <strong>{file?.name ?? `成员 ${assessment.memberOrdinal}`}</strong>
+      <small>{assessment.candidateOrdinal === null ? '无关联候选' : `关联候选 ${assessment.candidateOrdinal}`}</small>
+      <dl>
+        <div><dt>文件创建关系</dt><dd>{fileTimeRelationCopy[assessment.birthTimeRelation] ?? assessment.birthTimeRelation}</dd></div>
+        <div><dt>文件修改关系</dt><dd>{fileTimeRelationCopy[assessment.modifiedTimeRelation] ?? assessment.modifiedTimeRelation}</dd></div>
+        <div><dt>时间供体资格</dt><dd>{donorEligibilityCopy[assessment.donorEligibility] ?? assessment.donorEligibility}</dd></div>
+      </dl>
+      <p>原因代码：{assessment.reasonCode}</p>
+    </article>
+  )
+}
+
+const metadataFormatCopy: Record<string, string> = {
+  jpeg: 'JPEG / Exif',
+  tiff: 'TIFF',
+  iso_bmff: 'ISO-BMFF / QuickTime',
+}
+
+const metadataExtractionCopy: Record<string, string> = {
+  extracted_unvalidated: '已提取；可信性由双重提取与来源复核证明',
+  no_metadata: '未发现受支持元数据',
+  partial: '有界提取部分完成',
+  failed: '提取失败',
+  unsupported: '容器暂不支持',
+}
+
+const metadataFieldKindCopy: Record<string, string> = {
+  exif_date_time_original: 'EXIF DateTimeOriginal',
+  exif_create_date: 'EXIF CreateDate',
+  exif_modify_date: 'EXIF ModifyDate',
+  exif_offset_time_original: 'EXIF OffsetTimeOriginal',
+  exif_subsec_time_original: 'EXIF SubSecTimeOriginal',
+  quicktime_movie_header_creation_time: 'QuickTime movie header creation time',
+  quicktime_metadata_creation_date: 'QuickTime metadata creation date',
+}
+
+const metadataEncodingCopy: Record<string, string> = {
+  declared_ascii: '声明为 ASCII',
+  validated_utf8: '已验证 UTF-8',
+  unsigned_big_endian: '无符号大端整数',
+}
+
+function metadataLocatorCopy(locator: CaptureTimeMetadataLocator): ReactNode {
+  if (locator.kind === 'tiff') {
+    return (
+      <dl className="metadata-locator">
+        <div><dt>容器定位</dt><dd>TIFF</dd></div>
+        <div><dt>Header / IFD</dt><dd>{locator.headerOffset} / {locator.ifdOffset}</dd></div>
+        <div><dt>Tag / 字节序</dt><dd>{locator.tag} / {locator.byteOrder}</dd></div>
+      </dl>
+    )
+  }
+  if (locator.kind === 'jpeg_exif') {
+    return (
+      <dl className="metadata-locator">
+        <div><dt>容器定位</dt><dd>JPEG Exif</dd></div>
+        <div><dt>APP1 / Header / IFD</dt><dd>{locator.app1Offset} / {locator.headerOffset} / {locator.ifdOffset}</dd></div>
+        <div><dt>Tag / 字节序</dt><dd>{locator.tag} / {locator.byteOrder}</dd></div>
+      </dl>
+    )
+  }
+  return (
+    <div className="metadata-locator">
+      <dl>
+        <div><dt>容器定位</dt><dd>ISO-BMFF · box offset {locator.boxOffset}</dd></div>
+      </dl>
+      <span>Box 路径（STANDARD Base64）</span>
+      <pre aria-label="ISO-BMFF box 路径 Base64" className="metadata-raw-code" tabIndex={0}>
+        <code>{locator.boxPathBase64}</code>
+      </pre>
+    </div>
+  )
+}
+
+function MetadataRawDetailPanel({
+  analysisBuildId,
+  exactGroupBuildId,
+  field,
+  jobId,
+  report,
+}: {
+  analysisBuildId: string
+  exactGroupBuildId: string
+  field: CaptureTimeMetadataField
+  jobId: string
+  report: CaptureTimeMetadataReport
+}) {
+  const [detail, setDetail] = useState<CaptureTimeMetadataFieldRawDetail | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const requestGenerationRef = useRef(0)
+  const requestBusyRef = useRef(false)
+
+  const load = useCallback(async () => {
+    if (requestBusyRef.current) return
+    requestBusyRef.current = true
+    const generation = requestGenerationRef.current + 1
+    requestGenerationRef.current = generation
+    setIsLoading(true)
+    setError(null)
+    try {
+      const nextDetail = await loadCaptureTimeMetadataFieldRawDetail(
+        jobId,
+        exactGroupBuildId,
+        analysisBuildId,
+        report,
+        field,
+      )
+      if (requestGenerationRef.current === generation) setDetail(nextDetail)
+    } catch (detailError) {
+      if (requestGenerationRef.current === generation) {
+        setError(asScanError(detailError).message)
+      }
+    } finally {
+      if (requestGenerationRef.current === generation) {
+        requestBusyRef.current = false
+        setIsLoading(false)
+      }
+    }
+  }, [analysisBuildId, exactGroupBuildId, field, jobId, report])
+
+  useEffect(() => {
+    setDetail(null)
+    setError(null)
+    requestBusyRef.current = false
+    const initialRequest = window.setTimeout(() => void load(), 0)
+    return () => {
+      window.clearTimeout(initialRequest)
+      requestGenerationRef.current += 1
+      requestBusyRef.current = false
+    }
+  }, [load])
+
+  if (isLoading && !detail) {
+    return (
+      <div className="inline-load-state" role="status">
+        <LoaderCircle aria-hidden="true" className="is-spinning" size={15} /> 正在读取单字段封印原始值…
+      </div>
+    )
+  }
+  if (error) {
+    return (
+      <div className="inline-load-state inline-load-state--error" role="alert">
+        <TriangleAlert aria-hidden="true" size={15} />
+        <span>{error}</span>
+        <button onClick={() => void load()} type="button">重试原始字段</button>
+      </div>
+    )
+  }
+  if (!detail) return null
+
+  return (
+    <section aria-label={`${metadataFieldKindCopy[detail.fieldKind] ?? detail.fieldKind} 原始证据`} className="metadata-raw-detail">
+      <div className="metadata-proof-banner">
+        <ShieldCheck aria-hidden="true" size={14} />
+        <p><strong>历史证明 · 只读展示</strong>不构成 keeper、时间 donor 或任何文件写入授权。</p>
+      </div>
+      <dl className="metadata-detail-grid">
+        <div><dt>解析器</dt><dd>{detail.parserName} · {detail.parserVersion}</dd></div>
+        <div><dt>来源复核</dt><dd>描述符、路径、会话三重复核通过</dd></div>
+        <div><dt>双重提取</dt><dd>两次报告摘要逐字节一致</dd></div>
+        <div><dt>字段位置</dt><dd>absolute offset {detail.absoluteOffset}</dd></div>
+        <div><dt>原始长度</dt><dd>{formatBytes(detail.byteLength)}</dd></div>
+        <div><dt>来源路径身份</dt><dd>{detail.nativePath.encoding} 原生字节已无损封存</dd></div>
+      </dl>
+      {metadataLocatorCopy(detail.locator)}
+      <span className="metadata-raw-label">字段原始字节（STANDARD Base64；不做文本解码）</span>
+      <pre aria-label="字段原始字节 Base64" className="metadata-raw-code" tabIndex={0}>
+        <code>{detail.rawBase64}</code>
+      </pre>
+      <div className="metadata-digests">
+        <span>字段 BLAKE3</span><code>{detail.rawDigestHex}</code>
+        <span>报告 BLAKE3（两次一致）</span><code>{detail.firstReportDigestHex}</code>
+        <span>封印清单</span><code>{detail.sealedManifestDigestHex}</code>
+      </div>
+    </section>
+  )
+}
+
+function MetadataFieldCard({
+  analysisBuildId,
+  exactGroupBuildId,
+  field,
+  isExpanded,
+  jobId,
+  onToggle,
+  report,
+}: {
+  analysisBuildId: string
+  exactGroupBuildId: string
+  field: CaptureTimeMetadataField
+  isExpanded: boolean
+  jobId: string
+  onToggle: () => void
+  report: CaptureTimeMetadataReport
+}) {
+  const detailId = `metadata-field-detail-${report.reportId}-${field.fieldId}`
+  return (
+    <article className="metadata-field">
+      <button
+        aria-controls={detailId}
+        aria-expanded={isExpanded}
+        className="metadata-disclosure-button"
+        onClick={onToggle}
+        type="button"
+      >
+        <span>
+          <strong>{metadataFieldKindCopy[field.fieldKind] ?? field.fieldKind}</strong>
+          <small>{metadataEncodingCopy[field.encoding] ?? field.encoding} · {formatBytes(field.byteLength)} · offset {field.absoluteOffset}</small>
+        </span>
+        <ChevronRight aria-hidden="true" className={isExpanded ? 'is-expanded' : ''} size={15} />
+      </button>
+      {isExpanded ? (
+        <div id={detailId}>
+          <MetadataRawDetailPanel
+            analysisBuildId={analysisBuildId}
+            exactGroupBuildId={exactGroupBuildId}
+            field={field}
+            jobId={jobId}
+            key={`${field.ordinal}:${field.fieldId}`}
+            report={report}
+          />
+        </div>
+      ) : null}
+    </article>
+  )
+}
+
+function MetadataFieldPage({
+  analysisBuildId,
+  exactGroupBuildId,
+  jobId,
+  report,
+}: {
+  analysisBuildId: string
+  exactGroupBuildId: string
+  jobId: string
+  report: CaptureTimeMetadataReport
+}) {
+  const [expandedFieldId, setExpandedFieldId] = useState<string | null>(null)
+  return (
+    <CursorEvidencePage<CaptureTimeMetadataField>
+      emptyCopy="这个封印报告没有保留可审阅字段。"
+      itemKey={(field) => `${field.ordinal}:${field.fieldId}`}
+      label="原始元数据字段摘要"
+      loadPage={async (cursor) => {
+        const page = await loadCaptureTimeMetadataFieldPage(
+          jobId,
+          exactGroupBuildId,
+          analysisBuildId,
+          report,
+          cursor,
+        )
+        return { items: page.fields, nextCursor: page.nextCursor }
+      }}
+      renderItem={(field) => (
+        <MetadataFieldCard
+          analysisBuildId={analysisBuildId}
+          exactGroupBuildId={exactGroupBuildId}
+          field={field}
+          isExpanded={expandedFieldId === field.fieldId}
+          jobId={jobId}
+          onToggle={() => setExpandedFieldId((current) => (
+            current === field.fieldId ? null : field.fieldId
+          ))}
+          report={report}
+        />
+      )}
+    />
+  )
+}
+
+function MetadataReportCard({
+  analysisBuildId,
+  exactGroupBuildId,
+  isExpanded,
+  jobId,
+  onToggle,
+  report,
+}: {
+  analysisBuildId: string
+  exactGroupBuildId: string
+  isExpanded: boolean
+  jobId: string
+  onToggle: () => void
+  report: CaptureTimeMetadataReport
+}) {
+  const fieldsId = `metadata-report-fields-${report.reportId}`
+  return (
+    <article className="metadata-report">
+      <button
+        aria-controls={fieldsId}
+        aria-expanded={isExpanded}
+        className="metadata-disclosure-button"
+        onClick={onToggle}
+        type="button"
+      >
+        <span>
+          <strong>{fileNameFromPath(report.displayPath)}</strong>
+          <small>{report.reportParserName} · {report.reportParserVersion} · {metadataFormatCopy[report.detectedFormat ?? ''] ?? '格式未识别'}</small>
+        </span>
+        <ChevronRight aria-hidden="true" className={isExpanded ? 'is-expanded' : ''} size={15} />
+      </button>
+      <code className="metadata-display-path" title={report.displayPath}>{report.displayPath}</code>
+      <div className="metadata-report__facts">
+        <span>{metadataExtractionCopy[report.extractionStatus] ?? report.extractionStatus}</span>
+        <span>{report.fieldCount} 个字段 · {formatBytes(report.retainedFieldBytes)} 保留值</span>
+        <span>双重提取一致</span>
+        <span>描述符 / 路径 / 会话已复核</span>
+      </div>
+      {isExpanded ? (
+        <div className="metadata-report__fields" id={fieldsId}>
+          <MetadataFieldPage
+            analysisBuildId={analysisBuildId}
+            exactGroupBuildId={exactGroupBuildId}
+            jobId={jobId}
+            key={`${report.sourceOrdinal}:${report.reportId}`}
+            report={report}
+          />
+        </div>
+      ) : null}
+    </article>
+  )
+}
+
+function CaptureTimeMetadataReview({
+  analysisBuildId,
+  exactGroupBuildId,
+  jobId,
+}: {
+  analysisBuildId: string
+  exactGroupBuildId: string
+  jobId: string
+}) {
+  const [expandedReportId, setExpandedReportId] = useState<string | null>(null)
+  return (
+    <div className="metadata-review">
+      <div className="metadata-history-note">
+        原始值列表不会返回任何字节；只有展开报告并明确选择单个字段后，才按封印范围读取最多 1 MiB 的历史证明。
+      </div>
+      <CursorEvidencePage<CaptureTimeMetadataReport>
+        emptyCopy="该组没有封印的元数据提取报告。"
+        itemKey={(report) => `${report.sourceOrdinal}:${report.reportId}`}
+        label="原始元数据报告"
+        loadPage={async (cursor) => {
+          const page = await loadCaptureTimeMetadataReportPage(
+            jobId,
+            exactGroupBuildId,
+            analysisBuildId,
+            cursor,
+          )
+          return { items: page.reports, nextCursor: page.nextCursor }
+        }}
+        renderItem={(report) => (
+          <MetadataReportCard
+            analysisBuildId={analysisBuildId}
+            exactGroupBuildId={exactGroupBuildId}
+            isExpanded={expandedReportId === report.reportId}
+            jobId={jobId}
+            onToggle={() => setExpandedReportId((current) => (
+              current === report.reportId ? null : report.reportId
+            ))}
+            report={report}
+          />
+        )}
+      />
+    </div>
+  )
+}
+
+function CaptureTimeEvidencePanel({
+  group,
+  jobId,
+  stageStatus,
+}: {
+  group: DuplicateGroup
+  jobId?: string
+  stageStatus?: CaptureTimeStageStatus
+}) {
+  const [summary, setSummary] = useState<CaptureTimeGroupSummary | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [requestNonce, setRequestNonce] = useState(0)
+  const [showMetadata, setShowMetadata] = useState(false)
+  const [showMembers, setShowMembers] = useState(false)
+  const [showIssues, setShowIssues] = useState(false)
+
+  useEffect(() => {
+    if (!jobId || (stageStatus !== 'completed' && stageStatus !== 'partial')) return
+    let active = true
+    setIsLoading(true)
+    setLoadError(null)
+    setSummary(null)
+    setShowMetadata(false)
+    setShowMembers(false)
+    setShowIssues(false)
+    void loadCaptureTimeGroupSummary(jobId, group.id)
+      .then((nextSummary) => {
+        if (active) setSummary(nextSummary)
+      })
+      .catch((summaryError) => {
+        if (active) setLoadError(asScanError(summaryError).message)
+      })
+      .finally(() => {
+        if (active) setIsLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [group.id, jobId, requestNonce, stageStatus])
+
+  if (!jobId || !stageStatus || stageStatus === 'not_run') {
+    return <p className="capture-time-empty">本次没有运行拍摄时间分析。</p>
+  }
+  if (stageStatus === 'unavailable' || stageStatus === 'failed') {
+    return <p className="capture-time-empty">拍摄时间阶段不可用；D1 内容重复结论不受影响。</p>
+  }
+  if (isLoading) {
+    return (
+      <div className="inline-load-state" role="status">
+        <LoaderCircle aria-hidden="true" className="is-spinning" size={15} /> 正在读取封印后的时间摘要…
+      </div>
+    )
+  }
+  if (loadError) {
+    return (
+      <div className="inline-load-state inline-load-state--error" role="alert">
+        <TriangleAlert aria-hidden="true" size={15} />
+        <span>{loadError}</span>
+        <button onClick={() => setRequestNonce((value) => value + 1)} type="button">重试</button>
+      </div>
+    )
+  }
+  if (!summary) {
+    return <p className="capture-time-empty">该组没有封印的拍摄时间分析结果。</p>
+  }
+
+  return (
+    <div className="capture-time-evidence">
+      <div className="capture-time-summary">
+        <strong>{captureDecisionCopy[summary.decision]}</strong>
+        <small>
+          {summary.sourceCount} 个来源 · {summary.observationCount} 条观察 ·
+          {summary.candidateCount} 个候选 · {summary.issueCount} 条问题
+        </small>
+        <p>这是只读证据结论，不是 keeper、时间供体或文件写入授权。</p>
+      </div>
+
+      <CursorEvidencePage<CaptureTimeCandidate>
+        emptyCopy="没有封印的拍摄时间候选。"
+        itemKey={(candidate) => candidate.ordinal}
+        label="拍摄时间候选"
+        loadPage={async (cursor) => {
+          const page = await loadCaptureTimeCandidatePage(
+            jobId,
+            group.id,
+            summary.analysisBuildId,
+            cursor,
+          )
+          return { items: page.candidates, nextCursor: page.nextCursor }
+        }}
+        renderItem={(candidate) => (
+          <CaptureTimeCandidateCard
+            candidate={candidate}
+            isSelected={candidate.ordinal === summary.selectedCandidateOrdinal}
+          />
+        )}
+      />
+
+      <details
+        className="capture-time-details capture-time-details--metadata"
+        onToggle={(event) => setShowMetadata(event.currentTarget.open)}
+      >
+        <summary>原始元数据证据（{summary.sourceCount} 个来源）</summary>
+        {showMetadata ? (
+          <CaptureTimeMetadataReview
+            analysisBuildId={summary.analysisBuildId}
+            exactGroupBuildId={group.id}
+            jobId={jobId}
+            key={`${group.id}:${summary.analysisBuildId}`}
+          />
+        ) : null}
+      </details>
+
+      <details
+        className="capture-time-details"
+        onToggle={(event) => setShowMembers(event.currentTarget.open)}
+      >
+        <summary>文件时间关系（{summary.memberCount} 项）</summary>
+        {showMembers ? (
+          <CursorEvidencePage<CaptureTimeMemberAssessment>
+            emptyCopy="没有封印的成员时间关系。"
+            itemKey={(member) => member.memberOrdinal}
+            label="文件时间关系"
+            loadPage={async (cursor) => {
+              const page = await loadCaptureTimeMemberPage(
+                jobId,
+                group.id,
+                summary.analysisBuildId,
+                cursor,
+              )
+              return { items: page.members, nextCursor: page.nextCursor }
+            }}
+            renderItem={(member) => <CaptureTimeMemberCard assessment={member} group={group} />}
+          />
+        ) : null}
+      </details>
+
+      <details
+        className="capture-time-details"
+        onToggle={(event) => setShowIssues(event.currentTarget.open)}
+      >
+        <summary>时间问题（{summary.issueCount} 项）</summary>
+        {showIssues ? (
+          <CursorEvidencePage<CaptureTimeIssue>
+            emptyCopy="没有封印的时间问题。"
+            itemKey={(issue) => issue.ordinal}
+            label="拍摄时间问题"
+            loadPage={async (cursor) => {
+              const page = await loadCaptureTimeIssuePage(
+                jobId,
+                group.id,
+                summary.analysisBuildId,
+                cursor,
+              )
+              return { items: page.issues, nextCursor: page.nextCursor }
+            }}
+            renderItem={(issue: CaptureTimeIssue) => (
+              <article className="capture-time-issue">
+                <strong>{issue.code}</strong>
+                <small>{issue.fieldKind ?? '未绑定单一字段'} · {issue.sourceCount} 个来源</small>
+                <p>{issue.context}</p>
+              </article>
+            )}
+          />
+        ) : null}
+      </details>
+    </div>
+  )
+}
+
+function GroupInspector({
+  captureTimeStageStatus,
+  group,
+  isLive,
   isLoading,
+  jobId,
   loadError,
   memberPage,
   canLoadPrevious,
@@ -388,8 +1229,11 @@ function GroupInspector({
   onLoadPrevious,
   onLoadNext,
 }: {
+  captureTimeStageStatus?: CaptureTimeStageStatus
   group: DuplicateGroup
+  isLive: boolean
   isLoading: boolean
+  jobId?: string
   loadError: string | null
   memberPage: number
   canLoadPrevious: boolean
@@ -398,7 +1242,6 @@ function GroupInspector({
   onLoadPrevious: () => void
   onLoadNext: () => void
 }) {
-  const keeper = group.files.find((file) => file.isRecommendedKeeper)
   return (
     <aside aria-labelledby="inspector-title" className="inspector" tabIndex={0}>
       <header className="inspector__header">
@@ -432,10 +1275,10 @@ function GroupInspector({
         {group.files.length > 0 ? (
           <ol className="group-members">
             {group.files.map((file) => (
-              <li className={file.isRecommendedKeeper ? 'group-member group-member--keeper' : 'group-member'} key={file.id}>
+              <li className="group-member" key={file.id}>
                 <div className="group-member__heading">
                   <strong>{file.name}</strong>
-                  {file.isRecommendedKeeper ? <span><Archive aria-hidden="true" size={11} /> 暂定保留</span> : <span>重复成员</span>}
+                  <span>重复成员</span>
                 </div>
                 <code title={file.path}>{file.path}</code>
                 <dl>
@@ -463,32 +1306,40 @@ function GroupInspector({
       </section>
 
       <section className="inspector-section">
-        <div className="inspector-section__title"><span>暂定保留建议</span><span>未形成执行计划</span></div>
+        <div className="inspector-section__title"><span>保留决策</span><span>尚未形成</span></div>
         <div className="keeper-block">
           <span className="keeper-block__icon"><Archive size={18} /></span>
           <div>
-            <strong>{keeper?.name ?? (isLoading ? '正在载入暂定保留项…' : group.previewName)}</strong>
-            <small title={keeper?.path}>{keeper?.path}</small>
-            <p>{keeper?.keeperReason ?? '当前里程碑仅展示候选，不执行保留选择。'}</p>
+            <strong>尚未选择保留副本</strong>
+            <p>稳定排序不代表 keeper。需要封印后的资产完整性、画质与伴随文件政策，当前只读阶段不会代替你作出选择。</p>
           </div>
         </div>
       </section>
 
       <section className="inspector-section">
         <div className="inspector-section__title"><span>时间证据</span><span>不参与重复判定</span></div>
-        <div className="time-evidence-list">
-          {group.evidence.map((evidence) => (
-            <article key={`${evidence.label}-${evidence.source}`}>
-              <div>
-                <strong>{evidence.label}</strong>
-                <span className={`confidence confidence--${evidence.confidence}`}>{confidenceLabel(evidence.confidence)}</span>
-              </div>
-              <time>{evidence.value}</time>
-              <small>{evidence.source}</small>
-              {evidence.note ? <p>{evidence.note}</p> : null}
-            </article>
-          ))}
-        </div>
+        {isLive ? (
+          <CaptureTimeEvidencePanel
+            group={group}
+            jobId={jobId}
+            key={group.id}
+            stageStatus={captureTimeStageStatus}
+          />
+        ) : (
+          <div className="time-evidence-list">
+            {group.evidence.map((evidence) => (
+              <article key={`${evidence.label}-${evidence.source}`}>
+                <div>
+                  <strong>{evidence.label}</strong>
+                  <span className={`confidence confidence--${evidence.confidence}`}>{confidenceLabel(evidence.confidence)}</span>
+                </div>
+                <time>{evidence.value}</time>
+                <small>{evidence.source}</small>
+                {evidence.note ? <p>{evidence.note}</p> : null}
+              </article>
+            ))}
+          </div>
+        )}
       </section>
     </aside>
   )
@@ -501,6 +1352,40 @@ function EmptyResults({ status }: { status: ScanReport['status'] }) {
       <h2>在已扫描范围内没有发现确定重复项</h2>
       <p>本次只检查了逐字节完全相同的受支持媒体。相似照片与伴随资产不会被归入当前结果。</p>
       {status !== 'complete' ? <small>扫描并未覆盖全部条目，请同时复核问题清单。</small> : null}
+    </div>
+  )
+}
+
+function CaptureTimeStageNotice({ report }: { report: ScanReport }) {
+  const stage = report.captureTime
+  if (!stage || stage.status === 'not_run') return null
+
+  const statusCopy = {
+    completed: ['拍摄时间证据已封存', '已完成当前范围内的描述符绑定双重提取。'],
+    partial: ['拍摄时间证据部分完成', '只展示已经封存的组；未完成组不会产生时间结论。'],
+    unavailable: ['拍摄时间证据不可用', 'D1 重复结论仍有效；当前没有可展示的内嵌时间证据。'],
+    failed: ['拍摄时间阶段失败', 'D1 重复结论仍保留；失败不会降级成文件系统时间猜测。'],
+    not_run: ['', ''],
+  }[stage.status]
+
+  return (
+    <div
+      className={stage.status === 'completed' ? 'report-notice' : 'report-notice report-notice--partial'}
+      role="status"
+    >
+      {stage.status === 'completed'
+        ? <ShieldCheck aria-hidden="true" size={16} />
+        : <TriangleAlert aria-hidden="true" size={16} />}
+      <div>
+        <strong>{statusCopy[0]}</strong>
+        <span>{statusCopy[1]}</span>
+        <small>
+          已封存 {stage.groupsWritten.toLocaleString('zh-CN')} / {stage.groupsSeen.toLocaleString('zh-CN')} 组，
+          其中 {stage.evidenceGroups.toLocaleString('zh-CN')} 组有证据；实际读取 {formatBytes(stage.actualReadBytes)}。
+          {stage.budgetExhausted ? ' 本次达到只读预算上限。' : ''}
+          {stage.failure ? ` 终止原因：${stage.failure}。` : ''}
+        </small>
+      </div>
     </div>
   )
 }
@@ -657,6 +1542,11 @@ function ResultsWorkspace({
   report: ScanReport
   onReset: () => void
 }) {
+  const [acknowledgementPending, setAcknowledgementPending] = useState(
+    report.acknowledgementPending === true,
+  )
+  const [acknowledgementError, setAcknowledgementError] = useState<string | null>(null)
+  const [isAcknowledging, setIsAcknowledging] = useState(false)
   const [groups, setGroups] = useState(report.duplicateGroups)
   const [groupCursor, setGroupCursor] = useState<string | null>(null)
   const [nextGroupCursor, setNextGroupCursor] = useState(
@@ -686,6 +1576,20 @@ function ResultsWorkspace({
   const [memberLoadError, setMemberLoadError] = useState<string | null>(null)
   const memberRequestRef = useRef(0)
   const memberRequestBusyRef = useRef(false)
+
+  async function retryAcknowledgement() {
+    if (!report.acknowledgementJobId || isAcknowledging) return
+    setIsAcknowledging(true)
+    setAcknowledgementError(null)
+    try {
+      await retryScanAcknowledgement(report.acknowledgementJobId)
+      setAcknowledgementPending(false)
+    } catch (acknowledgementFailure) {
+      setAcknowledgementError(asScanError(acknowledgementFailure).message)
+    } finally {
+      setIsAcknowledging(false)
+    }
+  }
 
   const fetchMemberPage = useCallback(async function fetchMemberPage(
     group: DuplicateGroup,
@@ -869,6 +1773,18 @@ function ResultsWorkspace({
           </span>
           <h1>发现 {report.totalDuplicateGroups.toLocaleString('zh-CN')} 组确定重复</h1>
           <p title={report.root}>{report.root}</p>
+          {report.rootPath ? (
+            <span className="native-path-note">
+              路径身份按
+              {' '}
+              {report.rootPath.encoding === 'unix_bytes'
+                ? 'Unix 原生字节'
+                : report.rootPath.encoding === 'windows_utf16_le'
+                  ? 'Windows UTF-16LE'
+                  : 'UTF-8'}
+              {' '}无损封存，显示文本不用于寻址
+            </span>
+          ) : null}
         </div>
         <button className="button button--quiet" onClick={onReset} type="button">
           <RotateCcw aria-hidden="true" size={16} /> 扫描其他目录
@@ -888,6 +1804,27 @@ function ResultsWorkspace({
           </div>
         </div>
       ) : null}
+
+      {acknowledgementPending ? (
+        <div className="report-notice report-notice--partial" role="alert">
+          <TriangleAlert aria-hidden="true" size={16} />
+          <div>
+            <strong>报告已封存，但任务回执仍待确认。</strong>
+            <span>你可以继续复核本页；在确认成功前，新扫描会恢复这个终态任务，而不会覆盖证据。</span>
+            {acknowledgementError ? <small>{acknowledgementError}</small> : null}
+          </div>
+          <button
+            className="button button--quiet"
+            disabled={isAcknowledging}
+            onClick={() => void retryAcknowledgement()}
+            type="button"
+          >
+            {isAcknowledging ? '正在确认…' : '重试确认'}
+          </button>
+        </div>
+      ) : null}
+
+      {report.dataMode === 'live' ? <CaptureTimeStageNotice report={report} /> : null}
 
       <IssueDisclosure report={report} />
 
@@ -953,8 +1890,11 @@ function ResultsWorkspace({
           <GroupInspector
             canLoadNext={nextMemberCursor !== null}
             canLoadPrevious={memberHistory.length > 0}
+            captureTimeStageStatus={report.captureTime?.status}
             group={inspectedGroup}
+            isLive={report.dataMode === 'live'}
             isLoading={isLoadingMembers}
+            jobId={report.resultJobId}
             loadError={memberLoadError}
             memberPage={memberHistory.length + 1}
             onLoadNext={() => void loadNextMembers()}
@@ -987,6 +1927,7 @@ function ErrorWorkspace({ error, onReset }: { error: ScanErrorShape; onReset: ()
 function App() {
   const [phase, setPhase] = useState<AppPhase>('idle')
   const [source, setSource] = useState<string | null>(null)
+  const [selectedRootToken, setSelectedRootToken] = useState<string | null>(null)
   const [report, setReport] = useState<ScanReport | null>(null)
   const [error, setError] = useState<ScanErrorShape | null>(null)
   const [stageIndex, setStageIndex] = useState(0)
@@ -1005,7 +1946,8 @@ function App() {
       const selection = await chooseScanDirectory()
       if (selection) {
         shouldRestoreFocus = true
-        setSource(selection)
+        setSelectedRootToken(selection.rootToken)
+        setSource(AUTHORIZED_SOURCE_LABEL)
         setPhase('ready-to-scan')
       }
     } catch (selectionError) {
@@ -1020,7 +1962,7 @@ function App() {
   }
 
   async function handleScan() {
-    if (!source || scanAttemptRef.current) return
+    if (!source || !selectedRootToken || scanAttemptRef.current) return
     scanAttemptRef.current = true
     setStageIndex(0)
     setError(null)
@@ -1029,7 +1971,7 @@ function App() {
     setPhase('scanning')
     try {
       const session = await startDirectoryScanReadOnly(
-        source,
+        selectedRootToken,
         (progress) => {
           const nextStage = {
             enumerating: 0,
@@ -1044,6 +1986,7 @@ function App() {
       )
       setActiveScanJobId(session.jobId)
       const nextReport = await session.result
+      setSelectedRootToken(null)
       setSource(nextReport.root)
       setReport(nextReport)
       setPhase('results')
@@ -1075,6 +2018,7 @@ function App() {
     if (scanAttemptRef.current) return
     scanAttemptRef.current = true
     const demoRoot = createDemoReport().root
+    setSelectedRootToken(null)
     setSource(demoRoot)
     setStageIndex(0)
     setError(null)
@@ -1102,6 +2046,7 @@ function App() {
   function reset() {
     setPhase('idle')
     setSource(null)
+    setSelectedRootToken(null)
     setReport(null)
     setError(null)
     setStageIndex(0)

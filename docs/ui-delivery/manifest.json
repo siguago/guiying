@@ -175,7 +175,7 @@
     },
     "image_inspection": {
       "status": "used",
-      "notes": "All four browser captures and the native-window capture were decoded and inspected at full size."
+      "notes": "All current browser captures, including paged and expanded raw-metadata states, plus the native-window capture were decoded and inspected at full size."
     }
   },
   "evidence": {
