@@ -266,7 +266,7 @@
       "captured_at": "2026-08-11T17:51:31+08:00",
       "tool": "Playwright, axe-core, Vite, Oxlint",
       "version": "Playwright 1.62.1; axe-core 4.12.1; Vite 8.2.1; Oxlint 1.78.0",
-      "command": "pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui",
+      "command": "pnpm exec tsc --noEmit && pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-contrast",
@@ -281,7 +281,7 @@
       "captured_at": "2026-08-11T17:49:00+08:00",
       "tool": "Cargo",
       "version": "1.77.2",
-      "command": "cargo +1.77.2 fmt --manifest-path crates/guiying-core/Cargo.toml --all -- --check && cargo +1.77.2 clippy --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings && cargo +1.77.2 test --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features",
+      "command": "cargo +1.77.2 fmt --manifest-path crates/guiying-core/Cargo.toml --all -- --check && cargo +1.77.2 clippy --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings && cargo +1.77.2 test --locked --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features && RUSTDOCFLAGS=-D warnings cargo +1.77.2 doc --locked --manifest-path crates/guiying-core/Cargo.toml --no-deps",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-privacy"
@@ -295,7 +295,7 @@
       "captured_at": "2026-08-11T17:49:00+08:00",
       "tool": "Cargo",
       "version": "1.92.0",
-      "command": "cargo +1.92.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check && cargo +1.92.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings && cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features",
+      "command": "cargo +1.92.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check && cargo +1.92.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings && cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features && RUSTDOCFLAGS=-D warnings cargo +1.92.0 doc --locked --manifest-path src-tauri/Cargo.toml --no-deps",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-privacy"
