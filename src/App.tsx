@@ -45,6 +45,7 @@ import type {
   HistoryExportPathPolicy,
   HistoryExportResult,
   HistoryExportScope,
+  ScanAttemptKind,
   ScanErrorShape,
   ScanJobPhase,
   ScanReport,
@@ -603,6 +604,7 @@ function HistoryWorkspace({
 function ScanningWorkspace({
   source,
   stageIndex,
+  attemptKind,
   canCancel,
   isCancelling,
   cancelError,
@@ -614,6 +616,7 @@ function ScanningWorkspace({
 }: {
   source: string
   stageIndex: number
+  attemptKind: ScanAttemptKind | null
   canCancel: boolean
   isCancelling: boolean
   cancelError: string | null
@@ -703,9 +706,25 @@ function ScanningWorkspace({
         </ol>
       </section>
 
-      <div className="scan-note" role={cancelError || statusWarning ? 'alert' : undefined}>
-        {cancelError || statusWarning ? <TriangleAlert aria-hidden="true" size={16} /> : <LockKeyhole aria-hidden="true" size={16} />}
-        {cancelError ?? statusWarning ?? (stageIndex === 0
+      <div
+        className={`scan-note${attemptKind === 'fresh_full_child' && !cancelError && !statusWarning
+          ? ' scan-note--fresh-attempt'
+          : ''}`}
+        role={cancelError || statusWarning
+          ? 'alert'
+          : attemptKind === 'fresh_full_child' ? 'status' : undefined}
+      >
+        {cancelError || statusWarning
+          ? <TriangleAlert aria-hidden="true" size={16} />
+          : attemptKind === 'fresh_full_child'
+            ? <ShieldCheck aria-hidden="true" size={16} />
+            : <LockKeyhole aria-hidden="true" size={16} />}
+        {cancelError ?? statusWarning ?? (attemptKind === 'fresh_full_child' ? (
+          <span>
+            <strong>重新关联为新的全量扫描。</strong>
+            {' '}已验证同一逻辑卷标识 + 精确原生根范围；本次从根开始全量重扫，不恢复旧进度、文件句柄、目录权限或历史证据，也不证明是同一块物理磁盘。
+          </span>
+        ) : stageIndex === 0
           ? '暂停只在目录枚举安全点生效；仅本次打开期间可继续；退出后需重新扫描。停止扫描始终可用。'
           : '停止请求会在当前系统读取返回后的安全检查点生效；不会触发移动、改名或改时，文件系统仍可能记录 atime。')}
       </div>
@@ -2562,6 +2581,7 @@ function App() {
   const [activeScanJobId, setActiveScanJobId] = useState<string | null>(null)
   const [isCancelling, setIsCancelling] = useState(false)
   const [scanJobPhase, setScanJobPhase] = useState<ScanJobPhase>('running')
+  const [scanAttemptKind, setScanAttemptKind] = useState<ScanAttemptKind | null>(null)
   const [scanActionError, setScanActionError] = useState<string | null>(null)
   const [scanStatusWarning, setScanStatusWarning] = useState<string | null>(null)
   const chooseButtonRef = useRef<HTMLButtonElement>(null)
@@ -2627,6 +2647,7 @@ function App() {
     setError(null)
     setScanActionError(null)
     setScanStatusWarning(null)
+    setScanAttemptKind(null)
     updateScanJobPhase('running')
     setPhase('scanning')
     try {
@@ -2644,6 +2665,7 @@ function App() {
         },
         setScanStatusWarning,
         observeScanJobPhase,
+        setScanAttemptKind,
       )
       setActiveScanJobId(session.jobId)
       activeScanJobIdRef.current = session.jobId
@@ -2764,6 +2786,7 @@ function App() {
     setError(null)
     setScanActionError(null)
     setScanStatusWarning(null)
+    setScanAttemptKind(null)
     updateScanJobPhase('running')
     setPhase('scanning')
     try {
@@ -2789,6 +2812,7 @@ function App() {
     setError(null)
     setScanActionError(null)
     setScanStatusWarning(null)
+    setScanAttemptKind(null)
     updateScanJobPhase('running')
     setPhase('history')
   }
@@ -2816,6 +2840,7 @@ function App() {
     updateScanJobPhase('running')
     setScanActionError(null)
     setScanStatusWarning(null)
+    setScanAttemptKind(null)
     scanAttemptRef.current = false
   }
 
@@ -2877,6 +2902,7 @@ function App() {
         ) : null}
         {phase === 'scanning' && source ? (
           <ScanningWorkspace
+            attemptKind={scanAttemptKind}
             canCancel={activeScanJobId !== null}
             cancelError={scanActionError}
             isCancelling={isCancelling}

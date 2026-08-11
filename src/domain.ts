@@ -336,6 +336,8 @@ export type ScanJobPhase =
   | 'cancelled'
   | 'failed'
 
+export type ScanAttemptKind = 'initial_full' | 'fresh_full_child'
+
 export type HistoryExportFormat = 'json' | 'csv'
 export type HistoryExportScope = 'summary' | 'complete_evidence'
 export type HistoryExportPathPolicy = 'redacted' | 'display'

@@ -16,6 +16,95 @@ type HistoryExportFixtureMode =
   | 'wrong_extension'
   | 'zero_complete'
 
+type ScanAttemptFixtureMode =
+  | 'late_fresh'
+  | 'unknown_kind'
+  | 'noncanonical_run'
+  | 'run_drift'
+
+async function installScanAttemptFixture(page: Page, mode: ScanAttemptFixtureMode) {
+  await page.addInitScript((fixtureMode) => {
+    const calls: Array<{ command: string; payload: Record<string, unknown> }> = []
+    let reveal = false
+    let cancelled = false
+    let statusQueries = 0
+    const terminalResult = {
+      schemaVersion: 1,
+      scanRunId: '21',
+      root: '/Volumes/Fresh Photos',
+      status: 'cancelled',
+      mediaFiles: '0',
+      logicalBytes: '0',
+      candidateSizeBuckets: '0',
+      sampledFiles: '0',
+      sampledBytesRead: '0',
+      fullHashedFiles: '0',
+      fullHashBytesRead: '0',
+      verifiedGroups: '0',
+      verifiedMembers: '0',
+      redundantIndependentFiles: '0',
+      comparedPairs: '0',
+      comparedBytes: '0',
+      logicalReclaimableBytes: '0',
+      issues: '0',
+    }
+    const status = () => {
+      const attemptKind = fixtureMode === 'unknown_kind'
+        ? 'resume_from_checkpoint'
+        : fixtureMode === 'late_fresh'
+          ? reveal || cancelled ? 'fresh_full_child' : null
+          : 'initial_full'
+      const scanRunId = fixtureMode === 'noncanonical_run'
+        ? '01'
+        : fixtureMode === 'run_drift' && reveal
+          ? '22'
+          : attemptKind === null ? null : '21'
+      return {
+        jobId: 'scan-attempt-fixture',
+        phase: cancelled ? 'cancelled' : 'running',
+        attemptKind,
+        startedAtUnixMs: 1_000,
+        finishedAtUnixMs: cancelled ? 1_500 : null,
+        scanRunId,
+        historyEntryId: null,
+        progress: null,
+        result: cancelled ? terminalResult : null,
+        error: null,
+      }
+    }
+    Object.assign(window, {
+      isTauri: true,
+      __SCAN_ATTEMPT_FIXTURE__: {
+        calls,
+        reveal: () => { reveal = true },
+        statusQueries: () => statusQueries,
+      },
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
+          calls.push({ command, payload })
+          if (command === 'plugin:event|listen') return 1
+          if (command === 'plugin:event|unlisten') return undefined
+          if (command === 'select_scan_root') return { rootToken: `root-${'9'.repeat(64)}` }
+          if (command === 'start_scan') return { jobId: 'scan-attempt-fixture' }
+          if (command === 'get_scan_status') {
+            statusQueries += 1
+            return status()
+          }
+          if (command === 'cancel_scan') {
+            cancelled = true
+            return status()
+          }
+          if (command === 'acknowledge_scan') return { released: true }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  }, mode)
+}
+
 async function installHistoryExportFixture(page: Page, mode: HistoryExportFixtureMode) {
   await page.addInitScript((fixtureMode) => {
     const calls: Array<{ command: string; payload: Record<string, unknown> }> = []
@@ -334,6 +423,7 @@ test('a transient native status failure keeps cancellation control and recovers'
               return {
                 jobId: 'scan-fixture',
                 phase: 'running',
+                attemptKind: null,
                 startedAtUnixMs: 1_000,
                 finishedAtUnixMs: null,
                 scanRunId: null,
@@ -345,6 +435,7 @@ test('a transient native status failure keeps cancellation control and recovers'
             return {
               jobId: 'scan-fixture',
               phase: 'completed',
+              attemptKind: 'initial_full',
               historyEntryId: '7',
               startedAtUnixMs: 1_000,
               finishedAtUnixMs: 1_400,
@@ -368,6 +459,89 @@ test('a transient native status failure keeps cancellation control and recovers'
   await expect(page.getByText(/暂时无法确认扫描状态/)).toBeVisible()
   await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
   await expect(page.getByText('/Volumes/Test Photos').first()).toBeVisible()
+})
+
+test('a fresh full child is disclosed only after the late opaque attempt status arrives', async ({ page }) => {
+  await installScanAttemptFixture(page, 'late_fresh')
+  await page.goto('/')
+  await page.getByRole('button', { name: '选择照片目录' }).click()
+  await page.getByRole('button', { name: '开始只读扫描' }).click()
+
+  await expect(page.getByText('重新关联为新的全量扫描。')).toHaveCount(0)
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __SCAN_ATTEMPT_FIXTURE__: { statusQueries: () => number }
+    }
+  ).__SCAN_ATTEMPT_FIXTURE__.statusQueries())).toBeGreaterThan(0)
+  await page.evaluate(() => (
+    window as Window & {
+      __SCAN_ATTEMPT_FIXTURE__: { reveal: () => void }
+    }
+  ).__SCAN_ATTEMPT_FIXTURE__.reveal())
+
+  const disclosure = page.getByRole('status')
+  await expect(disclosure).toContainText('重新关联为新的全量扫描。')
+  await expect(disclosure).toContainText('同一逻辑卷标识 + 精确原生根范围')
+  await expect(disclosure).toContainText('本次从根开始全量重扫')
+  await expect(disclosure).toContainText('不恢复旧进度、文件句柄、目录权限或历史证据')
+  await expect(disclosure).toContainText('不证明是同一块物理磁盘')
+
+  const calls = await page.evaluate(() => (
+    window as Window & {
+      __SCAN_ATTEMPT_FIXTURE__: {
+        calls: Array<{ command: string; payload: Record<string, unknown> }>
+      }
+    }
+  ).__SCAN_ATTEMPT_FIXTURE__.calls)
+  const forbiddenAuthorityFields = [
+    'storeJobId',
+    'parentScanRunId',
+    'mountRelativeRootRaw',
+    'rawPath',
+    'recoveryTarget',
+  ]
+  for (const call of calls) {
+    for (const field of forbiddenAuthorityFields) expect(call.payload).not.toHaveProperty(field)
+  }
+
+  await page.getByRole('button', { name: '停止扫描' }).click()
+  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+})
+
+for (const malformed of [
+  { mode: 'unknown_kind', message: '扫描尝试类型无效' },
+  { mode: 'noncanonical_run', message: '扫描运行编号不是有效的有符号十进制数' },
+] as const) {
+  test(`scan status rejects ${malformed.mode} instead of inventing recovery semantics`, async ({ page }) => {
+    await installScanAttemptFixture(page, malformed.mode)
+    await page.goto('/')
+    await page.getByRole('button', { name: '选择照片目录' }).click()
+    await page.getByRole('button', { name: '开始只读扫描' }).click()
+
+    await expect(page.getByRole('heading', { name: '没有执行主动修改操作' })).toBeVisible()
+    await expect(page.getByText(malformed.message, { exact: false })).toBeVisible()
+    await expect(page.getByText('重新关联为新的全量扫描。')).toHaveCount(0)
+  })
+}
+
+test('an established attempt rejects a later scan-run identity drift', async ({ page }) => {
+  await installScanAttemptFixture(page, 'run_drift')
+  await page.goto('/')
+  await page.getByRole('button', { name: '选择照片目录' }).click()
+  await page.getByRole('button', { name: '开始只读扫描' }).click()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & {
+      __SCAN_ATTEMPT_FIXTURE__: { statusQueries: () => number }
+    }
+  ).__SCAN_ATTEMPT_FIXTURE__.statusQueries())).toBeGreaterThan(0)
+
+  await page.evaluate(() => (
+    window as Window & {
+      __SCAN_ATTEMPT_FIXTURE__: { reveal: () => void }
+    }
+  ).__SCAN_ATTEMPT_FIXTURE__.reveal())
+  await expect(page.getByRole('heading', { name: '没有执行主动修改操作' })).toBeVisible()
+  await expect(page.getByText('扫描运行编号在同一任务中发生变化', { exact: false })).toBeVisible()
 })
 
 test('enumeration pause is same-open only, resumes, and remains cancellable while paused', async ({ page }) => {
@@ -401,6 +575,7 @@ test('enumeration pause is same-open only, resumes, and remains cancellable whil
     const status = () => ({
       jobId: 'scan-pause-fixture',
       phase: fixture.phase,
+      attemptKind: 'initial_full',
       startedAtUnixMs: 1_000,
       finishedAtUnixMs: fixture.phase === 'cancelled' ? 1_500 : null,
       scanRunId: '11',
@@ -491,6 +666,7 @@ for (const delayedControl of ['pause', 'resume'] as const) {
       const status = (overridePhase = phase) => ({
         jobId: 'scan-race-fixture',
         phase: overridePhase,
+        attemptKind: 'initial_full',
         startedAtUnixMs: 1_000,
         finishedAtUnixMs: overridePhase === 'cancelled' ? 1_600 : null,
         scanRunId: '12',
@@ -605,6 +781,7 @@ test('enumeration completion clears a concurrent pausing state and advances the 
     const status = (overridePhase: string = phase) => ({
       jobId: 'scan-enumeration-race',
       phase: overridePhase,
+      attemptKind: 'initial_full',
       startedAtUnixMs: 1_000,
       finishedAtUnixMs: overridePhase === 'cancelled' ? 1_700 : null,
       scanRunId: '13',
@@ -1038,6 +1215,7 @@ test('persistent results page groups, members, and issues without unbounded accu
               return {
               jobId: 'scan-paged',
               phase: 'completed',
+              attemptKind: 'initial_full',
               historyEntryId: '77',
               startedAtUnixMs: 1_000,
               finishedAtUnixMs: 2_000,
@@ -1476,7 +1654,7 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
           if (command === 'get_scan_status') {
             return {
               jobId: 'scan-raw-metadata', phase: 'completed', historyEntryId: '77', startedAtUnixMs: 1000,
-              finishedAtUnixMs: 2200, scanRunId: '77', progress: null, result, error: null,
+              attemptKind: 'initial_full', finishedAtUnixMs: 2200, scanRunId: '77', progress: null, result, error: null,
             }
           }
           if (command === 'list_duplicate_groups') {
@@ -1764,7 +1942,7 @@ test('a malformed terminal summary is acknowledged before the adaptation error i
           if (command === 'get_scan_status') {
             return {
               jobId: 'scan-malformed', phase: 'completed', historyEntryId: '88', startedAtUnixMs: 1,
-              finishedAtUnixMs: 2, scanRunId: '88', progress: null, result, error: null,
+              attemptKind: 'initial_full', finishedAtUnixMs: 2, scanRunId: '88', progress: null, result, error: null,
             }
           }
           if (command === 'list_duplicate_groups') return { items: [], nextCursor: null }
@@ -1848,7 +2026,7 @@ test('a permanently failing acknowledgement still delivers the sealed report and
           if (command === 'get_scan_status') {
             return {
               jobId: 'scan-ack-pending', phase: 'completed', historyEntryId: '98', startedAtUnixMs: 1,
-              finishedAtUnixMs: 2, scanRunId: '98', progress: null, result, error: null,
+              attemptKind: 'initial_full', finishedAtUnixMs: 2, scanRunId: '98', progress: null, result, error: null,
             }
           }
           if (command === 'list_duplicate_groups') return { items: [], nextCursor: null }
@@ -1922,7 +2100,7 @@ test('cancelled work exposes no unsealed duplicate or issue pages', async ({ pag
           if (command === 'get_scan_status') {
             return {
               jobId: 'scan-cancelled', phase: 'cancelled', startedAtUnixMs: 1,
-              finishedAtUnixMs: 2, scanRunId: '99', progress: null, result, error: null,
+              attemptKind: 'initial_full', finishedAtUnixMs: 2, scanRunId: '99', progress: null, result, error: null,
             }
           }
           if (command === 'acknowledge_scan') return { released: true }

@@ -1046,6 +1046,24 @@
   font-size: 10px;
 }
 
+.scan-note--fresh-attempt {
+  justify-content: flex-start;
+  padding-inline: 34px;
+  color: var(--semantic-text-secondary);
+  background: var(--semantic-surface-selected);
+  border-top-color: color-mix(in srgb, var(--semantic-action-primary) 28%, var(--semantic-border-default));
+  line-height: 1.5;
+}
+
+.scan-note--fresh-attempt svg {
+  flex: 0 0 auto;
+  color: var(--semantic-text-positive);
+}
+
+.scan-note--fresh-attempt strong {
+  color: var(--semantic-text-primary);
+}
+
 .report-notice {
   display: flex;
   flex: 0 0 auto;

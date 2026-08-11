@@ -23,6 +23,7 @@ import type {
   HistoryExportScope,
   HistoryExportTargetSelection,
   NativePathRef,
+  ScanAttemptKind,
   ScanHistoryItem,
   ScanJobPhase,
   ScanReport,
@@ -100,6 +101,7 @@ interface CoreAppError {
 interface CoreScanJobStatus {
   jobId: string
   phase: ScanJobPhase
+  attemptKind: ScanAttemptKind | null
   startedAtUnixMs: number
   finishedAtUnixMs: number | null
   scanRunId: string | null
@@ -2516,6 +2518,7 @@ export async function startDirectoryScanReadOnly(
   onProgress?: (progress: ScanProgress) => void,
   onStatusWarning?: (warning: string | null) => void,
   onPhase?: (phase: ScanJobPhase) => void,
+  onAttemptKind?: (attemptKind: ScanAttemptKind) => void,
 ): Promise<ReadOnlyScanSession> {
   if (!isTauri()) {
     throw new Error('浏览器预览不能读取本地目录；请运行桌面应用，或使用明确标注的合成数据演示。')
@@ -2546,6 +2549,7 @@ export async function startDirectoryScanReadOnly(
       unlisten,
       onStatusWarning,
       onPhase,
+      onAttemptKind,
     )
     return { jobId: response.jobId, result }
   } catch (error) {
@@ -2558,6 +2562,7 @@ export async function startDirectoryScanReadOnly(
         unlisten,
         onStatusWarning,
         onPhase,
+        onAttemptKind,
       )
       return { jobId: existingJobId, result }
     }
@@ -2595,8 +2600,11 @@ async function waitForScanResult(
   unlisten: () => void,
   onStatusWarning?: (warning: string | null) => void,
   onPhase?: (phase: ScanJobPhase) => void,
+  onAttemptKind?: (attemptKind: ScanAttemptKind) => void,
 ): Promise<ScanReport> {
   let consecutiveStatusFailures = 0
+  let observedAttemptKind: ScanAttemptKind | null = null
+  let observedScanRunId: string | null = null
   try {
     for (;;) {
       let rawStatus: unknown
@@ -2616,6 +2624,21 @@ async function waitForScanResult(
       if (consecutiveStatusFailures > 0) {
         consecutiveStatusFailures = 0
         onStatusWarning?.(null)
+      }
+      if (observedAttemptKind !== null) {
+        if (status.attemptKind === null || status.scanRunId === null) {
+          throw new Error('扫描运行编号或尝试类型在建立后消失；已拒绝继续展示倒退状态。')
+        }
+        if (observedAttemptKind !== status.attemptKind) {
+          throw new Error('扫描尝试类型在同一任务中发生变化；已拒绝继续展示该状态。')
+        }
+        if (observedScanRunId !== status.scanRunId) {
+          throw new Error('扫描运行编号在同一任务中发生变化；已拒绝继续展示该状态。')
+        }
+      } else if (status.attemptKind !== null && status.scanRunId !== null) {
+        observedAttemptKind = status.attemptKind
+        observedScanRunId = status.scanRunId
+        onAttemptKind?.(status.attemptKind)
       }
       onPhase?.(status.phase)
 
@@ -2677,6 +2700,11 @@ const SCAN_JOB_PHASES: readonly ScanJobPhase[] = [
   'failed',
 ]
 
+const SCAN_ATTEMPT_KINDS: readonly ScanAttemptKind[] = [
+  'initial_full',
+  'fresh_full_child',
+]
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -2686,6 +2714,31 @@ function requireScanJobPhase(value: unknown): ScanJobPhase {
     throw new Error('扫描任务返回了未知状态；为避免错误控制任务，已拒绝该响应。')
   }
   return value as ScanJobPhase
+}
+
+function requireNullableScanAttemptKind(value: unknown): ScanAttemptKind | null {
+  if (value === null) return null
+  if (typeof value !== 'string' || !SCAN_ATTEMPT_KINDS.includes(value as ScanAttemptKind)) {
+    throw new Error('扫描尝试类型无效；已拒绝把该状态解释为恢复或新扫描。')
+  }
+  return value as ScanAttemptKind
+}
+
+function requireNullableScanRunId(value: unknown): string | null {
+  if (value !== null && typeof value !== 'string') {
+    throw new Error('扫描运行编号格式无效。')
+  }
+  if (value !== null) requirePositiveDecimal(value, '扫描运行编号')
+  return value
+}
+
+function assertScanAttemptPair(
+  scanRunId: string | null,
+  attemptKind: ScanAttemptKind | null,
+): void {
+  if ((scanRunId === null) !== (attemptKind === null)) {
+    throw new Error('扫描运行编号与尝试类型没有同时建立；已拒绝展示不完整状态。')
+  }
 }
 
 function requireFiniteTimestamp(value: unknown, label: string): number {
@@ -2698,11 +2751,18 @@ function requireFiniteTimestamp(value: unknown, label: string): number {
 function adaptScanJobStatusEvent(
   value: unknown,
   expectedJobId: string,
-): Pick<CoreScanJobStatus, 'jobId' | 'phase'> {
+): Pick<CoreScanJobStatus, 'jobId' | 'phase' | 'attemptKind'> {
   if (!isRecord(value) || value.jobId !== expectedJobId) {
     throw new Error('扫描控制响应不属于当前任务；已拒绝更新界面状态。')
   }
-  return { jobId: expectedJobId, phase: requireScanJobPhase(value.phase) }
+  const scanRunId = requireNullableScanRunId(value.scanRunId)
+  const attemptKind = requireNullableScanAttemptKind(value.attemptKind)
+  assertScanAttemptPair(scanRunId, attemptKind)
+  return {
+    jobId: expectedJobId,
+    phase: requireScanJobPhase(value.phase),
+    attemptKind,
+  }
 }
 
 function adaptCoreScanJobStatus(value: unknown, expectedJobId: string): CoreScanJobStatus {
@@ -2712,9 +2772,9 @@ function adaptCoreScanJobStatus(value: unknown, expectedJobId: string): CoreScan
   const finishedAtUnixMs = value.finishedAtUnixMs === null
     ? null
     : requireFiniteTimestamp(value.finishedAtUnixMs, '扫描结束时间')
-  if (value.scanRunId !== null && typeof value.scanRunId !== 'string') {
-    throw new Error('扫描运行编号格式无效。')
-  }
+  const scanRunId = requireNullableScanRunId(value.scanRunId)
+  const attemptKind = requireNullableScanAttemptKind(value.attemptKind)
+  assertScanAttemptPair(scanRunId, attemptKind)
   if (value.historyEntryId !== undefined
     && value.historyEntryId !== null
     && typeof value.historyEntryId !== 'string') {
@@ -2732,9 +2792,10 @@ function adaptCoreScanJobStatus(value: unknown, expectedJobId: string): CoreScan
   return {
     jobId: expectedJobId,
     phase: requireScanJobPhase(value.phase),
+    attemptKind,
     startedAtUnixMs: requireFiniteTimestamp(value.startedAtUnixMs, '扫描开始时间'),
     finishedAtUnixMs,
-    scanRunId: value.scanRunId as string | null,
+    scanRunId,
     historyEntryId: value.historyEntryId as string | null | undefined,
     progress: value.progress as ScanProgress | null,
     result: value.result as CoreScanResultSummary | null,

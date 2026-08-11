@@ -15,7 +15,7 @@ use guiying_core::{
 };
 use guiying_runtime::{
     ActiveReadOnlyScan, CaptureTimeStageFailureCode, CaptureTimeStageStatus,
-    CaptureTimeStageSummary, RuntimeError, RuntimeObserver,
+    CaptureTimeStageSummary, RuntimeAttemptKind, RuntimeError, RuntimeObserver,
 };
 use guiying_store::{
     CaptureTimeCandidateAnomaly, CaptureTimeCandidateCursor, CaptureTimeCandidateRecord,
@@ -610,11 +610,28 @@ pub(crate) struct NativePathRefItem {
     raw_base64: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScanAttemptKind {
+    InitialFull,
+    FreshFullChild,
+}
+
+impl From<RuntimeAttemptKind> for ScanAttemptKind {
+    fn from(value: RuntimeAttemptKind) -> Self {
+        match value {
+            RuntimeAttemptKind::InitialFull => Self::InitialFull,
+            RuntimeAttemptKind::FreshFullChild => Self::FreshFullChild,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ScanJobStatus {
     job_id: String,
     phase: ScanJobPhase,
+    attempt_kind: Option<ScanAttemptKind>,
     started_at_unix_ms: u64,
     finished_at_unix_ms: Option<u64>,
     scan_run_id: Option<String>,
@@ -629,6 +646,7 @@ pub(crate) struct ScanJobStatus {
 pub(crate) struct ScanJobStatusEvent {
     job_id: String,
     phase: ScanJobPhase,
+    attempt_kind: Option<ScanAttemptKind>,
     started_at_unix_ms: u64,
     finished_at_unix_ms: Option<u64>,
     scan_run_id: Option<String>,
@@ -641,6 +659,7 @@ impl From<&ScanJobStatus> for ScanJobStatusEvent {
         Self {
             job_id: status.job_id.clone(),
             phase: status.phase,
+            attempt_kind: status.attempt_kind,
             started_at_unix_ms: status.started_at_unix_ms,
             finished_at_unix_ms: status.finished_at_unix_ms,
             scan_run_id: status.scan_run_id.clone(),
@@ -2702,12 +2721,36 @@ impl ScanJobManager {
         }
     }
 
-    fn record_scan_run(&self, job_id: &str, scan_run_id: i64) {
+    fn record_scan_attempt(
+        &self,
+        job_id: &str,
+        scan_run_id: i64,
+        attempt_kind: RuntimeAttemptKind,
+    ) -> Result<(), AppError> {
         let mut registry = self.registry.blocking_lock();
-        if let Some(active) = registry.active.as_mut() {
-            if active.status.job_id == job_id {
-                active.status.scan_run_id = Some(scan_run_id.to_string());
+        let Some(active) = registry.active.as_mut() else {
+            return Err(AppError::job_not_found(job_id.to_owned()));
+        };
+        if active.status.job_id != job_id {
+            return Err(AppError::job_not_found(job_id.to_owned()));
+        }
+        let scan_run_id = scan_run_id.to_string();
+        let attempt_kind = ScanAttemptKind::from(attempt_kind);
+        match (&active.status.scan_run_id, active.status.attempt_kind) {
+            (None, None) => {
+                active.status.scan_run_id = Some(scan_run_id);
+                active.status.attempt_kind = Some(attempt_kind);
+                Ok(())
             }
+            (Some(recorded_run_id), Some(recorded_kind))
+                if recorded_run_id == &scan_run_id && recorded_kind == attempt_kind =>
+            {
+                Ok(())
+            }
+            _ => Err(AppError::scan(
+                job_id.to_owned(),
+                "扫描运行与尝试类型已经记录为另一组值；已拒绝覆盖界面状态。",
+            )),
         }
     }
 
@@ -2796,6 +2839,7 @@ fn reserve_job(registry: &mut ScanJobRegistry, owner_window_label: String) -> Jo
     let status = ScanJobStatus {
         job_id: job_id.clone(),
         phase: ScanJobPhase::Running,
+        attempt_kind: None,
         started_at_unix_ms: unix_time_ms(),
         finished_at_unix_ms: None,
         scan_run_id: None,
@@ -3349,7 +3393,19 @@ fn run_persistent_scan<O: ScanWorkerObserver>(
 ) -> ScanOutcome {
     let mut runtime = ActiveReadOnlyScan::start(&database_path, &root, ScanOptions::default())
         .map_err(|error| AppError::scan(job_id.to_owned(), error.to_string()))?;
-    manager.record_scan_run(job_id, runtime.ids().scan_run_id);
+    if let Err(error) =
+        manager.record_scan_attempt(job_id, runtime.ids().scan_run_id, runtime.attempt_kind())
+    {
+        if let Err(interrupt_error) = runtime.interrupt(
+            "DESKTOP_ATTEMPT_STATE_REJECTED",
+            "desktop job state rejected the newly bound read-only attempt",
+        ) {
+            log::warn!(
+                "cannot interrupt read-only runtime after desktop state rejection: {interrupt_error}"
+            );
+        }
+        return Err(error);
+    }
 
     let mut enumeration = runtime
         .enumerate(control, observer)
@@ -5891,6 +5947,48 @@ mod tests {
             issues: "0".to_owned(),
             capture_time: CaptureTimeResultSummary::not_run(),
         }
+    }
+
+    #[test]
+    fn scan_attempt_status_is_nullable_then_immutable_and_contains_no_recovery_authority() {
+        let manager = ScanJobManager::default();
+        let reservation = tauri::async_runtime::block_on(manager.reserve("main".to_owned()))
+            .expect("job should reserve");
+        let reserved = serde_json::to_value(ScanJobStatusEvent::from(&reservation.status))
+            .expect("reserved status should serialize");
+        assert!(reserved["attemptKind"].is_null());
+        assert!(reserved["scanRunId"].is_null());
+        for forbidden in [
+            "storeJobId",
+            "parentScanRunId",
+            "mountRelativeRootRaw",
+            "rawPath",
+            "recoveryTarget",
+        ] {
+            assert!(reserved.get(forbidden).is_none());
+        }
+
+        manager
+            .record_scan_attempt(&reservation.job_id, 41, RuntimeAttemptKind::InitialFull)
+            .expect("runtime attempt should record once");
+        manager
+            .record_scan_attempt(&reservation.job_id, 41, RuntimeAttemptKind::InitialFull)
+            .expect("exact repeated record should be idempotent");
+        let active = tauri::async_runtime::block_on(manager.status(&reservation.job_id))
+            .expect("active status should remain available");
+        let active_event = serde_json::to_value(ScanJobStatusEvent::from(&active))
+            .expect("active event should serialize");
+        assert_eq!(active_event["attemptKind"], "initial_full");
+        assert_eq!(active_event["scanRunId"], "41");
+
+        let mismatch = manager
+            .record_scan_attempt(&reservation.job_id, 42, RuntimeAttemptKind::FreshFullChild)
+            .expect_err("recorded attempt identity must not be overwritten");
+        assert_eq!(mismatch.code, "READ_ONLY_SCAN_FAILED");
+        let unchanged = tauri::async_runtime::block_on(manager.status(&reservation.job_id))
+            .expect("rejected overwrite must leave the original status");
+        assert_eq!(unchanged.attempt_kind, Some(ScanAttemptKind::InitialFull));
+        assert_eq!(unchanged.scan_run_id.as_deref(), Some("41"));
     }
 
     #[test]
