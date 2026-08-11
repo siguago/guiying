@@ -17,11 +17,13 @@
 仓库还包含尚未接入桌面主链的有界 EXIF / QuickTime 原始证据提取，以及显式
 floating/offset 时间规范化与冲突策略。它们都没有照片写入 API，也不会把缓存、未二次
 提取的时间或旧挂载会话提升为行动授权。下一阶段会按
-[持久化只读运行时方案](docs/engineering/PHASE1_RUNTIME.md)接入元数据时间，
+[持久化只读运行时方案](docs/engineering/PHASE1_RUNTIME.md)与
+[拍摄时间证据契约](docs/engineering/CAPTURE_TIME_EVIDENCE.md)接入元数据时间，
 再补暂停/恢复、历史结果入口和报告导出；M2 才会另行实现并故障注入验证同卷隔离与恢复事务。
 
 设计与安全边界见 [产品需求](docs/product/PRD.md)、[安全模型](docs/engineering/SAFETY.md)、
 [扫描任务协议](docs/engineering/SCAN_JOBS.md)、[文件系统策略](docs/engineering/FILESYSTEMS.md)、
+[拍摄时间证据契约](docs/engineering/CAPTURE_TIME_EVIDENCE.md)、
 [M0 复核记录](docs/engineering/M0_REVIEW.md) 和 [路线图](docs/ROADMAP.md)。
 
 ## 开发
