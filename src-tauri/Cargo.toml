@@ -30,6 +30,7 @@ guiying-store = { version = "0.1.0", path = "../crates/guiying-store" }
 uuid = { version = "=1.20.0", default-features = false }
 getrandom = "=0.3.4"
 base64 = "=0.23.1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "=3.15.0"

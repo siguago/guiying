@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,10 +22,12 @@ use guiying_store::{
     CaptureTimeMetadataFieldRawDetail, CaptureTimeMetadataFieldRecord,
     CaptureTimeMetadataReportRecord, CaptureTimeOffsetKind, CaptureTimeSemanticKind,
     CaptureTimeSummaryCursor, DuplicateGroupCursor, DuplicateGroupMemberCursor,
-    DuplicateGroupMemberRecord, FileTimeRelation, KeysetPage, MetadataDetectedFormat,
-    MetadataExtractionStatus, MetadataFieldCursor, MetadataFieldRawLocator, MetadataReportCursor,
-    ScanIssueCursor, ScanIssueRecord, Store, StoredMetadataContainerKind, StoredMetadataEncoding,
-    StoredMetadataFieldKind, StoredTiffByteOrder, TimeDonorEligibility, VerifiedExactGroup,
+    DuplicateGroupMemberRecord, EvidenceDatabaseScope, EvidenceReader, FileTimeRelation,
+    KeysetPage, MetadataDetectedFormat, MetadataExtractionStatus, MetadataFieldCursor,
+    MetadataFieldRawLocator, MetadataReportCursor, ScanHistoryContext, ScanHistoryCursor,
+    ScanHistoryRecord, ScanIssueCursor, ScanIssueRecord, StoredMetadataContainerKind,
+    StoredMetadataEncoding, StoredMetadataFieldKind, StoredTiffByteOrder, TimeDonorEligibility,
+    VerifiedExactGroup,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,12 @@ const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
 const PROGRESS_MIN_COUNT_DELTA: u64 = 256;
 const MAX_CURSOR_BYTES: usize = 16 * 1024;
 const RESULT_CURSOR_ENVELOPE_VERSION: u8 = 1;
+const HISTORY_CURSOR_ENVELOPE_VERSION: u8 = 1;
+const HISTORY_CURSOR_ENDPOINT: &str = "scan_history";
+const MAX_SCAN_HISTORY_PAGE_LIMIT: u32 = 64;
+const MAX_CONCURRENT_HISTORY_READS: usize = 4;
+const MAX_HISTORY_ROOT_DISPLAY_BYTES: usize = 64 * 1024;
+const MAX_HISTORY_SCAN_MODE_BYTES: usize = 64;
 const DUPLICATE_GROUPS_CURSOR_ENDPOINT: &str = "duplicate_groups";
 const DUPLICATE_GROUP_MEMBERS_CURSOR_ENDPOINT: &str = "duplicate_group_members";
 const SCAN_ISSUES_CURSOR_ENDPOINT: &str = "scan_issues";
@@ -57,6 +65,11 @@ const SCAN_ROOT_TOKEN_PREFIX: &str = "root-";
 const SCAN_ROOT_TOKEN_TTL: Duration = Duration::from_secs(60);
 const MAX_PENDING_SCAN_ROOT_TOKENS: usize = 16;
 const MAX_SCAN_ROOT_TOKEN_GENERATION_ATTEMPTS: usize = 8;
+const RESULT_READ_TOKEN_PREFIX: &str = "result-";
+const RESULT_READ_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_RESULT_READ_TOKENS: usize = 32;
+const MAX_RESULT_READ_TOKENS_PER_OWNER: usize = 8;
+const MAX_RESULT_READ_TOKEN_GENERATION_ATTEMPTS: usize = 8;
 static NEXT_SCAN_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -105,6 +118,86 @@ impl AppError {
         Self::new("SCAN_ROOT_TOKEN_UNAVAILABLE", message, None)
     }
 
+    fn invalid_result_read_token() -> Self {
+        Self::new(
+            "INVALID_RESULT_READ_TOKEN",
+            "结果查看授权不存在、已撤销或格式无效；请重新打开该历史结果。",
+            None,
+        )
+    }
+
+    fn result_read_token_owner_mismatch() -> Self {
+        Self::new(
+            "RESULT_READ_TOKEN_OWNER_MISMATCH",
+            "该结果查看授权不属于当前窗口，已拒绝访问。",
+            None,
+        )
+    }
+
+    fn result_read_token_expired() -> Self {
+        Self::new(
+            "RESULT_READ_TOKEN_EXPIRED",
+            "结果查看授权已过期，请重新打开该历史结果。",
+            None,
+        )
+    }
+
+    fn result_read_registry_full() -> Self {
+        Self::new(
+            "RESULT_READ_REGISTRY_FULL",
+            "当前窗口打开的历史结果已达到安全上限；请先关闭不再查看的结果。",
+            None,
+        )
+    }
+
+    fn result_read_busy() -> Self {
+        Self::new(
+            "RESULT_READ_BUSY",
+            "该封存结果已有一个读取请求正在执行；请等待后重试。",
+            None,
+        )
+    }
+
+    fn history_read_busy() -> Self {
+        Self::new(
+            "HISTORY_READ_BUSY",
+            "历史目录已有读取请求正在执行；请等待后重试。",
+            None,
+        )
+    }
+
+    fn result_read_token_unavailable(message: impl Into<String>) -> Self {
+        Self::new("RESULT_READ_TOKEN_UNAVAILABLE", message, None)
+    }
+
+    fn invalid_history_entry(message: impl Into<String>) -> Self {
+        Self::new("INVALID_HISTORY_ENTRY_ID", message, None)
+    }
+
+    fn history_unavailable(message: impl Into<String>) -> Self {
+        Self::new("HISTORY_ENTRY_UNAVAILABLE", message, None)
+    }
+
+    fn invalid_history_cursor(message: impl Into<String>) -> Self {
+        Self::new("INVALID_HISTORY_CURSOR", message, None)
+    }
+
+    fn result_store(message: impl Into<String>) -> Self {
+        Self::new("RESULT_STORE_FAILED", message, None)
+    }
+
+    fn result_task(message: impl Into<String>) -> Self {
+        Self::new("RESULT_READ_TASK_FAILED", message, None)
+    }
+
+    fn result_context_unavailable() -> Self {
+        Self::new(
+            "RESULT_READ_CONTEXT_UNAVAILABLE",
+            "封存结果的只读身份已变化或不再可用；请重新打开该历史结果。",
+            None,
+        )
+    }
+
     fn root_selection(message: impl Into<String>) -> Self {
         Self::new("SCAN_ROOT_SELECTION_FAILED", message, None)
     }
@@ -141,12 +234,8 @@ impl AppError {
         )
     }
 
-    fn result_unavailable(job_id: String, message: impl Into<String>) -> Self {
-        Self::new("SCAN_RESULT_UNAVAILABLE", message, Some(job_id))
-    }
-
-    fn invalid_cursor(job_id: String, message: impl Into<String>) -> Self {
-        Self::new("INVALID_RESULT_CURSOR", message, Some(job_id))
+    fn invalid_cursor(_result_scope: String, message: impl Into<String>) -> Self {
+        Self::new("INVALID_RESULT_CURSOR", message, None)
     }
 
     fn scan(job_id: String, message: impl Into<String>) -> Self {
@@ -157,8 +246,8 @@ impl AppError {
         Self::new("SCAN_TASK_FAILED", message, Some(job_id))
     }
 
-    fn store(job_id: String, message: impl Into<String>) -> Self {
-        Self::new("RESULT_STORE_FAILED", message, Some(job_id))
+    fn store(_result_scope: String, message: impl Into<String>) -> Self {
+        Self::new("RESULT_STORE_FAILED", message, None)
     }
 
     fn configuration(message: impl Into<String>) -> Self {
@@ -377,6 +466,7 @@ pub(crate) struct ScanJobStatus {
     started_at_unix_ms: u64,
     finished_at_unix_ms: Option<u64>,
     scan_run_id: Option<String>,
+    history_entry_id: Option<String>,
     progress: Option<ScanProgressEvent>,
     result: Option<ScanResultSummary>,
     error: Option<AppError>,
@@ -390,6 +480,7 @@ pub(crate) struct ScanJobStatusEvent {
     started_at_unix_ms: u64,
     finished_at_unix_ms: Option<u64>,
     scan_run_id: Option<String>,
+    history_entry_id: Option<String>,
     error: Option<AppError>,
 }
 
@@ -401,6 +492,7 @@ impl From<&ScanJobStatus> for ScanJobStatusEvent {
             started_at_unix_ms: status.started_at_unix_ms,
             finished_at_unix_ms: status.finished_at_unix_ms,
             scan_run_id: status.scan_run_id.clone(),
+            history_entry_id: status.history_entry_id.clone(),
             error: status.error.clone(),
         }
     }
@@ -440,6 +532,10 @@ pub(crate) struct AcknowledgeScanResponse {
 pub(crate) struct ScanJobManager {
     registry: Arc<Mutex<ScanJobRegistry>>,
     root_tokens: Arc<StdMutex<ScanRootTokenRegistry>>,
+    result_reads: Arc<Mutex<ResultReadRegistry>>,
+    result_owners: Arc<StdMutex<HashMap<String, ResultOwnerState>>>,
+    history_reader: Arc<StdMutex<Option<SharedEvidenceReader>>>,
+    history_reads: Arc<StdMutex<HistoryReadGate>>,
     database_path: Arc<OnceLock<PathBuf>>,
 }
 
@@ -448,7 +544,37 @@ impl Default for ScanJobManager {
         Self {
             registry: Arc::new(Mutex::new(ScanJobRegistry::default())),
             root_tokens: Arc::new(StdMutex::new(ScanRootTokenRegistry::default())),
+            result_reads: Arc::new(Mutex::new(ResultReadRegistry::default())),
+            result_owners: Arc::new(StdMutex::new(HashMap::new())),
+            history_reader: Arc::new(StdMutex::new(None)),
+            history_reads: Arc::new(StdMutex::new(HistoryReadGate::default())),
             database_path: Arc::new(OnceLock::new()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HistoryReadGate {
+    total: usize,
+    owners: HashMap<String, usize>,
+}
+
+struct HistoryReadPermit {
+    gate: Arc<StdMutex<HistoryReadGate>>,
+    owner_window_label: String,
+}
+
+impl Drop for HistoryReadPermit {
+    fn drop(&mut self) {
+        let Ok(mut gate) = self.gate.lock() else {
+            return;
+        };
+        gate.total = gate.total.saturating_sub(1);
+        if let Some(count) = gate.owners.get_mut(&self.owner_window_label) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                gate.owners.remove(&self.owner_window_label);
+            }
         }
     }
 }
@@ -464,6 +590,198 @@ struct ScanRootGrant {
     owner_window_label: String,
     root: PathBuf,
     expires_at: Instant,
+}
+
+#[derive(Default)]
+struct ResultReadRegistry {
+    grants: HashMap<String, ResultReadGrant>,
+    pending_opens: HashMap<u64, PendingResultOpenRecord>,
+    next_generation: u64,
+    next_open_sequence: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ResultOwnerState {
+    epoch: u64,
+    closed: bool,
+}
+
+struct PendingResultOpenRecord {
+    owner_window_label: String,
+    scan_run_id: i64,
+    owner_epoch: u64,
+}
+
+struct ResultOpenPermit {
+    registry: Arc<Mutex<ResultReadRegistry>>,
+    owner_window_label: String,
+    scan_run_id: i64,
+    owner_epoch: u64,
+    sequence: u64,
+    consumed: bool,
+}
+
+impl Drop for ResultOpenPermit {
+    fn drop(&mut self) {
+        if self.consumed {
+            return;
+        }
+        if let Ok(mut registry) = self.registry.try_lock() {
+            registry.pending_opens.remove(&self.sequence);
+            return;
+        }
+        let registry = Arc::clone(&self.registry);
+        let sequence = self.sequence;
+        let _task = tauri::async_runtime::spawn(async move {
+            registry.lock().await.pending_opens.remove(&sequence);
+        });
+    }
+}
+
+struct ResultReadGrant {
+    owner_window_label: String,
+    database_path: PathBuf,
+    database_scope: EvidenceDatabaseScope,
+    reader: SharedEvidenceReader,
+    context: ResultReadContext,
+    scan_run_id: i64,
+    generation: u64,
+    owner_epoch: u64,
+    in_flight: bool,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct ResultReadLease {
+    token: String,
+    owner_window_label: String,
+    database_path: PathBuf,
+    database_scope: EvidenceDatabaseScope,
+    reader: SharedEvidenceReader,
+    context: ResultReadContext,
+    scan_run_id: i64,
+    generation: u64,
+    owner_epoch: u64,
+    cleanup: Arc<ResultReadLeaseCleanup>,
+}
+
+struct ResultReadLeaseCleanup {
+    registry: Arc<Mutex<ResultReadRegistry>>,
+    token: String,
+    generation: u64,
+    owner_epoch: u64,
+    completed: AtomicBool,
+}
+
+impl Drop for ResultReadLeaseCleanup {
+    fn drop(&mut self) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Ok(mut registry) = self.registry.try_lock() {
+            release_result_read_in_flight(
+                &mut registry,
+                &self.token,
+                self.generation,
+                self.owner_epoch,
+            );
+            return;
+        }
+        let registry = Arc::clone(&self.registry);
+        let token = self.token.clone();
+        let generation = self.generation;
+        let owner_epoch = self.owner_epoch;
+        let _task = tauri::async_runtime::spawn(async move {
+            let mut registry = registry.lock().await;
+            release_result_read_in_flight(&mut registry, &token, generation, owner_epoch);
+        });
+    }
+}
+
+fn release_result_read_in_flight(
+    registry: &mut ResultReadRegistry,
+    token: &str,
+    generation: u64,
+    owner_epoch: u64,
+) {
+    if let Some(grant) = registry.grants.get_mut(token) {
+        if grant.generation == generation && grant.owner_epoch == owner_epoch {
+            grant.in_flight = false;
+        }
+    }
+}
+
+impl std::fmt::Debug for ResultReadLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResultReadLease")
+            .field("token", &"<redacted>")
+            .field("owner_window_label", &self.owner_window_label)
+            .field("scan_run_id", &self.scan_run_id)
+            .field("generation", &self.generation)
+            .field("owner_epoch", &self.owner_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+type SharedEvidenceReader = Arc<StdMutex<EvidenceReader>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResultReadContext {
+    Validated(ScanHistoryContext),
+    #[cfg(test)]
+    RegistryOnly(i64),
+}
+
+impl ResultReadContext {
+    const fn scan_run_id(&self) -> i64 {
+        match self {
+            Self::Validated(context) => context.scan_run_id(),
+            #[cfg(test)]
+            Self::RegistryOnly(scan_run_id) => *scan_run_id,
+        }
+    }
+
+    fn validated(&self) -> Result<&ScanHistoryContext, AppError> {
+        match self {
+            Self::Validated(context) => Ok(context),
+            #[cfg(test)]
+            Self::RegistryOnly(_) => Err(AppError::result_context_unavailable()),
+        }
+    }
+}
+
+fn lock_evidence_reader(
+    reader: &SharedEvidenceReader,
+) -> Result<std::sync::MutexGuard<'_, EvidenceReader>, AppError> {
+    reader
+        .lock()
+        .map_err(|_| AppError::result_context_unavailable())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IssuedResultReadToken {
+    result_read_token: String,
+    expires_at_unix_ms: String,
+}
+
+struct ResultReadIssue {
+    owner_window_label: String,
+    scan_run_id: i64,
+    database_scope: EvidenceDatabaseScope,
+    reader: SharedEvidenceReader,
+    context: ResultReadContext,
+    owner_epoch: u64,
+    open_sequence: u64,
+    now: Instant,
+    now_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CloseResultReadResponse {
+    revoked: bool,
 }
 
 #[derive(Default)]
@@ -520,6 +838,600 @@ impl ScanJobManager {
             .get()
             .cloned()
             .ok_or_else(|| AppError::configuration("本地审计数据库尚未初始化。"))
+    }
+
+    fn shared_history_reader(&self) -> Result<SharedEvidenceReader, AppError> {
+        let mut cached = self
+            .history_reader
+            .lock()
+            .map_err(|_| AppError::history_unavailable("历史只读连接注册表不可用；请重启应用。"))?;
+        if let Some(reader) = cached.as_ref() {
+            let identity_is_current = reader
+                .lock()
+                .map_err(|_| AppError::history_unavailable("历史只读连接状态不可用；请重启应用。"))?
+                .revalidate_source_identity()
+                .is_ok();
+            if identity_is_current {
+                return Ok(Arc::clone(reader));
+            }
+            *cached = None;
+        }
+
+        let reader = EvidenceReader::open_existing_read_only(self.database_path()?)
+            .map_err(|_| AppError::history_unavailable("历史目录暂时不可读取。"))?;
+        let reader = Arc::new(StdMutex::new(reader));
+        *cached = Some(Arc::clone(&reader));
+        Ok(reader)
+    }
+
+    fn begin_history_read(&self, owner_window_label: &str) -> Result<HistoryReadPermit, AppError> {
+        if owner_window_label.is_empty() {
+            return Err(AppError::history_read_busy());
+        }
+        let mut gate = self
+            .history_reads
+            .lock()
+            .map_err(|_| AppError::history_read_busy())?;
+        if gate.total >= MAX_CONCURRENT_HISTORY_READS
+            || gate.owners.get(owner_window_label).copied().unwrap_or(0) >= 1
+        {
+            return Err(AppError::history_read_busy());
+        }
+        gate.total += 1;
+        *gate
+            .owners
+            .entry(owner_window_label.to_owned())
+            .or_insert(0) += 1;
+        Ok(HistoryReadPermit {
+            gate: Arc::clone(&self.history_reads),
+            owner_window_label: owner_window_label.to_owned(),
+        })
+    }
+
+    fn result_owner_state(&self, owner_window_label: &str) -> Result<ResultOwnerState, AppError> {
+        let owners = self
+            .result_owners
+            .lock()
+            .map_err(|_| AppError::invalid_result_read_token())?;
+        Ok(owners.get(owner_window_label).copied().unwrap_or_default())
+    }
+
+    fn ensure_result_owner_live(
+        &self,
+        owner_window_label: &str,
+        expected_epoch: u64,
+    ) -> Result<(), AppError> {
+        let state = self.result_owner_state(owner_window_label)?;
+        if state.closed || state.epoch != expected_epoch {
+            return Err(AppError::invalid_result_read_token());
+        }
+        Ok(())
+    }
+
+    fn mark_result_owner_closed(&self, owner_window_label: &str) {
+        let mut owners = match self.result_owners.lock() {
+            Ok(owners) => owners,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let state = owners.entry(owner_window_label.to_owned()).or_default();
+        state.epoch = state.epoch.saturating_add(1);
+        state.closed = true;
+    }
+
+    async fn begin_result_open(
+        &self,
+        owner_window_label: &str,
+        scan_run_id: i64,
+    ) -> Result<ResultOpenPermit, AppError> {
+        if owner_window_label.is_empty() || scan_run_id <= 0 {
+            return Err(AppError::result_read_token_unavailable(
+                "窗口身份或历史选择编号无效，不能打开封存结果。",
+            ));
+        }
+        let owner_state = self.result_owner_state(owner_window_label)?;
+        if owner_state.closed || owner_state.epoch == u64::MAX {
+            return Err(AppError::invalid_result_read_token());
+        }
+        let mut registry = self.result_reads.lock().await;
+        let now = Instant::now();
+        registry.grants.retain(|_, grant| now < grant.expires_at);
+        let owners = self
+            .result_owners
+            .lock()
+            .map_err(|_| AppError::invalid_result_read_token())?;
+        let owner_state = owners.get(owner_window_label).copied().unwrap_or_default();
+        if owner_state.closed || owner_state.epoch == u64::MAX {
+            return Err(AppError::invalid_result_read_token());
+        }
+        if registry.pending_opens.values().any(|pending| {
+            pending.owner_window_label == owner_window_label && pending.scan_run_id == scan_run_id
+        }) {
+            return Err(AppError::result_read_busy());
+        }
+        let replaced_grants = registry
+            .grants
+            .values()
+            .filter(|grant| {
+                grant.owner_window_label == owner_window_label && grant.scan_run_id == scan_run_id
+            })
+            .count();
+        let effective_total = registry
+            .grants
+            .len()
+            .saturating_sub(replaced_grants)
+            .saturating_add(registry.pending_opens.len());
+        let effective_owner = registry
+            .grants
+            .values()
+            .filter(|grant| grant.owner_window_label == owner_window_label)
+            .count()
+            .saturating_sub(replaced_grants)
+            .saturating_add(
+                registry
+                    .pending_opens
+                    .values()
+                    .filter(|pending| pending.owner_window_label == owner_window_label)
+                    .count(),
+            );
+        if effective_total >= MAX_RESULT_READ_TOKENS
+            || effective_owner >= MAX_RESULT_READ_TOKENS_PER_OWNER
+        {
+            return Err(AppError::result_read_registry_full());
+        }
+        let sequence = registry.next_open_sequence.checked_add(1).ok_or_else(|| {
+            AppError::result_read_token_unavailable("结果打开序列号已耗尽；请重启应用。")
+        })?;
+        registry.next_open_sequence = sequence;
+        registry.pending_opens.insert(
+            sequence,
+            PendingResultOpenRecord {
+                owner_window_label: owner_window_label.to_owned(),
+                scan_run_id,
+                owner_epoch: owner_state.epoch,
+            },
+        );
+        Ok(ResultOpenPermit {
+            registry: Arc::clone(&self.result_reads),
+            owner_window_label: owner_window_label.to_owned(),
+            scan_run_id,
+            owner_epoch: owner_state.epoch,
+            sequence,
+            consumed: false,
+        })
+    }
+
+    fn verify_result_open_epoch(
+        &self,
+        owner_window_label: &str,
+        expected_epoch: u64,
+    ) -> Result<(), AppError> {
+        self.ensure_result_owner_live(owner_window_label, expected_epoch)
+    }
+
+    async fn assert_history_run_inactive(&self, scan_run_id: i64) -> Result<(), AppError> {
+        let registry = self.registry.lock().await;
+        let is_active = registry.active.as_ref().is_some_and(|active| {
+            active
+                .status
+                .scan_run_id
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok())
+                == Some(scan_run_id)
+        });
+        if is_active {
+            return Err(AppError::history_unavailable(
+                "该扫描仍由当前工作任务占用；请等待终态封印完成后再打开。",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn issue_result_read(
+        &self,
+        permit: &mut ResultOpenPermit,
+        reader: SharedEvidenceReader,
+        context: ScanHistoryContext,
+    ) -> Result<IssuedResultReadToken, AppError> {
+        let context = ResultReadContext::Validated(context);
+        let scan_run_id = context.scan_run_id();
+        if scan_run_id != permit.scan_run_id {
+            return Err(AppError::result_context_unavailable());
+        }
+        let database_scope = lock_evidence_reader(&reader)?.database_scope();
+        let issued = self
+            .issue_result_read_at(ResultReadIssue {
+                owner_window_label: permit.owner_window_label.clone(),
+                scan_run_id,
+                database_scope,
+                reader,
+                context,
+                owner_epoch: permit.owner_epoch,
+                open_sequence: permit.sequence,
+                now: Instant::now(),
+                now_unix_ms: unix_time_ms(),
+            })
+            .await?;
+        permit.consumed = true;
+        Ok(issued)
+    }
+
+    async fn issue_result_read_at(
+        &self,
+        request: ResultReadIssue,
+    ) -> Result<IssuedResultReadToken, AppError> {
+        let ResultReadIssue {
+            owner_window_label,
+            scan_run_id,
+            database_scope,
+            reader,
+            context,
+            owner_epoch,
+            open_sequence,
+            now,
+            now_unix_ms,
+        } = request;
+        if owner_window_label.is_empty() || scan_run_id <= 0 {
+            return Err(AppError::result_read_token_unavailable(
+                "窗口身份或持久化扫描编号无效，未签发结果查看授权。",
+            ));
+        }
+        let database_path = self.database_path()?;
+        let expires_at = now.checked_add(RESULT_READ_TOKEN_TTL).ok_or_else(|| {
+            AppError::result_read_token_unavailable("无法计算结果查看授权的安全过期时间。")
+        })?;
+        let ttl_ms = u64::try_from(RESULT_READ_TOKEN_TTL.as_millis()).map_err(|_| {
+            AppError::result_read_token_unavailable("结果查看授权有效期超出时间范围。")
+        })?;
+        let expires_at_unix_ms = now_unix_ms.checked_add(ttl_ms).ok_or_else(|| {
+            AppError::result_read_token_unavailable("无法计算结果查看授权的显示时间。")
+        })?;
+
+        let mut registry = self.result_reads.lock().await;
+        let owners = self
+            .result_owners
+            .lock()
+            .map_err(|_| AppError::invalid_result_read_token())?;
+        let owner_state = owners.get(&owner_window_label).copied().unwrap_or_default();
+        if owner_state.closed || owner_state.epoch != owner_epoch {
+            return Err(AppError::invalid_result_read_token());
+        }
+        let pending_matches = registry
+            .pending_opens
+            .get(&open_sequence)
+            .is_some_and(|pending| {
+                pending.owner_window_label == owner_window_label
+                    && pending.scan_run_id == scan_run_id
+                    && pending.owner_epoch == owner_epoch
+            });
+        if !pending_matches {
+            return Err(AppError::invalid_result_read_token());
+        }
+        registry.grants.retain(|_, grant| now < grant.expires_at);
+        let replaced_tokens = registry
+            .grants
+            .iter()
+            .filter_map(|(token, grant)| {
+                (grant.owner_window_label == owner_window_label && grant.scan_run_id == scan_run_id)
+                    .then_some(token.clone())
+            })
+            .collect::<Vec<_>>();
+        let pending_total = registry.pending_opens.len().saturating_sub(1);
+        let effective_total = registry
+            .grants
+            .len()
+            .saturating_sub(replaced_tokens.len())
+            .saturating_add(pending_total);
+        let effective_owner = registry
+            .grants
+            .values()
+            .filter(|grant| grant.owner_window_label == owner_window_label)
+            .count()
+            .saturating_sub(replaced_tokens.len())
+            .saturating_add(
+                registry
+                    .pending_opens
+                    .values()
+                    .filter(|pending| {
+                        pending.owner_window_label == owner_window_label
+                            && pending.scan_run_id != scan_run_id
+                    })
+                    .count(),
+            );
+        if effective_total >= MAX_RESULT_READ_TOKENS
+            || effective_owner >= MAX_RESULT_READ_TOKENS_PER_OWNER
+        {
+            return Err(AppError::result_read_registry_full());
+        }
+        let generation = registry.next_generation.checked_add(1).ok_or_else(|| {
+            AppError::result_read_token_unavailable("结果查看授权代际编号已耗尽。")
+        })?;
+
+        for _ in 0..MAX_RESULT_READ_TOKEN_GENERATION_ATTEMPTS {
+            let mut entropy = [0_u8; 32];
+            getrandom::fill(&mut entropy).map_err(|_| {
+                AppError::result_read_token_unavailable(
+                    "操作系统安全随机数源不可用，未签发结果查看授权。",
+                )
+            })?;
+            let token = format!("{RESULT_READ_TOKEN_PREFIX}{}", hex(&entropy));
+            if registry.grants.contains_key(&token) {
+                continue;
+            }
+            for replaced in &replaced_tokens {
+                registry.grants.remove(replaced);
+            }
+            registry.pending_opens.remove(&open_sequence);
+            registry.next_generation = generation;
+            registry.grants.insert(
+                token.clone(),
+                ResultReadGrant {
+                    owner_window_label,
+                    database_path,
+                    database_scope,
+                    reader,
+                    context,
+                    scan_run_id,
+                    generation,
+                    owner_epoch,
+                    in_flight: false,
+                    expires_at,
+                },
+            );
+            return Ok(IssuedResultReadToken {
+                result_read_token: token,
+                expires_at_unix_ms: expires_at_unix_ms.to_string(),
+            });
+        }
+        Err(AppError::result_read_token_unavailable(
+            "结果查看授权令牌发生重复，已安全终止签发。",
+        ))
+    }
+
+    #[cfg(test)]
+    async fn issue_result_read_for_test_at(
+        &self,
+        owner_window_label: &str,
+        scan_run_id: i64,
+        now: Instant,
+        now_unix_ms: u64,
+    ) -> Result<IssuedResultReadToken, AppError> {
+        let mut permit = self
+            .begin_result_open(owner_window_label, scan_run_id)
+            .await?;
+        let reader = self.shared_history_reader()?;
+        let database_scope = lock_evidence_reader(&reader)?.database_scope();
+        let issued = self
+            .issue_result_read_at(ResultReadIssue {
+                owner_window_label: owner_window_label.to_owned(),
+                scan_run_id,
+                database_scope,
+                reader,
+                context: ResultReadContext::RegistryOnly(scan_run_id),
+                owner_epoch: permit.owner_epoch,
+                open_sequence: permit.sequence,
+                now,
+                now_unix_ms,
+            })
+            .await?;
+        permit.consumed = true;
+        Ok(issued)
+    }
+
+    #[cfg(test)]
+    async fn issue_result_read_for_test(
+        &self,
+        owner_window_label: &str,
+        scan_run_id: i64,
+    ) -> Result<IssuedResultReadToken, AppError> {
+        self.issue_result_read_for_test_at(
+            owner_window_label,
+            scan_run_id,
+            Instant::now(),
+            unix_time_ms(),
+        )
+        .await
+    }
+
+    async fn begin_result_read(
+        &self,
+        owner_window_label: &str,
+        token: &str,
+    ) -> Result<ResultReadLease, AppError> {
+        self.begin_result_read_at(owner_window_label, token, Instant::now())
+            .await
+    }
+
+    async fn begin_result_read_at(
+        &self,
+        owner_window_label: &str,
+        token: &str,
+        now: Instant,
+    ) -> Result<ResultReadLease, AppError> {
+        if !is_canonical_result_read_token(token) {
+            return Err(AppError::invalid_result_read_token());
+        }
+        let mut registry = self.result_reads.lock().await;
+        let owners = self
+            .result_owners
+            .lock()
+            .map_err(|_| AppError::invalid_result_read_token())?;
+        let Some(grant) = registry.grants.get(token) else {
+            return Err(AppError::invalid_result_read_token());
+        };
+        if grant.owner_window_label != owner_window_label {
+            return Err(AppError::result_read_token_owner_mismatch());
+        }
+        let owner_state = owners.get(owner_window_label).copied().unwrap_or_default();
+        if owner_state.closed || owner_state.epoch != grant.owner_epoch {
+            return Err(AppError::invalid_result_read_token());
+        }
+        if now >= grant.expires_at {
+            registry.grants.remove(token);
+            return Err(AppError::result_read_token_expired());
+        }
+        if grant.in_flight {
+            return Err(AppError::result_read_busy());
+        }
+        let cleanup = Arc::new(ResultReadLeaseCleanup {
+            registry: Arc::clone(&self.result_reads),
+            token: token.to_owned(),
+            generation: grant.generation,
+            owner_epoch: grant.owner_epoch,
+            completed: AtomicBool::new(false),
+        });
+        let lease = ResultReadLease {
+            token: token.to_owned(),
+            owner_window_label: owner_window_label.to_owned(),
+            database_path: grant.database_path.clone(),
+            database_scope: grant.database_scope,
+            reader: Arc::clone(&grant.reader),
+            context: grant.context.clone(),
+            scan_run_id: grant.scan_run_id,
+            generation: grant.generation,
+            owner_epoch: grant.owner_epoch,
+            cleanup,
+        };
+        registry
+            .grants
+            .get_mut(token)
+            .expect("grant remained present while registry lock was held")
+            .in_flight = true;
+        Ok(lease)
+    }
+
+    async fn finish_result_read(&self, lease: &ResultReadLease) -> Result<(), AppError> {
+        self.finish_result_read_at(lease, Instant::now()).await
+    }
+
+    async fn finish_result_read_at(
+        &self,
+        lease: &ResultReadLease,
+        now: Instant,
+    ) -> Result<(), AppError> {
+        let mut registry = self.result_reads.lock().await;
+        let complete_cleanup = || lease.cleanup.completed.store(true, Ordering::Release);
+        let owners = self
+            .result_owners
+            .lock()
+            .map_err(|_| AppError::invalid_result_read_token())?;
+        let Some(grant) = registry.grants.get(&lease.token) else {
+            complete_cleanup();
+            return Err(AppError::invalid_result_read_token());
+        };
+        if now >= grant.expires_at {
+            registry.grants.remove(&lease.token);
+            complete_cleanup();
+            return Err(AppError::result_read_token_expired());
+        }
+        if grant.owner_window_label != lease.owner_window_label {
+            complete_cleanup();
+            return Err(AppError::result_read_token_owner_mismatch());
+        }
+        let owner_state = owners
+            .get(&lease.owner_window_label)
+            .copied()
+            .unwrap_or_default();
+        if owner_state.closed || owner_state.epoch != lease.owner_epoch {
+            release_result_read_in_flight(
+                &mut registry,
+                &lease.token,
+                lease.generation,
+                lease.owner_epoch,
+            );
+            complete_cleanup();
+            return Err(AppError::invalid_result_read_token());
+        }
+        if grant.generation != lease.generation
+            || grant.owner_epoch != lease.owner_epoch
+            || grant.scan_run_id != lease.scan_run_id
+            || grant.database_path != lease.database_path
+            || grant.database_scope != lease.database_scope
+            || !Arc::ptr_eq(&grant.reader, &lease.reader)
+            || grant.context != lease.context
+            || !grant.in_flight
+        {
+            release_result_read_in_flight(
+                &mut registry,
+                &lease.token,
+                lease.generation,
+                lease.owner_epoch,
+            );
+            complete_cleanup();
+            return Err(AppError::invalid_result_read_token());
+        }
+        release_result_read_in_flight(
+            &mut registry,
+            &lease.token,
+            lease.generation,
+            lease.owner_epoch,
+        );
+        complete_cleanup();
+        Ok(())
+    }
+
+    async fn close_result_read(
+        &self,
+        owner_window_label: &str,
+        token: &str,
+    ) -> Result<CloseResultReadResponse, AppError> {
+        if !is_canonical_result_read_token(token) {
+            return Err(AppError::invalid_result_read_token());
+        }
+        let mut registry = self.result_reads.lock().await;
+        if let Some(grant) = registry.grants.get(token) {
+            if grant.owner_window_label != owner_window_label {
+                return Err(AppError::result_read_token_owner_mismatch());
+            }
+        }
+        Ok(CloseResultReadResponse {
+            revoked: registry.grants.remove(token).is_some(),
+        })
+    }
+
+    async fn revoke_result_read_lease(&self, lease: &ResultReadLease) {
+        let mut registry = self.result_reads.lock().await;
+        let matches = registry.grants.get(&lease.token).is_some_and(|grant| {
+            grant.generation == lease.generation
+                && grant.database_scope == lease.database_scope
+                && Arc::ptr_eq(&grant.reader, &lease.reader)
+        });
+        if matches {
+            registry.grants.remove(&lease.token);
+        }
+    }
+
+    #[cfg(test)]
+    async fn clear_result_reads_for_owner(&self, owner_window_label: &str) {
+        self.mark_result_owner_closed(owner_window_label);
+        self.remove_result_reads_for_owner(owner_window_label).await;
+    }
+
+    async fn remove_result_reads_for_owner(&self, owner_window_label: &str) {
+        let mut registry = self.result_reads.lock().await;
+        registry
+            .pending_opens
+            .retain(|_, pending| pending.owner_window_label != owner_window_label);
+        registry
+            .grants
+            .retain(|_, grant| grant.owner_window_label != owner_window_label);
+    }
+
+    fn try_remove_result_reads_for_owner(&self, owner_window_label: &str) -> bool {
+        let Ok(mut registry) = self.result_reads.try_lock() else {
+            return false;
+        };
+        registry
+            .pending_opens
+            .retain(|_, pending| pending.owner_window_label != owner_window_label);
+        registry
+            .grants
+            .retain(|_, grant| grant.owner_window_label != owner_window_label);
+        true
+    }
+
+    #[cfg(test)]
+    async fn pending_result_read_count(&self) -> usize {
+        self.result_reads.lock().await.grants.len()
     }
 
     #[cfg(test)]
@@ -844,17 +1756,20 @@ impl ScanJobManager {
             Ok(WorkerCompletion::Completed(result)) => {
                 status.phase = ScanJobPhase::Completed;
                 status.scan_run_id = Some(result.scan_run_id.clone());
-                status.result = Some(result.clone());
+                status.history_entry_id = Some(result.scan_run_id.clone());
+                status.result = None;
                 status.error = None;
             }
             Ok(WorkerCompletion::Cancelled(result)) => {
                 status.phase = ScanJobPhase::Cancelled;
                 status.scan_run_id = Some(result.scan_run_id.clone());
+                status.history_entry_id = None;
                 status.result = Some(result.clone());
                 status.error = None;
             }
             Err(error) => {
                 status.phase = ScanJobPhase::Failed;
+                status.history_entry_id = None;
                 status.result = None;
                 status.error = Some(error.clone());
             }
@@ -864,39 +1779,6 @@ impl ScanJobManager {
         registry.last_terminal_owner_window_label = Some(terminal_owner_window_label);
         registry.terminal_acknowledged = false;
         Some(event)
-    }
-
-    async fn completed_run(&self, job_id: &str) -> Result<(PathBuf, i64), AppError> {
-        let registry = self.registry.lock().await;
-        if registry.active.is_some() {
-            return Err(AppError::result_unavailable(
-                job_id.to_owned(),
-                "扫描运行期间禁止另开数据库连接读取结果；请等待任务完成。",
-            ));
-        }
-        let status = registry
-            .last_terminal
-            .as_ref()
-            .filter(|status| status.job_id == job_id)
-            .ok_or_else(|| AppError::job_not_found(job_id.to_owned()))?;
-        if status.phase != ScanJobPhase::Completed {
-            return Err(AppError::result_unavailable(
-                job_id.to_owned(),
-                "只有完成全部覆盖复核并封印的扫描才能分页读取重复组。",
-            ));
-        }
-        let scan_run_id = status
-            .scan_run_id
-            .as_deref()
-            .ok_or_else(|| {
-                AppError::result_unavailable(job_id.to_owned(), "任务缺少持久化扫描编号。")
-            })?
-            .parse::<i64>()
-            .map_err(|_| {
-                AppError::result_unavailable(job_id.to_owned(), "持久化扫描编号格式无效。")
-            })?;
-        drop(registry);
-        Ok((self.database_path()?, scan_run_id))
     }
 }
 
@@ -923,6 +1805,7 @@ fn reserve_job(registry: &mut ScanJobRegistry, owner_window_label: String) -> Jo
         started_at_unix_ms: unix_time_ms(),
         finished_at_unix_ms: None,
         scan_run_id: None,
+        history_entry_id: None,
         progress: None,
         result: None,
         error: None,
@@ -993,6 +1876,17 @@ fn issue_scan_root_token(
 fn is_canonical_scan_root_token(value: &str) -> bool {
     value
         .strip_prefix(SCAN_ROOT_TOKEN_PREFIX)
+        .is_some_and(|body| {
+            body.len() == 64
+                && body
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}
+
+fn is_canonical_result_read_token(value: &str) -> bool {
+    value
+        .strip_prefix(RESULT_READ_TOKEN_PREFIX)
         .is_some_and(|body| {
             body.len() == 64
                 && body
@@ -1370,6 +2264,19 @@ pub(crate) fn cancel_for_window_close(
     manager: ScanJobManager,
 ) {
     manager.clear_scan_roots_for_owner(&owner_window_label);
+    // This short synchronous tombstone is the authorization boundary: even
+    // if the async registry is contended, no queued or in-flight invoke can
+    // mint or deliver a token for the destroyed label after this returns.
+    manager.mark_result_owner_closed(&owner_window_label);
+    if !manager.try_remove_result_reads_for_owner(&owner_window_label) {
+        let cleanup_manager = manager.clone();
+        let cleanup_owner = owner_window_label.clone();
+        let _task = tauri::async_runtime::spawn(async move {
+            cleanup_manager
+                .remove_result_reads_for_owner(&cleanup_owner)
+                .await;
+        });
+    }
     match manager.try_cancel_for_owner(&owner_window_label) {
         ImmediateOwnerCancel::Cancelled(status) => emit_status(&app, &owner_window_label, &status),
         ImmediateOwnerCancel::NoAction => {}
@@ -1660,209 +2567,701 @@ pub(crate) type CaptureTimeIssuePage = ResultPage<CaptureTimeIssueItem>;
 pub(crate) type CaptureTimeMetadataReportPage = ResultPage<CaptureTimeMetadataReportItem>;
 pub(crate) type CaptureTimeMetadataFieldPage = ResultPage<CaptureTimeMetadataFieldItem>;
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScanHistoryCaptureTimeItem {
+    status: &'static str,
+    expected_groups: String,
+    evidence_groups: String,
+    unavailable_groups: String,
+    failed_groups: String,
+    sealed_report_read_bytes: String,
+    sealed_report_read_operations: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScanHistoryItem {
+    history_entry_id: String,
+    root_display: String,
+    scan_mode: String,
+    started_at_unix_ms: String,
+    finished_at_unix_ms: String,
+    duration_ms: String,
+    coverage_status: &'static str,
+    observed_files: String,
+    logical_bytes: String,
+    verified_groups: String,
+    verified_members: String,
+    redundant_copies: String,
+    logical_reclaimable_bytes: String,
+    issues: String,
+    unresolved_issues: String,
+    capture_time: ScanHistoryCaptureTimeItem,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScanHistoryPage {
+    schema_version: u8,
+    items: Vec<ScanHistoryItem>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenScanHistoryResult {
+    schema_version: u8,
+    history_entry_id: String,
+    result_read_token: String,
+    expires_at_unix_ms: String,
+    summary: ScanHistoryItem,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HistoryCursorEnvelope<T> {
+    envelope_version: u8,
+    endpoint: String,
+    payload: T,
+}
+
+pub(crate) async fn list_scan_history(
+    manager: &ScanJobManager,
+    owner_window_label: &str,
+    cursor: Option<String>,
+    limit: u32,
+) -> Result<ScanHistoryPage, AppError> {
+    validate_history_page_limit(limit)?;
+    let cursor = decode_history_cursor::<ScanHistoryCursor>(cursor)?;
+    let permit = manager.begin_history_read(owner_window_label)?;
+    let blocking_manager = manager.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let shared_reader = blocking_manager.shared_history_reader()?;
+        let reader = lock_evidence_reader(&shared_reader)?;
+        reader
+            .revalidate_source_identity()
+            .map_err(|_| AppError::history_unavailable("历史数据库身份已变化，请重新载入目录。"))?;
+        let page = reader
+            .list_scan_history_page(cursor.as_ref(), limit)
+            .map_err(|_| AppError::history_unavailable("历史目录分页校验失败。"))?;
+        let items = page
+            .items
+            .into_iter()
+            .map(map_scan_history_item)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = encode_history_cursor(page.next_cursor)?;
+        let response = ScanHistoryPage {
+            schema_version: 1,
+            items,
+            next_cursor,
+        };
+        enforce_serialized_result_budget(&response)?;
+        Ok(response)
+    })
+    .await
+    .map_err(|_| AppError::result_task("历史目录读取任务意外终止。"))??;
+    Ok(result)
+}
+
+pub(crate) async fn open_scan_history(
+    manager: &ScanJobManager,
+    owner_window_label: &str,
+    history_entry_id: &str,
+) -> Result<OpenScanHistoryResult, AppError> {
+    let scan_run_id = parse_history_entry_id(history_entry_id)?;
+    let mut open_permit = manager
+        .begin_result_open(owner_window_label, scan_run_id)
+        .await?;
+    let owner_epoch = open_permit.owner_epoch;
+    manager.assert_history_run_inactive(scan_run_id).await?;
+    let blocking_manager = manager.clone();
+    let (shared_reader, context) = tauri::async_runtime::spawn_blocking(move || {
+        let shared_reader = blocking_manager.shared_history_reader()?;
+        let reader = lock_evidence_reader(&shared_reader)?;
+        reader
+            .revalidate_source_identity()
+            .map_err(|_| AppError::history_unavailable("历史数据库身份已变化，请重新载入目录。"))?;
+        if reader
+            .get_scan_history_entry(scan_run_id)
+            .map_err(|_| AppError::history_unavailable("历史结果资格校验失败。"))?
+            .is_none()
+        {
+            return Err(AppError::history_unavailable(
+                "该历史选择编号不存在或不满足完成与封印条件。",
+            ));
+        }
+        let context = reader
+            .resolve_scan_history_entry(scan_run_id)
+            .map_err(|_| AppError::history_unavailable("历史结果只读身份解析失败。"))?
+            .ok_or_else(|| AppError::history_unavailable("历史结果只读身份不可用。"))?;
+        drop(reader);
+        Ok((shared_reader, context))
+    })
+    .await
+    .map_err(|_| AppError::result_task("历史结果打开任务意外终止。"))??;
+
+    manager.verify_result_open_epoch(owner_window_label, owner_epoch)?;
+    manager.assert_history_run_inactive(scan_run_id).await?;
+    let issued = manager
+        .issue_result_read(&mut open_permit, shared_reader, context)
+        .await?;
+    let token = issued.result_read_token.clone();
+    let summary_result = with_result_reader(
+        manager,
+        owner_window_label,
+        &token,
+        move |reader, context, _result_scope| {
+            let record = reader
+                .get_scan_history_entry(context.scan_run_id())
+                .map_err(|_| AppError::result_store("封存结果摘要读取失败。"))?
+                .ok_or_else(AppError::result_context_unavailable)?;
+            map_scan_history_item(record)
+        },
+    )
+    .await;
+    let summary = match summary_result {
+        Ok(summary) => summary,
+        Err(error) => {
+            let _ = manager.close_result_read(owner_window_label, &token).await;
+            return Err(error);
+        }
+    };
+    let response = OpenScanHistoryResult {
+        schema_version: 1,
+        history_entry_id: history_entry_id.to_owned(),
+        result_read_token: token.clone(),
+        expires_at_unix_ms: issued.expires_at_unix_ms,
+        summary,
+    };
+    if let Err(error) = enforce_serialized_result_budget(&response) {
+        let _ = manager.close_result_read(owner_window_label, &token).await;
+        return Err(error);
+    }
+    if let Err(error) = manager.verify_result_open_epoch(owner_window_label, owner_epoch) {
+        let _ = manager.close_result_read(owner_window_label, &token).await;
+        return Err(error);
+    }
+    if let Err(error) = manager.assert_history_run_inactive(scan_run_id).await {
+        let _ = manager.close_result_read(owner_window_label, &token).await;
+        return Err(error);
+    }
+    Ok(response)
+}
+
+pub(crate) async fn close_result_read(
+    manager: &ScanJobManager,
+    owner_window_label: &str,
+    result_read_token: &str,
+) -> Result<CloseResultReadResponse, AppError> {
+    manager
+        .close_result_read(owner_window_label, result_read_token)
+        .await
+}
+
+async fn with_result_reader<T, F>(
+    manager: &ScanJobManager,
+    owner_window_label: &str,
+    result_read_token: &str,
+    operation: F,
+) -> Result<T, AppError>
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce(&EvidenceReader, &ScanHistoryContext, &str) -> Result<T, AppError> + Send + 'static,
+{
+    let lease = manager
+        .begin_result_read(owner_window_label, result_read_token)
+        .await?;
+    let blocking_lease = lease.clone();
+    let task_result = tauri::async_runtime::spawn_blocking(move || {
+        let reader = lock_evidence_reader(&blocking_lease.reader)?;
+        reader
+            .revalidate_source_identity()
+            .map_err(|_| AppError::result_context_unavailable())?;
+        if reader.database_scope() != blocking_lease.database_scope {
+            return Err(AppError::result_context_unavailable());
+        }
+        if blocking_lease.context.scan_run_id() != blocking_lease.scan_run_id {
+            return Err(AppError::result_context_unavailable());
+        }
+        let context = blocking_lease.context.validated()?;
+        let result_scope = blocking_lease.scan_run_id.to_string();
+        let value = operation(&reader, context, &result_scope)?;
+        enforce_serialized_result_budget(&value)?;
+        Ok(value)
+    })
+    .await
+    .map_err(|_| AppError::result_task("封存结果读取任务意外终止。"));
+
+    // This second generation/TTL/owner check is deliberately after the
+    // blocking read. A close, reopen, expiry, or window teardown that races the
+    // query suppresses the late response instead of delivering stale data.
+    let source_identity_failed = matches!(
+        &task_result,
+        Ok(Err(error)) if error.code == "RESULT_READ_CONTEXT_UNAVAILABLE"
+    );
+    manager.finish_result_read(&lease).await?;
+    if source_identity_failed {
+        manager.revoke_result_read_lease(&lease).await;
+    }
+    task_result?
+}
+
+fn map_scan_history_item(record: ScanHistoryRecord) -> Result<ScanHistoryItem, AppError> {
+    if record.scan_run_id <= 0
+        || record.started_at_ms < 0
+        || record.finished_at_ms < record.started_at_ms
+        || record.duration_ms != record.finished_at_ms - record.started_at_ms
+        || record.root_display_path.len() > MAX_HISTORY_ROOT_DISPLAY_BYTES
+        || record.scan_mode.is_empty()
+        || record.scan_mode.len() > MAX_HISTORY_SCAN_MODE_BYTES
+    {
+        return Err(AppError::history_unavailable(
+            "历史结果的显示文本、编号或时间范围无效。",
+        ));
+    }
+    let coverage_status = match record.coverage_status.as_str() {
+        "complete" => "complete",
+        "partial" => "partial",
+        _ => {
+            return Err(AppError::history_unavailable(
+                "历史结果缺少受支持的终态覆盖结论。",
+            ));
+        }
+    };
+    let counts = [
+        record.discovered_count,
+        record.fingerprinted_count,
+        record.error_count,
+        record.logical_bytes_seen,
+        record.observed_file_count,
+        record.verified_group_count,
+        record.verified_member_count,
+        record.redundant_copy_count,
+        record.logical_reclaimable_bytes,
+        record.issue_count,
+        record.unresolved_issue_count,
+    ];
+    if counts.into_iter().any(|value| value < 0)
+        || record.unresolved_issue_count > record.issue_count
+        || record.redundant_copy_count > record.verified_member_count
+    {
+        return Err(AppError::history_unavailable(
+            "历史结果的封印统计存在矛盾。",
+        ));
+    }
+    let capture_time = map_scan_history_capture_time(record.time_outcome)?;
+    Ok(ScanHistoryItem {
+        history_entry_id: record.scan_run_id.to_string(),
+        root_display: record.root_display_path,
+        scan_mode: record.scan_mode,
+        started_at_unix_ms: record.started_at_ms.to_string(),
+        finished_at_unix_ms: record.finished_at_ms.to_string(),
+        duration_ms: record.duration_ms.to_string(),
+        coverage_status,
+        observed_files: record.observed_file_count.to_string(),
+        logical_bytes: record.logical_bytes_seen.to_string(),
+        verified_groups: record.verified_group_count.to_string(),
+        verified_members: record.verified_member_count.to_string(),
+        redundant_copies: record.redundant_copy_count.to_string(),
+        logical_reclaimable_bytes: record.logical_reclaimable_bytes.to_string(),
+        issues: record.issue_count.to_string(),
+        unresolved_issues: record.unresolved_issue_count.to_string(),
+        capture_time,
+    })
+}
+
+fn map_scan_history_capture_time(
+    outcome: guiying_store::ScanHistoryTimeOutcomeRecord,
+) -> Result<ScanHistoryCaptureTimeItem, AppError> {
+    let terminal = matches!(outcome.state.as_str(), "complete" | "partial");
+    if !terminal {
+        if !matches!(outcome.state.as_str(), "not_run" | "unavailable" | "failed")
+            || outcome.expected_group_count.is_some()
+            || outcome.evidence_group_count.is_some()
+            || outcome.unavailable_group_count.is_some()
+            || outcome.failed_group_count.is_some()
+            || outcome.max_total_read_bytes.is_some()
+            || outcome.max_probe_count_per_group.is_some()
+            || outcome.max_report_total_bytes_read.is_some()
+            || outcome.max_report_read_operations.is_some()
+            || outcome.max_report_retained_field_bytes.is_some()
+            || outcome.max_report_fields.is_some()
+            || outcome.max_report_issues.is_some()
+            || outcome.sealed_report_read_bytes.is_some()
+            || outcome.sealed_report_read_operations.is_some()
+            || outcome.finalized_at_ms.is_some()
+        {
+            return Err(AppError::history_unavailable(
+                "未完成的拍摄时间阶段携带了未封印数据。",
+            ));
+        }
+        let status = match outcome.state.as_str() {
+            "not_run" => "not_run",
+            "unavailable" => "unavailable",
+            "failed" => "failed",
+            _ => unreachable!(),
+        };
+        return Ok(ScanHistoryCaptureTimeItem {
+            status,
+            expected_groups: "0".to_owned(),
+            evidence_groups: "0".to_owned(),
+            unavailable_groups: "0".to_owned(),
+            failed_groups: "0".to_owned(),
+            sealed_report_read_bytes: "0".to_owned(),
+            sealed_report_read_operations: "0".to_owned(),
+        });
+    }
+
+    let required = [
+        outcome.expected_group_count,
+        outcome.evidence_group_count,
+        outcome.unavailable_group_count,
+        outcome.failed_group_count,
+        outcome.max_total_read_bytes,
+        outcome.max_probe_count_per_group,
+        outcome.max_report_total_bytes_read,
+        outcome.max_report_read_operations,
+        outcome.max_report_retained_field_bytes,
+        outcome.max_report_fields,
+        outcome.max_report_issues,
+        outcome.sealed_report_read_bytes,
+        outcome.sealed_report_read_operations,
+    ];
+    if required
+        .into_iter()
+        .any(|value| value.is_none_or(|value| value < 0))
+        || outcome.finalized_at_ms.is_none_or(|value| value < 0)
+    {
+        return Err(AppError::history_unavailable(
+            "拍摄时间终态缺少完整、非负的封印统计。",
+        ));
+    }
+    let expected = outcome.expected_group_count.unwrap_or_default();
+    let evidence = outcome.evidence_group_count.unwrap_or_default();
+    let unavailable = outcome.unavailable_group_count.unwrap_or_default();
+    let failed = outcome.failed_group_count.unwrap_or_default();
+    let classified = evidence
+        .checked_add(unavailable)
+        .and_then(|value| value.checked_add(failed))
+        .ok_or_else(|| AppError::history_unavailable("拍摄时间覆盖统计溢出。"))?;
+    if (outcome.state == "complete" && classified != expected)
+        || (outcome.state == "partial" && classified > expected)
+    {
+        return Err(AppError::history_unavailable(
+            "拍摄时间覆盖统计与终态不一致。",
+        ));
+    }
+    Ok(ScanHistoryCaptureTimeItem {
+        status: if outcome.state == "complete" {
+            "complete"
+        } else {
+            "partial"
+        },
+        expected_groups: expected.to_string(),
+        evidence_groups: evidence.to_string(),
+        unavailable_groups: unavailable.to_string(),
+        failed_groups: failed.to_string(),
+        sealed_report_read_bytes: outcome
+            .sealed_report_read_bytes
+            .unwrap_or_default()
+            .to_string(),
+        sealed_report_read_operations: outcome
+            .sealed_report_read_operations
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn parse_history_entry_id(value: &str) -> Result<i64, AppError> {
+    let parsed = value.parse::<i64>().map_err(|_| {
+        AppError::invalid_history_entry("historyEntryId 不是有效的十进制选择编号。")
+    })?;
+    if parsed <= 0 || parsed.to_string() != value {
+        return Err(AppError::invalid_history_entry(
+            "historyEntryId 必须是规范的正十进制选择编号。",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_history_page_limit(limit: u32) -> Result<(), AppError> {
+    if limit == 0 || limit > MAX_SCAN_HISTORY_PAGE_LIMIT {
+        return Err(AppError::invalid_history_cursor(format!(
+            "limit 必须在 1..={MAX_SCAN_HISTORY_PAGE_LIMIT} 范围内。"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_history_cursor<T: DeserializeOwned>(
+    cursor: Option<String>,
+) -> Result<Option<T>, AppError> {
+    cursor
+        .map(|value| {
+            if value.len() > MAX_CURSOR_BYTES {
+                return Err(AppError::invalid_history_cursor(
+                    "历史分页游标超过 16 KiB 安全上限。",
+                ));
+            }
+            let envelope: HistoryCursorEnvelope<T> = serde_json::from_str(&value)
+                .map_err(|_| AppError::invalid_history_cursor("历史分页游标格式无效。"))?;
+            if envelope.envelope_version != HISTORY_CURSOR_ENVELOPE_VERSION
+                || envelope.endpoint != HISTORY_CURSOR_ENDPOINT
+            {
+                return Err(AppError::invalid_history_cursor(
+                    "历史分页游标的版本或接口作用域不匹配。",
+                ));
+            }
+            Ok(envelope.payload)
+        })
+        .transpose()
+}
+
+fn encode_history_cursor<T: Serialize>(cursor: Option<T>) -> Result<Option<String>, AppError> {
+    cursor
+        .map(|payload| {
+            let envelope = HistoryCursorEnvelope {
+                envelope_version: HISTORY_CURSOR_ENVELOPE_VERSION,
+                endpoint: HISTORY_CURSOR_ENDPOINT.to_owned(),
+                payload,
+            };
+            let encoded = serde_json::to_string(&envelope)
+                .map_err(|_| AppError::history_unavailable("历史分页游标生成失败。"))?;
+            if encoded.len() > MAX_CURSOR_BYTES {
+                return Err(AppError::history_unavailable(
+                    "生成的历史分页游标超过 16 KiB 安全上限。",
+                ));
+            }
+            Ok(encoded)
+        })
+        .transpose()
+}
+
+fn enforce_serialized_result_budget<T: Serialize>(value: &T) -> Result<(), AppError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| AppError::result_store("结果响应序列化失败。"))?;
+    if bytes.len() > MAX_RESULT_JSON_BYTES {
+        return Err(AppError::result_store("结果响应超过 16 MiB 安全上限。"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn list_capture_time_group_summaries(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     cursor: Option<String>,
     limit: u32,
 ) -> Result<CaptureTimeGroupSummaryPage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
-    let decoded = decode_result_cursor::<CaptureTimeSummaryCursor>(
-        job_id,
-        CAPTURE_TIME_GROUP_SUMMARIES_CURSOR_ENDPOINT,
-        cursor,
-    )?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_capture_time_group_summaries_page(scan_run_id, decoded.as_ref(), limit)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_capture_time_group_summary_page(&blocking_job_id, page)
-    })
+    validate_page_limit("result", "limit", limit, guiying_store::MAX_PAGE_SIZE)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let decoded = decode_result_cursor::<CaptureTimeSummaryCursor>(
+                result_scope,
+                CAPTURE_TIME_GROUP_SUMMARIES_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_capture_time_group_summaries_page(context, decoded.as_ref(), limit)
+                .map_err(|_| AppError::result_store("拍摄时间组摘要读取失败或不可用。"))?;
+            map_capture_time_group_summary_page(result_scope, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 pub(crate) async fn get_capture_time_group_summary(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     exact_group_build_id: &str,
 ) -> Result<Option<CaptureTimeGroupSummaryItem>, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
     let exact_group_build_id =
-        parse_positive_id(job_id, "exactGroupBuildId", exact_group_build_id)?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let summary = store
-            .get_capture_time_group_summary(scan_run_id, exact_group_build_id)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        summary
-            .map(|record| map_capture_time_group_summary_item(&blocking_job_id, record))
-            .transpose()
-    })
+        parse_positive_id("result", "exactGroupBuildId", exact_group_build_id)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let Some(group) = reader
+                .resolve_scan_history_group(context, exact_group_build_id)
+                .map_err(|_| AppError::result_store("重复组只读身份解析失败。"))?
+            else {
+                return Ok(None);
+            };
+            let summary = reader
+                .get_capture_time_group_summary(&group)
+                .map_err(|_| AppError::result_store("拍摄时间组摘要读取失败。"))?;
+            summary
+                .map(|record| map_capture_time_group_summary_item(result_scope, record))
+                .transpose()
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 pub(crate) async fn list_capture_time_candidates(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     exact_group_build_id: &str,
     analysis_build_id: &str,
     cursor: Option<String>,
     limit: u32,
 ) -> Result<CaptureTimeCandidatePage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
     let exact_group_build_id =
-        parse_positive_id(job_id, "exactGroupBuildId", exact_group_build_id)?;
-    let analysis_build_id = parse_positive_id(job_id, "analysisBuildId", analysis_build_id)?;
-    let decoded = decode_result_cursor::<CaptureTimeCandidateCursor>(
-        job_id,
-        CAPTURE_TIME_CANDIDATES_CURSOR_ENDPOINT,
-        cursor,
-    )?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_capture_time_candidates_page(
-                scan_run_id,
+        parse_positive_id("result", "exactGroupBuildId", exact_group_build_id)?;
+    let analysis_build_id = parse_positive_id("result", "analysisBuildId", analysis_build_id)?;
+    validate_page_limit("result", "limit", limit, guiying_store::MAX_PAGE_SIZE)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let group = resolve_history_analysis_group(
+                reader,
+                context,
                 exact_group_build_id,
                 analysis_build_id,
-                decoded.as_ref(),
-                limit,
-            )
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_capture_time_candidate_page(&blocking_job_id, page)
-    })
+            )?;
+            let decoded = decode_result_cursor::<CaptureTimeCandidateCursor>(
+                result_scope,
+                CAPTURE_TIME_CANDIDATES_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_capture_time_candidates_page(&group, decoded.as_ref(), limit)
+                .map_err(|_| AppError::result_store("拍摄时间候选证据读取失败。"))?;
+            map_capture_time_candidate_page(result_scope, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 pub(crate) async fn list_capture_time_members(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     exact_group_build_id: &str,
     analysis_build_id: &str,
     cursor: Option<String>,
     limit: u32,
 ) -> Result<CaptureTimeMemberPage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
     let exact_group_build_id =
-        parse_positive_id(job_id, "exactGroupBuildId", exact_group_build_id)?;
-    let analysis_build_id = parse_positive_id(job_id, "analysisBuildId", analysis_build_id)?;
-    let decoded = decode_result_cursor::<CaptureTimeMemberCursor>(
-        job_id,
-        CAPTURE_TIME_MEMBERS_CURSOR_ENDPOINT,
-        cursor,
-    )?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_capture_time_members_page(
-                scan_run_id,
+        parse_positive_id("result", "exactGroupBuildId", exact_group_build_id)?;
+    let analysis_build_id = parse_positive_id("result", "analysisBuildId", analysis_build_id)?;
+    validate_page_limit("result", "limit", limit, guiying_store::MAX_PAGE_SIZE)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let group = resolve_history_analysis_group(
+                reader,
+                context,
                 exact_group_build_id,
                 analysis_build_id,
-                decoded.as_ref(),
-                limit,
-            )
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_capture_time_member_page(&blocking_job_id, page)
-    })
+            )?;
+            let decoded = decode_result_cursor::<CaptureTimeMemberCursor>(
+                result_scope,
+                CAPTURE_TIME_MEMBERS_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_capture_time_members_page(&group, decoded.as_ref(), limit)
+                .map_err(|_| AppError::result_store("拍摄时间成员评估读取失败。"))?;
+            map_capture_time_member_page(result_scope, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 pub(crate) async fn list_capture_time_issues(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     exact_group_build_id: &str,
     analysis_build_id: &str,
     cursor: Option<String>,
     limit: u32,
 ) -> Result<CaptureTimeIssuePage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
     let exact_group_build_id =
-        parse_positive_id(job_id, "exactGroupBuildId", exact_group_build_id)?;
-    let analysis_build_id = parse_positive_id(job_id, "analysisBuildId", analysis_build_id)?;
-    let decoded = decode_result_cursor::<CaptureTimeIssueCursor>(
-        job_id,
-        CAPTURE_TIME_ISSUES_CURSOR_ENDPOINT,
-        cursor,
-    )?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_capture_time_issues_page(
-                scan_run_id,
+        parse_positive_id("result", "exactGroupBuildId", exact_group_build_id)?;
+    let analysis_build_id = parse_positive_id("result", "analysisBuildId", analysis_build_id)?;
+    validate_page_limit("result", "limit", limit, guiying_store::MAX_PAGE_SIZE)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let group = resolve_history_analysis_group(
+                reader,
+                context,
                 exact_group_build_id,
                 analysis_build_id,
-                decoded.as_ref(),
-                limit,
-            )
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_capture_time_issue_page(&blocking_job_id, page)
-    })
+            )?;
+            let decoded = decode_result_cursor::<CaptureTimeIssueCursor>(
+                result_scope,
+                CAPTURE_TIME_ISSUES_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_capture_time_issues_page(&group, decoded.as_ref(), limit)
+                .map_err(|_| AppError::result_store("拍摄时间问题证据读取失败。"))?;
+            map_capture_time_issue_page(result_scope, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 pub(crate) async fn list_capture_time_metadata_reports(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     exact_group_build_id: &str,
     analysis_build_id: &str,
     cursor: Option<String>,
     limit: u32,
 ) -> Result<CaptureTimeMetadataReportPage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
     let exact_group_build_id =
-        parse_positive_id(job_id, "exactGroupBuildId", exact_group_build_id)?;
-    let analysis_build_id = parse_positive_id(job_id, "analysisBuildId", analysis_build_id)?;
-    validate_page_limit(job_id, "limit", limit, MAX_METADATA_REPORT_PAGE_LIMIT)?;
-    let decoded = decode_result_cursor::<MetadataReportCursor>(
-        job_id,
-        CAPTURE_TIME_METADATA_REPORTS_CURSOR_ENDPOINT,
-        cursor,
-    )?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_capture_time_metadata_reports_page(
-                scan_run_id,
+        parse_positive_id("result", "exactGroupBuildId", exact_group_build_id)?;
+    let analysis_build_id = parse_positive_id("result", "analysisBuildId", analysis_build_id)?;
+    validate_page_limit("result", "limit", limit, MAX_METADATA_REPORT_PAGE_LIMIT)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let group = resolve_history_analysis_group(
+                reader,
+                context,
                 exact_group_build_id,
                 analysis_build_id,
-                decoded.as_ref(),
-                limit,
-            )
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_capture_time_metadata_report_page(&blocking_job_id, page)
-    })
+            )?;
+            let decoded = decode_result_cursor::<MetadataReportCursor>(
+                result_scope,
+                CAPTURE_TIME_METADATA_REPORTS_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_capture_time_metadata_reports_page(&group, decoded.as_ref(), limit)
+                .map_err(|_| AppError::result_store("元数据封印报告读取失败。"))?;
+            map_capture_time_metadata_report_page(result_scope, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_capture_time_metadata_fields(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     exact_group_build_id: &str,
     analysis_build_id: &str,
     source_ordinal: &str,
@@ -1870,44 +3269,48 @@ pub(crate) async fn list_capture_time_metadata_fields(
     cursor: Option<String>,
     limit: u32,
 ) -> Result<CaptureTimeMetadataFieldPage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
     let exact_group_build_id =
-        parse_positive_id(job_id, "exactGroupBuildId", exact_group_build_id)?;
-    let analysis_build_id = parse_positive_id(job_id, "analysisBuildId", analysis_build_id)?;
-    let source_ordinal = parse_nonnegative_id(job_id, "sourceOrdinal", source_ordinal)?;
-    let report_id = parse_positive_id(job_id, "reportId", report_id)?;
-    validate_page_limit(job_id, "limit", limit, MAX_METADATA_FIELD_PAGE_LIMIT)?;
-    let decoded = decode_result_cursor::<MetadataFieldCursor>(
-        job_id,
-        CAPTURE_TIME_METADATA_FIELDS_CURSOR_ENDPOINT,
-        cursor,
-    )?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_capture_time_metadata_fields_page(
-                scan_run_id,
+        parse_positive_id("result", "exactGroupBuildId", exact_group_build_id)?;
+    let analysis_build_id = parse_positive_id("result", "analysisBuildId", analysis_build_id)?;
+    let source_ordinal = parse_nonnegative_id("result", "sourceOrdinal", source_ordinal)?;
+    let report_id = parse_positive_id("result", "reportId", report_id)?;
+    validate_page_limit("result", "limit", limit, MAX_METADATA_FIELD_PAGE_LIMIT)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let group = resolve_history_analysis_group(
+                reader,
+                context,
                 exact_group_build_id,
                 analysis_build_id,
-                source_ordinal,
-                report_id,
-                decoded.as_ref(),
-                limit,
-            )
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_capture_time_metadata_field_page(&blocking_job_id, page)
-    })
+            )?;
+            let decoded = decode_result_cursor::<MetadataFieldCursor>(
+                result_scope,
+                CAPTURE_TIME_METADATA_FIELDS_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_capture_time_metadata_fields_page(
+                    &group,
+                    source_ordinal,
+                    report_id,
+                    decoded.as_ref(),
+                    limit,
+                )
+                .map_err(|_| AppError::result_store("元数据字段证据读取失败。"))?;
+            map_capture_time_metadata_field_page(result_scope, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_capture_time_metadata_field_raw_detail(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     exact_group_build_id: &str,
     analysis_build_id: &str,
     source_ordinal: &str,
@@ -1915,126 +3318,165 @@ pub(crate) async fn get_capture_time_metadata_field_raw_detail(
     field_ordinal: &str,
     field_id: &str,
 ) -> Result<Option<CaptureTimeMetadataFieldRawDetailItem>, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
     let exact_group_build_id =
-        parse_positive_id(job_id, "exactGroupBuildId", exact_group_build_id)?;
-    let analysis_build_id = parse_positive_id(job_id, "analysisBuildId", analysis_build_id)?;
-    let source_ordinal = parse_nonnegative_id(job_id, "sourceOrdinal", source_ordinal)?;
-    let report_id = parse_positive_id(job_id, "reportId", report_id)?;
-    let field_ordinal = parse_nonnegative_id(job_id, "fieldOrdinal", field_ordinal)?;
-    let field_id = parse_positive_id(job_id, "fieldId", field_id)?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let detail = store
-            .get_capture_time_metadata_field_raw_detail(
-                scan_run_id,
+        parse_positive_id("result", "exactGroupBuildId", exact_group_build_id)?;
+    let analysis_build_id = parse_positive_id("result", "analysisBuildId", analysis_build_id)?;
+    let source_ordinal = parse_nonnegative_id("result", "sourceOrdinal", source_ordinal)?;
+    let report_id = parse_positive_id("result", "reportId", report_id)?;
+    let field_ordinal = parse_nonnegative_id("result", "fieldOrdinal", field_ordinal)?;
+    let field_id = parse_positive_id("result", "fieldId", field_id)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let group = resolve_history_analysis_group(
+                reader,
+                context,
                 exact_group_build_id,
                 analysis_build_id,
-                source_ordinal,
-                report_id,
-                field_ordinal,
-                field_id,
-            )
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        detail
-            .map(|record| map_capture_time_metadata_field_raw_detail(&blocking_job_id, record))
-            .transpose()
-    })
+            )?;
+            let detail = reader
+                .get_capture_time_metadata_field_raw_detail(
+                    &group,
+                    source_ordinal,
+                    report_id,
+                    field_ordinal,
+                    field_id,
+                )
+                .map_err(|_| AppError::result_store("元数据原始字段证据读取失败。"))?;
+            detail
+                .map(|record| map_capture_time_metadata_field_raw_detail(result_scope, record))
+                .transpose()
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 pub(crate) async fn list_duplicate_groups(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     cursor: Option<String>,
     limit: u32,
 ) -> Result<DuplicateGroupPage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
-    let decoded = decode_result_cursor::<DuplicateGroupCursor>(
-        job_id,
-        DUPLICATE_GROUPS_CURSOR_ENDPOINT,
-        cursor,
-    )?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_duplicate_groups_page(scan_run_id, decoded.as_ref(), limit)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_group_page(&blocking_job_id, &store, scan_run_id, page)
-    })
+    validate_page_limit("result", "limit", limit, guiying_store::MAX_PAGE_SIZE)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let decoded = decode_result_cursor::<DuplicateGroupCursor>(
+                result_scope,
+                DUPLICATE_GROUPS_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_duplicate_groups_page(context, decoded.as_ref(), limit)
+                .map_err(|_| AppError::result_store("重复组封印证据读取失败。"))?;
+            map_group_page(result_scope, reader, context, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 pub(crate) async fn list_duplicate_group_members(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     group_build_id: &str,
     cursor: Option<String>,
     limit: u32,
 ) -> Result<DuplicateGroupMemberPage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
-    let group_build_id = parse_positive_id(job_id, "groupBuildId", group_build_id)?;
-    let decoded = decode_result_cursor::<DuplicateGroupMemberCursor>(
-        job_id,
-        DUPLICATE_GROUP_MEMBERS_CURSOR_ENDPOINT,
-        cursor,
-    )?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_duplicate_group_members_page(scan_run_id, group_build_id, decoded.as_ref(), limit)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_member_page(&blocking_job_id, page)
-    })
+    let group_build_id = parse_positive_id("result", "groupBuildId", group_build_id)?;
+    validate_page_limit("result", "limit", limit, guiying_store::MAX_PAGE_SIZE)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let group = resolve_history_group(reader, context, group_build_id)?;
+            let decoded = decode_result_cursor::<DuplicateGroupMemberCursor>(
+                result_scope,
+                DUPLICATE_GROUP_MEMBERS_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_duplicate_group_members_page(&group, decoded.as_ref(), limit)
+                .map_err(|_| AppError::result_store("重复组成员封印证据读取失败。"))?;
+            map_member_page(result_scope, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
 }
 
 pub(crate) async fn list_scan_issues(
     manager: &ScanJobManager,
-    job_id: &str,
+    owner_window_label: &str,
+    result_read_token: &str,
     cursor: Option<String>,
     limit: u32,
 ) -> Result<ScanIssuePage, AppError> {
-    let (database_path, scan_run_id) = manager.completed_run(job_id).await?;
-    let decoded =
-        decode_result_cursor::<ScanIssueCursor>(job_id, SCAN_ISSUES_CURSOR_ENDPOINT, cursor)?;
-    let job_id = job_id.to_owned();
-    let blocking_job_id = job_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = Store::open_existing(database_path)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        let page = store
-            .list_scan_issues_page(scan_run_id, decoded.as_ref(), limit)
-            .map_err(|error| AppError::store(blocking_job_id.clone(), error.to_string()))?;
-        map_issue_page(&blocking_job_id, page)
-    })
+    validate_page_limit("result", "limit", limit, guiying_store::MAX_PAGE_SIZE)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, result_scope| {
+            let decoded = decode_result_cursor::<ScanIssueCursor>(
+                result_scope,
+                SCAN_ISSUES_CURSOR_ENDPOINT,
+                cursor,
+            )?;
+            let page = reader
+                .list_scan_issues_page(context, decoded.as_ref(), limit)
+                .map_err(|_| AppError::result_store("扫描问题封印证据读取失败。"))?;
+            map_issue_page(result_scope, page)
+        },
+    )
     .await
-    .map_err(|error| AppError::task(job_id, error.to_string()))?
+}
+
+fn resolve_history_group(
+    reader: &EvidenceReader,
+    context: &ScanHistoryContext,
+    exact_group_build_id: i64,
+) -> Result<guiying_store::ScanHistoryGroupContext, AppError> {
+    reader
+        .resolve_scan_history_group(context, exact_group_build_id)
+        .map_err(|_| AppError::result_store("重复组只读身份解析失败。"))?
+        .ok_or_else(|| AppError::result_store("重复组不属于当前封存结果。"))
+}
+
+fn resolve_history_analysis_group(
+    reader: &EvidenceReader,
+    context: &ScanHistoryContext,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+) -> Result<guiying_store::ScanHistoryGroupContext, AppError> {
+    let group = resolve_history_group(reader, context, exact_group_build_id)?;
+    if group.analysis_build_id() != Some(analysis_build_id)
+        || group.time_outcome() != Some("evidence")
+    {
+        return Err(AppError::result_store(
+            "拍摄时间分析编号不属于当前封存重复组，或该组没有可用时间证据。",
+        ));
+    }
+    Ok(group)
 }
 
 fn map_group_page(
     job_id: &str,
-    store: &Store,
-    scan_run_id: i64,
+    reader: &EvidenceReader,
+    context: &ScanHistoryContext,
     page: KeysetPage<VerifiedExactGroup, DuplicateGroupCursor>,
 ) -> Result<DuplicateGroupPage, AppError> {
     let mut items = Vec::with_capacity(page.items.len());
     for group in page.items {
-        let preview = store
-            .list_duplicate_group_members_page(scan_run_id, group.build_id, None, 1)
-            .map_err(|error| AppError::store(job_id.to_owned(), error.to_string()))?
+        let group_context = resolve_history_group(reader, context, group.build_id)?;
+        let preview = reader
+            .list_duplicate_group_members_page(&group_context, None, 1)
+            .map_err(|_| AppError::result_store("重复组预览成员读取失败。"))?
             .items
             .into_iter()
             .next()
@@ -3021,7 +4463,7 @@ fn validate_page_limit(
 struct ResultCursorEnvelope<T> {
     envelope_version: u8,
     endpoint: String,
-    job_id: String,
+    scan_run_id: String,
     payload: T,
 }
 
@@ -3042,7 +4484,7 @@ fn decode_result_cursor<T: DeserializeOwned>(
                 .map_err(|_| AppError::invalid_cursor(job_id.to_owned(), "分页游标格式无效。"))?;
             if envelope.envelope_version != RESULT_CURSOR_ENVELOPE_VERSION
                 || envelope.endpoint != endpoint
-                || envelope.job_id != job_id
+                || envelope.scan_run_id != job_id
             {
                 return Err(AppError::invalid_cursor(
                     job_id.to_owned(),
@@ -3064,7 +4506,7 @@ fn encode_result_cursor<T: Serialize>(
             let envelope = ResultCursorEnvelope {
                 envelope_version: RESULT_CURSOR_ENVELOPE_VERSION,
                 endpoint: endpoint.to_owned(),
-                job_id: job_id.to_owned(),
+                scan_run_id: job_id.to_owned(),
                 payload: value,
             };
             let encoded = serde_json::to_string(&envelope)
@@ -3270,6 +4712,508 @@ mod tests {
             .consume_scan_root_at("main", &token, now)
             .expect_err("replay must fail");
         assert_eq!(replay.code, "INVALID_SCAN_ROOT_TOKEN");
+    }
+
+    fn configured_result_read_manager() -> (tempfile::TempDir, ScanJobManager) {
+        let fixture = tempfile::tempdir().expect("result-read fixture");
+        let manager = ScanJobManager::default();
+        let database_path = fixture.path().join("guiying.sqlite3");
+        guiying_store::Store::open_or_create_with_parent_creation(&database_path)
+            .expect("result-read database should initialize")
+            .close()
+            .expect("result-read database should close");
+        manager
+            .configure_database_path(database_path)
+            .expect("database path should configure");
+        (fixture, manager)
+    }
+
+    #[test]
+    fn result_read_token_is_random_canonical_window_bound_and_one_run_only() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let issued = manager
+                .issue_result_read_for_test_at("main", 7, Instant::now(), 1_000)
+                .await
+                .expect("result token should issue");
+            assert!(is_canonical_result_read_token(&issued.result_read_token));
+            assert_eq!(
+                issued.expires_at_unix_ms,
+                (1_000 + RESULT_READ_TOKEN_TTL.as_millis() as u64).to_string()
+            );
+            let wrong_owner = manager
+                .begin_result_read("settings", &issued.result_read_token)
+                .await
+                .expect_err("another window must not use the token");
+            assert_eq!(wrong_owner.code, "RESULT_READ_TOKEN_OWNER_MISMATCH");
+            let lease = manager
+                .begin_result_read("main", &issued.result_read_token)
+                .await
+                .expect("owner should begin result read");
+            assert_eq!(lease.scan_run_id, 7);
+            manager
+                .finish_result_read(&lease)
+                .await
+                .expect("unchanged lease should finish");
+            assert_eq!(manager.pending_result_read_count().await, 1);
+        });
+    }
+
+    #[test]
+    fn result_read_token_expires_at_deadline_and_reopen_revokes_old_generation() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let issued_at = Instant::now();
+            let first = manager
+                .issue_result_read_for_test_at("main", 7, issued_at, 1_000)
+                .await
+                .expect("first result token");
+            let first_lease = manager
+                .begin_result_read_at("main", &first.result_read_token, issued_at)
+                .await
+                .expect("first lease");
+            let second = manager
+                .issue_result_read_for_test_at("main", 7, issued_at, 1_001)
+                .await
+                .expect("reopened result token");
+            assert_ne!(first.result_read_token, second.result_read_token);
+            assert_eq!(manager.pending_result_read_count().await, 1);
+            let stale = manager
+                .finish_result_read_at(&first_lease, issued_at)
+                .await
+                .expect_err("reopen must revoke in-flight prior generation");
+            assert_eq!(stale.code, "INVALID_RESULT_READ_TOKEN");
+
+            let deadline = issued_at
+                .checked_add(RESULT_READ_TOKEN_TTL)
+                .expect("test deadline");
+            let expired = manager
+                .begin_result_read_at("main", &second.result_read_token, deadline)
+                .await
+                .expect_err("token must expire at its deadline");
+            assert_eq!(expired.code, "RESULT_READ_TOKEN_EXPIRED");
+            assert_eq!(manager.pending_result_read_count().await, 0);
+        });
+    }
+
+    #[test]
+    fn explicit_close_and_window_cleanup_suppress_late_result_delivery() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let first = manager
+                .issue_result_read_for_test("main", 7)
+                .await
+                .expect("first token");
+            let lease = manager
+                .begin_result_read("main", &first.result_read_token)
+                .await
+                .expect("first lease");
+            assert!(
+                manager
+                    .close_result_read("main", &first.result_read_token)
+                    .await
+                    .expect("close token")
+                    .revoked
+            );
+            assert_eq!(
+                manager
+                    .finish_result_read(&lease)
+                    .await
+                    .expect_err("closed lease must not deliver")
+                    .code,
+                "INVALID_RESULT_READ_TOKEN"
+            );
+            assert!(
+                !manager
+                    .close_result_read("main", &first.result_read_token)
+                    .await
+                    .expect("repeated close is idempotent")
+                    .revoked
+            );
+
+            let second = manager
+                .issue_result_read_for_test("main", 8)
+                .await
+                .expect("second token");
+            let second_lease = manager
+                .begin_result_read("main", &second.result_read_token)
+                .await
+                .expect("second lease");
+            manager.clear_result_reads_for_owner("main").await;
+            assert_eq!(
+                manager
+                    .finish_result_read(&second_lease)
+                    .await
+                    .expect_err("window cleanup must suppress late result")
+                    .code,
+                "INVALID_RESULT_READ_TOKEN"
+            );
+        });
+    }
+
+    #[test]
+    fn result_read_registry_caps_each_window_without_evicting_live_grants() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let mut tokens = Vec::new();
+            for scan_run_id in 1..=MAX_RESULT_READ_TOKENS_PER_OWNER as i64 {
+                tokens.push(
+                    manager
+                        .issue_result_read_for_test("main", scan_run_id)
+                        .await
+                        .expect("grant within per-window cap")
+                        .result_read_token,
+                );
+            }
+            let full = manager
+                .issue_result_read_for_test("main", 99)
+                .await
+                .expect_err("grant beyond per-window cap must fail");
+            assert_eq!(full.code, "RESULT_READ_REGISTRY_FULL");
+            assert_eq!(
+                manager.pending_result_read_count().await,
+                MAX_RESULT_READ_TOKENS_PER_OWNER
+            );
+            for token in tokens {
+                manager
+                    .begin_result_read("main", &token)
+                    .await
+                    .expect("registry-full failure must retain existing grants");
+            }
+        });
+    }
+
+    #[test]
+    fn result_read_is_single_flight_and_recovers_after_finish() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let issued = manager
+                .issue_result_read_for_test("main", 7)
+                .await
+                .expect("result token");
+            let first = manager
+                .begin_result_read("main", &issued.result_read_token)
+                .await
+                .expect("first read should acquire single-flight gate");
+            let busy = manager
+                .begin_result_read("main", &issued.result_read_token)
+                .await
+                .expect_err("same token must not queue another blocking read");
+            assert_eq!(busy.code, "RESULT_READ_BUSY");
+            manager
+                .finish_result_read(&first)
+                .await
+                .expect("first read should release gate");
+            let second = manager
+                .begin_result_read("main", &issued.result_read_token)
+                .await
+                .expect("gate should recover after finish");
+            manager
+                .finish_result_read(&second)
+                .await
+                .expect("second read should finish");
+            let cancelled = manager
+                .begin_result_read("main", &issued.result_read_token)
+                .await
+                .expect("cancelled future lease");
+            drop(cancelled);
+            let recovered = manager
+                .begin_result_read("main", &issued.result_read_token)
+                .await
+                .expect("dropping the last lease must release single-flight state");
+            manager
+                .finish_result_read(&recovered)
+                .await
+                .expect("recovered read should finish");
+        });
+    }
+
+    #[test]
+    fn pending_result_opens_are_bounded_cleaned_and_window_epoch_bound() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let mut permits = Vec::new();
+            for scan_run_id in 1..=MAX_RESULT_READ_TOKENS_PER_OWNER as i64 {
+                permits.push(
+                    manager
+                        .begin_result_open("main", scan_run_id)
+                        .await
+                        .expect("pending open within per-window cap"),
+                );
+            }
+            assert!(matches!(
+                manager.begin_result_open("main", 99).await,
+                Err(AppError {
+                    code: "RESULT_READ_REGISTRY_FULL",
+                    ..
+                })
+            ));
+
+            let stale = permits.remove(0);
+            manager.clear_result_reads_for_owner("main").await;
+            assert!(manager
+                .verify_result_open_epoch("main", stale.owner_epoch)
+                .is_err());
+            let reader = manager
+                .shared_history_reader()
+                .expect("shared reader should remain available");
+            let scope = lock_evidence_reader(&reader)
+                .expect("reader lock")
+                .database_scope();
+            let stale_issue = manager
+                .issue_result_read_at(ResultReadIssue {
+                    owner_window_label: "main".to_owned(),
+                    scan_run_id: stale.scan_run_id,
+                    database_scope: scope,
+                    reader,
+                    context: ResultReadContext::RegistryOnly(stale.scan_run_id),
+                    owner_epoch: stale.owner_epoch,
+                    open_sequence: stale.sequence,
+                    now: Instant::now(),
+                    now_unix_ms: 1_000,
+                })
+                .await
+                .expect_err("destroyed-window pending open must not mint a token");
+            assert_eq!(stale_issue.code, "INVALID_RESULT_READ_TOKEN");
+
+            assert!(matches!(
+                manager.begin_result_open("main", 100).await,
+                Err(AppError {
+                    code: "INVALID_RESULT_READ_TOKEN",
+                    ..
+                })
+            ));
+            drop(permits);
+        });
+    }
+
+    #[test]
+    fn destroyed_owner_tombstone_wins_even_when_async_registry_is_contended() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let pending = manager
+                .begin_result_open("main", 7)
+                .await
+                .expect("pending open");
+            let registry_guard = manager.result_reads.lock().await;
+
+            manager.mark_result_owner_closed("main");
+            assert!(!manager.try_remove_result_reads_for_owner("main"));
+            assert!(manager
+                .verify_result_open_epoch("main", pending.owner_epoch)
+                .is_err());
+            assert!(matches!(
+                manager.begin_result_open("main", 8).await,
+                Err(AppError {
+                    code: "INVALID_RESULT_READ_TOKEN",
+                    ..
+                })
+            ));
+
+            drop(registry_guard);
+            manager.remove_result_reads_for_owner("main").await;
+            assert_eq!(manager.pending_result_read_count().await, 0);
+            drop(pending);
+        });
+    }
+
+    #[test]
+    fn history_catalog_reads_have_global_and_per_window_single_flight_caps() {
+        let (_fixture, manager) = configured_result_read_manager();
+        let main = manager
+            .begin_history_read("main")
+            .expect("first main history read");
+        assert!(matches!(
+            manager.begin_history_read("main"),
+            Err(AppError {
+                code: "HISTORY_READ_BUSY",
+                ..
+            })
+        ));
+        let second = manager.begin_history_read("second").expect("second owner");
+        let third = manager.begin_history_read("third").expect("third owner");
+        let fourth = manager.begin_history_read("fourth").expect("fourth owner");
+        assert!(matches!(
+            manager.begin_history_read("fifth"),
+            Err(AppError {
+                code: "HISTORY_READ_BUSY",
+                ..
+            })
+        ));
+        drop(main);
+        manager
+            .begin_history_read("main")
+            .expect("catalog gate should recover on permit drop");
+        drop((second, third, fourth));
+    }
+
+    #[test]
+    fn acknowledgement_does_not_revoke_result_read_tokens() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let issued = manager
+                .issue_result_read_for_test("main", 7)
+                .await
+                .expect("result token");
+            let reservation = manager
+                .reserve("main".to_owned())
+                .await
+                .expect("scan reservation");
+            manager
+                .finish(
+                    &reservation.job_id,
+                    &Ok(WorkerCompletion::Completed(result(7))),
+                )
+                .await
+                .expect("terminal status");
+            manager
+                .acknowledge(&reservation.job_id)
+                .await
+                .expect("acknowledgement");
+            let lease = manager
+                .begin_result_read("main", &issued.result_read_token)
+                .await
+                .expect("ACK must not revoke independently opened evidence");
+            manager
+                .finish_result_read(&lease)
+                .await
+                .expect("token remains deliverable");
+        });
+    }
+
+    #[test]
+    fn an_active_runtime_run_cannot_be_opened_as_history() {
+        tauri::async_runtime::block_on(async {
+            let manager = ScanJobManager::default();
+            let _reservation = manager
+                .reserve("main".to_owned())
+                .await
+                .expect("active scan");
+            manager
+                .registry
+                .lock()
+                .await
+                .active
+                .as_mut()
+                .expect("active scan state")
+                .status
+                .scan_run_id = Some("42".to_owned());
+            let error = manager
+                .assert_history_run_inactive(42)
+                .await
+                .expect_err("active runtime run must fail closed");
+            assert_eq!(error.code, "HISTORY_ENTRY_UNAVAILABLE");
+        });
+    }
+
+    #[test]
+    fn history_capture_time_mapping_exposes_only_five_sealed_states() {
+        fn outcome(state: &str) -> guiying_store::ScanHistoryTimeOutcomeRecord {
+            let terminal = matches!(state, "complete" | "partial");
+            let value = terminal.then_some(0);
+            guiying_store::ScanHistoryTimeOutcomeRecord {
+                state: state.to_owned(),
+                expected_group_count: value,
+                evidence_group_count: value,
+                unavailable_group_count: value,
+                failed_group_count: value,
+                max_total_read_bytes: value,
+                max_probe_count_per_group: value,
+                max_report_total_bytes_read: value,
+                max_report_read_operations: value,
+                max_report_retained_field_bytes: value,
+                max_report_fields: value,
+                max_report_issues: value,
+                sealed_report_read_bytes: value,
+                sealed_report_read_operations: value,
+                finalized_at_ms: terminal.then_some(1),
+            }
+        }
+
+        for state in ["complete", "partial", "not_run", "unavailable", "failed"] {
+            let mapped = map_scan_history_capture_time(outcome(state))
+                .expect("supported history time state");
+            assert_eq!(mapped.status, state);
+            if !matches!(state, "complete" | "partial") {
+                assert_eq!(mapped.expected_groups, "0");
+                assert_eq!(mapped.sealed_report_read_bytes, "0");
+            }
+        }
+        let draft_leak = guiying_store::ScanHistoryTimeOutcomeRecord {
+            expected_group_count: Some(1),
+            ..outcome("unavailable")
+        };
+        assert_eq!(
+            map_scan_history_capture_time(draft_leak)
+                .expect_err("nonterminal time data must never be exposed")
+                .code,
+            "HISTORY_ENTRY_UNAVAILABLE"
+        );
+        assert!(map_scan_history_capture_time(outcome("draft")).is_err());
+    }
+
+    #[test]
+    fn history_selectors_and_cursors_are_canonical_and_bounded() {
+        assert_eq!(parse_history_entry_id("1").expect("canonical id"), 1);
+        for value in ["0", "01", "+1", "-1", "history-1"] {
+            assert_eq!(
+                parse_history_entry_id(value)
+                    .expect_err("display-only selector must be canonical")
+                    .code,
+                "INVALID_HISTORY_ENTRY_ID"
+            );
+        }
+        let encoded = encode_history_cursor(Some(serde_json::json!({"after": "1"})))
+            .expect("history cursor should encode")
+            .expect("history cursor should exist");
+        assert!(encoded.len() <= MAX_CURSOR_BYTES);
+        assert_eq!(
+            decode_history_cursor::<serde_json::Value>(Some(encoded))
+                .expect("history cursor should decode")
+                .expect("history cursor payload"),
+            serde_json::json!({"after": "1"})
+        );
+        assert_eq!(
+            decode_history_cursor::<serde_json::Value>(Some("x".repeat(MAX_CURSOR_BYTES + 1)))
+                .expect_err("oversized history cursor must fail closed")
+                .code,
+            "INVALID_HISTORY_CURSOR"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn result_grant_detects_database_path_replacement_before_delivery() {
+        tauri::async_runtime::block_on(async {
+            let (_fixture, manager) = configured_result_read_manager();
+            let issued = manager
+                .issue_result_read_for_test("main", 7)
+                .await
+                .expect("result token");
+            let lease = manager
+                .begin_result_read("main", &issued.result_read_token)
+                .await
+                .expect("result lease");
+            let database_path = manager.database_path().expect("database path");
+            let displaced_path = database_path.with_extension("displaced.sqlite3");
+            std::fs::rename(&database_path, &displaced_path)
+                .expect("original database should move aside");
+            guiying_store::Store::open_or_create_with_parent_creation(&database_path)
+                .expect("replacement database")
+                .close()
+                .expect("replacement database close");
+
+            assert!(lock_evidence_reader(&lease.reader)
+                .expect("cached reader lock")
+                .revalidate_source_identity()
+                .is_err());
+            manager
+                .finish_result_read(&lease)
+                .await
+                .expect("generation gate still releases single-flight state");
+            manager.revoke_result_read_lease(&lease).await;
+            assert_eq!(manager.pending_result_read_count().await, 0);
+        });
     }
 
     #[test]
@@ -3640,28 +5584,21 @@ mod tests {
     }
 
     #[test]
-    fn raw_metadata_reads_reject_running_jobs_before_opening_the_store() {
+    fn raw_metadata_reads_require_an_owner_bound_result_token_before_opening_the_store() {
         tauri::async_runtime::block_on(async {
             let manager = ScanJobManager::default();
-            let reservation = manager
-                .reserve("main".to_owned())
-                .await
-                .expect("test scan should reserve");
-            manager
-                .assert_job_owner("main", &reservation.job_id)
-                .await
-                .expect("the owning window should pass the command gate");
             let error = list_capture_time_metadata_reports(
                 &manager,
-                &reservation.job_id,
+                "main",
+                "scan-job-id-is-not-authority",
                 "1",
                 "1",
                 None,
                 1,
             )
             .await
-            .expect_err("raw metadata pages must remain unavailable while scanning");
-            assert_eq!(error.code, "SCAN_RESULT_UNAVAILABLE");
+            .expect_err("raw metadata pages must reject a bare job id");
+            assert_eq!(error.code, "INVALID_RESULT_READ_TOKEN");
         });
     }
 
@@ -4199,24 +6136,34 @@ mod tests {
 
         tauri::async_runtime::block_on(manager.finish(&reservation.job_id, &outcome))
             .expect("manager should retain terminal summary");
-        let (_, scan_run_id) =
-            tauri::async_runtime::block_on(manager.completed_run(&reservation.job_id))
-                .expect("completed run should be readable");
-        let store = Store::open_existing(database).expect("completed store should reopen");
-        let groups = store
-            .list_duplicate_groups_page(scan_run_id, None, 10)
+        let scan_run_id = summary
+            .scan_run_id
+            .parse::<i64>()
+            .expect("completed run id should remain decimal");
+        let reader = EvidenceReader::open_existing_read_only(&database)
+            .expect("completed evidence should reopen read-only");
+        let history_context = reader
+            .resolve_scan_history_entry(scan_run_id)
+            .expect("history context query")
+            .expect("completed sealed scan should enter history");
+        let groups = reader
+            .list_duplicate_groups_page(&history_context, None, 10)
             .expect("verified groups should page");
         assert_eq!(groups.items.len(), 1);
         assert_eq!(groups.items[0].member_count, 2);
         let group_build_id = groups.items[0].build_id;
-        let mapped = map_group_page(&reservation.job_id, &store, scan_run_id, groups)
+        let mapped = map_group_page(&scan_run_id.to_string(), &reader, &history_context, groups)
             .expect("verified groups should map to bounded preview records");
         assert_eq!(mapped.items.len(), 1);
         assert_eq!(mapped.items[0].member_count, "2");
         assert_eq!(mapped.items[0].size_bytes, content.len().to_string());
         assert!(mapped.items[0].preview_path.ends_with(".tiff"));
-        let member_records = store
-            .list_duplicate_group_members_page(scan_run_id, group_build_id, None, 10)
+        let history_group_context = reader
+            .resolve_scan_history_group(&history_context, group_build_id)
+            .expect("history group query")
+            .expect("verified group should resolve");
+        let member_records = reader
+            .list_duplicate_group_members_page(&history_group_context, None, 10)
             .expect("verified group members should page");
         let mapped_members = map_member_page(&reservation.job_id, member_records)
             .expect("member filesystem timestamps should map without JS precision loss");
@@ -4229,8 +6176,8 @@ mod tests {
         assert!(!mapped_members.items[0].native_path.raw_base64.is_empty());
         assert_eq!(mapped_members.items[0].native_path.encoding, "unix_bytes");
 
-        let time_groups = store
-            .list_capture_time_group_summaries_page(scan_run_id, None, 10)
+        let time_groups = reader
+            .list_capture_time_group_summaries_page(&history_context, None, 10)
             .expect("sealed capture-time groups should page");
         let time_groups = map_capture_time_group_summary_page(&reservation.job_id, time_groups)
             .expect("sealed capture-time summary should map");
@@ -4250,14 +6197,8 @@ mod tests {
             .analysis_build_id
             .parse::<i64>()
             .expect("analysis id should remain decimal");
-        let candidates = store
-            .list_capture_time_candidates_page(
-                scan_run_id,
-                exact_group_build_id,
-                analysis_build_id,
-                None,
-                10,
-            )
+        let candidates = reader
+            .list_capture_time_candidates_page(&history_group_context, None, 10)
             .expect("sealed capture-time candidates should page");
         let candidates = map_capture_time_candidate_page(&reservation.job_id, candidates)
             .expect("sealed capture-time candidates should map");
@@ -4269,14 +6210,8 @@ mod tests {
         assert!(candidates.items[0].evidence_blockers.is_empty());
         assert_eq!(candidates.items[0].source_count, "1");
 
-        let time_members = store
-            .list_capture_time_members_page(
-                scan_run_id,
-                exact_group_build_id,
-                analysis_build_id,
-                None,
-                10,
-            )
+        let time_members = reader
+            .list_capture_time_members_page(&history_group_context, None, 10)
             .expect("sealed capture-time members should page");
         let time_members = map_capture_time_member_page(&reservation.job_id, time_members)
             .expect("sealed capture-time members should map");
@@ -4286,10 +6221,18 @@ mod tests {
             .iter()
             .all(|member| member.donor_eligibility == "ineligible"));
 
-        drop(store);
+        reader.close().expect("history reader should close");
+        let opened = tauri::async_runtime::block_on(open_scan_history(
+            &manager,
+            "main",
+            &scan_run_id.to_string(),
+        ))
+        .expect("completed result should mint a read token");
+        let result_read_token = opened.result_read_token;
         let point_summary = tauri::async_runtime::block_on(get_capture_time_group_summary(
             &manager,
-            &reservation.job_id,
+            "main",
+            &result_read_token,
             &exact_group_build_id.to_string(),
         ))
         .expect("selected capture-time group should have an exact point summary")
@@ -4306,7 +6249,8 @@ mod tests {
         assert!(!point_summary.write_authorized);
         let metadata_reports = tauri::async_runtime::block_on(list_capture_time_metadata_reports(
             &manager,
-            &reservation.job_id,
+            "main",
+            &result_read_token,
             &exact_group_build_id.to_string(),
             &analysis_build_id.to_string(),
             None,
@@ -4329,7 +6273,8 @@ mod tests {
 
         let metadata_fields = tauri::async_runtime::block_on(list_capture_time_metadata_fields(
             &manager,
-            &reservation.job_id,
+            "main",
+            &result_read_token,
             &exact_group_build_id.to_string(),
             &analysis_build_id.to_string(),
             &metadata_report.source_ordinal,
@@ -4353,7 +6298,8 @@ mod tests {
         let raw_detail =
             tauri::async_runtime::block_on(get_capture_time_metadata_field_raw_detail(
                 &manager,
-                &reservation.job_id,
+                "main",
+                &result_read_token,
                 &exact_group_build_id.to_string(),
                 &analysis_build_id.to_string(),
                 &metadata_report.source_ordinal,
@@ -4373,7 +6319,8 @@ mod tests {
         assert!(
             tauri::async_runtime::block_on(get_capture_time_metadata_field_raw_detail(
                 &manager,
-                &reservation.job_id,
+                "main",
+                &result_read_token,
                 &exact_group_build_id.to_string(),
                 &analysis_build_id.to_string(),
                 &metadata_report.source_ordinal,
@@ -4388,7 +6335,8 @@ mod tests {
         let field_cursor_replayed_as_report =
             tauri::async_runtime::block_on(list_capture_time_metadata_reports(
                 &manager,
-                &reservation.job_id,
+                "main",
+                &result_read_token,
                 &exact_group_build_id.to_string(),
                 &analysis_build_id.to_string(),
                 Some(metadata_field_cursor.clone()),
@@ -4402,7 +6350,8 @@ mod tests {
         let field_cursor_replayed_in_another_scope =
             tauri::async_runtime::block_on(list_capture_time_metadata_fields(
                 &manager,
-                &reservation.job_id,
+                "main",
+                &result_read_token,
                 &exact_group_build_id.to_string(),
                 &analysis_build_id.to_string(),
                 &(metadata_report
@@ -4423,7 +6372,8 @@ mod tests {
         assert!(
             tauri::async_runtime::block_on(get_capture_time_group_summary(
                 &manager,
-                &reservation.job_id,
+                "main",
+                &result_read_token,
                 &(exact_group_build_id + 1_000).to_string(),
             ))
             .expect("unknown group lookup should remain a successful read")
@@ -4432,7 +6382,7 @@ mod tests {
         let wrong_scope_cursor = serde_json::json!({
             "envelopeVersion": RESULT_CURSOR_ENVELOPE_VERSION,
             "endpoint": CAPTURE_TIME_GROUP_SUMMARIES_CURSOR_ENDPOINT,
-            "jobId": reservation.job_id,
+            "scanRunId": scan_run_id.to_string(),
             "payload": {
                 "cursor_version": 1,
                 "scan_run_id": scan_run_id + 1,
@@ -4442,7 +6392,8 @@ mod tests {
         .to_string();
         let wrong_scope = tauri::async_runtime::block_on(list_capture_time_group_summaries(
             &manager,
-            &reservation.job_id,
+            "main",
+            &result_read_token,
             Some(wrong_scope_cursor),
             10,
         ))
@@ -4452,7 +6403,7 @@ mod tests {
         let wrong_candidate_scope = serde_json::json!({
             "envelopeVersion": RESULT_CURSOR_ENVELOPE_VERSION,
             "endpoint": CAPTURE_TIME_CANDIDATES_CURSOR_ENDPOINT,
-            "jobId": reservation.job_id,
+            "scanRunId": scan_run_id.to_string(),
             "payload": {
                 "cursor_version": 1,
                 "scan_run_id": scan_run_id,
@@ -4464,7 +6415,8 @@ mod tests {
         .to_string();
         let wrong_candidate_scope = tauri::async_runtime::block_on(list_capture_time_candidates(
             &manager,
-            &reservation.job_id,
+            "main",
+            &result_read_token,
             &exact_group_build_id.to_string(),
             &analysis_build_id.to_string(),
             Some(wrong_candidate_scope),

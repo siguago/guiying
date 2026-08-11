@@ -1318,6 +1318,7 @@ dependencies = [
  "guiying-core",
  "guiying-runtime",
  "guiying-store",
+ "libc",
  "log",
  "serde",
  "serde_json",
