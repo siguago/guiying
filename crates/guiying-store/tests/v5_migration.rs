@@ -3,12 +3,12 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 #[test]
-fn fresh_store_has_v6_runtime_companion_schema_and_manifest_guards(
+fn fresh_store_has_latest_runtime_companion_schema_and_manifest_guards(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let database = temporary.path().join("guiying-v5.sqlite3");
     let store = Store::open_or_create(&database)?;
-    assert_eq!(store.schema_version()?, 6);
+    assert_eq!(store.schema_version()?, 7);
     store.close()?;
 
     let connection = Connection::open(&database)?;
@@ -32,7 +32,7 @@ fn fresh_store_has_v6_runtime_companion_schema_and_manifest_guards(
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(migration_count, 6);
+    assert_eq!(migration_count, 7);
     connection.execute_batch("DROP TRIGGER trg_scan_runs_enter_running_session_gate_v5;")?;
     connection.close().map_err(|(_, error)| error)?;
 

@@ -163,11 +163,60 @@ pub enum StoreError {
     #[error("backup temporary file was replaced while being verified: {0:?}")]
     BackupTemporaryReplaced(PathBuf),
 
+    #[error("published backup file was replaced while being verified: {0:?}")]
+    BackupPublishedReplaced(PathBuf),
+
+    #[error("completed backup still depends on an SQLite sidecar: {0:?}")]
+    BackupSidecarPresent(PathBuf),
+
     #[error("backup parent directory changed while the backup was running: {0:?}")]
     BackupParentChanged(PathBuf),
 
     #[error("backup parent directory is not private or does not share the database owner: {0:?}")]
     UnsafeBackupParent(PathBuf),
+
+    #[error(
+        "pre-v7 backup {role} schema version mismatch: expected {expected}, observed {observed}"
+    )]
+    PreV7BackupVersionMismatch {
+        role: &'static str,
+        expected: i64,
+        observed: i64,
+    },
+
+    #[error("could not allocate a unique no-clobber pre-v7 backup name in {0:?}")]
+    PreV7BackupNameExhausted(PathBuf),
+
+    #[error("unsafe pre-v7 source file family member at {path:?}: {reason}")]
+    PreV7SourceFamilyUnsafe { path: PathBuf, reason: String },
+
+    #[error("pre-v7 source file family changed while it was being staged: {0:?}")]
+    PreV7SourceFamilyChanged(PathBuf),
+
+    #[error("pre-v7 source file family requires {bytes} bytes, above the staging limit {limit}")]
+    PreV7StagingLimit { bytes: u64, limit: u64 },
+
+    #[error("pre-v7 staging copy digest mismatch between {source_path:?} and {staged_path:?}")]
+    PreV7StagingDigestMismatch {
+        source_path: PathBuf,
+        staged_path: PathBuf,
+    },
+
+    #[error("pre-v7 staging directory could not be removed: {0:?}")]
+    PreV7StagingCleanupFailed(PathBuf),
+
+    #[error("backup destination family member already exists: {0:?}")]
+    BackupDestinationFamilyExists(PathBuf),
+
+    #[error("backup destination collides with the source database family: {0:?}")]
+    BackupDestinationIsSourceFamily(PathBuf),
+
+    #[error("v7 migration/open failed after durable pre-v7 backup {backup_path:?}: {source}")]
+    PreV7MigrationFailed {
+        backup_path: PathBuf,
+        #[source]
+        source: Box<StoreError>,
+    },
 
     #[error("volume identity conflict for key {identity_key:?}: {reason}")]
     VolumeIdentityConflict {

@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::error::{Result, StoreError};
 
 pub(crate) const APPLICATION_ID: i32 = 0x4755_5949; // ASCII "GUYI"
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 6;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 7;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_init.sql");
 
@@ -16,6 +16,8 @@ const SESSION_BOUND_EVIDENCE_MIGRATION: &str =
     include_str!("migrations/0005_session_bound_evidence.sql");
 const RUNTIME_STREAM_EVIDENCE_MIGRATION: &str =
     include_str!("migrations/0006_runtime_stream_evidence.sql");
+const CAPTURE_TIME_EVIDENCE_MIGRATION: &str =
+    include_str!("migrations/0007_capture_time_evidence.sql");
 
 const REGISTRY_SQL: &str = r#"
 CREATE TABLE guiying_schema_migrations (
@@ -38,7 +40,7 @@ struct Migration {
     strips_embedded_transaction: bool,
 }
 
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     Migration {
         version: 1,
         name: "initial_data_model",
@@ -73,6 +75,12 @@ const MIGRATIONS: [Migration; 6] = [
         version: 6,
         name: "runtime_stream_evidence",
         sql: RUNTIME_STREAM_EVIDENCE_MIGRATION,
+        strips_embedded_transaction: false,
+    },
+    Migration {
+        version: 7,
+        name: "capture_time_evidence",
+        sql: CAPTURE_TIME_EVIDENCE_MIGRATION,
         strips_embedded_transaction: false,
     },
 ];
@@ -189,6 +197,92 @@ pub(crate) fn reconcile_stale_scan_sessions(
            )",
         [now_ms],
     )?;
+    if read_user_version(&transaction)? >= 7 {
+        transaction.execute(
+            "UPDATE capture_time_analysis_builds \
+             SET state = 'abandoned', \
+                 abandon_reason_code = 'PROCESS_RESTARTED', \
+                 abandon_reason_message = \
+                     'Draft time analysis cannot cross a process-local source session.', \
+                 finalized_at_ms = MAX( \
+                     created_at_ms, ?1, \
+                     COALESCE((SELECT max(source.created_at_ms) \
+                               FROM capture_time_analysis_sources AS source \
+                               WHERE source.analysis_build_id = \
+                                   capture_time_analysis_builds.id), created_at_ms), \
+                     COALESCE((SELECT max(observation.created_at_ms) \
+                               FROM capture_time_observations AS observation \
+                               WHERE observation.analysis_build_id = \
+                                   capture_time_analysis_builds.id), created_at_ms), \
+                     COALESCE((SELECT max(candidate.created_at_ms) \
+                               FROM capture_time_candidates AS candidate \
+                               WHERE candidate.analysis_build_id = \
+                                   capture_time_analysis_builds.id), created_at_ms), \
+                     COALESCE((SELECT max(issue.created_at_ms) \
+                               FROM capture_time_policy_issues AS issue \
+                               WHERE issue.analysis_build_id = \
+                                   capture_time_analysis_builds.id), created_at_ms), \
+                     COALESCE((SELECT max(member.created_at_ms) \
+                               FROM capture_time_member_assessments AS member \
+                               WHERE member.analysis_build_id = \
+                                   capture_time_analysis_builds.id), created_at_ms), \
+                     COALESCE((SELECT max(recommendation.created_at_ms) \
+                               FROM capture_time_recommendations AS recommendation \
+                               WHERE recommendation.analysis_build_id = \
+                                   capture_time_analysis_builds.id), created_at_ms) \
+                 ) \
+             WHERE state = 'draft'",
+            [now_ms],
+        )?;
+        transaction.execute(
+            "UPDATE metadata_extraction_reports \
+             SET state = 'abandoned', \
+                 abandon_reason_code = 'PROCESS_RESTARTED', \
+                 abandon_reason_message = \
+                     'Draft metadata evidence cannot cross a process-local source session.', \
+                 finalized_at_ms = MAX( \
+                     created_at_ms, ?1, \
+                     COALESCE((SELECT max(field.created_at_ms) \
+                               FROM metadata_extraction_fields AS field \
+                               WHERE field.report_id = \
+                                   metadata_extraction_reports.id), created_at_ms), \
+                     COALESCE((SELECT max(issue.created_at_ms) \
+                               FROM metadata_extraction_issues AS issue \
+                               WHERE issue.report_id = \
+                                   metadata_extraction_reports.id), created_at_ms), \
+                     COALESCE((SELECT max(revalidation.revalidated_at_ms) \
+                               FROM metadata_source_revalidations AS revalidation \
+                               WHERE revalidation.report_id = \
+                                   metadata_extraction_reports.id), created_at_ms) \
+                 ) \
+             WHERE state = 'draft'",
+            [now_ms],
+        )?;
+        transaction.execute(
+            "UPDATE scan_time_sessions \
+             SET state = 'abandoned', \
+                 abandon_reason_code = 'PROCESS_RESTARTED', \
+                 abandon_reason_message = \
+                     'The process-local core and volume bindings ended; start a fresh time stage.', \
+                 finalized_at_ms = MAX( \
+                     created_at_ms, ?1, \
+                     COALESCE((SELECT max(report.finalized_at_ms) \
+                               FROM metadata_extraction_reports AS report \
+                               WHERE report.time_session_id = scan_time_sessions.id), \
+                              created_at_ms), \
+                     COALESCE((SELECT max(build.finalized_at_ms) \
+                               FROM capture_time_analysis_builds AS build \
+                               WHERE build.time_session_id = scan_time_sessions.id), \
+                              created_at_ms), \
+                     COALESCE((SELECT max(outcome.created_at_ms) \
+                               FROM capture_time_group_outcomes AS outcome \
+                               WHERE outcome.time_session_id = scan_time_sessions.id), \
+                              created_at_ms) \
+                 ) \
+             WHERE state = 'draft'",
+            [now_ms],
+        )?;
+    }
     transaction.execute(
         "UPDATE scan_jobs \
          SET state = 'failed', \
@@ -513,6 +607,9 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
     }
     if version >= 6 {
         validate_runtime_stream_evidence(connection)?;
+    }
+    if version >= 7 {
+        validate_capture_time_evidence(connection)?;
     }
     validate_stored_path_evidence(connection, version)?;
     Ok(())
@@ -1059,6 +1156,1759 @@ fn validate_runtime_stream_evidence(connection: &Connection) -> Result<()> {
         "scan issue references media that was not observed by its run",
     )?;
     Ok(())
+}
+
+fn validate_capture_time_declared_bounds(connection: &Connection) -> Result<()> {
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_time_sessions \
+             WHERE length(time_session_key) <> 32 \
+                OR length(core_session_id) <> 32 \
+                OR schema_contract_version <> 1 \
+                OR scope_manifest_version <> 1 \
+                OR outcome_manifest_version <> 2 \
+                OR state NOT IN ('draft', 'complete', 'partial', 'abandoned') \
+                OR expected_group_count < 0 \
+                OR max_total_read_bytes NOT BETWEEN 1 AND 4294967296 \
+                OR max_probe_count_per_group NOT BETWEEN 1 AND 4 \
+                OR max_report_total_bytes_read NOT BETWEEN 1 AND 8388608 \
+                OR max_report_read_operations NOT BETWEEN 1 AND 32768 \
+                OR max_report_retained_field_bytes NOT BETWEEN 1 AND 262144 \
+                OR max_report_fields NOT BETWEEN 1 AND 128 \
+                OR max_report_issues NOT BETWEEN 1 AND 128 \
+                OR length(expected_manifest_digest) <> 32 \
+                OR (sealed_manifest_digest IS NOT NULL \
+                    AND length(sealed_manifest_digest) <> 32) \
+                OR (sealed_outcome_manifest_digest IS NOT NULL \
+                    AND length(sealed_outcome_manifest_digest) <> 32) \
+                OR created_at_ms < 0 \
+                OR (finalized_at_ms IS NOT NULL AND finalized_at_ms < created_at_ms) \
+                OR (state = 'draft' AND ( \
+                    evidence_group_count IS NOT NULL \
+                    OR unavailable_group_count IS NOT NULL \
+                    OR failed_group_count IS NOT NULL \
+                    OR sealed_manifest_digest IS NOT NULL \
+                    OR sealed_outcome_manifest_digest IS NOT NULL \
+                    OR abandon_reason_code IS NOT NULL \
+                    OR abandon_reason_message IS NOT NULL \
+                    OR finalized_at_ms IS NOT NULL \
+                )) \
+                OR (state IN ('complete', 'partial') AND ( \
+                    evidence_group_count IS NULL OR evidence_group_count < 0 \
+                    OR unavailable_group_count IS NULL OR unavailable_group_count < 0 \
+                    OR failed_group_count IS NULL OR failed_group_count < 0 \
+                    OR sealed_manifest_digest <> expected_manifest_digest \
+                    OR sealed_outcome_manifest_digest IS NULL \
+                    OR abandon_reason_code IS NOT NULL \
+                    OR abandon_reason_message IS NOT NULL \
+                    OR finalized_at_ms IS NULL \
+                    OR (state = 'complete' AND ( \
+                        SELECT count(*) FROM capture_time_group_outcomes AS outcome \
+                        WHERE outcome.time_session_id = scan_time_sessions.id \
+                    ) <> expected_group_count) \
+                    OR (state = 'partial' AND ( \
+                        SELECT count(*) FROM capture_time_group_outcomes AS outcome \
+                        WHERE outcome.time_session_id = scan_time_sessions.id \
+                    ) > expected_group_count) \
+                )) \
+                OR (state = 'abandoned' AND ( \
+                    evidence_group_count IS NOT NULL \
+                    OR unavailable_group_count IS NOT NULL \
+                    OR failed_group_count IS NOT NULL \
+                    OR sealed_manifest_digest IS NOT NULL \
+                    OR sealed_outcome_manifest_digest IS NOT NULL \
+                    OR abandon_reason_code IS NULL \
+                    OR finalized_at_ms IS NULL \
+                )) \
+                OR (abandon_reason_code IS NOT NULL AND \
+                    length(CAST(abandon_reason_code AS BLOB)) NOT BETWEEN 1 AND 256) \
+                OR (abandon_reason_message IS NOT NULL AND \
+                    length(CAST(abandon_reason_message AS BLOB)) NOT BETWEEN 1 AND 65536) \
+         )",
+        "capture-time session violates its typed state, manifest, or budget bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM metadata_extraction_reports AS report \
+             WHERE report.probe_ordinal NOT BETWEEN 0 AND 3 \
+                OR report.source_size_bytes < 0 \
+                OR length(CAST(report.report_parser_name AS BLOB)) NOT BETWEEN 1 AND 128 \
+                OR length(CAST(report.report_parser_version AS BLOB)) NOT BETWEEN 1 AND 128 \
+                OR (report.detected_format IS NOT NULL \
+                    AND report.detected_format NOT IN ('jpeg', 'tiff', 'iso_bmff')) \
+                OR report.extraction_status NOT IN ( \
+                    'extracted_unvalidated', 'no_metadata', 'partial', 'failed', 'unsupported' \
+                ) \
+                OR report.effective_max_total_bytes_read NOT BETWEEN 1 AND 67108864 \
+                OR report.effective_max_read_operations NOT BETWEEN 1 AND 262144 \
+                OR report.effective_max_retained_field_bytes NOT BETWEEN 1 AND 16777216 \
+                OR report.effective_max_field_bytes NOT BETWEEN 1 AND 1048576 \
+                OR report.effective_max_fields NOT BETWEEN 1 AND 4096 \
+                OR report.effective_max_jpeg_segments NOT BETWEEN 1 AND 65536 \
+                OR report.effective_max_ifd_entries NOT BETWEEN 1 AND 65536 \
+                OR report.effective_max_ifd_depth NOT BETWEEN 1 AND 64 \
+                OR report.effective_max_bmff_boxes NOT BETWEEN 1 AND 65536 \
+                OR report.effective_max_bmff_depth NOT BETWEEN 1 AND 64 \
+                OR report.usage_bytes_read NOT BETWEEN 0 AND report.effective_max_total_bytes_read \
+                OR report.usage_read_operations NOT BETWEEN 0 \
+                    AND report.effective_max_read_operations \
+                OR report.usage_retained_field_bytes NOT BETWEEN 0 \
+                    AND report.effective_max_retained_field_bytes \
+                OR report.usage_fields_emitted NOT BETWEEN 0 \
+                    AND report.effective_max_fields \
+                OR report.usage_jpeg_segments_visited NOT BETWEEN 0 \
+                    AND report.effective_max_jpeg_segments \
+                OR report.usage_ifd_entries_visited NOT BETWEEN 0 \
+                    AND report.effective_max_ifd_entries \
+                OR report.usage_bmff_boxes_visited NOT BETWEEN 0 \
+                    AND report.effective_max_bmff_boxes \
+                OR report.usage_max_depth_observed NOT BETWEEN 0 \
+                    AND MAX(report.effective_max_ifd_depth, report.effective_max_bmff_depth) \
+                OR report.effective_max_field_bytes > \
+                    report.effective_max_retained_field_bytes \
+                OR report.expected_field_count NOT BETWEEN 0 AND 4096 \
+                OR report.expected_issue_count NOT BETWEEN 0 AND 4096 \
+                OR report.expected_retained_field_bytes NOT BETWEEN 0 AND 16777216 \
+                OR report.expected_field_count <> report.usage_fields_emitted \
+                OR report.expected_retained_field_bytes <> report.usage_retained_field_bytes \
+                OR report.manifest_version <> 1 \
+                OR length(report.retained_report_digest) <> 32 \
+                OR length(report.expected_manifest_digest) <> 32 \
+                OR (report.sealed_manifest_digest IS NOT NULL \
+                    AND length(report.sealed_manifest_digest) <> 32) \
+                OR report.state NOT IN ('draft', 'sealed', 'abandoned') \
+                OR report.created_at_ms < 0 \
+                OR (report.finalized_at_ms IS NOT NULL \
+                    AND report.finalized_at_ms < report.created_at_ms) \
+                OR (report.state = 'draft' AND ( \
+                    report.sealed_manifest_digest IS NOT NULL \
+                    OR report.abandon_reason_code IS NOT NULL \
+                    OR report.abandon_reason_message IS NOT NULL \
+                    OR report.finalized_at_ms IS NOT NULL \
+                )) \
+                OR (report.state = 'sealed' AND ( \
+                    report.sealed_manifest_digest <> report.expected_manifest_digest \
+                    OR report.abandon_reason_code IS NOT NULL \
+                    OR report.abandon_reason_message IS NOT NULL \
+                    OR report.finalized_at_ms IS NULL \
+                )) \
+                OR (report.state = 'abandoned' AND ( \
+                    report.sealed_manifest_digest IS NOT NULL \
+                    OR report.abandon_reason_code IS NULL \
+                    OR report.finalized_at_ms IS NULL \
+                )) \
+                OR (report.abandon_reason_code IS NOT NULL AND \
+                    length(CAST(report.abandon_reason_code AS BLOB)) NOT BETWEEN 1 AND 256) \
+                OR (report.abandon_reason_message IS NOT NULL AND \
+                    length(CAST(report.abandon_reason_message AS BLOB)) NOT BETWEEN 1 AND 65536) \
+         )",
+        "metadata extraction report violates typed limits, usage, or state bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM metadata_extraction_fields AS field \
+             JOIN metadata_extraction_reports AS report ON report.id = field.report_id \
+             WHERE field.ordinal NOT BETWEEN 0 AND 4095 \
+                OR field.ordinal >= report.expected_field_count \
+                OR length(CAST(field.parser_name AS BLOB)) NOT BETWEEN 1 AND 128 \
+                OR length(CAST(field.parser_version AS BLOB)) NOT BETWEEN 1 AND 128 \
+                OR field.field_kind NOT IN ( \
+                    'exif_date_time_original', 'exif_create_date', 'exif_modify_date', \
+                    'exif_offset_time_original', 'exif_subsec_time_original', \
+                    'quicktime_movie_header_creation_time', \
+                    'quicktime_metadata_creation_date' \
+                ) \
+                OR field.encoding NOT IN ( \
+                    'declared_ascii', 'validated_utf8', 'unsigned_big_endian' \
+                ) \
+                OR field.absolute_offset < 0 \
+                OR field.byte_len NOT BETWEEN 1 AND 1048576 \
+                OR length(field.raw_bytes) NOT BETWEEN 1 AND 1048576 \
+                OR field.byte_len <> length(field.raw_bytes) \
+                OR length(field.raw_digest) <> 32 \
+                OR field.container_kind NOT IN ('tiff', 'jpeg_exif', 'iso_bmff') \
+                OR (field.bmff_box_path IS NOT NULL AND ( \
+                    length(field.bmff_box_path) NOT BETWEEN 4 AND 256 \
+                    OR length(field.bmff_box_path) % 4 <> 0 \
+                )) \
+                OR field.created_at_ms < 0 \
+                OR (field.container_kind = 'tiff' AND NOT ( \
+                    field.tiff_header_offset IS NOT NULL \
+                    AND field.tiff_header_offset >= 0 \
+                    AND field.tiff_ifd_offset IS NOT NULL \
+                    AND field.tiff_ifd_offset >= 0 \
+                    AND field.tiff_tag IS NOT NULL \
+                    AND field.tiff_tag BETWEEN 0 AND 65535 \
+                    AND field.tiff_byte_order IS NOT NULL \
+                    AND field.tiff_byte_order IN ('little_endian', 'big_endian') \
+                    AND field.jpeg_app1_offset IS NULL \
+                    AND field.bmff_box_offset IS NULL \
+                    AND field.bmff_box_path IS NULL \
+                )) \
+                OR (field.container_kind = 'jpeg_exif' AND NOT ( \
+                    field.tiff_header_offset IS NOT NULL \
+                    AND field.tiff_header_offset >= 0 \
+                    AND field.tiff_ifd_offset IS NOT NULL \
+                    AND field.tiff_ifd_offset >= 0 \
+                    AND field.tiff_tag IS NOT NULL \
+                    AND field.tiff_tag BETWEEN 0 AND 65535 \
+                    AND field.tiff_byte_order IS NOT NULL \
+                    AND field.tiff_byte_order IN ('little_endian', 'big_endian') \
+                    AND field.jpeg_app1_offset IS NOT NULL \
+                    AND field.jpeg_app1_offset >= 0 \
+                    AND field.bmff_box_offset IS NULL \
+                    AND field.bmff_box_path IS NULL \
+                )) \
+                OR (field.container_kind = 'iso_bmff' AND NOT ( \
+                    field.tiff_header_offset IS NULL \
+                    AND field.tiff_ifd_offset IS NULL \
+                    AND field.tiff_tag IS NULL \
+                    AND field.tiff_byte_order IS NULL \
+                    AND field.jpeg_app1_offset IS NULL \
+                    AND field.bmff_box_offset IS NOT NULL \
+                    AND field.bmff_box_offset >= 0 \
+                    AND field.bmff_box_path IS NOT NULL \
+                )) \
+         )",
+        "metadata extraction field violates typed locator or payload bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM metadata_extraction_issues AS issue \
+             JOIN metadata_extraction_reports AS report ON report.id = issue.report_id \
+             WHERE issue.ordinal NOT BETWEEN 0 AND 4095 \
+                OR issue.ordinal >= report.expected_issue_count \
+                OR length(CAST(issue.parser_name AS BLOB)) NOT BETWEEN 1 AND 128 \
+                OR length(CAST(issue.parser_version AS BLOB)) NOT BETWEEN 1 AND 128 \
+                OR issue.issue_code NOT IN ( \
+                    'io', 'unexpected_eof', 'arithmetic_overflow', 'out_of_bounds', \
+                    'invalid_structure', 'cycle_detected', 'limit_exceeded', \
+                    'unsupported_version', 'invalid_source' \
+                ) \
+                OR (issue.source_offset IS NOT NULL AND ( \
+                    issue.source_offset < 0 OR issue.source_offset > report.source_size_bytes \
+                )) \
+                OR length(CAST(issue.context AS BLOB)) NOT BETWEEN 1 AND 4096 \
+                OR issue.created_at_ms < 0 \
+         )",
+        "metadata extraction issue violates typed ordinal, locator, or text bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM metadata_source_revalidations AS revalidation \
+             LEFT JOIN metadata_extraction_reports AS report \
+               ON report.id = revalidation.report_id \
+             LEFT JOIN media_observation_snapshots AS observation \
+               ON observation.id = revalidation.metadata_probe_observation_id \
+              AND observation.scan_run_id = revalidation.scan_run_id \
+              AND observation.volume_id = revalidation.volume_id \
+             WHERE report.id IS NULL \
+                OR observation.id IS NULL \
+                OR revalidation.time_session_id <> report.time_session_id \
+                OR revalidation.volume_id <> report.volume_id \
+                OR revalidation.scan_run_id <> report.scan_run_id \
+                OR revalidation.core_session_id <> report.core_session_id \
+                OR revalidation.exact_group_build_id <> report.exact_group_build_id \
+                OR revalidation.metadata_probe_observation_id <> \
+                    report.metadata_probe_observation_id \
+                OR length(revalidation.core_session_id) <> 32 \
+                OR length(revalidation.source_key) <> 32 \
+                OR revalidation.source_key_version <> 2 \
+                OR length(revalidation.lineage_key) <> 32 \
+                OR revalidation.lineage_key_version <> 1 \
+                OR length(revalidation.source_signature_before) <> 32 \
+                OR length(revalidation.source_signature_after) <> 32 \
+                OR revalidation.source_signature_before <> observation.source_signature \
+                OR revalidation.source_signature_after <> observation.source_signature \
+                OR revalidation.source_signature_before <> \
+                    revalidation.source_signature_after \
+                OR length(revalidation.first_report_digest) <> 32 \
+                OR length(revalidation.second_report_digest) <> 32 \
+                OR revalidation.first_report_digest <> report.retained_report_digest \
+                OR revalidation.second_report_digest <> report.retained_report_digest \
+                OR revalidation.first_report_digest <> revalidation.second_report_digest \
+                OR revalidation.outcome <> 'reextracted_pinned_exact' \
+                OR revalidation.descriptor_revalidated <> 1 \
+                OR revalidation.path_revalidated <> 1 \
+                OR revalidation.session_revalidated <> 1 \
+                OR revalidation.trust_scope <> 'historical_proof_only' \
+                OR revalidation.revalidated_at_ms < report.created_at_ms \
+                OR revalidation.revalidated_at_ms < COALESCE(( \
+                    SELECT max(field.created_at_ms) \
+                    FROM metadata_extraction_fields AS field \
+                    WHERE field.report_id = report.id \
+                ), report.created_at_ms) \
+                OR revalidation.revalidated_at_ms < COALESCE(( \
+                    SELECT max(issue.created_at_ms) \
+                    FROM metadata_extraction_issues AS issue \
+                    WHERE issue.report_id = report.id \
+                ), report.created_at_ms) \
+                OR (report.finalized_at_ms IS NOT NULL \
+                    AND revalidation.revalidated_at_ms > report.finalized_at_ms) \
+         )",
+        "metadata source revalidation violates its pinned report or source bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_analysis_builds AS build \
+             WHERE length(CAST(build.policy_name AS BLOB)) NOT BETWEEN 1 AND 128 \
+                OR length(CAST(build.policy_version AS BLOB)) NOT BETWEEN 1 AND 128 \
+                OR length(CAST(build.policy_context_json AS BLOB)) NOT BETWEEN 2 AND 1048576 \
+                OR length(build.policy_context_digest) <> 32 \
+                OR build.state NOT IN ('draft', 'sealed', 'abandoned') \
+                OR (build.decision IS NOT NULL AND build.decision NOT IN ( \
+                    'no_usable_evidence', 'review_required', 'evidence_eligible', 'conflict' \
+                )) \
+                OR (build.selected_candidate_ordinal IS NOT NULL \
+                    AND build.selected_candidate_ordinal < 0) \
+                OR build.expected_source_count NOT BETWEEN 1 AND 4096 \
+                OR build.expected_observation_count NOT BETWEEN 0 AND 8192 \
+                OR build.expected_candidate_count NOT BETWEEN 0 AND 8192 \
+                OR build.expected_issue_count NOT BETWEEN 0 AND 8192 \
+                OR build.expected_member_count NOT BETWEEN 2 AND 8192 \
+                OR build.expected_recommendation_count <> 1 \
+                OR build.manifest_version <> 1 \
+                OR length(build.expected_manifest_digest) <> 32 \
+                OR (build.sealed_manifest_digest IS NOT NULL \
+                    AND length(build.sealed_manifest_digest) <> 32) \
+                OR build.created_at_ms < 0 \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND build.finalized_at_ms < build.created_at_ms) \
+                OR (build.state = 'draft' AND ( \
+                    build.decision IS NOT NULL \
+                    OR build.selected_candidate_ordinal IS NOT NULL \
+                    OR build.sealed_manifest_digest IS NOT NULL \
+                    OR build.abandon_reason_code IS NOT NULL \
+                    OR build.abandon_reason_message IS NOT NULL \
+                    OR build.finalized_at_ms IS NOT NULL \
+                )) \
+                OR (build.state = 'sealed' AND ( \
+                    build.decision IS NULL \
+                    OR (build.decision IN ('review_required', 'evidence_eligible') \
+                        AND build.selected_candidate_ordinal IS NULL) \
+                    OR (build.decision IN ('no_usable_evidence', 'conflict') \
+                        AND build.selected_candidate_ordinal IS NOT NULL) \
+                    OR build.sealed_manifest_digest <> build.expected_manifest_digest \
+                    OR build.abandon_reason_code IS NOT NULL \
+                    OR build.abandon_reason_message IS NOT NULL \
+                    OR build.finalized_at_ms IS NULL \
+                )) \
+                OR (build.state = 'abandoned' AND ( \
+                    build.decision IS NOT NULL \
+                    OR build.selected_candidate_ordinal IS NOT NULL \
+                    OR build.sealed_manifest_digest IS NOT NULL \
+                    OR build.abandon_reason_code IS NULL \
+                    OR build.finalized_at_ms IS NULL \
+                )) \
+                OR (build.abandon_reason_code IS NOT NULL AND \
+                    length(CAST(build.abandon_reason_code AS BLOB)) NOT BETWEEN 1 AND 256) \
+                OR (build.abandon_reason_message IS NOT NULL AND \
+                    length(CAST(build.abandon_reason_message AS BLOB)) NOT BETWEEN 1 AND 65536) \
+         )",
+        "capture-time analysis violates typed counts, policy, manifest, or state bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_analysis_sources AS source \
+             LEFT JOIN capture_time_analysis_builds AS build \
+               ON build.id = source.analysis_build_id \
+             LEFT JOIN metadata_extraction_reports AS report ON report.id = source.report_id \
+             LEFT JOIN metadata_source_revalidations AS revalidation \
+               ON revalidation.report_id = source.report_id \
+              AND revalidation.source_key = source.source_key \
+              AND revalidation.lineage_key = source.lineage_key \
+             WHERE build.id IS NULL \
+                OR report.id IS NULL \
+                OR revalidation.id IS NULL \
+                OR source.ordinal NOT BETWEEN 0 AND 4095 \
+                OR source.ordinal >= build.expected_source_count \
+                OR length(source.source_key) <> 32 \
+                OR length(source.lineage_key) <> 32 \
+                OR source.binding_status <> 'reextracted_pinned_source' \
+                OR source.created_at_ms < MAX(build.created_at_ms, report.finalized_at_ms) \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND source.created_at_ms > build.finalized_at_ms) \
+                OR report.state <> 'sealed' \
+                OR report.time_session_id <> build.time_session_id \
+                OR report.exact_group_build_id <> build.exact_group_build_id \
+         )",
+        "capture-time analysis source violates its sealed revalidated report binding",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_observations AS observation \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = observation.analysis_build_id \
+             WHERE observation.ordinal NOT BETWEEN 0 AND 8191 \
+                OR observation.ordinal >= build.expected_observation_count \
+                OR observation.source_ordinal NOT BETWEEN 0 AND 4095 \
+                OR observation.interpretation_kind NOT IN ( \
+                    'timestamp', 'offset', 'subsecond', 'rejected' \
+                ) \
+                OR observation.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND observation.created_at_ms > build.finalized_at_ms) \
+                OR (observation.interpretation_kind = 'timestamp' AND NOT ( \
+                    observation.wall_year IS NOT NULL \
+                    AND observation.wall_month IS NOT NULL \
+                    AND observation.wall_day IS NOT NULL \
+                    AND observation.wall_hour IS NOT NULL \
+                    AND observation.wall_minute IS NOT NULL \
+                    AND observation.wall_second IS NOT NULL \
+                    AND observation.wall_nanosecond IS NOT NULL \
+                    AND observation.semantic_kind IS NOT NULL \
+                    AND observation.offset_kind IS NOT NULL \
+                    AND observation.normalized_precision_ns IS NOT NULL \
+                    AND observation.parsed_offset_minutes IS NULL \
+                    AND observation.subsecond_nanosecond IS NULL \
+                    AND observation.subsecond_digits IS NULL \
+                    AND observation.subsecond_precision_ns IS NULL \
+                    AND observation.rejection_code IS NULL \
+                )) \
+                OR (observation.interpretation_kind = 'offset' AND NOT ( \
+                    observation.wall_year IS NULL \
+                    AND observation.wall_month IS NULL \
+                    AND observation.wall_day IS NULL \
+                    AND observation.wall_hour IS NULL \
+                    AND observation.wall_minute IS NULL \
+                    AND observation.wall_second IS NULL \
+                    AND observation.wall_nanosecond IS NULL \
+                    AND observation.semantic_kind IS NULL \
+                    AND observation.offset_kind IS NULL \
+                    AND observation.utc_offset_minutes IS NULL \
+                    AND observation.utc_seconds_decimal IS NULL \
+                    AND observation.utc_nanoseconds IS NULL \
+                    AND observation.normalized_precision_ns IS NULL \
+                    AND observation.parsed_offset_minutes IS NOT NULL \
+                    AND observation.parsed_offset_minutes BETWEEN -840 AND 840 \
+                    AND observation.subsecond_nanosecond IS NULL \
+                    AND observation.subsecond_digits IS NULL \
+                    AND observation.subsecond_precision_ns IS NULL \
+                    AND observation.rejection_code IS NULL \
+                )) \
+                OR (observation.interpretation_kind = 'subsecond' AND NOT ( \
+                    observation.wall_year IS NULL \
+                    AND observation.wall_month IS NULL \
+                    AND observation.wall_day IS NULL \
+                    AND observation.wall_hour IS NULL \
+                    AND observation.wall_minute IS NULL \
+                    AND observation.wall_second IS NULL \
+                    AND observation.wall_nanosecond IS NULL \
+                    AND observation.semantic_kind IS NULL \
+                    AND observation.offset_kind IS NULL \
+                    AND observation.utc_offset_minutes IS NULL \
+                    AND observation.utc_seconds_decimal IS NULL \
+                    AND observation.utc_nanoseconds IS NULL \
+                    AND observation.normalized_precision_ns IS NULL \
+                    AND observation.parsed_offset_minutes IS NULL \
+                    AND observation.subsecond_nanosecond IS NOT NULL \
+                    AND observation.subsecond_nanosecond BETWEEN 0 AND 999999999 \
+                    AND observation.subsecond_digits IS NOT NULL \
+                    AND observation.subsecond_digits BETWEEN 1 AND 9 \
+                    AND observation.subsecond_precision_ns IS NOT NULL \
+                    AND observation.subsecond_precision_ns BETWEEN 1 AND 1000000000 \
+                    AND observation.rejection_code IS NULL \
+                )) \
+                OR (observation.interpretation_kind = 'rejected' AND NOT ( \
+                    observation.wall_year IS NULL \
+                    AND observation.wall_month IS NULL \
+                    AND observation.wall_day IS NULL \
+                    AND observation.wall_hour IS NULL \
+                    AND observation.wall_minute IS NULL \
+                    AND observation.wall_second IS NULL \
+                    AND observation.wall_nanosecond IS NULL \
+                    AND observation.semantic_kind IS NULL \
+                    AND observation.offset_kind IS NULL \
+                    AND observation.utc_offset_minutes IS NULL \
+                    AND observation.utc_seconds_decimal IS NULL \
+                    AND observation.utc_nanoseconds IS NULL \
+                    AND observation.normalized_precision_ns IS NULL \
+                    AND observation.parsed_offset_minutes IS NULL \
+                    AND observation.subsecond_nanosecond IS NULL \
+                    AND observation.subsecond_digits IS NULL \
+                    AND observation.subsecond_precision_ns IS NULL \
+                    AND observation.rejection_code IS NOT NULL \
+                    AND observation.rejection_code IN ( \
+                        'empty', 'invalid_encoding', 'invalid_syntax', \
+                        'year_out_of_range', 'month_out_of_range', 'day_out_of_range', \
+                        'hour_out_of_range', 'minute_out_of_range', \
+                        'second_out_of_range', 'nanosecond_out_of_range', \
+                        'subsecond_out_of_range', 'offset_out_of_range', \
+                        'unknown_negative_zero_offset', 'precision_out_of_range', \
+                        'unsupported_binary_length', 'arithmetic_overflow' \
+                    ) \
+                )) \
+         )",
+        "capture-time observation violates typed ordinal or interpretation bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_candidates AS candidate \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = candidate.analysis_build_id \
+             WHERE candidate.ordinal NOT BETWEEN 0 AND 8191 \
+                OR candidate.ordinal >= build.expected_candidate_count \
+                OR candidate.confidence NOT IN ('conflict', 'low', 'medium', 'high') \
+                OR candidate.evidence_gate NOT IN ('eligible', 'blocked') \
+                OR candidate.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND candidate.created_at_ms > build.finalized_at_ms) \
+                OR length(CAST(candidate.evidence_kinds_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR length(CAST(candidate.source_keys_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR length(CAST(candidate.lineage_keys_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR length(CAST(candidate.observation_ordinals_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR length(CAST(candidate.anomalies_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR length(CAST(candidate.blockers_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR NOT json_valid(candidate.evidence_kinds_json) \
+                OR NOT json_valid(candidate.source_keys_json) \
+                OR NOT json_valid(candidate.lineage_keys_json) \
+                OR NOT json_valid(candidate.observation_ordinals_json) \
+                OR NOT json_valid(candidate.anomalies_json) \
+                OR NOT json_valid(candidate.blockers_json) \
+         )",
+        "capture-time candidate violates typed ordinal, chronology, or JSON byte bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_policy_issues AS issue \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = issue.analysis_build_id \
+             WHERE issue.ordinal NOT BETWEEN 0 AND 8191 \
+                OR issue.ordinal >= build.expected_issue_count \
+                OR length(CAST(issue.context AS BLOB)) NOT BETWEEN 1 AND 4096 \
+                OR issue.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND issue.created_at_ms > build.finalized_at_ms) \
+                OR length(CAST(issue.observation_ordinals_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR length(CAST(issue.source_keys_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR length(CAST(issue.lineage_keys_json AS BLOB)) \
+                    NOT BETWEEN 2 AND 1048576 \
+                OR NOT json_valid(issue.observation_ordinals_json) \
+                OR NOT json_valid(issue.source_keys_json) \
+                OR NOT json_valid(issue.lineage_keys_json) \
+         )",
+        "capture-time policy issue violates typed ordinal, chronology, or JSON byte bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_group_outcomes AS outcome \
+             JOIN scan_time_sessions AS time_session \
+               ON time_session.id = outcome.time_session_id \
+             WHERE outcome.outcome NOT IN ('evidence', 'unavailable', 'failed') \
+                OR (outcome.outcome = 'evidence' AND outcome.analysis_build_id IS NULL) \
+                OR (outcome.outcome IN ('unavailable', 'failed') \
+                    AND outcome.analysis_build_id IS NOT NULL) \
+                OR length(CAST(outcome.reason_code AS BLOB)) NOT BETWEEN 1 AND 256 \
+                OR outcome.created_at_ms < time_session.created_at_ms \
+                OR (time_session.finalized_at_ms IS NOT NULL \
+                    AND outcome.created_at_ms > time_session.finalized_at_ms) \
+         )",
+        "capture-time group outcome violates its typed state or chronology bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_member_assessments AS member \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = member.analysis_build_id \
+             JOIN media_observation_snapshots AS observation \
+               ON observation.id = member.media_observation_snapshot_id \
+              AND observation.scan_run_id = member.scan_run_id \
+              AND observation.volume_id = member.volume_id \
+             LEFT JOIN capture_time_candidates AS candidate \
+               ON candidate.analysis_build_id = member.analysis_build_id \
+              AND candidate.id = member.candidate_id \
+             WHERE member.member_ordinal < 0 \
+                OR member.member_ordinal >= build.expected_member_count \
+                OR member.volume_id <> build.volume_id \
+                OR member.scan_run_id <> build.scan_run_id \
+                OR member.exact_group_build_id <> build.exact_group_build_id \
+                OR member.birth_time_relation NOT IN ( \
+                    'unavailable', 'not_compared', 'matches', 'differs', \
+                    'review_fs_precision_unknown' \
+                ) \
+                OR member.modified_time_relation NOT IN ( \
+                    'not_compared', 'matches', 'differs', 'review_fs_precision_unknown' \
+                ) \
+                OR member.donor_eligibility <> 'ineligible' \
+                OR length(CAST(member.reason_code AS BLOB)) NOT BETWEEN 1 AND 256 \
+                OR member.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND member.created_at_ms > build.finalized_at_ms) \
+                OR (member.birth_time_relation = 'unavailable') <> \
+                    (observation.birth_time_seconds IS NULL) \
+                OR (member.candidate_id IS NULL AND ( \
+                    member.birth_time_relation NOT IN ('unavailable', 'not_compared') \
+                    OR member.modified_time_relation <> 'not_compared' \
+                    OR member.reason_code <> 'no_strong_embedded_candidate' \
+                )) \
+                OR (member.candidate_id IS NOT NULL AND ( \
+                    candidate.id IS NULL \
+                    OR candidate.evidence_gate <> 'eligible' \
+                    OR candidate.semantic_kind <> 'utc' \
+                    OR (observation.timestamp_granularity_ns IS NULL AND ( \
+                        member.birth_time_relation <> CASE \
+                            WHEN observation.birth_time_seconds IS NULL \
+                            THEN 'unavailable' \
+                            ELSE 'review_fs_precision_unknown' \
+                        END \
+                        OR member.modified_time_relation <> \
+                            'review_fs_precision_unknown' \
+                        OR member.reason_code <> 'fs_precision_unknown' \
+                    )) \
+                    OR (observation.timestamp_granularity_ns IS NOT NULL AND ( \
+                        member.birth_time_relation NOT IN ( \
+                            'unavailable', 'matches', 'differs' \
+                        ) \
+                        OR member.modified_time_relation NOT IN ('matches', 'differs') \
+                        OR member.reason_code <> CASE \
+                            WHEN member.birth_time_relation = 'matches' \
+                              OR member.modified_time_relation = 'matches' \
+                            THEN 'embedded_time_matches_fs' \
+                            ELSE 'embedded_time_differs_fs' \
+                        END \
+                    )) \
+                )) \
+         )",
+        "capture-time member assessment violates exact-member or donor eligibility bounds",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_recommendations AS recommendation \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = recommendation.analysis_build_id \
+             WHERE recommendation.volume_id <> build.volume_id \
+                OR recommendation.scan_run_id <> build.scan_run_id \
+                OR recommendation.exact_group_build_id <> build.exact_group_build_id \
+                OR recommendation.evidence_only <> 1 \
+                OR recommendation.write_authorized <> 0 \
+                OR length(CAST(recommendation.reason_code AS BLOB)) NOT BETWEEN 1 AND 256 \
+                OR recommendation.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND recommendation.created_at_ms > build.finalized_at_ms) \
+                OR (recommendation.keeper_policy_name IS NOT NULL AND \
+                    length(CAST(recommendation.keeper_policy_name AS BLOB)) \
+                        NOT BETWEEN 1 AND 128) \
+                OR (recommendation.keeper_policy_version IS NOT NULL AND \
+                    length(CAST(recommendation.keeper_policy_version AS BLOB)) \
+                        NOT BETWEEN 1 AND 128) \
+                OR (recommendation.time_donor_policy_name IS NOT NULL AND \
+                    length(CAST(recommendation.time_donor_policy_name AS BLOB)) \
+                        NOT BETWEEN 1 AND 128) \
+                OR (recommendation.time_donor_policy_version IS NOT NULL AND \
+                    length(CAST(recommendation.time_donor_policy_version AS BLOB)) \
+                        NOT BETWEEN 1 AND 128) \
+                OR (recommendation.keeper_observation_id IS NULL AND ( \
+                    recommendation.keeper_policy_name IS NOT NULL \
+                    OR recommendation.keeper_policy_version IS NOT NULL \
+                    OR recommendation.time_donor_observation_id IS NOT NULL \
+                    OR recommendation.candidate_id IS NOT NULL \
+                    OR recommendation.time_donor_policy_name IS NOT NULL \
+                    OR recommendation.time_donor_policy_version IS NOT NULL \
+                )) \
+                OR (recommendation.keeper_observation_id IS NOT NULL AND ( \
+                    recommendation.keeper_policy_name IS NULL \
+                    OR recommendation.keeper_policy_version IS NULL \
+                    OR ((recommendation.time_donor_observation_id IS NULL) <> \
+                        (recommendation.candidate_id IS NULL)) \
+                    OR ((recommendation.time_donor_observation_id IS NULL) <> \
+                        (recommendation.time_donor_policy_name IS NULL)) \
+                    OR ((recommendation.time_donor_observation_id IS NULL) <> \
+                        (recommendation.time_donor_policy_version IS NULL)) \
+                )) \
+         )",
+        "capture-time recommendation violates evidence-only identity or policy bounds",
+    )?;
+    Ok(())
+}
+
+fn validate_capture_time_evidence(connection: &Connection) -> Result<()> {
+    validate_capture_time_declared_bounds(connection)?;
+    crate::repository::validate_capture_time_member_relations(connection)?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_time_sessions AS time_session \
+             LEFT JOIN scan_core_sessions AS core \
+               ON core.scan_run_id = time_session.scan_run_id \
+              AND core.volume_id = time_session.volume_id \
+              AND core.core_session_id = time_session.core_session_id \
+             LEFT JOIN scan_run_sessions AS run_session \
+               ON run_session.scan_run_id = core.scan_run_id \
+              AND run_session.volume_id = core.volume_id \
+              AND run_session.capability_profile_id = core.capability_profile_id \
+              AND run_session.namespace_profile_id = core.namespace_profile_id \
+             LEFT JOIN scan_runs AS run \
+               ON run.id = run_session.scan_run_id \
+              AND run.volume_id = run_session.volume_id \
+             LEFT JOIN scan_jobs AS job \
+               ON job.id = run_session.scan_job_id \
+              AND job.volume_id = run_session.volume_id \
+              AND job.active_scan_run_id = run.id \
+             LEFT JOIN capability_profiles AS profile \
+               ON profile.id = run_session.capability_profile_id \
+              AND profile.volume_id = run_session.volume_id \
+             LEFT JOIN scan_stage_seals AS exact_seal \
+               ON exact_seal.scan_run_id = time_session.scan_run_id \
+              AND exact_seal.volume_id = time_session.volume_id \
+              AND exact_seal.stage = 'exact_verification' \
+             WHERE core.scan_run_id IS NULL \
+                OR run_session.scan_run_id IS NULL \
+                OR run.id IS NULL \
+                OR job.id IS NULL \
+                OR profile.id IS NULL \
+                OR exact_seal.scan_run_id IS NULL \
+                OR run.state <> 'completed' \
+                OR job.state <> 'completed' \
+                OR time_session.created_at_ms < core.bound_at_ms \
+                OR time_session.created_at_ms < exact_seal.sealed_at_ms \
+                OR (time_session.state = 'draft' AND ( \
+                    profile.profile_hash_version <> 2 \
+                    OR profile.probe_status <> 'complete' \
+                    OR profile.can_read <> 1 \
+                    OR profile.is_current <> 1 \
+                    OR profile.mount_session_key <> \
+                        run_session.mount_session_key COLLATE BINARY \
+                )) \
+                OR time_session.expected_group_count <> ( \
+                    SELECT count(*) FROM exact_group_builds AS exact_build \
+                    WHERE exact_build.scan_run_id = time_session.scan_run_id \
+                      AND exact_build.volume_id = time_session.volume_id \
+                      AND exact_build.state = 'verified' \
+                ) \
+                OR (time_session.state <> 'draft' AND ( \
+                    EXISTS ( \
+                        SELECT 1 FROM metadata_extraction_reports AS report \
+                        WHERE report.time_session_id = time_session.id \
+                          AND report.state = 'draft' \
+                    ) \
+                    OR EXISTS ( \
+                        SELECT 1 FROM capture_time_analysis_builds AS build \
+                        WHERE build.time_session_id = time_session.id \
+                          AND build.state = 'draft' \
+                    ) \
+                    OR time_session.finalized_at_ms < COALESCE(( \
+                        SELECT max(report.finalized_at_ms) \
+                        FROM metadata_extraction_reports AS report \
+                        WHERE report.time_session_id = time_session.id \
+                    ), time_session.created_at_ms) \
+                    OR time_session.finalized_at_ms < COALESCE(( \
+                        SELECT max(build.finalized_at_ms) \
+                        FROM capture_time_analysis_builds AS build \
+                        WHERE build.time_session_id = time_session.id \
+                    ), time_session.created_at_ms) \
+                    OR time_session.finalized_at_ms < COALESCE(( \
+                        SELECT max(outcome.created_at_ms) \
+                        FROM capture_time_group_outcomes AS outcome \
+                        WHERE outcome.time_session_id = time_session.id \
+                    ), time_session.created_at_ms) \
+                )) \
+                OR (time_session.state IN ('complete', 'partial') AND ( \
+                    EXISTS ( \
+                        SELECT 1 FROM metadata_extraction_reports AS report \
+                        WHERE report.time_session_id = time_session.id \
+                          AND report.state = 'draft' \
+                    ) \
+                    OR EXISTS ( \
+                        SELECT 1 FROM capture_time_analysis_builds AS build \
+                        WHERE build.time_session_id = time_session.id \
+                          AND build.state = 'draft' \
+                    ) \
+                    OR time_session.evidence_group_count <> ( \
+                        SELECT count(*) FROM capture_time_group_outcomes AS outcome \
+                        WHERE outcome.time_session_id = time_session.id \
+                          AND outcome.outcome = 'evidence' \
+                    ) \
+                    OR time_session.unavailable_group_count <> ( \
+                        SELECT count(*) FROM capture_time_group_outcomes AS outcome \
+                        WHERE outcome.time_session_id = time_session.id \
+                          AND outcome.outcome = 'unavailable' \
+                    ) \
+                    OR time_session.failed_group_count <> ( \
+                        SELECT count(*) FROM capture_time_group_outcomes AS outcome \
+                        WHERE outcome.time_session_id = time_session.id \
+                          AND outcome.outcome = 'failed' \
+                    ) \
+                )) \
+         )",
+        "capture-time session is detached from core or has stale terminal coverage",
+    )?;
+    let mut session_manifest_statement = connection.prepare(
+        "SELECT id, scan_run_id, expected_group_count, expected_manifest_digest, state, \
+                sealed_manifest_digest, sealed_outcome_manifest_digest \
+         FROM scan_time_sessions ORDER BY id",
+    )?;
+    let mut session_manifest_rows = session_manifest_statement.query([])?;
+    while let Some(row) = session_manifest_rows.next()? {
+        let id = row.get::<_, i64>(0)?;
+        let scan_run_id = row.get::<_, i64>(1)?;
+        let persisted_count = row.get::<_, i64>(2)?;
+        let persisted_digest = row.get::<_, Vec<u8>>(3)?;
+        let state = row.get::<_, String>(4)?;
+        let sealed_scope = row.get::<_, Option<Vec<u8>>>(5)?;
+        let sealed_outcomes = row.get::<_, Option<Vec<u8>>>(6)?;
+        let (actual_count, actual_digest) =
+            crate::repository::recompute_time_session_scope_manifest(connection, scan_run_id)?;
+        if actual_count != persisted_count
+            || persisted_digest.as_slice() != actual_digest.as_bytes()
+        {
+            return Err(StoreError::MigrationHistoryMismatch(format!(
+                "capture-time session id {id} has a stale exact-scope manifest"
+            )));
+        }
+        if matches!(state.as_str(), "complete" | "partial") {
+            if sealed_scope.as_deref() != Some(actual_digest.as_bytes()) {
+                return Err(StoreError::MigrationHistoryMismatch(format!(
+                    "capture-time session id {id} has a stale sealed exact-scope manifest"
+                )));
+            }
+            let actual_outcomes =
+                crate::repository::recompute_time_session_outcome_manifest(connection, id)?;
+            if sealed_outcomes.as_deref() != Some(actual_outcomes.as_bytes()) {
+                return Err(StoreError::MigrationHistoryMismatch(format!(
+                    "capture-time session id {id} has a stale sealed outcome manifest"
+                )));
+            }
+        }
+    }
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_time_sessions AS time_session \
+             WHERE ( \
+                 SELECT COALESCE(sum(report.usage_bytes_read), 0) \
+                 FROM metadata_extraction_reports AS report \
+                 WHERE report.time_session_id = time_session.id \
+             ) > time_session.max_total_read_bytes / 2 \
+         )",
+        "capture-time session exceeded its immutable double-extraction read budget",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_group_outcomes AS outcome \
+             JOIN scan_time_sessions AS time_session \
+               ON time_session.id = outcome.time_session_id \
+             JOIN exact_group_builds AS exact_build \
+               ON exact_build.id = outcome.exact_group_build_id \
+              AND exact_build.scan_run_id = outcome.scan_run_id \
+              AND exact_build.volume_id = outcome.volume_id \
+             WHERE exact_build.state <> 'verified' \
+                OR outcome.scan_run_id <> time_session.scan_run_id \
+                OR outcome.volume_id <> time_session.volume_id \
+                OR EXISTS ( \
+                    SELECT 1 FROM metadata_extraction_reports AS report \
+                    WHERE report.time_session_id = outcome.time_session_id \
+                      AND report.exact_group_build_id = outcome.exact_group_build_id \
+                      AND (report.state = 'draft' \
+                           OR report.finalized_at_ms IS NULL \
+                           OR report.finalized_at_ms > outcome.created_at_ms) \
+                ) \
+                OR EXISTS ( \
+                    SELECT 1 FROM capture_time_analysis_builds AS build \
+                    WHERE build.time_session_id = outcome.time_session_id \
+                      AND build.exact_group_build_id = outcome.exact_group_build_id \
+                      AND (build.state = 'draft' \
+                           OR build.finalized_at_ms IS NULL \
+                           OR build.finalized_at_ms > outcome.created_at_ms) \
+                ) \
+                OR (outcome.outcome = 'evidence' AND NOT EXISTS ( \
+                    SELECT 1 FROM capture_time_analysis_builds AS build \
+                    WHERE build.id = outcome.analysis_build_id \
+                      AND build.time_session_id = outcome.time_session_id \
+                      AND build.exact_group_build_id = outcome.exact_group_build_id \
+                      AND build.state = 'sealed' \
+                )) \
+                OR (outcome.outcome IN ('unavailable', 'failed') AND EXISTS ( \
+                    SELECT 1 FROM capture_time_analysis_builds AS build \
+                    WHERE build.time_session_id = outcome.time_session_id \
+                      AND build.exact_group_build_id = outcome.exact_group_build_id \
+                      AND build.state = 'sealed' \
+                )) \
+         )",
+        "capture-time group outcome is detached from its explicit terminal result",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM metadata_extraction_reports AS report \
+             JOIN scan_time_sessions AS time_session \
+               ON time_session.id = report.time_session_id \
+             JOIN exact_group_builds AS exact_build \
+               ON exact_build.id = report.exact_group_build_id \
+              AND exact_build.scan_run_id = report.scan_run_id \
+              AND exact_build.volume_id = report.volume_id \
+             JOIN media_observation_snapshots AS observation \
+               ON observation.id = report.metadata_probe_observation_id \
+              AND observation.scan_run_id = report.scan_run_id \
+              AND observation.volume_id = report.volume_id \
+             JOIN observation_fingerprints AS fingerprint \
+               ON fingerprint.id = report.metadata_probe_fingerprint_id \
+              AND fingerprint.media_observation_snapshot_id = observation.id \
+              AND fingerprint.scan_run_id = observation.scan_run_id \
+              AND fingerprint.volume_id = observation.volume_id \
+             WHERE exact_build.state <> 'verified' \
+                OR report.core_session_id <> time_session.core_session_id \
+                OR report.created_at_ms < time_session.created_at_ms \
+                OR report.probe_ordinal >= time_session.max_probe_count_per_group \
+                OR report.source_size_bytes <> observation.size_bytes \
+                OR fingerprint.fingerprint_kind <> 'exact_bytes' \
+                OR fingerprint.source_signature_before <> observation.source_signature \
+                OR fingerprint.source_signature_after <> observation.source_signature \
+                OR report.effective_max_total_bytes_read > \
+                    time_session.max_report_total_bytes_read \
+                OR report.effective_max_read_operations > \
+                    time_session.max_report_read_operations \
+                OR report.effective_max_retained_field_bytes > \
+                    time_session.max_report_retained_field_bytes \
+                OR report.effective_max_fields > time_session.max_report_fields \
+                OR report.expected_issue_count > time_session.max_report_issues \
+                OR (report.state = 'sealed' AND ( \
+                    (SELECT count(*) FROM metadata_extraction_fields AS field \
+                     WHERE field.report_id = report.id) <> report.expected_field_count \
+                    OR (SELECT count(*) FROM metadata_extraction_issues AS issue \
+                        WHERE issue.report_id = report.id) <> report.expected_issue_count \
+                    OR COALESCE(( \
+                        SELECT sum(length(field.raw_bytes)) \
+                        FROM metadata_extraction_fields AS field \
+                        WHERE field.report_id = report.id \
+                    ), 0) <> report.expected_retained_field_bytes \
+                    OR NOT EXISTS ( \
+                        SELECT 1 FROM metadata_source_revalidations AS revalidation \
+                        WHERE revalidation.report_id = report.id \
+                          AND revalidation.source_key IS NOT NULL \
+                          AND revalidation.lineage_key IS NOT NULL \
+                          AND revalidation.first_report_digest = report.retained_report_digest \
+                          AND revalidation.second_report_digest = report.retained_report_digest \
+                          AND revalidation.source_signature_before = observation.source_signature \
+                          AND revalidation.source_signature_after = observation.source_signature \
+                    ) \
+                )) \
+         )",
+        "metadata extraction report is detached, over budget, or incompletely sealed",
+    )?;
+    let mut report_manifest_statement = connection.prepare(
+        "SELECT id, expected_manifest_digest, sealed_manifest_digest \
+         FROM metadata_extraction_reports WHERE state = 'sealed' ORDER BY id",
+    )?;
+    let mut report_manifest_rows = report_manifest_statement.query([])?;
+    while let Some(row) = report_manifest_rows.next()? {
+        let id = row.get::<_, i64>(0)?;
+        let expected = row.get::<_, Vec<u8>>(1)?;
+        let sealed = row.get::<_, Vec<u8>>(2)?;
+        let actual = crate::repository::recompute_metadata_report_manifest(connection, id)?;
+        if expected.as_slice() != actual.as_bytes() || sealed.as_slice() != actual.as_bytes() {
+            return Err(StoreError::MigrationHistoryMismatch(format!(
+                "metadata extraction report id {id} has a stale sealed manifest"
+            )));
+        }
+    }
+    let mut source_key_statement = connection.prepare(
+        "SELECT report_id, source_key, lineage_key \
+         FROM metadata_source_revalidations ORDER BY report_id",
+    )?;
+    let mut source_key_rows = source_key_statement.query([])?;
+    while let Some(row) = source_key_rows.next()? {
+        let report_id = row.get::<_, i64>(0)?;
+        let persisted_source = row.get::<_, Vec<u8>>(1)?;
+        let persisted_lineage = row.get::<_, Vec<u8>>(2)?;
+        let (actual_source, actual_lineage) =
+            crate::repository::recompute_metadata_source_keys(connection, report_id)?;
+        if persisted_source.as_slice() != actual_source.as_bytes()
+            || persisted_lineage.as_slice() != actual_lineage.as_bytes()
+        {
+            return Err(StoreError::MigrationHistoryMismatch(format!(
+                "metadata report id {report_id} has stale source or lineage identity"
+            )));
+        }
+    }
+    let mut raw_digest_statement = connection
+        .prepare("SELECT id, raw_bytes, raw_digest FROM metadata_extraction_fields ORDER BY id")?;
+    let mut raw_digest_rows = raw_digest_statement.query([])?;
+    while let Some(row) = raw_digest_rows.next()? {
+        let id = row.get::<_, i64>(0)?;
+        let raw_bytes = row.get::<_, Vec<u8>>(1)?;
+        let raw_digest = row.get::<_, Vec<u8>>(2)?;
+        if raw_digest.as_slice() != blake3::hash(&raw_bytes).as_bytes() {
+            return Err(StoreError::MigrationHistoryMismatch(format!(
+                "metadata extraction field id {id} has a stale raw-byte digest"
+            )));
+        }
+    }
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM metadata_extraction_fields AS field \
+             JOIN metadata_extraction_reports AS report ON report.id = field.report_id \
+             WHERE field.absolute_offset > report.source_size_bytes \
+                OR field.byte_len > report.source_size_bytes - field.absolute_offset \
+                OR field.byte_len > report.effective_max_field_bytes \
+                OR COALESCE(field.tiff_header_offset, 0) > report.source_size_bytes \
+                OR COALESCE(field.tiff_ifd_offset, 0) > report.source_size_bytes \
+                OR COALESCE(field.jpeg_app1_offset, 0) > report.source_size_bytes \
+                OR COALESCE(field.bmff_box_offset, 0) > report.source_size_bytes \
+         )",
+        "metadata field locator exceeds its immutable source or extraction budget",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM metadata_extraction_fields AS field \
+             JOIN metadata_extraction_reports AS report ON report.id = field.report_id \
+             WHERE field.created_at_ms < report.created_at_ms \
+                OR (report.finalized_at_ms IS NOT NULL \
+                    AND field.created_at_ms > report.finalized_at_ms) \
+             UNION ALL \
+             SELECT 1 FROM metadata_extraction_issues AS issue \
+             JOIN metadata_extraction_reports AS report ON report.id = issue.report_id \
+             WHERE issue.created_at_ms < report.created_at_ms \
+                OR (report.finalized_at_ms IS NOT NULL \
+                    AND issue.created_at_ms > report.finalized_at_ms) \
+             UNION ALL \
+             SELECT 1 FROM metadata_source_revalidations AS revalidation \
+             JOIN metadata_extraction_reports AS report ON report.id = revalidation.report_id \
+             WHERE revalidation.revalidated_at_ms < report.created_at_ms \
+                OR (report.finalized_at_ms IS NOT NULL \
+                    AND revalidation.revalidated_at_ms > report.finalized_at_ms) \
+             LIMIT 1 \
+         )",
+        "metadata extraction evidence chronology is inconsistent",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_analysis_builds AS build \
+             JOIN scan_time_sessions AS time_session \
+               ON time_session.id = build.time_session_id \
+              AND time_session.scan_run_id = build.scan_run_id \
+              AND time_session.volume_id = build.volume_id \
+             JOIN exact_group_builds AS exact_build \
+               ON exact_build.id = build.exact_group_build_id \
+              AND exact_build.scan_run_id = build.scan_run_id \
+              AND exact_build.volume_id = build.volume_id \
+             WHERE exact_build.state <> 'verified' \
+                OR build.created_at_ms < time_session.created_at_ms \
+                OR build.expected_member_count <> exact_build.expected_member_count \
+                OR (build.state = 'sealed' AND ( \
+                    (SELECT count(*) FROM capture_time_analysis_sources AS source \
+                     WHERE source.analysis_build_id = build.id) <> build.expected_source_count \
+                    OR (SELECT count(*) FROM capture_time_observations AS observation \
+                        WHERE observation.analysis_build_id = build.id) <> \
+                       build.expected_observation_count \
+                    OR (SELECT count(*) FROM capture_time_candidates AS candidate \
+                        WHERE candidate.analysis_build_id = build.id) <> \
+                       build.expected_candidate_count \
+                    OR (SELECT count(*) FROM capture_time_policy_issues AS issue \
+                        WHERE issue.analysis_build_id = build.id) <> build.expected_issue_count \
+                    OR (SELECT count(*) FROM capture_time_member_assessments AS member \
+                        WHERE member.analysis_build_id = build.id) <> build.expected_member_count \
+                    OR (SELECT count(*) FROM capture_time_recommendations AS recommendation \
+                        WHERE recommendation.analysis_build_id = build.id) <> \
+                       build.expected_recommendation_count \
+                    OR (build.selected_candidate_ordinal IS NOT NULL AND NOT EXISTS ( \
+                        SELECT 1 FROM capture_time_candidates AS candidate \
+                        WHERE candidate.analysis_build_id = build.id \
+                          AND candidate.ordinal = build.selected_candidate_ordinal \
+                    )) \
+                    OR (build.decision = 'evidence_eligible' AND NOT EXISTS ( \
+                        SELECT 1 FROM capture_time_candidates AS candidate \
+                        WHERE candidate.analysis_build_id = build.id \
+                          AND candidate.ordinal = build.selected_candidate_ordinal \
+                          AND candidate.evidence_gate = 'eligible' \
+                    )) \
+                )) \
+         )",
+        "capture-time analysis is detached or its sealed counts are stale",
+    )?;
+    let mut analysis_manifest_statement = connection.prepare(
+        "SELECT id, expected_manifest_digest, sealed_manifest_digest \
+         FROM capture_time_analysis_builds WHERE state = 'sealed' ORDER BY id",
+    )?;
+    let mut analysis_manifest_rows = analysis_manifest_statement.query([])?;
+    while let Some(row) = analysis_manifest_rows.next()? {
+        let id = row.get::<_, i64>(0)?;
+        let expected = row.get::<_, Vec<u8>>(1)?;
+        let sealed = row.get::<_, Vec<u8>>(2)?;
+        let actual = crate::repository::recompute_capture_time_analysis_manifest(connection, id)?;
+        if expected.as_slice() != actual.as_bytes() || sealed.as_slice() != actual.as_bytes() {
+            return Err(StoreError::MigrationHistoryMismatch(format!(
+                "capture-time analysis id {id} has a stale sealed manifest"
+            )));
+        }
+    }
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_analysis_builds AS build \
+             WHERE ( \
+                 SELECT COALESCE(sum(report.expected_retained_field_bytes), 0) \
+                 FROM capture_time_analysis_sources AS source \
+                 JOIN metadata_extraction_reports AS report ON report.id = source.report_id \
+                 WHERE source.analysis_build_id = build.id \
+             ) > 33554432 \
+                OR ( \
+                    SELECT COALESCE(sum(report.expected_issue_count), 0) \
+                    FROM capture_time_analysis_sources AS source \
+                    JOIN metadata_extraction_reports AS report ON report.id = source.report_id \
+                    WHERE source.analysis_build_id = build.id \
+                ) > 8192 \
+                OR ( \
+                    SELECT COALESCE(sum(length(field.bmff_box_path) / 4), 0) \
+                    FROM capture_time_analysis_sources AS source \
+                    JOIN metadata_extraction_fields AS field \
+                      ON field.report_id = source.report_id \
+                    WHERE source.analysis_build_id = build.id \
+                ) > 49152 \
+                OR length(CAST(build.policy_context_json AS BLOB)) + ( \
+                    SELECT COALESCE(sum( \
+                        length(CAST(candidate.evidence_kinds_json AS BLOB)) \
+                        + length(CAST(candidate.source_keys_json AS BLOB)) \
+                        + length(CAST(candidate.lineage_keys_json AS BLOB)) \
+                        + length(CAST(candidate.observation_ordinals_json AS BLOB)) \
+                        + length(CAST(candidate.anomalies_json AS BLOB)) \
+                        + length(CAST(candidate.blockers_json AS BLOB)) \
+                    ), 0) \
+                    FROM capture_time_candidates AS candidate \
+                    WHERE candidate.analysis_build_id = build.id \
+                ) + ( \
+                    SELECT COALESCE(sum( \
+                        length(CAST(issue.observation_ordinals_json AS BLOB)) \
+                        + length(CAST(issue.source_keys_json AS BLOB)) \
+                        + length(CAST(issue.lineage_keys_json AS BLOB)) \
+                        + length(CAST(issue.context AS BLOB)) \
+                    ), 0) \
+                    FROM capture_time_policy_issues AS issue \
+                    WHERE issue.analysis_build_id = build.id \
+                ) > 16777216 \
+         )",
+        "capture-time analysis exceeds raw, issue, BMFF-path, or JSON byte limits",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_analysis_sources AS source \
+             JOIN capture_time_analysis_builds AS build ON build.id = source.analysis_build_id \
+             JOIN metadata_extraction_reports AS report ON report.id = source.report_id \
+             WHERE source.created_at_ms < MAX(build.created_at_ms, report.finalized_at_ms) \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND source.created_at_ms > build.finalized_at_ms) \
+             UNION ALL \
+             SELECT 1 FROM capture_time_observations AS observation \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = observation.analysis_build_id \
+             WHERE observation.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND observation.created_at_ms > build.finalized_at_ms) \
+             UNION ALL \
+             SELECT 1 FROM capture_time_candidates AS candidate \
+             JOIN capture_time_analysis_builds AS build ON build.id = candidate.analysis_build_id \
+             WHERE candidate.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND candidate.created_at_ms > build.finalized_at_ms) \
+             UNION ALL \
+             SELECT 1 FROM capture_time_policy_issues AS issue \
+             JOIN capture_time_analysis_builds AS build ON build.id = issue.analysis_build_id \
+             WHERE issue.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND issue.created_at_ms > build.finalized_at_ms) \
+             UNION ALL \
+             SELECT 1 FROM capture_time_member_assessments AS member \
+             JOIN capture_time_analysis_builds AS build ON build.id = member.analysis_build_id \
+             WHERE member.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND member.created_at_ms > build.finalized_at_ms) \
+             UNION ALL \
+             SELECT 1 FROM capture_time_recommendations AS recommendation \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = recommendation.analysis_build_id \
+             WHERE recommendation.created_at_ms < build.created_at_ms \
+                OR (build.finalized_at_ms IS NOT NULL \
+                    AND recommendation.created_at_ms > build.finalized_at_ms) \
+             UNION ALL \
+             SELECT 1 FROM capture_time_group_outcomes AS outcome \
+             JOIN scan_time_sessions AS time_session ON time_session.id = outcome.time_session_id \
+             WHERE outcome.created_at_ms < time_session.created_at_ms \
+                OR (time_session.finalized_at_ms IS NOT NULL \
+                    AND outcome.created_at_ms > time_session.finalized_at_ms) \
+             LIMIT 1 \
+         )",
+        "capture-time evidence chronology is inconsistent",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_recommendations AS recommendation \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = recommendation.analysis_build_id \
+             WHERE recommendation.evidence_only <> 1 \
+                OR recommendation.write_authorized <> 0 \
+                OR recommendation.volume_id <> build.volume_id \
+                OR recommendation.scan_run_id <> build.scan_run_id \
+                OR recommendation.exact_group_build_id <> build.exact_group_build_id \
+                OR (recommendation.time_donor_observation_id IS NOT NULL AND NOT EXISTS ( \
+                    SELECT 1 FROM capture_time_member_assessments AS member \
+                    JOIN capture_time_candidates AS candidate \
+                      ON candidate.analysis_build_id = member.analysis_build_id \
+                     AND candidate.id = member.candidate_id \
+                    WHERE member.analysis_build_id = recommendation.analysis_build_id \
+                      AND member.media_observation_snapshot_id = \
+                          recommendation.time_donor_observation_id \
+                      AND member.candidate_id = recommendation.candidate_id \
+                      AND member.donor_eligibility = 'eligible' \
+                      AND candidate.evidence_gate = 'eligible' \
+                      AND candidate.semantic_kind = 'utc' \
+                )) \
+         )",
+        "capture-time recommendation escaped its evidence-only donor boundary",
+    )?;
+    validate_capture_time_normalized_values(connection)?;
+    validate_capture_time_json_evidence(connection)?;
+    crate::repository::validate_capture_time_candidate_supports(connection)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_normalized_capture_time(
+    entity: &str,
+    id: i64,
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    nanosecond: i64,
+    semantic_kind: &str,
+    offset_kind: &str,
+    utc_offset_minutes: Option<i64>,
+    utc_seconds_decimal: Option<&str>,
+    utc_nanoseconds: Option<i64>,
+    precision_ns: i64,
+) -> Result<()> {
+    let invalid = |reason: &str| {
+        StoreError::MigrationHistoryMismatch(format!(
+            "{entity} id {id} has an invalid normalized capture time: {reason}"
+        ))
+    };
+    if !(1..=9_999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+        || !(0..=999_999_999).contains(&nanosecond)
+        || !(1..=1_000_000_000).contains(&precision_ns)
+        || nanosecond % precision_ns != 0
+    {
+        return Err(invalid("wall components or precision are inconsistent"));
+    }
+
+    match semantic_kind {
+        "floating" => {
+            if offset_kind != "missing"
+                || utc_offset_minutes.is_some()
+                || utc_seconds_decimal.is_some()
+                || utc_nanoseconds.is_some()
+            {
+                return Err(invalid("floating time contains an invented UTC instant"));
+            }
+        }
+        "utc" => {
+            let offset = utc_offset_minutes
+                .filter(|value| (-840..=840).contains(value))
+                .ok_or_else(|| invalid("UTC offset is missing or outside +/-14:00"))?;
+            if !matches!(offset_kind, "explicit" | "quicktime_epoch_assumed_utc")
+                || (offset_kind == "quicktime_epoch_assumed_utc" && offset != 0)
+            {
+                return Err(invalid("UTC offset provenance is inconsistent"));
+            }
+            let decimal = utc_seconds_decimal.ok_or_else(|| invalid("UTC seconds are missing"))?;
+            let utc_seconds = parse_canonical_i128(decimal)
+                .ok_or_else(|| invalid("UTC seconds are not a canonical signed i128 decimal"))?;
+            let persisted_nanoseconds = utc_nanoseconds
+                .filter(|value| (0..=999_999_999).contains(value))
+                .ok_or_else(|| invalid("UTC nanoseconds are missing or out of range"))?;
+            let wall_seconds = wall_unix_seconds(year, month, day, hour, minute, second)
+                .ok_or_else(|| invalid("wall time arithmetic overflowed"))?;
+            let expected_utc = wall_seconds
+                .checked_sub(i128::from(offset) * 60)
+                .ok_or_else(|| invalid("wall-offset conversion overflowed"))?;
+            if expected_utc != utc_seconds || persisted_nanoseconds != nanosecond {
+                return Err(invalid("wall time, offset, and UTC instant disagree"));
+            }
+        }
+        _ => return Err(invalid("unknown semantic kind")),
+    }
+    Ok(())
+}
+
+fn validate_capture_time_normalized_values(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT 'capture_time_observations', id, wall_year, wall_month, wall_day, \
+                wall_hour, wall_minute, wall_second, wall_nanosecond, semantic_kind, \
+                offset_kind, utc_offset_minutes, utc_seconds_decimal, utc_nanoseconds, \
+                normalized_precision_ns \
+         FROM capture_time_observations \
+         WHERE interpretation_kind = 'timestamp' \
+         UNION ALL \
+         SELECT 'capture_time_candidates', id, wall_year, wall_month, wall_day, \
+                wall_hour, wall_minute, wall_second, wall_nanosecond, semantic_kind, \
+                offset_kind, utc_offset_minutes, utc_seconds_decimal, utc_nanoseconds, \
+                precision_ns \
+         FROM capture_time_candidates \
+         ORDER BY 1, 2",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let entity = row.get::<_, String>(0)?;
+        let id = row.get::<_, i64>(1)?;
+        validate_normalized_capture_time(
+            &entity,
+            id,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            &row.get::<_, String>(9)?,
+            &row.get::<_, String>(10)?,
+            row.get(11)?,
+            row.get::<_, Option<String>>(12)?.as_deref(),
+            row.get(13)?,
+            row.get(14)?,
+        )?;
+    }
+
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_observations AS observation \
+             WHERE observation.interpretation_kind = 'subsecond' \
+               AND (observation.subsecond_precision_ns <> \
+                        CASE observation.subsecond_digits \
+                            WHEN 1 THEN 100000000 \
+                            WHEN 2 THEN 10000000 \
+                            WHEN 3 THEN 1000000 \
+                            WHEN 4 THEN 100000 \
+                            WHEN 5 THEN 10000 \
+                            WHEN 6 THEN 1000 \
+                            WHEN 7 THEN 100 \
+                            WHEN 8 THEN 10 \
+                            WHEN 9 THEN 1 \
+                        END \
+                    OR observation.subsecond_nanosecond % \
+                        observation.subsecond_precision_ns <> 0) \
+         )",
+        "capture-time subsecond interpretation has inconsistent digits or precision",
+    )?;
+    Ok(())
+}
+
+fn validate_capture_time_json_evidence(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT id, policy_context_json, policy_context_digest \
+         FROM capture_time_analysis_builds ORDER BY id",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let id = row.get::<_, i64>(0)?;
+        let stored = row.get::<_, String>(1)?;
+        let persisted_digest = row.get::<_, Vec<u8>>(2)?;
+        let parsed: serde_json::Value = serde_json::from_str(&stored).map_err(|error| {
+            StoreError::MigrationHistoryMismatch(format!(
+                "capture-time analysis id {id} has invalid policy JSON: {error}"
+            ))
+        })?;
+        let policy = parsed.as_object().ok_or_else(|| {
+            StoreError::MigrationHistoryMismatch(format!(
+                "capture-time analysis id {id} policy JSON is not an object"
+            ))
+        })?;
+        if policy
+            .get("sentinel_rules")
+            .is_some_and(|rules| rules.as_array().map_or(true, |items| items.len() > 1_024))
+        {
+            return Err(StoreError::MigrationHistoryMismatch(format!(
+                "capture-time analysis id {id} has invalid or oversized sentinel rules"
+            )));
+        }
+        let canonical = canonical_json_text(&parsed).map_err(StoreError::from)?;
+        if canonical != stored {
+            return Err(StoreError::MigrationHistoryMismatch(format!(
+                "capture-time analysis id {id} has non-canonical policy JSON"
+            )));
+        }
+        let expected_digest = crate::repository::compute_time_policy_context_digest(&parsed)?;
+        if persisted_digest.as_slice() != expected_digest.as_bytes() {
+            return Err(StoreError::MigrationHistoryMismatch(format!(
+                "capture-time analysis id {id} has a stale policy-context digest"
+            )));
+        }
+    }
+
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_candidates AS candidate \
+             WHERE json_type(candidate.evidence_kinds_json) <> 'array' \
+                OR candidate.evidence_kinds_json <> json(candidate.evidence_kinds_json) \
+                OR json_array_length(candidate.evidence_kinds_json) NOT BETWEEN 1 AND 8192 \
+                OR json_type(candidate.source_keys_json) <> 'array' \
+                OR candidate.source_keys_json <> json(candidate.source_keys_json) \
+                OR json_array_length(candidate.source_keys_json) NOT BETWEEN 1 AND 4096 \
+                OR json_type(candidate.lineage_keys_json) <> 'array' \
+                OR candidate.lineage_keys_json <> json(candidate.lineage_keys_json) \
+                OR json_array_length(candidate.lineage_keys_json) NOT BETWEEN 1 AND 4096 \
+                OR json_type(candidate.observation_ordinals_json) <> 'array' \
+                OR candidate.observation_ordinals_json <> \
+                    json(candidate.observation_ordinals_json) \
+                OR json_array_length(candidate.observation_ordinals_json) \
+                    NOT BETWEEN 1 AND 8192 \
+                OR json_type(candidate.anomalies_json) <> 'array' \
+                OR candidate.anomalies_json <> json(candidate.anomalies_json) \
+                OR json_array_length(candidate.anomalies_json) > 8192 \
+                OR json_type(candidate.blockers_json) <> 'array' \
+                OR candidate.blockers_json <> json(candidate.blockers_json) \
+                OR json_array_length(candidate.blockers_json) > 8192 \
+                OR (candidate.evidence_gate = 'eligible' AND ( \
+                    candidate.confidence <> 'high' \
+                    OR candidate.semantic_kind <> 'utc' \
+                    OR candidate.offset_kind <> 'explicit' \
+                    OR json_array_length(candidate.blockers_json) <> 0 \
+                )) \
+                OR (candidate.evidence_gate = 'blocked' \
+                    AND json_array_length(candidate.blockers_json) < 1) \
+         )",
+        "capture-time candidate JSON is non-canonical, oversized, or gate-inconsistent",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_policy_issues AS issue \
+             WHERE issue.issue_code NOT IN ( \
+                    'invalid_field', 'invalid_companion', 'orphan_exif_companion', \
+                    'repeated_field_conflict', 'lineage_conflict', \
+                    'strong_evidence_conflict', \
+                    'strong_evidence_within_tolerance_ambiguous', \
+                    'possible_timezone_conflict', 'sentinel_value', 'obvious_future', \
+                    'outside_automatic_range', \
+                    'quicktime_epoch_semantic_uncertainty', \
+                    'extraction_report_untrusted', 'extraction_report_contradiction', \
+                    'parser_identity_mismatch', 'field_encoding_mismatch', \
+                    'container_format_mismatch', 'metadata_locator_mismatch', \
+                    'duplicate_source_identity', 'unknown_parser_identity', \
+                    'extraction_budget_contradiction', 'analysis_limit_exceeded' \
+                ) \
+                OR (issue.field_kind IS NOT NULL AND issue.field_kind NOT IN ( \
+                    'exif_date_time_original', 'exif_create_date', 'exif_modify_date', \
+                    'exif_offset_time_original', 'exif_subsec_time_original', \
+                    'quicktime_movie_header_creation_time', \
+                    'quicktime_metadata_creation_date' \
+                )) \
+                OR json_type(issue.observation_ordinals_json) <> 'array' \
+                OR issue.observation_ordinals_json <> \
+                    json(issue.observation_ordinals_json) \
+                OR json_array_length(issue.observation_ordinals_json) > 8192 \
+                OR json_type(issue.source_keys_json) <> 'array' \
+                OR issue.source_keys_json <> json(issue.source_keys_json) \
+                OR json_array_length(issue.source_keys_json) > 4096 \
+                OR json_type(issue.lineage_keys_json) <> 'array' \
+                OR issue.lineage_keys_json <> json(issue.lineage_keys_json) \
+                OR json_array_length(issue.lineage_keys_json) > 4096 \
+         )",
+        "capture-time policy issue JSON or enum evidence is non-canonical",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_candidates AS candidate, \
+                  json_each(candidate.evidence_kinds_json) AS item \
+             WHERE item.type <> 'text' \
+                OR item.value NOT IN ( \
+                    'exif_date_time_original', 'exif_create_date', 'exif_modify_date', \
+                    'quicktime_metadata_creation_date', \
+                    'quicktime_movie_header_creation_time' \
+                ) \
+             UNION ALL \
+             SELECT 1 \
+             FROM capture_time_candidates AS candidate, \
+                  json_each(candidate.anomalies_json) AS item \
+             WHERE item.type <> 'text' \
+                OR item.value NOT IN ( \
+                    'missing_offset', 'sentinel_value', 'obvious_future', \
+                    'outside_automatic_range', \
+                    'quicktime_epoch_semantic_uncertainty', 'invalid_companion' \
+                ) \
+             UNION ALL \
+             SELECT 1 \
+             FROM capture_time_candidates AS candidate, \
+                  json_each(candidate.blockers_json) AS item \
+             WHERE item.type <> 'text' \
+                OR item.value NOT IN ( \
+                    'confidence_below_high', 'no_utc_instant', 'evidence_conflict', \
+                    'sentinel_value', 'obvious_future', 'outside_automatic_range', \
+                    'quicktime_epoch_semantic_uncertainty', 'invalid_evidence_present', \
+                    'extraction_report_untrusted', 'source_not_revalidated', \
+                    'multiple_strong_values_within_tolerance' \
+                ) \
+             LIMIT 1 \
+         )",
+        "capture-time candidate JSON contains an unknown or non-text enum",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_candidates AS candidate, \
+                  json_each(candidate.source_keys_json) AS item \
+             WHERE item.type <> 'text' \
+                OR length(item.value) <> 64 \
+                OR item.value GLOB '*[^0-9a-f]*' \
+                OR NOT EXISTS ( \
+                    SELECT 1 FROM capture_time_analysis_sources AS source \
+                    WHERE source.analysis_build_id = candidate.analysis_build_id \
+                      AND lower(hex(source.source_key)) = item.value \
+                ) \
+             UNION ALL \
+             SELECT 1 \
+             FROM capture_time_candidates AS candidate, \
+                  json_each(candidate.lineage_keys_json) AS item \
+             WHERE item.type <> 'text' \
+                OR length(item.value) <> 64 \
+                OR item.value GLOB '*[^0-9a-f]*' \
+                OR NOT EXISTS ( \
+                    SELECT 1 FROM capture_time_analysis_sources AS source \
+                    WHERE source.analysis_build_id = candidate.analysis_build_id \
+                      AND lower(hex(source.lineage_key)) = item.value \
+                ) \
+             UNION ALL \
+             SELECT 1 \
+             FROM capture_time_candidates AS candidate, \
+                  json_each(candidate.observation_ordinals_json) AS item \
+             WHERE item.type <> 'integer' \
+                OR item.value < 0 \
+                OR NOT EXISTS ( \
+                    SELECT 1 FROM capture_time_observations AS observation \
+                    WHERE observation.analysis_build_id = candidate.analysis_build_id \
+                      AND observation.ordinal = item.value \
+                ) \
+             LIMIT 1 \
+         )",
+        "capture-time candidate JSON references an invalid source, lineage, or observation",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM ( \
+                 SELECT candidate.id, item.value \
+                 FROM capture_time_candidates AS candidate, \
+                      json_each(candidate.evidence_kinds_json) AS item \
+                 GROUP BY candidate.id, item.value HAVING count(*) > 1 \
+                 UNION ALL \
+                 SELECT candidate.id, item.value \
+                 FROM capture_time_candidates AS candidate, \
+                      json_each(candidate.source_keys_json) AS item \
+                 GROUP BY candidate.id, item.value HAVING count(*) > 1 \
+                 UNION ALL \
+                 SELECT candidate.id, item.value \
+                 FROM capture_time_candidates AS candidate, \
+                      json_each(candidate.lineage_keys_json) AS item \
+                 GROUP BY candidate.id, item.value HAVING count(*) > 1 \
+                 UNION ALL \
+                 SELECT candidate.id, item.value \
+                 FROM capture_time_candidates AS candidate, \
+                      json_each(candidate.observation_ordinals_json) AS item \
+                 GROUP BY candidate.id, item.value HAVING count(*) > 1 \
+                 UNION ALL \
+                 SELECT candidate.id, item.value \
+                 FROM capture_time_candidates AS candidate, \
+                      json_each(candidate.anomalies_json) AS item \
+                 GROUP BY candidate.id, item.value HAVING count(*) > 1 \
+                 UNION ALL \
+                 SELECT candidate.id, item.value \
+                 FROM capture_time_candidates AS candidate, \
+                      json_each(candidate.blockers_json) AS item \
+                 GROUP BY candidate.id, item.value HAVING count(*) > 1 \
+             ) LIMIT 1 \
+         )",
+        "capture-time candidate JSON contains duplicate support that could amplify confidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM capture_time_policy_issues AS issue, \
+                  json_each(issue.source_keys_json) AS item \
+             WHERE item.type <> 'text' \
+                OR length(item.value) <> 64 \
+                OR item.value GLOB '*[^0-9a-f]*' \
+                OR NOT EXISTS ( \
+                    SELECT 1 FROM capture_time_analysis_sources AS source \
+                    WHERE source.analysis_build_id = issue.analysis_build_id \
+                      AND lower(hex(source.source_key)) = item.value \
+                ) \
+             UNION ALL \
+             SELECT 1 \
+             FROM capture_time_policy_issues AS issue, \
+                  json_each(issue.lineage_keys_json) AS item \
+             WHERE item.type <> 'text' \
+                OR length(item.value) <> 64 \
+                OR item.value GLOB '*[^0-9a-f]*' \
+                OR NOT EXISTS ( \
+                    SELECT 1 FROM capture_time_analysis_sources AS source \
+                    WHERE source.analysis_build_id = issue.analysis_build_id \
+                      AND lower(hex(source.lineage_key)) = item.value \
+                ) \
+             UNION ALL \
+             SELECT 1 \
+             FROM capture_time_policy_issues AS issue, \
+                  json_each(issue.observation_ordinals_json) AS item \
+             WHERE item.type <> 'integer' \
+                OR item.value < 0 \
+                OR NOT EXISTS ( \
+                    SELECT 1 FROM capture_time_observations AS observation \
+                    WHERE observation.analysis_build_id = issue.analysis_build_id \
+                      AND observation.ordinal = item.value \
+                ) \
+             LIMIT 1 \
+         )",
+        "capture-time policy issue JSON references invalid evidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM ( \
+                 SELECT issue.id, item.value \
+                 FROM capture_time_policy_issues AS issue, \
+                      json_each(issue.source_keys_json) AS item \
+                 GROUP BY issue.id, item.value HAVING count(*) > 1 \
+                 UNION ALL \
+                 SELECT issue.id, item.value \
+                 FROM capture_time_policy_issues AS issue, \
+                      json_each(issue.lineage_keys_json) AS item \
+                 GROUP BY issue.id, item.value HAVING count(*) > 1 \
+                 UNION ALL \
+                 SELECT issue.id, item.value \
+                 FROM capture_time_policy_issues AS issue, \
+                      json_each(issue.observation_ordinals_json) AS item \
+                 GROUP BY issue.id, item.value HAVING count(*) > 1 \
+             ) LIMIT 1 \
+         )",
+        "capture-time policy issue JSON contains duplicate references",
+    )?;
+    Ok(())
+}
+
+fn canonical_json_text(value: &serde_json::Value) -> serde_json::Result<String> {
+    serde_json::to_string(&canonicalize_json_value(value))
+}
+
+fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonicalize_json_value).collect())
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key.clone(), canonicalize_json_value(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn parse_canonical_i128(value: &str) -> Option<i128> {
+    if value.is_empty()
+        || value.starts_with('+')
+        || value == "-0"
+        || (value.starts_with('0') && value.len() > 1)
+        || (value.starts_with("-0"))
+        || value.trim() != value
+    {
+        return None;
+    }
+    let parsed = value.parse::<i128>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn wall_unix_seconds(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<i128> {
+    let adjusted_year = year.checked_sub(i64::from(month <= 2))?;
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year.checked_sub(era.checked_mul(400)?)?;
+    let shifted_month = month.checked_add(if month > 2 { -3 } else { 9 })?;
+    let day_of_year = 153_i64
+        .checked_mul(shifted_month)?
+        .checked_add(2)?
+        .checked_div(5)?
+        .checked_add(day.checked_sub(1)?)?;
+    let day_of_era = year_of_era
+        .checked_mul(365)?
+        .checked_add(year_of_era / 4)?
+        .checked_sub(year_of_era / 100)?
+        .checked_add(day_of_year)?;
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)?;
+    i128::from(days)
+        .checked_mul(86_400)?
+        .checked_add(i128::from(hour) * 3_600)?
+        .checked_add(i128::from(minute) * 60)?
+        .checked_add(i128::from(second))
 }
 
 fn validate_v6_upgrade_preconditions(connection: &Connection) -> Result<()> {
@@ -2001,8 +3851,10 @@ fn schema_key((kind, name): &(String, String)) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_migration, migrate, preflight_existing, strip_transaction, validate_current_schema,
-        MIGRATIONS,
+        apply_migration, migrate, preflight_existing, reconcile_stale_scan_sessions,
+        strip_transaction, validate_capture_time_declared_bounds,
+        validate_capture_time_json_evidence, validate_capture_time_normalized_values,
+        validate_current_schema, Migration, MIGRATIONS,
     };
     use crate::model::{CapabilityProfileInput, NewScanJob, PathKey};
     use crate::repository::{
@@ -2042,6 +3894,7 @@ mod tests {
         apply_migration(&mut connection, &MIGRATIONS[3], 1_003, false)?;
         apply_migration(&mut connection, &MIGRATIONS[4], 1_004, false)?;
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
         validate_current_schema(&connection)?;
         let (encoding, raw): (String, Vec<u8>) = connection.query_row(
             "SELECT path_encoding, relative_path_raw FROM media_file_paths WHERE media_file_id = 1",
@@ -2069,6 +3922,279 @@ mod tests {
         assert!(strip_transaction(DUPLICATE_COMMIT).is_err());
         const TRAILING_SQL: &str = "BEGIN IMMEDIATE;\r\nSELECT 1;\r\nCOMMIT;\r\nSELECT 2;\r\n";
         assert!(strip_transaction(TRAILING_SQL).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn version_seven_accepts_crlf_without_changing_transaction_boundaries() -> crate::Result<()> {
+        let mut connection = empty_version_six_connection()?;
+        let crlf_sql = MIGRATIONS[6].sql.replace('\n', "\r\n").into_boxed_str();
+        let crlf_sql = Box::leak(crlf_sql);
+        let migration = Migration {
+            version: 7,
+            name: "capture_time_evidence_crlf_test",
+            sql: crlf_sql,
+            strips_embedded_transaction: false,
+        };
+
+        apply_migration(&mut connection, &migration, 1_006, false)?;
+        assert_eq!(read_test_user_version(&connection)?, 7);
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM pragma_table_list \
+                 WHERE name = 'scan_time_sessions' AND strict = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_seven_statement_failure_rolls_back_every_v7_object() -> crate::Result<()> {
+        let mut connection = empty_version_six_connection()?;
+        let failing_sql = format!(
+            "{}\nINSERT INTO definitely_missing_v7_fault_target VALUES (1);\n",
+            MIGRATIONS[6].sql
+        )
+        .into_boxed_str();
+        let failing_sql = Box::leak(failing_sql);
+        let migration = Migration {
+            version: 7,
+            name: "capture_time_evidence_fault_test",
+            sql: failing_sql,
+            strips_embedded_transaction: false,
+        };
+
+        assert!(apply_migration(&mut connection, &migration, 1_006, false).is_err());
+        assert_eq!(read_test_user_version(&connection)?, 6);
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM guiying_schema_migrations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            6
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM sqlite_schema \
+                 WHERE name IN ( \
+                     'scan_time_sessions', 'metadata_extraction_reports', \
+                     'capture_time_analysis_builds', \
+                     'trg_capture_time_recommendations_no_update_v7' \
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_seven_schema_manifest_covers_evidence_only_triggers() -> crate::Result<()> {
+        let connection = empty_latest_connection()?;
+        validate_current_schema(&connection)?;
+        connection.execute_batch("DROP TRIGGER trg_capture_time_recommendations_no_update_v7;")?;
+        assert!(validate_current_schema(&connection).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn version_seven_never_promotes_legacy_time_candidates() -> crate::Result<()> {
+        let mut connection = empty_version_six_connection()?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.execute_batch(
+            "INSERT INTO time_candidates ( \
+                 id, candidate_key, volume_id, media_file_id, scan_run_id, source_kind, \
+                 raw_value, raw_encoding, parse_status, offset_kind, precision_kind, \
+                 confidence_basis_points, ambiguity, normalized_at_ms, created_at_ms \
+             ) VALUES ( \
+                 1, zeroblob(32), 91, 92, 93, 'exif', x'01', 'ascii', 'unparseable', \
+                 'absent', 'unknown', 0, 'invalid_value', 1, 1 \
+             );",
+        )?;
+        apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM time_candidates", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            1
+        );
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM capture_time_candidates", [], |row| {
+                row.get::<_, i64>(0)
+            },)?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_seven_collision_is_atomic_and_preserves_v6_history() -> crate::Result<()> {
+        let mut connection = empty_version_six_connection()?;
+        connection
+            .execute_batch("CREATE TABLE scan_time_sessions(id INTEGER PRIMARY KEY) STRICT;")?;
+        assert!(apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false).is_err());
+        assert_eq!(read_test_user_version(&connection)?, 6);
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM guiying_schema_migrations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            6
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM sqlite_schema \
+                 WHERE name = 'metadata_extraction_reports'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_seven_reopen_validators_reject_calendar_utc_and_policy_tampering(
+    ) -> crate::Result<()> {
+        let connection = empty_latest_connection()?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.execute_batch(
+            "DROP TRIGGER trg_capture_time_candidates_insert_guard_v7; \
+             DROP TRIGGER trg_capture_time_builds_insert_guard_v7; \
+             INSERT INTO capture_time_candidates ( \
+                 id, analysis_build_id, ordinal, wall_year, wall_month, wall_day, \
+                 wall_hour, wall_minute, wall_second, wall_nanosecond, semantic_kind, \
+                 offset_kind, utc_offset_minutes, utc_seconds_decimal, utc_nanoseconds, \
+                 precision_ns, confidence, evidence_gate, evidence_kinds_json, \
+                 source_keys_json, lineage_keys_json, observation_ordinals_json, \
+                 anomalies_json, blockers_json, created_at_ms \
+             ) VALUES ( \
+                 1, 1, 0, 2023, 2, 30, 0, 0, 0, 0, 'utc', 'explicit', 0, \
+                 '1677715200', 0, 1000000000, 'low', 'blocked', \
+                 '[\"exif_date_time_original\"]', '[\"0000000000000000000000000000000000000000000000000000000000000000\"]', \
+                 '[\"0000000000000000000000000000000000000000000000000000000000000000\"]', \
+                 '[0]', '[]', '[\"confidence_below_high\"]', 1 \
+             ); \
+             INSERT INTO capture_time_analysis_builds ( \
+                 id, time_session_id, volume_id, scan_run_id, exact_group_build_id, \
+                 policy_name, policy_version, policy_context_json, policy_context_digest, \
+                 expected_source_count, expected_observation_count, expected_candidate_count, \
+                 expected_issue_count, expected_member_count, expected_recommendation_count, \
+                 expected_manifest_digest, created_at_ms \
+             ) VALUES ( \
+                 2, 1, 1, 1, 1, 'guiying-time', '1', '{\"a\":1}', zeroblob(32), \
+                 1, 0, 0, 0, 2, 1, zeroblob(32), 1 \
+             );",
+        )?;
+        assert!(validate_capture_time_normalized_values(&connection).is_err());
+        assert!(validate_capture_time_json_evidence(&connection).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn version_seven_stale_drafts_are_abandoned_without_deleting_children() -> crate::Result<()> {
+        let mut connection = empty_latest_connection()?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.execute_batch(
+            "DROP TRIGGER trg_scan_time_sessions_insert_guard_v7; \
+             DROP TRIGGER trg_metadata_reports_insert_guard_v7; \
+             DROP TRIGGER trg_capture_time_builds_insert_guard_v7; \
+             DROP TRIGGER trg_metadata_issues_insert_guard_v7; \
+             DROP TRIGGER trg_capture_time_sources_insert_guard_v7; \
+             INSERT INTO scan_time_sessions ( \
+                 id, time_session_key, volume_id, scan_run_id, core_session_id, \
+                 schema_contract_version, expected_group_count, max_total_read_bytes, \
+                 max_probe_count_per_group, max_report_total_bytes_read, \
+                 max_report_read_operations, max_report_retained_field_bytes, \
+                 max_report_fields, max_report_issues, expected_manifest_digest, created_at_ms \
+             ) VALUES ( \
+                 1, zeroblob(32), 1, 1, zeroblob(32), 1, 1, 4294967296, 4, \
+                 8388608, 32768, 262144, 128, 128, zeroblob(32), 1 \
+             ); \
+             INSERT INTO metadata_extraction_reports ( \
+                 id, time_session_id, volume_id, scan_run_id, core_session_id, \
+                 exact_group_build_id, metadata_probe_observation_id, \
+                 metadata_probe_fingerprint_id, probe_ordinal, source_size_bytes, \
+                 report_parser_name, report_parser_version, extraction_status, \
+                 effective_max_total_bytes_read, effective_max_read_operations, \
+                 effective_max_retained_field_bytes, effective_max_field_bytes, \
+                 effective_max_fields, effective_max_jpeg_segments, \
+                 effective_max_ifd_entries, effective_max_ifd_depth, \
+                 effective_max_bmff_boxes, effective_max_bmff_depth, usage_bytes_read, \
+                 usage_read_operations, usage_retained_field_bytes, usage_fields_emitted, \
+                 usage_jpeg_segments_visited, usage_ifd_entries_visited, \
+                 usage_bmff_boxes_visited, usage_max_depth_observed, expected_field_count, \
+                 expected_issue_count, expected_retained_field_bytes, retained_report_digest, \
+                 expected_manifest_digest, created_at_ms \
+             ) VALUES ( \
+                 1, 1, 1, 1, zeroblob(32), 1, 1, 1, 0, 0, 'guiying-metadata', '1', \
+                 'unsupported', 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, \
+                 0, 0, 0, 0, 0, zeroblob(32), zeroblob(32), 1 \
+             ); \
+             INSERT INTO capture_time_analysis_builds ( \
+                 id, time_session_id, volume_id, scan_run_id, exact_group_build_id, \
+                 policy_name, policy_version, policy_context_json, policy_context_digest, \
+                 expected_source_count, expected_observation_count, expected_candidate_count, \
+                 expected_issue_count, expected_member_count, expected_recommendation_count, \
+                 expected_manifest_digest, created_at_ms \
+             ) VALUES ( \
+                 1, 1, 1, 1, 1, 'guiying-time', '1', '{}', zeroblob(32), \
+                 1, 0, 0, 0, 2, 1, zeroblob(32), 1 \
+             ); \
+             INSERT INTO metadata_extraction_issues ( \
+                 id, report_id, ordinal, parser_name, parser_version, issue_code, \
+                 source_offset, context, created_at_ms \
+             ) VALUES (1, 1, 0, 'guiying-metadata', '1', 'invalid_source', NULL, 'late', 11); \
+             INSERT INTO capture_time_analysis_sources ( \
+                 analysis_build_id, ordinal, report_id, source_key, lineage_key, \
+                 binding_status, created_at_ms \
+             ) VALUES (1, 0, 1, zeroblob(32), zeroblob(32), \
+                       'reextracted_pinned_source', 10);",
+        )?;
+        reconcile_stale_scan_sessions(&mut connection, 2)?;
+        let states: (String, i64, String, i64, String, i64) = connection.query_row(
+            "SELECT time_session.state, time_session.finalized_at_ms, \
+                    report.state, report.finalized_at_ms, build.state, build.finalized_at_ms \
+             FROM scan_time_sessions AS time_session \
+             JOIN metadata_extraction_reports AS report ON report.time_session_id = time_session.id \
+             JOIN capture_time_analysis_builds AS build ON build.time_session_id = time_session.id",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            states,
+            (
+                "abandoned".into(),
+                11,
+                "abandoned".into(),
+                11,
+                "abandoned".into(),
+                10,
+            )
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM metadata_extraction_reports",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
         Ok(())
     }
 
@@ -2137,6 +4263,7 @@ mod tests {
             transaction.rollback()?;
         }
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
         validate_current_schema(&connection)?;
         Ok(())
     }
@@ -2173,6 +4300,7 @@ mod tests {
         )?;
         assert_eq!((scope.0.as_str(), scope.1), ("legacy_session_v4", 0));
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
         validate_current_schema(&connection)?;
         Ok(())
     }
@@ -2695,6 +4823,20 @@ mod tests {
         Ok(connection)
     }
 
+    fn empty_version_six_connection() -> crate::Result<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        for (index, migration) in MIGRATIONS.iter().take(6).enumerate() {
+            apply_migration(
+                &mut connection,
+                migration,
+                1_000 + i64::try_from(index).expect("six migrations fit i64"),
+                index == 0,
+            )?;
+        }
+        Ok(connection)
+    }
+
     fn read_test_user_version(connection: &Connection) -> crate::Result<i64> {
         connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -2760,5 +4902,52 @@ mod tests {
                 u8::from_str_radix(text, 16).expect("fixture hex is valid")
             })
             .collect()
+    }
+
+    #[test]
+    fn version_seven_reopen_bounds_reject_check_bypassed_zero_limits() -> crate::Result<()> {
+        let connection = empty_latest_connection()?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.pragma_update(None, "ignore_check_constraints", true)?;
+        let trigger_sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema \
+             WHERE type = 'trigger' AND name = 'trg_metadata_reports_insert_guard_v7'",
+            [],
+            |row| row.get(0),
+        )?;
+        connection.execute_batch("DROP TRIGGER trg_metadata_reports_insert_guard_v7;")?;
+        connection.execute(
+            "INSERT INTO metadata_extraction_reports ( \
+                 id, time_session_id, volume_id, scan_run_id, core_session_id, \
+                 exact_group_build_id, metadata_probe_observation_id, \
+                 metadata_probe_fingerprint_id, probe_ordinal, source_size_bytes, \
+                 report_parser_name, report_parser_version, extraction_status, \
+                 effective_max_total_bytes_read, effective_max_read_operations, \
+                 effective_max_retained_field_bytes, effective_max_field_bytes, \
+                 effective_max_fields, effective_max_jpeg_segments, effective_max_ifd_entries, \
+                 effective_max_ifd_depth, effective_max_bmff_boxes, effective_max_bmff_depth, \
+                 usage_bytes_read, usage_read_operations, usage_retained_field_bytes, \
+                 usage_fields_emitted, usage_jpeg_segments_visited, usage_ifd_entries_visited, \
+                 usage_bmff_boxes_visited, usage_max_depth_observed, expected_field_count, \
+                 expected_issue_count, expected_retained_field_bytes, retained_report_digest, \
+                 expected_manifest_digest, state, abandon_reason_code, created_at_ms, \
+                 finalized_at_ms \
+             ) VALUES ( \
+                 1, 1, 1, 1, zeroblob(32), 1, 1, 1, 0, 0, 'parser', '1', 'failed', \
+                 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, \
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, zeroblob(32), zeroblob(32), \
+                 'abandoned', 'TEST_TAMPER', 1, 1 \
+             )",
+            [],
+        )?;
+        connection.execute_batch(&trigger_sql)?;
+        connection.pragma_update(None, "ignore_check_constraints", false)?;
+
+        let error = validate_capture_time_declared_bounds(&connection)
+            .expect_err("reopen bounds accepted a zero effective extraction limit");
+        assert!(error
+            .to_string()
+            .contains("typed limits, usage, or state bounds"));
+        Ok(())
     }
 }

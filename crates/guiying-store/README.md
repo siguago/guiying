@@ -10,11 +10,13 @@ Safety properties:
 - the normal open/create API never creates parent directories implicitly;
 - the complete v1 migration is packaged inside this crate; packaged builds do
   not depend on a sibling `src-tauri` source tree;
-- an existing file is first opened read-only with `SQLITE_OPEN_NOFOLLOW` and is
-  checked for application id, supported version, contiguous/checksummed
-  migration registry, `quick_check`, foreign keys, and its actual
-  `sqlite_schema`; only then is it reopened read-write. The read-write handle
-  repeats the preflight before WAL or migrations can change the file;
+- an existing Unix database is inspected as a raw, descriptor-bound SQLite file
+  family before SQLite is allowed to open the source. A current-v7 main file
+  with the expected raw application id/version and no sidecar takes a bounded
+  fast path. Every other family is first recovered and validated on an isolated
+  clone. The source read-write handle then repeats the application id, migration
+  registry, `quick_check`, foreign-key, and actual-schema preflight before WAL
+  configuration or migration can change the file;
 - the schema manifest hashes every explicit application table, index, and
   trigger against a schema compiled from the embedded migrations. Added,
   removed, or edited safety triggers therefore fail closed even if a migration
@@ -22,10 +24,9 @@ Safety properties:
 - on Unix, existing database files must be owner-readable/writable with no
   group/world permission bits, must share an owner with their parent, and the
   parent must not be group/world writable. New files are mode `0600`; parents
-  created explicitly by this crate are mode `0700`. On Windows, Rust's standard
-  library has no complete ACL ownership check, so callers must place the DB in
-  the per-user application-data directory with an OS ACL; regular-file and
-  `SQLITE_OPEN_NOFOLLOW` checks still apply;
+  created explicitly by this crate are mode `0700`. Existing-database open on
+  Windows currently fails closed: the crate does not claim an equivalent to the
+  Unix descriptor-relative, no-follow file-family staging proof;
 - every connection enforces and reads back foreign keys, a 5-second busy
   timeout, `synchronous=FULL`, WAL mode, and `trusted_schema=OFF`;
 - SQLite defensive mode is enabled and double-quoted string literals are
@@ -49,7 +50,38 @@ Safety properties:
   pathname can still be swapped after the final check on platforms without a
   descriptor-relative no-clobber rename API, so backup destinations must also
   live in an application-private, non-writable-by-others directory. Any
-  detected mismatch aborts; an existing destination is never replaced;
+  detected mismatch aborts. The destination main file and its `-wal`, `-shm`,
+  and `-journal` names must all be absent before work, immediately before
+  publication, and after publication; none may alias any source-family name;
+- before opening a possible v1-v6 source with SQLite, Unix builds enumerate the
+  main/`-wal`/`-shm`/`-journal` family twice through a stable private-parent
+  directory descriptor. Unknown sidecars, symlinks, non-regular or linked
+  members, unsafe ownership/modes, simultaneous WAL and rollback journals,
+  oversized families, and any identity/size/time change fail closed. Main, WAL,
+  and rollback-journal bytes are copied with bounded buffers into a mode-`0700`
+  staging directory in that same parent; SHM is hashed and stability-checked but
+  deliberately omitted so isolated SQLite rebuilds it. Every copied member is
+  BLAKE3-compared, synced, and the staging directory is synced. The source is
+  never opened by SQLite during this phase and is re-hashed immediately before
+  the caller may open it read-write;
+- SQLite performs WAL or hot-journal recovery only on that isolated clone. The
+  clone must pass exact managed-version preflight, `quick_check`, full
+  `integrity_check`, and foreign-key validation. For v1-v6, SQLite's Online
+  Backup API then creates a self-contained old-version snapshot in the source
+  database's application-private parent under a unique no-clobber
+  `.guiying-pre-v7-v<version>-*.sqlite3` name. The target is normalized to a
+  rollback-journal header and repeats exact-version/full-integrity validation;
+  its file, directory entry, and parent identity are synced and rechecked before
+  the source receives any SQLite open;
+- a staging, recovery, validation, sync, or publication failure removes private
+  temporaries and returns an error without opening or changing the source. If a
+  later transactional migration or post-migration validation fails, the error
+  carries the durable snapshot path and both source and snapshot are retained;
+  the snapshot is never used to overwrite the source automatically;
+- the application database parent is the only automatic-backup destination.
+  Store code never derives a backup path from a scanned media root and never
+  writes a snapshot to the photo volume. Callers must continue to place the
+  database itself in the per-user application-data directory;
 - repository writes are short `BEGIN IMMEDIATE` transactions. Filesystem and
   hashing work must happen before entering the callback. If any public
   repository mutator returns an error, the repository is poisoned: even when
@@ -151,6 +183,20 @@ Safety properties:
   finalization must not predate their observations, fingerprints, comparisons,
   or coverage evidence. Bound issues may identify a media file only when that
   same run recorded its immutable observation;
+- version 7 adds normalized, read-only capture-time evidence after a successful
+  D1 run. A `TimeEvidenceGuard` can be minted only by the same live `Store`
+  instance that bound the current core session, after the run and job are both
+  completed and exact verification is sealed. Metadata reports are extracted
+  twice from the pinned source, bind a version-2 session/path/stat source key
+  and a version-1 exact-content lineage key, and are independently re-derived
+  from the immutable database graph when sealed and whenever the database is
+  reopened. Time sessions, reports, analyses, and per-group outcomes move only
+  from draft to an explicit terminal state; abandoned or partial work is never
+  exposed as complete. Summary, candidate, member, and policy-issue reads use
+  endpoint-bound keyset cursors, 1--256 row pages, and a 16 MiB page budget.
+  Every version-7 recommendation is constrained to `evidence_only = 1` and
+  `write_authorized = 0`. Keeper/donor policy and every media mutation remain
+  intentionally unimplemented;
 - exact duplicate groups begin as drafts. The repository derives every member
   leaf from current database evidence, requires a full verification edge for
   each non-representative member, streams and recomputes the canonical manifest,

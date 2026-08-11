@@ -20,7 +20,7 @@ fn open_enforces_settings_migrations_and_integrity() -> Result<(), Box<dyn std::
     let database = temporary.path().join("guiying.sqlite3");
     let store = Store::open_or_create(&database)?;
 
-    assert_eq!(store.schema_version()?, 6);
+    assert_eq!(store.schema_version()?, 7);
     assert!(store.settings().foreign_keys);
     assert_eq!(store.settings().busy_timeout_ms, 5_000);
     assert_eq!(store.settings().synchronous, "FULL");
@@ -41,14 +41,35 @@ fn open_enforces_settings_migrations_and_integrity() -> Result<(), Box<dyn std::
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(migration_count, 6);
+    assert_eq!(migration_count, 7);
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     assert_eq!(application_id, 0x4755_5949);
     connection.close().map_err(|(_, error)| error)?;
 
     let reopened = Store::open_existing(&database)?;
-    assert_eq!(reopened.schema_version()?, 6);
+    assert_eq!(reopened.schema_version()?, 7);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_existing_database_open_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let database = temporary.path().join("guiying.sqlite3");
+    Store::open_or_create(&database)?.close()?;
+
+    let error = match Store::open_existing(&database) {
+        Ok(_) => return Err("Windows existing-database open unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::UnsupportedPlatform {
+            operation: "pre-v7 stable file-family staging",
+            ..
+        }
+    ));
     Ok(())
 }
 

@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::fs;
 #[cfg(unix)]
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::config::DbConfig;
@@ -20,18 +22,30 @@ use tempfile::NamedTempFile;
 use crate::error::{Result, StoreError};
 use crate::migrations;
 use crate::model::{
-    CandidateBucketRecord, CoreSessionId, DirectoryObjectSignature, DirectoryTicketCursor,
+    CandidateBucketRecord, CaptureTimeCandidateAnomaly, CaptureTimeCandidateCursor,
+    CaptureTimeCandidateRecord, CaptureTimeConfidence, CaptureTimeDecision,
+    CaptureTimeEvidenceBlocker, CaptureTimeEvidenceGate, CaptureTimeEvidenceKind,
+    CaptureTimeGroupSummaryRecord, CaptureTimeIssueCursor, CaptureTimeIssueRecord,
+    CaptureTimeMemberCursor, CaptureTimeMemberRecord, CaptureTimeMetadataFieldRawDetail,
+    CaptureTimeMetadataFieldRecord, CaptureTimeMetadataReportRecord, CaptureTimeSummaryCursor,
+    CaptureWallTime, CoreSessionId, DirectoryObjectSignature, DirectoryTicketCursor,
     DirectoryTicketRecord, DuplicateGroupCursor, DuplicateGroupMemberCursor,
     DuplicateGroupMemberRecord, ExactDigestBucketCursor, ExactGroupKey, FileTicketCursor,
-    FileTicketRecord, FileTimestampParts, FingerprintBucketRecord, FingerprintFileTicketCursor,
-    FingerprintFileTicketRecord, FingerprintHintRecord, ForeignKeyViolation, FreshFingerprintKind,
-    IntegrityCheckKind, IntegrityReport, KeysetPage, ManifestDigest, MediaFileRecord,
-    ObservationCursor, ObservationRecord, Page, ParametersHash, RunEvidenceGuard,
-    SampleBucketCursor, ScanCheckpointRecord, ScanIssueCursor, ScanIssueRecord, ScanJobRecord,
-    ScanReportRecord, ScanRunRecord, SizeBucketCursor, SizeFileTicketCursor, SizeMemberCursor,
-    StablePathKey, StoreSettings, TicketSortKey, VerifiedExactGroup, MAX_PAGE_SIZE,
+    FileTicketRecord, FileTimeRelation, FileTimestampParts, FingerprintBucketRecord,
+    FingerprintFileTicketCursor, FingerprintFileTicketRecord, FingerprintHintRecord,
+    ForeignKeyViolation, FreshFingerprintKind, IntegrityCheckKind, IntegrityReport, KeysetPage,
+    ManifestDigest, MediaFileRecord, MetadataDetectedFormat, MetadataExtractionStatus,
+    MetadataFieldCursor, MetadataFieldRawLocator, MetadataReportCursor, MetadataReportDigest,
+    NormalizedCaptureTime, ObservationCursor, ObservationRecord, Page, ParametersHash,
+    RunEvidenceGuard, SampleBucketCursor, ScanCheckpointRecord, ScanIssueCursor, ScanIssueRecord,
+    ScanJobRecord, ScanReportRecord, ScanRunRecord, SizeBucketCursor, SizeFileTicketCursor,
+    SizeMemberCursor, StablePathKey, StoreSettings, StoredMetadataContainerKind,
+    StoredMetadataEncoding, StoredMetadataFieldKind, StoredTiffByteOrder, TicketSortKey,
+    TimeDonorEligibility, TimeEvidenceGuard, TimeEvidenceManifestDigest, TimeLineageKey,
+    TimeSourceKey, VerifiedExactGroup, VerifiedTimeProbeMemberRecord, VerifiedTimeProbeScopeCursor,
+    VerifiedTimeProbeScopeRecord, VerifiedTimeScopeSummary, MAX_OPAQUE_BLOB_BYTES, MAX_PAGE_SIZE,
 };
-use crate::repository::RepositoryTx;
+use crate::repository::{recompute_time_session_scope_manifest, RepositoryTx};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
@@ -43,6 +57,7 @@ const SQLITE_MAX_VARIABLES: i32 = 2_048;
 const SQLITE_MAX_TRIGGER_DEPTH: i32 = 64;
 const MAX_INTEGRITY_MESSAGES: usize = 1_024;
 const KEYSET_CURSOR_VERSION: i64 = 1;
+static STORE_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// A single configured connection to Guiying's local application database.
 ///
@@ -53,6 +68,8 @@ pub struct Store {
     pub(crate) database_path: PathBuf,
     security_snapshot: DatabaseSecuritySnapshot,
     settings: StoreSettings,
+    store_instance_key: [u8; 32],
+    live_core_sessions: HashSet<(i64, [u8; 32])>,
 }
 
 impl Store {
@@ -80,6 +97,79 @@ impl Store {
 
     pub fn settings(&self) -> &StoreSettings {
         &self.settings
+    }
+
+    /// Mint a process-local guard for the capture-time evidence stage.
+    ///
+    /// The exact stage may already have moved the scan run to a terminal
+    /// state. The binding still requires the same current capability, mount
+    /// session, core session, and this live `Store` instance. Reopening the
+    /// database produces a different instance key, so persisted core rows can
+    /// never recreate this guard.
+    pub fn time_evidence_guard(
+        &self,
+        run: RunEvidenceGuard,
+        core_session_id: CoreSessionId,
+    ) -> Result<TimeEvidenceGuard> {
+        if !self
+            .live_core_sessions
+            .contains(&(run.scan_run_id, core_session_id.into_bytes()))
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "live_core_session_store_instance",
+                id: run.scan_run_id,
+            });
+        }
+        self.consistent_read(|connection| {
+            require_current_time_core_session(connection, &run, &core_session_id)?;
+            require_stage_sealed(connection, run.scan_run_id, "exact_verification")?;
+            Ok(TimeEvidenceGuard::new(
+                run,
+                core_session_id,
+                self.store_instance_key,
+            ))
+        })
+    }
+
+    /// Returns the frozen verified-exact scope header without materializing
+    /// every group. This read is only available to the live running core
+    /// session; its result can later be supplied to `BeginTimeSessionInput`
+    /// after the run and job reach their successful terminal state.
+    pub fn verified_time_scope_summary(
+        &self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+    ) -> Result<VerifiedTimeScopeSummary> {
+        self.consistent_read(|connection| {
+            require_current_core_session(connection, guard, core_session_id)?;
+            require_stage_sealed(connection, guard.scan_run_id, "exact_verification")?;
+            let (expected_group_count, expected_manifest_digest) =
+                recompute_time_session_scope_manifest(connection, guard.scan_run_id)?;
+            Ok(VerifiedTimeScopeSummary {
+                scan_run_id: guard.scan_run_id,
+                expected_group_count,
+                expected_manifest_digest,
+            })
+        })
+    }
+
+    /// Revalidates and returns the same frozen scope after successful D1
+    /// completion, using the process-local time-evidence guard.
+    pub fn verified_time_scope_summary_for_time(
+        &self,
+        guard: &TimeEvidenceGuard,
+    ) -> Result<VerifiedTimeScopeSummary> {
+        self.consistent_read(|connection| {
+            require_live_time_evidence_guard(connection, guard, &self.store_instance_key)?;
+            require_stage_sealed(connection, guard.run().scan_run_id, "exact_verification")?;
+            let (expected_group_count, expected_manifest_digest) =
+                recompute_time_session_scope_manifest(connection, guard.run().scan_run_id)?;
+            Ok(VerifiedTimeScopeSummary {
+                scan_run_id: guard.run().scan_run_id,
+                expected_group_count,
+                expected_manifest_digest,
+            })
+        })
     }
 
     fn consistent_read<T>(&self, callback: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -113,16 +203,19 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (callback_result, poisoned) = {
-            let mut repository = RepositoryTx::new(&transaction);
+        let (callback_result, poisoned, bound_core_sessions) = {
+            let mut repository = RepositoryTx::new_bound(&transaction, self.store_instance_key);
             let result = callback(&mut repository);
-            (result, repository.is_poisoned())
+            let poisoned = repository.is_poisoned();
+            let bound_core_sessions = repository.take_bound_core_sessions();
+            (result, poisoned, bound_core_sessions)
         };
         let value = callback_result?;
         if poisoned {
             return Err(StoreError::WriteTransactionPoisoned);
         }
         transaction.commit()?;
+        self.live_core_sessions.extend(bound_core_sessions);
         self.verify_bound_database()?;
         Ok(value)
     }
@@ -1258,6 +1351,1480 @@ impl Store {
     }
 
     /// Lists only fully verified exact-byte groups.
+    pub fn list_verified_time_probe_scopes_page(
+        &self,
+        guard: &TimeEvidenceGuard,
+        cursor: Option<&VerifiedTimeProbeScopeCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<VerifiedTimeProbeScopeRecord, VerifiedTimeProbeScopeCursor>> {
+        let scan_run_id = guard.run().scan_run_id;
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        let after_build_id = validate_time_probe_scope_cursor(scan_run_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_live_time_evidence_guard(connection, guard, &self.store_instance_key)?;
+            require_stage_sealed(connection, scan_run_id, "exact_verification")?;
+            let page_bytes = connection.query_row(
+                "WITH eligible AS ( \
+                     SELECT id FROM exact_group_builds \
+                     WHERE scan_run_id = ?1 AND state = 'verified' AND id > ?2 \
+                     ORDER BY id LIMIT ?3 \
+                 ), ranked AS ( \
+                     SELECT member.exact_group_build_id, member.ordinal, \
+                            row_number() OVER ( \
+                                PARTITION BY member.exact_group_build_id \
+                                ORDER BY member.sort_rank, member.ordinal \
+                            ) AS probe_rank, \
+                            namespace_path.stable_path_key, \
+                            namespace_path.mount_relative_path_raw, \
+                            observation.root_relative_path_raw, observation.path_encoding, \
+                            observation.display_path, ticket.source_signature, \
+                            observation.file_object_key, ticket.ticket_blob, \
+                            ticket.ticket_sort_key, fingerprint.digest \
+                     FROM eligible \
+                     JOIN exact_group_build_members AS member \
+                       ON member.exact_group_build_id = eligible.id \
+                     JOIN observation_fingerprints AS fingerprint \
+                       ON fingerprint.id = member.observation_fingerprint_id \
+                      AND fingerprint.media_observation_snapshot_id = \
+                          member.media_observation_snapshot_id \
+                      AND fingerprint.fingerprint_kind = 'exact_bytes' \
+                      AND fingerprint.read_origin = 'full_hash_read' \
+                     JOIN scan_file_tickets AS ticket \
+                       ON ticket.scan_run_id = member.scan_run_id \
+                      AND ticket.media_observation_snapshot_id = \
+                          member.media_observation_snapshot_id \
+                      AND ticket.core_session_id = ?4 \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.id = member.media_observation_snapshot_id \
+                      AND observation.scan_run_id = member.scan_run_id \
+                      AND observation.volume_id = member.volume_id \
+                     JOIN media_namespace_paths AS namespace_path \
+                       ON namespace_path.id = observation.media_namespace_path_id \
+                      AND namespace_path.volume_id = observation.volume_id \
+                      AND namespace_path.media_file_id = observation.media_file_id \
+                      AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+                 ) \
+                 SELECT COALESCE(sum(4096 + length(stable_path_key) \
+                     + length(mount_relative_path_raw) + length(root_relative_path_raw) \
+                     + length(CAST(path_encoding AS BLOB)) \
+                     + length(CAST(display_path AS BLOB)) + length(source_signature) \
+                     + COALESCE(length(file_object_key), 0) + length(ticket_blob) \
+                     + length(ticket_sort_key) + length(digest)), 0) \
+                 FROM ranked WHERE probe_rank <= 4",
+                rusqlite::params![
+                    scan_run_id,
+                    after_build_id,
+                    fetch_limit,
+                    guard.core_session_id().as_bytes().as_slice(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "verified time probe scope page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+
+            let mut group_statement = connection.prepare(
+                "SELECT build.id, build.group_key, build.expected_member_count, \
+                        build.expected_edge_count, build.independent_file_count, \
+                        build.logical_reclaimable_bytes, build.expected_manifest_digest, \
+                        build.finalized_at_ms, fingerprint.fingerprint_kind, \
+                        fingerprint.algorithm, fingerprint.algorithm_version, \
+                        fingerprint.parameters_hash, fingerprint.observed_size_bytes, \
+                        fingerprint.digest \
+                 FROM exact_group_builds AS build \
+                 JOIN observation_fingerprints AS fingerprint \
+                   ON fingerprint.id = build.representative_fingerprint_id \
+                  AND fingerprint.media_observation_snapshot_id = \
+                      build.representative_observation_id \
+                  AND fingerprint.scan_run_id = build.scan_run_id \
+                  AND fingerprint.volume_id = build.volume_id \
+                 WHERE build.scan_run_id = ?1 AND build.state = 'verified' \
+                   AND build.id > ?2 AND fingerprint.fingerprint_kind = 'exact_bytes' \
+                   AND fingerprint.read_origin = 'full_hash_read' \
+                 ORDER BY build.id LIMIT ?3",
+            )?;
+            let raw_groups = group_statement
+                .query_map(
+                    rusqlite::params![scan_run_id, after_build_id, fetch_limit],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, i64>(10)?,
+                            row.get::<_, Vec<u8>>(11)?,
+                            row.get::<_, i64>(12)?,
+                            row.get::<_, Vec<u8>>(13)?,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut items = Vec::with_capacity(raw_groups.len());
+            let mut member_statement = connection.prepare(
+                "SELECT member.ordinal, member.sort_rank, fingerprint.id, \
+                        ticket.media_observation_snapshot_id, \
+                        namespace_path.stable_path_key, namespace_path.mount_relative_path_raw, \
+                        observation.root_relative_path_raw, observation.path_encoding, \
+                        observation.display_path, ticket.source_signature, \
+                        observation.file_object_key, observation.size_bytes, \
+                        ticket.ticket_format_version, ticket.ticket_blob, ticket.ticket_sort_key, \
+                        fingerprint.algorithm, fingerprint.algorithm_version, \
+                        fingerprint.parameters_hash, fingerprint.observed_size_bytes, \
+                        fingerprint.digest \
+                 FROM exact_group_build_members AS member \
+                 JOIN observation_fingerprints AS fingerprint \
+                   ON fingerprint.id = member.observation_fingerprint_id \
+                  AND fingerprint.media_observation_snapshot_id = \
+                      member.media_observation_snapshot_id \
+                  AND fingerprint.fingerprint_kind = 'exact_bytes' \
+                  AND fingerprint.read_origin = 'full_hash_read' \
+                 JOIN scan_file_tickets AS ticket \
+                   ON ticket.scan_run_id = member.scan_run_id \
+                  AND ticket.media_observation_snapshot_id = member.media_observation_snapshot_id \
+                  AND ticket.core_session_id = ?3 \
+                 JOIN media_observation_snapshots AS observation \
+                   ON observation.id = member.media_observation_snapshot_id \
+                  AND observation.scan_run_id = member.scan_run_id \
+                  AND observation.volume_id = member.volume_id \
+                 JOIN media_namespace_paths AS namespace_path \
+                   ON namespace_path.id = observation.media_namespace_path_id \
+                  AND namespace_path.volume_id = observation.volume_id \
+                  AND namespace_path.media_file_id = observation.media_file_id \
+                  AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+                 WHERE member.scan_run_id = ?1 AND member.exact_group_build_id = ?2 \
+                 ORDER BY member.sort_rank, member.ordinal LIMIT 4",
+            )?;
+            for raw in raw_groups {
+                let group_key = fixed_32_bytes("group_key", raw.1)?;
+                let manifest_digest = fixed_32_bytes("expected_manifest_digest", raw.6)?;
+                let parameters_hash = fixed_32_bytes("parameters_hash", raw.11)?;
+                if raw.8 != "exact_bytes" || raw.2 < 2 || raw.12 < 0 || raw.13.is_empty() {
+                    return Err(StoreError::invalid_input(
+                        "verified_time_probe_scope",
+                        "verified group representative fingerprint is malformed",
+                    ));
+                }
+                let member_rows = member_statement
+                    .query_map(
+                        rusqlite::params![
+                            scan_run_id,
+                            raw.0,
+                            guard.core_session_id().as_bytes().as_slice(),
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                raw_file_ticket_from_row(row, 3)?,
+                                row.get::<_, String>(15)?,
+                                row.get::<_, i64>(16)?,
+                                row.get::<_, Vec<u8>>(17)?,
+                                row.get::<_, i64>(18)?,
+                                row.get::<_, Vec<u8>>(19)?,
+                            ))
+                        },
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let expected_probe_count = usize::try_from(raw.2.min(4)).map_err(|_| {
+                    StoreError::invalid_input("member_count", "member count does not fit usize")
+                })?;
+                if member_rows.len() != expected_probe_count {
+                    return Err(StoreError::invalid_input(
+                        "verified_time_probe_scope",
+                        "verified group does not have the required live ticket probes",
+                    ));
+                }
+                let mut probes = Vec::with_capacity(member_rows.len());
+                for member in member_rows {
+                    if member.4 != raw.9
+                        || member.5 != raw.10
+                        || fixed_32_bytes("parameters_hash", member.6)? != parameters_hash
+                        || member.7 != raw.12
+                        || member.8 != raw.13
+                    {
+                        return Err(StoreError::invalid_input(
+                            "verified_time_probe_scope",
+                            "group member exact fingerprint differs from the representative",
+                        ));
+                    }
+                    probes.push(VerifiedTimeProbeMemberRecord {
+                        ordinal: member.0,
+                        sort_rank: member.1,
+                        fingerprint_id: member.2,
+                        ticket: file_ticket_record_from_raw(member.3)?,
+                    });
+                }
+                items.push(VerifiedTimeProbeScopeRecord {
+                    scan_run_id,
+                    group: VerifiedExactGroup {
+                        build_id: raw.0,
+                        group_key: ExactGroupKey::from_runtime_evidence(group_key),
+                        member_count: raw.2,
+                        edge_count: raw.3,
+                        independent_file_count: raw.4,
+                        logical_reclaimable_bytes: raw.5,
+                        manifest_digest: ManifestDigest::from_runtime_evidence(manifest_digest),
+                        finalized_at_ms: raw.7,
+                    },
+                    fingerprint_kind: FreshFingerprintKind::ExactBytes,
+                    algorithm: raw.9,
+                    algorithm_version: raw.10,
+                    parameters_hash: ParametersHash::from_runtime_evidence(parameters_hash),
+                    observed_size_bytes: raw.12,
+                    digest: raw.13,
+                    probes,
+                });
+            }
+            keyset_page_from_items(items, limit, |record| VerifiedTimeProbeScopeCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                last_group_build_id: record.group.build_id,
+            })
+        })
+    }
+
+    /// Lists terminal, manifest-validated capture-time group summaries only.
+    pub fn list_capture_time_group_summaries_page(
+        &self,
+        scan_run_id: i64,
+        cursor: Option<&CaptureTimeSummaryCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<CaptureTimeGroupSummaryRecord, CaptureTimeSummaryCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        let after_group_id = validate_capture_time_summary_cursor(scan_run_id, cursor)?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(1024 + length(CAST(recommendation.reason_code AS BLOB))), 0) \
+                 FROM ( \
+                     SELECT build.id FROM capture_time_analysis_builds AS build \
+                     JOIN scan_time_sessions AS session \
+                       ON session.id = build.time_session_id \
+                      AND session.state IN ('complete', 'partial') \
+                     WHERE build.scan_run_id = ?1 AND build.state = 'sealed' \
+                       AND build.exact_group_build_id > ?2 \
+                     ORDER BY build.exact_group_build_id LIMIT ?3 \
+                 ) AS eligible \
+                 JOIN capture_time_recommendations AS recommendation \
+                   ON recommendation.analysis_build_id = eligible.id",
+                rusqlite::params![scan_run_id, after_group_id, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "capture-time summary page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT build.id, build.exact_group_build_id, build.decision, \
+                        build.selected_candidate_ordinal, build.expected_source_count, \
+                        build.expected_observation_count, build.expected_candidate_count, \
+                        build.expected_issue_count, build.expected_member_count, \
+                        (SELECT report.metadata_probe_observation_id \
+                         FROM capture_time_analysis_sources AS source \
+                         JOIN metadata_extraction_reports AS report ON report.id = source.report_id \
+                         WHERE source.analysis_build_id = build.id \
+                         ORDER BY source.ordinal LIMIT 1), \
+                        recommendation.keeper_observation_id, \
+                        recommendation.time_donor_observation_id, \
+                        recommendation.evidence_only, recommendation.write_authorized, \
+                        build.finalized_at_ms \
+                 FROM capture_time_analysis_builds AS build \
+                 JOIN scan_time_sessions AS session \
+                   ON session.id = build.time_session_id \
+                  AND session.state IN ('complete', 'partial') \
+                 JOIN capture_time_recommendations AS recommendation \
+                   ON recommendation.analysis_build_id = build.id \
+                 WHERE build.scan_run_id = ?1 AND build.state = 'sealed' \
+                   AND build.exact_group_build_id > ?2 \
+                 ORDER BY build.exact_group_build_id LIMIT ?3",
+            )?;
+            let mut items = Vec::new();
+            let rows = statement.query_map(
+                rusqlite::params![scan_run_id, after_group_id, fetch_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, i64>(14)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let row = row?;
+                if row.12 != 1 || row.13 != 0 || row.10.is_some() || row.11.is_some() {
+                    return Err(StoreError::invalid_input(
+                        "capture_time_recommendation",
+                        "sealed v7 recommendation is not evidence-only/no-write or carries an unimplemented keeper/donor",
+                    ));
+                }
+                items.push(CaptureTimeGroupSummaryRecord {
+                    analysis_build_id: row.0,
+                    exact_group_build_id: row.1,
+                    decision: parse_capture_time_decision(&row.2)?,
+                    selected_candidate_ordinal: row.3,
+                    source_count: row.4,
+                    observation_count: row.5,
+                    candidate_count: row.6,
+                    issue_count: row.7,
+                    member_count: row.8,
+                    metadata_probe_observation_id: row.9,
+                    keeper_observation_id: None,
+                    time_donor_observation_id: None,
+                    evidence_only: true,
+                    write_authorized: false,
+                    finalized_at_ms: row.14,
+                });
+            }
+            keyset_page_from_items(items, limit, |record| CaptureTimeSummaryCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                last_exact_group_build_id: record.exact_group_build_id,
+            })
+        })
+    }
+
+    /// Reads one terminal, manifest-validated capture-time group summary.
+    ///
+    /// This point lookup exists so a UI sorted by a different duplicate-group
+    /// key never has to walk the global capture-time summary cursor just to
+    /// inspect one selected group.
+    pub fn get_capture_time_group_summary(
+        &self,
+        scan_run_id: i64,
+        exact_group_build_id: i64,
+    ) -> Result<Option<CaptureTimeGroupSummaryRecord>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("exact_group_build_id", exact_group_build_id)?;
+        self.consistent_read(|connection| {
+            let row = connection
+                .query_row(
+                    "SELECT build.id, build.exact_group_build_id, build.decision, \
+                            build.selected_candidate_ordinal, build.expected_source_count, \
+                            build.expected_observation_count, build.expected_candidate_count, \
+                            build.expected_issue_count, build.expected_member_count, \
+                            (SELECT report.metadata_probe_observation_id \
+                             FROM capture_time_analysis_sources AS source \
+                             JOIN metadata_extraction_reports AS report ON report.id = source.report_id \
+                             WHERE source.analysis_build_id = build.id \
+                             ORDER BY source.ordinal LIMIT 1), \
+                            recommendation.keeper_observation_id, \
+                            recommendation.time_donor_observation_id, \
+                            recommendation.evidence_only, recommendation.write_authorized, \
+                            build.finalized_at_ms, \
+                            length(CAST(recommendation.reason_code AS BLOB)) \
+                     FROM capture_time_analysis_builds AS build \
+                     JOIN scan_time_sessions AS session \
+                       ON session.id = build.time_session_id \
+                      AND session.state IN ('complete', 'partial') \
+                     JOIN capture_time_recommendations AS recommendation \
+                       ON recommendation.analysis_build_id = build.id \
+                     WHERE build.scan_run_id = ?1 \
+                       AND build.exact_group_build_id = ?2 \
+                       AND build.state = 'sealed'",
+                    rusqlite::params![scan_run_id, exact_group_build_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, Option<i64>>(9)?,
+                            row.get::<_, Option<i64>>(10)?,
+                            row.get::<_, Option<i64>>(11)?,
+                            row.get::<_, i64>(12)?,
+                            row.get::<_, i64>(13)?,
+                            row.get::<_, i64>(14)?,
+                            row.get::<_, i64>(15)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            enforce_read_budget(
+                "capture-time summary point lookup",
+                1024_i64.checked_add(row.15).ok_or_else(|| {
+                    StoreError::invalid_input(
+                        "capture_time_recommendation",
+                        "capture-time summary byte estimate overflowed",
+                    )
+                })?,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            if row.12 != 1 || row.13 != 0 || row.10.is_some() || row.11.is_some() {
+                return Err(StoreError::invalid_input(
+                    "capture_time_recommendation",
+                    "sealed v7 recommendation is not evidence-only/no-write or carries an unimplemented keeper/donor",
+                ));
+            }
+            Ok(Some(CaptureTimeGroupSummaryRecord {
+                analysis_build_id: row.0,
+                exact_group_build_id: row.1,
+                decision: parse_capture_time_decision(&row.2)?,
+                selected_candidate_ordinal: row.3,
+                source_count: row.4,
+                observation_count: row.5,
+                candidate_count: row.6,
+                issue_count: row.7,
+                member_count: row.8,
+                metadata_probe_observation_id: row.9,
+                keeper_observation_id: None,
+                time_donor_observation_id: None,
+                evidence_only: true,
+                write_authorized: false,
+                finalized_at_ms: row.14,
+            }))
+        })
+    }
+
+    pub fn list_capture_time_candidates_page(
+        &self,
+        scan_run_id: i64,
+        exact_group_build_id: i64,
+        analysis_build_id: i64,
+        cursor: Option<&CaptureTimeCandidateCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<CaptureTimeCandidateRecord, CaptureTimeCandidateCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("exact_group_build_id", exact_group_build_id)?;
+        validate_positive_read_id("analysis_build_id", analysis_build_id)?;
+        let after_ordinal = validate_capture_time_candidate_cursor(
+            scan_run_id,
+            exact_group_build_id,
+            analysis_build_id,
+            cursor,
+        )?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_sealed_time_analysis_scope(
+                connection,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+            )?;
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(2048 + length(CAST(evidence_kinds_json AS BLOB)) \
+                        + length(CAST(source_keys_json AS BLOB)) \
+                        + length(CAST(lineage_keys_json AS BLOB)) \
+                        + length(CAST(observation_ordinals_json AS BLOB)) \
+                        + length(CAST(anomalies_json AS BLOB)) \
+                        + length(CAST(blockers_json AS BLOB))), 0) \
+                 FROM (SELECT * FROM capture_time_candidates \
+                       WHERE analysis_build_id = ?1 AND ordinal > ?2 \
+                       ORDER BY ordinal, id LIMIT ?3)",
+                rusqlite::params![analysis_build_id, after_ordinal, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "capture-time candidate page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT ordinal, wall_year, wall_month, wall_day, wall_hour, wall_minute, \
+                        wall_second, wall_nanosecond, semantic_kind, offset_kind, \
+                        utc_offset_minutes, utc_seconds_decimal, utc_nanoseconds, precision_ns, \
+                        confidence, evidence_gate, evidence_kinds_json, source_keys_json, \
+                        lineage_keys_json, observation_ordinals_json, anomalies_json, blockers_json \
+                 FROM capture_time_candidates \
+                 WHERE analysis_build_id = ?1 AND ordinal > ?2 \
+                 ORDER BY ordinal, id LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![analysis_build_id, after_ordinal, fetch_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<i64>>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, String>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, String>(18)?,
+                        row.get::<_, String>(19)?,
+                        row.get::<_, String>(20)?,
+                        row.get::<_, String>(21)?,
+                    ))
+                },
+            )?;
+            let mut items = Vec::new();
+            for row in rows {
+                let row = row?;
+                let wall = CaptureWallTime::new(
+                    checked_from_i64("wall_year", row.1)?,
+                    checked_from_i64("wall_month", row.2)?,
+                    checked_from_i64("wall_day", row.3)?,
+                    checked_from_i64("wall_hour", row.4)?,
+                    checked_from_i64("wall_minute", row.5)?,
+                    checked_from_i64("wall_second", row.6)?,
+                    checked_from_i64("wall_nanosecond", row.7)?,
+                )?;
+                let precision_ns = checked_from_i64("precision_ns", row.13)?;
+                let timestamp = match (row.8.as_str(), row.9.as_str()) {
+                    ("floating", "missing") => NormalizedCaptureTime::floating(wall, precision_ns)?,
+                    ("utc", "explicit") => NormalizedCaptureTime::explicit_utc(
+                        wall,
+                        checked_optional_i16("utc_offset_minutes", row.10)?,
+                        row.11.ok_or_else(|| StoreError::invalid_input(
+                            "utc_seconds_decimal",
+                            "stored UTC candidate lacks canonical seconds",
+                        ))?,
+                        checked_optional_u32("utc_nanoseconds", row.12)?,
+                        precision_ns,
+                    )?,
+                    ("utc", "quicktime_epoch_assumed_utc") => {
+                        if checked_optional_i16("utc_offset_minutes", row.10)? != 0 {
+                            return Err(StoreError::invalid_input(
+                                "utc_offset_minutes",
+                                "QuickTime epoch assumption must use UTC offset zero",
+                            ));
+                        }
+                        NormalizedCaptureTime::quicktime_epoch_assumed_utc(
+                            wall,
+                            row.11.ok_or_else(|| StoreError::invalid_input(
+                                "utc_seconds_decimal",
+                                "stored UTC candidate lacks canonical seconds",
+                            ))?,
+                            checked_optional_u32("utc_nanoseconds", row.12)?,
+                            precision_ns,
+                        )?
+                    }
+                    _ => {
+                        return Err(StoreError::invalid_input(
+                            "capture_time_candidate",
+                            "stored semantic/offset combination is invalid",
+                        ));
+                    }
+                };
+                let evidence_kinds = parse_evidence_kind_array(&row.16)?;
+                let source_keys = parse_time_source_key_array(&row.17)?;
+                let lineage_keys = parse_time_lineage_key_array(&row.18)?;
+                let observation_ordinals = parse_nonnegative_i64_array(&row.19)?;
+                let anomalies = parse_candidate_anomaly_array(&row.20)?;
+                let blockers = parse_evidence_blocker_array(&row.21)?;
+                let evidence_gate = match row.15.as_str() {
+                    "eligible" if blockers.is_empty() => CaptureTimeEvidenceGate::eligible(),
+                    "blocked" => CaptureTimeEvidenceGate::blocked(blockers)?,
+                    _ => {
+                        return Err(StoreError::invalid_input(
+                            "capture_time_evidence_gate",
+                            "stored gate and blocker list are inconsistent",
+                        ));
+                    }
+                };
+                items.push(CaptureTimeCandidateRecord {
+                    analysis_build_id,
+                    ordinal: row.0,
+                    timestamp,
+                    confidence: parse_capture_time_confidence(&row.14)?,
+                    evidence_gate,
+                    evidence_kinds,
+                    source_keys,
+                    lineage_keys,
+                    observation_ordinals,
+                    anomalies,
+                });
+            }
+            keyset_page_from_items(items, limit, |record| CaptureTimeCandidateCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+                last_ordinal: record.ordinal,
+            })
+        })
+    }
+
+    pub fn list_capture_time_members_page(
+        &self,
+        scan_run_id: i64,
+        exact_group_build_id: i64,
+        analysis_build_id: i64,
+        cursor: Option<&CaptureTimeMemberCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<CaptureTimeMemberRecord, CaptureTimeMemberCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("exact_group_build_id", exact_group_build_id)?;
+        validate_positive_read_id("analysis_build_id", analysis_build_id)?;
+        let after_ordinal = validate_capture_time_member_cursor(
+            scan_run_id,
+            exact_group_build_id,
+            analysis_build_id,
+            cursor,
+        )?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_sealed_time_analysis_scope(
+                connection,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+            )?;
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(1024 + length(CAST(reason_code AS BLOB))), 0) \
+                 FROM (SELECT reason_code FROM capture_time_member_assessments \
+                       WHERE analysis_build_id = ?1 AND member_ordinal > ?2 \
+                       ORDER BY member_ordinal LIMIT ?3)",
+                rusqlite::params![analysis_build_id, after_ordinal, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "capture-time member page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT member.member_ordinal, member.media_observation_snapshot_id, \
+                        candidate.ordinal, observation.birth_time_seconds, \
+                        observation.birth_time_nanoseconds, observation.modified_time_seconds, \
+                        observation.modified_time_nanoseconds, observation.timestamp_granularity_ns, \
+                        member.birth_time_relation, member.modified_time_relation, \
+                        member.donor_eligibility, member.reason_code \
+                 FROM capture_time_member_assessments AS member \
+                 JOIN media_observation_snapshots AS observation \
+                   ON observation.id = member.media_observation_snapshot_id \
+                  AND observation.scan_run_id = member.scan_run_id \
+                  AND observation.volume_id = member.volume_id \
+                 LEFT JOIN capture_time_candidates AS candidate \
+                   ON candidate.analysis_build_id = member.analysis_build_id \
+                  AND candidate.id = member.candidate_id \
+                 WHERE member.analysis_build_id = ?1 AND member.member_ordinal > ?2 \
+                 ORDER BY member.member_ordinal LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![analysis_build_id, after_ordinal, fetch_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                    ))
+                },
+            )?;
+            let mut items = Vec::new();
+            for row in rows {
+                let row = row?;
+                let birth_time = match (row.3, row.4) {
+                    (None, None) => None,
+                    (Some(seconds), Some(nanoseconds)) => Some(FileTimestampParts {
+                        seconds,
+                        nanoseconds: checked_from_i64("birth_time_nanoseconds", nanoseconds)?,
+                    }),
+                    _ => {
+                        return Err(StoreError::invalid_input(
+                            "birth_time",
+                            "stored birth-time seconds/nanoseconds nullability differs",
+                        ));
+                    }
+                };
+                items.push(CaptureTimeMemberRecord {
+                    analysis_build_id,
+                    member_ordinal: row.0,
+                    observation_id: row.1,
+                    candidate_ordinal: row.2,
+                    birth_time,
+                    modified_time: FileTimestampParts {
+                        seconds: row.5,
+                        nanoseconds: checked_from_i64("modified_time_nanoseconds", row.6)?,
+                    },
+                    timestamp_granularity_ns: row.7,
+                    birth_time_relation: parse_file_time_relation(&row.8)?,
+                    modified_time_relation: parse_file_time_relation(&row.9)?,
+                    donor_eligibility: parse_time_donor_eligibility(&row.10)?,
+                    reason_code: row.11,
+                });
+            }
+            keyset_page_from_items(items, limit, |record| CaptureTimeMemberCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+                last_member_ordinal: record.member_ordinal,
+            })
+        })
+    }
+
+    pub fn list_capture_time_issues_page(
+        &self,
+        scan_run_id: i64,
+        exact_group_build_id: i64,
+        analysis_build_id: i64,
+        cursor: Option<&CaptureTimeIssueCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<CaptureTimeIssueRecord, CaptureTimeIssueCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("exact_group_build_id", exact_group_build_id)?;
+        validate_positive_read_id("analysis_build_id", analysis_build_id)?;
+        let after_ordinal = validate_capture_time_issue_cursor(
+            scan_run_id,
+            exact_group_build_id,
+            analysis_build_id,
+            cursor,
+        )?;
+        let fetch_limit = validated_keyset_limit(limit)?;
+        self.consistent_read(|connection| {
+            require_sealed_time_analysis_scope(
+                connection,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+            )?;
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(1024 + length(CAST(issue_code AS BLOB)) \
+                        + length(CAST(observation_ordinals_json AS BLOB)) \
+                        + length(CAST(source_keys_json AS BLOB)) \
+                        + length(CAST(lineage_keys_json AS BLOB)) \
+                        + length(CAST(context AS BLOB))), 0) \
+                 FROM (SELECT * FROM capture_time_policy_issues \
+                       WHERE analysis_build_id = ?1 AND ordinal > ?2 \
+                       ORDER BY ordinal, id LIMIT ?3)",
+                rusqlite::params![analysis_build_id, after_ordinal, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget("capture-time issue page", page_bytes, MAX_PAGE_RESULT_BYTES)?;
+            let mut statement = connection.prepare(
+                "SELECT ordinal, issue_code, field_kind, observation_ordinals_json, \
+                        source_keys_json, lineage_keys_json, context \
+                 FROM capture_time_policy_issues \
+                 WHERE analysis_build_id = ?1 AND ordinal > ?2 \
+                 ORDER BY ordinal, id LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![analysis_build_id, after_ordinal, fetch_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )?;
+            let mut items = Vec::new();
+            for row in rows {
+                let row = row?;
+                items.push(CaptureTimeIssueRecord {
+                    analysis_build_id,
+                    ordinal: row.0,
+                    code: row.1,
+                    field_kind: row
+                        .2
+                        .as_deref()
+                        .map(parse_stored_metadata_field_kind)
+                        .transpose()?,
+                    observation_ordinals: parse_nonnegative_i64_array(&row.3)?,
+                    source_keys: parse_time_source_key_array(&row.4)?,
+                    lineage_keys: parse_time_lineage_key_array(&row.5)?,
+                    context: row.6,
+                });
+            }
+            keyset_page_from_items(items, limit, |record| CaptureTimeIssueCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+                last_ordinal: record.ordinal,
+            })
+        })
+    }
+
+    /// Lists only sealed metadata reports that are part of one terminal,
+    /// evidence-producing capture-time analysis.
+    ///
+    /// The projection intentionally excludes retained raw field bytes, the
+    /// source's native root-relative bytes, and ISO-BMFF box paths.
+    pub fn list_capture_time_metadata_reports_page(
+        &self,
+        scan_run_id: i64,
+        exact_group_build_id: i64,
+        analysis_build_id: i64,
+        cursor: Option<&MetadataReportCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<CaptureTimeMetadataReportRecord, MetadataReportCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("exact_group_build_id", exact_group_build_id)?;
+        validate_positive_read_id("analysis_build_id", analysis_build_id)?;
+        let after = validate_metadata_report_cursor(
+            scan_run_id,
+            exact_group_build_id,
+            analysis_build_id,
+            cursor,
+        )?;
+        let fetch_limit = validated_metadata_page_limit(limit, 32, "metadata report")?;
+        self.consistent_read(|connection| {
+            require_sealed_time_analysis_scope(
+                connection,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+            )?;
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(2048 \
+                        + length(CAST(observation.display_path AS BLOB)) \
+                        + length(CAST(observation.path_encoding AS BLOB)) \
+                        + length(CAST(report.report_parser_name AS BLOB)) \
+                        + length(CAST(report.report_parser_version AS BLOB)) \
+                        + COALESCE(length(CAST(report.detected_format AS BLOB)), 0) \
+                        + length(CAST(report.extraction_status AS BLOB)) \
+                        + length(report.retained_report_digest) \
+                        + length(report.sealed_manifest_digest) \
+                        + length(revalidation.first_report_digest) \
+                        + length(revalidation.second_report_digest) \
+                        + length(CAST(revalidation.trust_scope AS BLOB))), 0) \
+                 FROM ( \
+                     SELECT source.ordinal AS source_ordinal, source.report_id \
+                     FROM capture_time_analysis_sources AS source \
+                     WHERE source.analysis_build_id = ?1 \
+                       AND source.binding_status = 'reextracted_pinned_source' \
+                       AND EXISTS ( \
+                           SELECT 1 FROM capture_time_analysis_builds AS inner_build \
+                           JOIN scan_time_sessions AS inner_session \
+                             ON inner_session.id = inner_build.time_session_id \
+                            AND inner_session.state IN ('complete', 'partial') \
+                            AND inner_session.sealed_manifest_digest = \
+                                inner_session.expected_manifest_digest \
+                            AND inner_session.sealed_outcome_manifest_digest IS NOT NULL \
+                           JOIN capture_time_group_outcomes AS inner_outcome \
+                             ON inner_outcome.time_session_id = inner_session.id \
+                            AND inner_outcome.exact_group_build_id = \
+                                inner_build.exact_group_build_id \
+                            AND inner_outcome.analysis_build_id = inner_build.id \
+                            AND inner_outcome.outcome = 'evidence' \
+                           JOIN capture_time_recommendations AS inner_recommendation \
+                             ON inner_recommendation.analysis_build_id = inner_build.id \
+                            AND inner_recommendation.evidence_only = 1 \
+                            AND inner_recommendation.write_authorized = 0 \
+                            AND inner_recommendation.keeper_observation_id IS NULL \
+                            AND inner_recommendation.time_donor_observation_id IS NULL \
+                           JOIN metadata_extraction_reports AS inner_report \
+                             ON inner_report.id = source.report_id \
+                            AND inner_report.time_session_id = inner_session.id \
+                            AND inner_report.scan_run_id = inner_build.scan_run_id \
+                            AND inner_report.exact_group_build_id = \
+                                inner_build.exact_group_build_id \
+                            AND inner_report.state = 'sealed' \
+                            AND inner_report.sealed_manifest_digest = \
+                                inner_report.expected_manifest_digest \
+                           JOIN metadata_source_revalidations AS inner_revalidation \
+                             ON inner_revalidation.report_id = inner_report.id \
+                            AND inner_revalidation.time_session_id = \
+                                inner_report.time_session_id \
+                            AND inner_revalidation.scan_run_id = inner_report.scan_run_id \
+                            AND inner_revalidation.exact_group_build_id = \
+                                inner_report.exact_group_build_id \
+                            AND inner_revalidation.metadata_probe_observation_id = \
+                                inner_report.metadata_probe_observation_id \
+                            AND inner_revalidation.source_key = source.source_key \
+                            AND inner_revalidation.lineage_key = source.lineage_key \
+                            AND inner_revalidation.source_key_version = 2 \
+                            AND inner_revalidation.lineage_key_version = 1 \
+                            AND inner_revalidation.outcome = 'reextracted_pinned_exact' \
+                            AND inner_revalidation.descriptor_revalidated = 1 \
+                            AND inner_revalidation.path_revalidated = 1 \
+                            AND inner_revalidation.session_revalidated = 1 \
+                            AND inner_revalidation.trust_scope = 'historical_proof_only' \
+                            AND inner_revalidation.source_signature_before = \
+                                inner_revalidation.source_signature_after \
+                            AND inner_revalidation.first_report_digest = \
+                                inner_revalidation.second_report_digest \
+                            AND inner_revalidation.first_report_digest = \
+                                inner_report.retained_report_digest \
+                           JOIN media_observation_snapshots AS inner_observation \
+                             ON inner_observation.id = \
+                                inner_report.metadata_probe_observation_id \
+                            AND inner_observation.volume_id = inner_report.volume_id \
+                            AND inner_observation.scan_run_id = inner_report.scan_run_id \
+                            AND inner_observation.source_signature = \
+                                inner_revalidation.source_signature_before \
+                           WHERE inner_build.id = source.analysis_build_id \
+                             AND inner_build.scan_run_id = ?5 \
+                             AND inner_build.exact_group_build_id = ?6 \
+                             AND inner_build.state = 'sealed' \
+                             AND inner_build.sealed_manifest_digest = \
+                                 inner_build.expected_manifest_digest \
+                       ) \
+                       AND (source.ordinal > ?2 \
+                            OR (source.ordinal = ?2 AND source.report_id > ?3)) \
+                     ORDER BY source.ordinal, source.report_id LIMIT ?4 \
+                 ) AS page \
+                 JOIN capture_time_analysis_sources AS source \
+                   ON source.analysis_build_id = ?1 \
+                  AND source.ordinal = page.source_ordinal \
+                  AND source.report_id = page.report_id \
+                  AND source.binding_status = 'reextracted_pinned_source' \
+                 JOIN capture_time_analysis_builds AS build \
+                   ON build.id = source.analysis_build_id \
+                  AND build.scan_run_id = ?5 \
+                  AND build.exact_group_build_id = ?6 \
+                  AND build.state = 'sealed' \
+                  AND build.sealed_manifest_digest = build.expected_manifest_digest \
+                 JOIN scan_time_sessions AS session \
+                   ON session.id = build.time_session_id \
+                  AND session.state IN ('complete', 'partial') \
+                  AND session.sealed_manifest_digest = session.expected_manifest_digest \
+                  AND session.sealed_outcome_manifest_digest IS NOT NULL \
+                 JOIN capture_time_group_outcomes AS outcome \
+                   ON outcome.time_session_id = session.id \
+                  AND outcome.exact_group_build_id = build.exact_group_build_id \
+                  AND outcome.analysis_build_id = build.id \
+                  AND outcome.outcome = 'evidence' \
+                 JOIN capture_time_recommendations AS recommendation \
+                   ON recommendation.analysis_build_id = build.id \
+                  AND recommendation.evidence_only = 1 \
+                  AND recommendation.write_authorized = 0 \
+                  AND recommendation.keeper_observation_id IS NULL \
+                  AND recommendation.time_donor_observation_id IS NULL \
+                 JOIN metadata_extraction_reports AS report \
+                   ON report.id = source.report_id \
+                  AND report.time_session_id = session.id \
+                  AND report.scan_run_id = build.scan_run_id \
+                  AND report.exact_group_build_id = build.exact_group_build_id \
+                  AND report.state = 'sealed' \
+                  AND report.sealed_manifest_digest = report.expected_manifest_digest \
+                 JOIN metadata_source_revalidations AS revalidation \
+                   ON revalidation.report_id = report.id \
+                  AND revalidation.time_session_id = report.time_session_id \
+                  AND revalidation.scan_run_id = report.scan_run_id \
+                  AND revalidation.exact_group_build_id = report.exact_group_build_id \
+                  AND revalidation.metadata_probe_observation_id = \
+                      report.metadata_probe_observation_id \
+                  AND revalidation.source_key = source.source_key \
+                  AND revalidation.lineage_key = source.lineage_key \
+                  AND revalidation.source_key_version = 2 \
+                  AND revalidation.lineage_key_version = 1 \
+                  AND revalidation.outcome = 'reextracted_pinned_exact' \
+                  AND revalidation.descriptor_revalidated = 1 \
+                  AND revalidation.path_revalidated = 1 \
+                  AND revalidation.session_revalidated = 1 \
+                  AND revalidation.trust_scope = 'historical_proof_only' \
+                  AND revalidation.source_signature_before = \
+                      revalidation.source_signature_after \
+                  AND revalidation.first_report_digest = \
+                      revalidation.second_report_digest \
+                  AND revalidation.first_report_digest = report.retained_report_digest \
+                 JOIN media_observation_snapshots AS observation \
+                   ON observation.id = report.metadata_probe_observation_id \
+                  AND observation.volume_id = report.volume_id \
+                  AND observation.scan_run_id = report.scan_run_id \
+                  AND observation.source_signature = \
+                      revalidation.source_signature_before",
+                rusqlite::params![
+                    analysis_build_id,
+                    after.0,
+                    after.1,
+                    fetch_limit,
+                    scan_run_id,
+                    exact_group_build_id,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "capture-time metadata report page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT build.id, build.exact_group_build_id, source.ordinal, report.id, \
+                        report.metadata_probe_observation_id, observation.display_path, \
+                        observation.path_encoding, report.probe_ordinal, \
+                        report.source_size_bytes, report.report_parser_name, \
+                        report.report_parser_version, report.detected_format, \
+                        report.extraction_status, report.expected_field_count, \
+                        report.expected_issue_count, report.expected_retained_field_bytes, \
+                        report.usage_bytes_read, report.usage_read_operations, \
+                        report.retained_report_digest, report.sealed_manifest_digest, \
+                        revalidation.first_report_digest, revalidation.second_report_digest, \
+                        revalidation.descriptor_revalidated, revalidation.path_revalidated, \
+                        revalidation.session_revalidated, revalidation.trust_scope, \
+                        revalidation.revalidated_at_ms, report.finalized_at_ms \
+                 FROM capture_time_analysis_sources AS source \
+                 JOIN capture_time_analysis_builds AS build \
+                   ON build.id = source.analysis_build_id \
+                  AND build.scan_run_id = ?1 \
+                  AND build.exact_group_build_id = ?2 \
+                  AND build.state = 'sealed' \
+                  AND build.sealed_manifest_digest = build.expected_manifest_digest \
+                 JOIN scan_time_sessions AS session \
+                   ON session.id = build.time_session_id \
+                  AND session.state IN ('complete', 'partial') \
+                  AND session.sealed_manifest_digest = session.expected_manifest_digest \
+                  AND session.sealed_outcome_manifest_digest IS NOT NULL \
+                 JOIN capture_time_group_outcomes AS outcome \
+                   ON outcome.time_session_id = session.id \
+                  AND outcome.exact_group_build_id = build.exact_group_build_id \
+                  AND outcome.analysis_build_id = build.id \
+                  AND outcome.outcome = 'evidence' \
+                 JOIN capture_time_recommendations AS recommendation \
+                   ON recommendation.analysis_build_id = build.id \
+                  AND recommendation.evidence_only = 1 \
+                  AND recommendation.write_authorized = 0 \
+                  AND recommendation.keeper_observation_id IS NULL \
+                  AND recommendation.time_donor_observation_id IS NULL \
+                 JOIN metadata_extraction_reports AS report \
+                   ON report.id = source.report_id \
+                  AND report.time_session_id = session.id \
+                  AND report.scan_run_id = build.scan_run_id \
+                  AND report.exact_group_build_id = build.exact_group_build_id \
+                  AND report.state = 'sealed' \
+                  AND report.sealed_manifest_digest = report.expected_manifest_digest \
+                 JOIN metadata_source_revalidations AS revalidation \
+                   ON revalidation.report_id = report.id \
+                  AND revalidation.time_session_id = report.time_session_id \
+                  AND revalidation.scan_run_id = report.scan_run_id \
+                  AND revalidation.exact_group_build_id = report.exact_group_build_id \
+                  AND revalidation.metadata_probe_observation_id = \
+                      report.metadata_probe_observation_id \
+                  AND revalidation.source_key = source.source_key \
+                  AND revalidation.lineage_key = source.lineage_key \
+                  AND revalidation.source_key_version = 2 \
+                  AND revalidation.lineage_key_version = 1 \
+                  AND revalidation.outcome = 'reextracted_pinned_exact' \
+                  AND revalidation.descriptor_revalidated = 1 \
+                  AND revalidation.path_revalidated = 1 \
+                  AND revalidation.session_revalidated = 1 \
+                  AND revalidation.trust_scope = 'historical_proof_only' \
+                  AND revalidation.source_signature_before = \
+                      revalidation.source_signature_after \
+                  AND revalidation.first_report_digest = \
+                      revalidation.second_report_digest \
+                  AND revalidation.first_report_digest = report.retained_report_digest \
+                 JOIN media_observation_snapshots AS observation \
+                   ON observation.id = report.metadata_probe_observation_id \
+                  AND observation.volume_id = report.volume_id \
+                  AND observation.scan_run_id = report.scan_run_id \
+                  AND observation.source_signature = \
+                      revalidation.source_signature_before \
+                 WHERE source.analysis_build_id = ?3 \
+                   AND source.binding_status = 'reextracted_pinned_source' \
+                   AND (source.ordinal > ?4 \
+                        OR (source.ordinal = ?4 AND report.id > ?5)) \
+                 ORDER BY source.ordinal, report.id LIMIT ?6",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![
+                    scan_run_id,
+                    exact_group_build_id,
+                    analysis_build_id,
+                    after.0,
+                    after.1,
+                    fetch_limit,
+                ],
+                metadata_report_record_from_row,
+            )?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row??);
+            }
+            keyset_page_from_items(items, limit, |record| MetadataReportCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+                last_source_ordinal: record.source_ordinal,
+                last_report_id: record.report_id,
+            })
+        })
+    }
+
+    /// Lists retained metadata fields without reading or returning raw bytes
+    /// or ISO-BMFF box paths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_capture_time_metadata_fields_page(
+        &self,
+        scan_run_id: i64,
+        exact_group_build_id: i64,
+        analysis_build_id: i64,
+        source_ordinal: i64,
+        report_id: i64,
+        cursor: Option<&MetadataFieldCursor>,
+        limit: u32,
+    ) -> Result<KeysetPage<CaptureTimeMetadataFieldRecord, MetadataFieldCursor>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("exact_group_build_id", exact_group_build_id)?;
+        validate_positive_read_id("analysis_build_id", analysis_build_id)?;
+        validate_nonnegative_read_id("source_ordinal", source_ordinal)?;
+        validate_positive_read_id("report_id", report_id)?;
+        let after = validate_metadata_field_cursor(
+            scan_run_id,
+            exact_group_build_id,
+            analysis_build_id,
+            source_ordinal,
+            report_id,
+            cursor,
+        )?;
+        let fetch_limit = validated_metadata_page_limit(limit, 128, "metadata field")?;
+        self.consistent_read(|connection| {
+            require_sealed_time_metadata_report_scope(
+                connection,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+                source_ordinal,
+                report_id,
+            )?;
+            let page_bytes = connection.query_row(
+                "SELECT COALESCE(sum(1024 + length(CAST(parser_name AS BLOB)) \
+                        + length(CAST(parser_version AS BLOB)) \
+                        + length(CAST(field_kind AS BLOB)) \
+                        + length(CAST(encoding AS BLOB)) \
+                        + length(raw_digest) \
+                        + length(CAST(container_kind AS BLOB))), 0) \
+                 FROM ( \
+                     SELECT id, parser_name, parser_version, field_kind, encoding, \
+                            raw_digest, container_kind \
+                     FROM metadata_extraction_fields \
+                     WHERE report_id = ?1 \
+                       AND (ordinal > ?2 OR (ordinal = ?2 AND id > ?3)) \
+                     ORDER BY ordinal, id LIMIT ?4 \
+                 )",
+                rusqlite::params![report_id, after.0, after.1, fetch_limit],
+                |row| row.get::<_, i64>(0),
+            )?;
+            enforce_read_budget(
+                "capture-time metadata field page",
+                page_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT id, ordinal, parser_name, parser_version, field_kind, encoding, \
+                        byte_len, raw_digest, container_kind, absolute_offset \
+                 FROM metadata_extraction_fields \
+                 WHERE report_id = ?1 \
+                   AND (ordinal > ?2 OR (ordinal = ?2 AND id > ?3)) \
+                 ORDER BY ordinal, id LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![report_id, after.0, after.1, fetch_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            )?;
+            let mut items = Vec::new();
+            for row in rows {
+                let row = row?;
+                items.push(CaptureTimeMetadataFieldRecord {
+                    analysis_build_id,
+                    source_ordinal,
+                    report_id,
+                    field_id: row.0,
+                    ordinal: row.1,
+                    parser_name: row.2,
+                    parser_version: row.3,
+                    field_kind: parse_stored_metadata_field_kind(&row.4)?,
+                    encoding: parse_stored_metadata_encoding(&row.5)?,
+                    byte_length: row.6,
+                    raw_digest: MetadataReportDigest::from_runtime_evidence(fixed_32_bytes(
+                        "metadata_field_raw_digest",
+                        row.7,
+                    )?),
+                    container_kind: parse_stored_metadata_container_kind(&row.8)?,
+                    absolute_offset: row.9,
+                    raw_available: true,
+                });
+            }
+            keyset_page_from_items(items, limit, |record| MetadataFieldCursor {
+                cursor_version: KEYSET_CURSOR_VERSION,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+                source_ordinal,
+                report_id,
+                last_field_ordinal: record.ordinal,
+                last_field_id: record.field_id,
+            })
+        })
+    }
+
+    /// Reads one retained raw metadata field after binding both its ordinal
+    /// and row id to the exact terminal evidence scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_capture_time_metadata_field_raw_detail(
+        &self,
+        scan_run_id: i64,
+        exact_group_build_id: i64,
+        analysis_build_id: i64,
+        source_ordinal: i64,
+        report_id: i64,
+        field_ordinal: i64,
+        field_id: i64,
+    ) -> Result<Option<CaptureTimeMetadataFieldRawDetail>> {
+        validate_positive_read_id("scan_run_id", scan_run_id)?;
+        validate_positive_read_id("exact_group_build_id", exact_group_build_id)?;
+        validate_positive_read_id("analysis_build_id", analysis_build_id)?;
+        validate_nonnegative_read_id("source_ordinal", source_ordinal)?;
+        validate_positive_read_id("report_id", report_id)?;
+        validate_nonnegative_read_id("field_ordinal", field_ordinal)?;
+        validate_positive_read_id("field_id", field_id)?;
+        self.consistent_read(|connection| {
+            require_sealed_time_metadata_report_scope(
+                connection,
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+                source_ordinal,
+                report_id,
+            )?;
+            let sizes = connection
+                .query_row(
+                    "SELECT field.byte_len, length(field.raw_bytes), \
+                            length(observation.root_relative_path_raw), \
+                            length(CAST(observation.display_path AS BLOB)), \
+                            length(CAST(observation.path_encoding AS BLOB)), \
+                            length(CAST(report.report_parser_name AS BLOB)), \
+                            length(CAST(report.report_parser_version AS BLOB)), \
+                            length(CAST(field.parser_name AS BLOB)), \
+                            length(CAST(field.parser_version AS BLOB)), \
+                            COALESCE(length(field.bmff_box_path), 0) \
+                     FROM capture_time_analysis_sources AS source \
+                     JOIN capture_time_analysis_builds AS build \
+                       ON build.id = source.analysis_build_id \
+                      AND build.scan_run_id = ?1 \
+                      AND build.exact_group_build_id = ?2 \
+                     JOIN metadata_extraction_reports AS report \
+                       ON report.id = source.report_id \
+                      AND report.time_session_id = build.time_session_id \
+                      AND report.exact_group_build_id = build.exact_group_build_id \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.id = report.metadata_probe_observation_id \
+                      AND observation.scan_run_id = report.scan_run_id \
+                      AND observation.volume_id = report.volume_id \
+                     JOIN metadata_extraction_fields AS field \
+                       ON field.report_id = report.id \
+                      AND field.ordinal = ?6 AND field.id = ?7 \
+                     WHERE source.analysis_build_id = ?3 \
+                       AND source.ordinal = ?4 AND source.report_id = ?5",
+                    rusqlite::params![
+                        scan_run_id,
+                        exact_group_build_id,
+                        analysis_build_id,
+                        source_ordinal,
+                        report_id,
+                        field_ordinal,
+                        field_id,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some(sizes) = sizes else {
+                return Ok(None);
+            };
+            if sizes.0 != sizes.1
+                || sizes.1 <= 0
+                || sizes.1 > i64::try_from(MAX_OPAQUE_BLOB_BYTES).unwrap_or(i64::MAX)
+            {
+                return Err(StoreError::invalid_input(
+                    "metadata_field_raw_bytes",
+                    "stored raw byte length is outside 1 byte through 1 MiB or mismatches byte_len",
+                ));
+            }
+            let detail_bytes = [
+                4096_i64, sizes.1, sizes.2, sizes.3, sizes.4, sizes.5, sizes.6, sizes.7, sizes.8,
+                sizes.9,
+            ]
+            .into_iter()
+            .try_fold(0_i64, |total, value| total.checked_add(value))
+            .ok_or_else(|| {
+                StoreError::invalid_input("metadata_field_raw_detail", "result size overflow")
+            })?;
+            enforce_read_budget(
+                "capture-time metadata raw field detail",
+                detail_bytes,
+                MAX_PAGE_RESULT_BYTES,
+            )?;
+
+            let row = connection
+                .query_row(
+                    "SELECT report.metadata_probe_observation_id, observation.display_path, \
+                            observation.path_encoding, observation.root_relative_path_raw, \
+                            report.probe_ordinal, report.source_size_bytes, \
+                            report.report_parser_name, report.report_parser_version, \
+                            report.detected_format, report.extraction_status, \
+                            report.expected_field_count, report.expected_issue_count, \
+                            report.expected_retained_field_bytes, report.usage_bytes_read, \
+                            report.usage_read_operations, report.retained_report_digest, \
+                            report.sealed_manifest_digest, revalidation.first_report_digest, \
+                            revalidation.second_report_digest, \
+                            revalidation.descriptor_revalidated, \
+                            revalidation.path_revalidated, \
+                            revalidation.session_revalidated, revalidation.trust_scope, \
+                            revalidation.revalidated_at_ms, report.finalized_at_ms, \
+                            field.parser_name, field.parser_version, field.field_kind, \
+                            field.encoding, field.byte_len, field.raw_bytes, field.raw_digest, \
+                            field.absolute_offset, field.container_kind, \
+                            field.tiff_header_offset, field.tiff_ifd_offset, field.tiff_tag, \
+                            field.tiff_byte_order, field.jpeg_app1_offset, \
+                            field.bmff_box_offset, field.bmff_box_path \
+                     FROM capture_time_analysis_sources AS source \
+                     JOIN capture_time_analysis_builds AS build \
+                       ON build.id = source.analysis_build_id \
+                      AND build.scan_run_id = ?1 \
+                      AND build.exact_group_build_id = ?2 \
+                      AND build.state = 'sealed' \
+                      AND build.sealed_manifest_digest = build.expected_manifest_digest \
+                     JOIN scan_time_sessions AS session \
+                       ON session.id = build.time_session_id \
+                      AND session.state IN ('complete', 'partial') \
+                      AND session.sealed_manifest_digest = session.expected_manifest_digest \
+                      AND session.sealed_outcome_manifest_digest IS NOT NULL \
+                     JOIN capture_time_group_outcomes AS outcome \
+                       ON outcome.time_session_id = session.id \
+                      AND outcome.exact_group_build_id = build.exact_group_build_id \
+                      AND outcome.analysis_build_id = build.id \
+                      AND outcome.outcome = 'evidence' \
+                     JOIN capture_time_recommendations AS recommendation \
+                       ON recommendation.analysis_build_id = build.id \
+                      AND recommendation.evidence_only = 1 \
+                      AND recommendation.write_authorized = 0 \
+                      AND recommendation.keeper_observation_id IS NULL \
+                      AND recommendation.time_donor_observation_id IS NULL \
+                     JOIN metadata_extraction_reports AS report \
+                       ON report.id = source.report_id \
+                      AND report.time_session_id = session.id \
+                      AND report.scan_run_id = build.scan_run_id \
+                      AND report.exact_group_build_id = build.exact_group_build_id \
+                      AND report.state = 'sealed' \
+                      AND report.sealed_manifest_digest = report.expected_manifest_digest \
+                     JOIN metadata_source_revalidations AS revalidation \
+                       ON revalidation.report_id = report.id \
+                      AND revalidation.time_session_id = report.time_session_id \
+                      AND revalidation.scan_run_id = report.scan_run_id \
+                      AND revalidation.exact_group_build_id = report.exact_group_build_id \
+                      AND revalidation.metadata_probe_observation_id = \
+                          report.metadata_probe_observation_id \
+                      AND revalidation.source_key = source.source_key \
+                      AND revalidation.lineage_key = source.lineage_key \
+                      AND revalidation.source_key_version = 2 \
+                      AND revalidation.lineage_key_version = 1 \
+                      AND revalidation.outcome = 'reextracted_pinned_exact' \
+                      AND revalidation.descriptor_revalidated = 1 \
+                      AND revalidation.path_revalidated = 1 \
+                      AND revalidation.session_revalidated = 1 \
+                      AND revalidation.trust_scope = 'historical_proof_only' \
+                      AND revalidation.source_signature_before = \
+                          revalidation.source_signature_after \
+                      AND revalidation.first_report_digest = \
+                          revalidation.second_report_digest \
+                      AND revalidation.first_report_digest = report.retained_report_digest \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.id = report.metadata_probe_observation_id \
+                      AND observation.volume_id = report.volume_id \
+                      AND observation.scan_run_id = report.scan_run_id \
+                      AND observation.source_signature = \
+                          revalidation.source_signature_before \
+                     JOIN metadata_extraction_fields AS field \
+                       ON field.report_id = report.id \
+                      AND field.ordinal = ?6 AND field.id = ?7 \
+                     WHERE source.analysis_build_id = ?3 \
+                       AND source.ordinal = ?4 AND source.report_id = ?5 \
+                       AND source.binding_status = 'reextracted_pinned_source'",
+                    rusqlite::params![
+                        scan_run_id,
+                        exact_group_build_id,
+                        analysis_build_id,
+                        source_ordinal,
+                        report_id,
+                        field_ordinal,
+                        field_id,
+                    ],
+                    metadata_raw_detail_row,
+                )
+                .optional()?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            metadata_raw_detail_from_row(
+                scan_run_id,
+                exact_group_build_id,
+                analysis_build_id,
+                source_ordinal,
+                report_id,
+                field_ordinal,
+                field_id,
+                row,
+            )
+            .map(Some)
+        })
+    }
+
+    /// Lists only fully verified exact-byte groups.
     pub fn list_duplicate_groups_page(
         &self,
         scan_run_id: i64,
@@ -1752,70 +3319,119 @@ impl Store {
     }
 
     fn open_inner(path: &Path, create: bool, create_parents: bool) -> Result<Self> {
+        Self::open_inner_with_operations(
+            path,
+            create,
+            create_parents,
+            crate::backup::prepare_existing_database_before_sqlite_open,
+            migrations::migrate,
+        )
+    }
+
+    fn open_inner_with_operations(
+        path: &Path,
+        create: bool,
+        create_parents: bool,
+        mut prepare_existing: impl FnMut(&Path) -> Result<crate::backup::PreparedExistingDatabase>,
+        mut migrate: impl FnMut(&mut Connection, i64) -> Result<()>,
+    ) -> Result<Self> {
         let prepared = prepare_database_path(path, create, create_parents)?;
         let resolved_path = prepared.path;
-        if !prepared.existed {
+        let preparation = if prepared.existed {
+            capture_database_security(&resolved_path)?;
+            Some(prepare_existing(&resolved_path)?)
+        } else {
             initialize_database(&resolved_path)?;
-        }
+            None
+        };
 
-        let read_only_snapshot = capture_database_security(&resolved_path)?;
-        let read_only_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let read_only = Connection::open_with_flags(&resolved_path, read_only_flags)?;
-        verify_database_security(&resolved_path, &read_only_snapshot)?;
-        configure_preflight_connection(&read_only)?;
-        let integrity = integrity_check_connection(&read_only, IntegrityCheckKind::Quick)?;
-        if !integrity.is_healthy() {
-            return Err(StoreError::IntegrityCheckFailed {
-                details: integrity.failure_details(),
-            });
-        }
-        migrations::preflight_existing(&read_only)?;
-        verify_database_security(&resolved_path, &read_only_snapshot)?;
-        read_only
-            .close()
-            .map_err(|(_, error)| StoreError::ConnectionClose(error.to_string()))?;
-        verify_database_security(&resolved_path, &read_only_snapshot)?;
+        let retained_backup_path = preparation
+            .as_ref()
+            .and_then(|prepared| prepared.backup_path().map(Path::to_path_buf));
+        let result = (|| {
+            if let Some(preparation) = &preparation {
+                preparation.verify_before_read_write()?;
+            } else {
+                let read_only_snapshot = capture_database_security(&resolved_path)?;
+                let read_only_flags =
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+                let read_only = Connection::open_with_flags(&resolved_path, read_only_flags)?;
+                verify_database_security(&resolved_path, &read_only_snapshot)?;
+                configure_preflight_connection(&read_only)?;
+                let integrity = integrity_check_connection(&read_only, IntegrityCheckKind::Quick)?;
+                if !integrity.is_healthy() {
+                    return Err(StoreError::IntegrityCheckFailed {
+                        details: integrity.failure_details(),
+                    });
+                }
+                migrations::preflight_existing(&read_only)?;
+                verify_database_security(&resolved_path, &read_only_snapshot)?;
+                read_only
+                    .close()
+                    .map_err(|(_, error)| StoreError::ConnectionClose(error.to_string()))?;
+                verify_database_security(&resolved_path, &read_only_snapshot)?;
+            }
 
-        let read_write_snapshot = capture_database_security(&resolved_path)?;
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let mut connection = Connection::open_with_flags(&resolved_path, flags)?;
-        verify_database_security(&resolved_path, &read_write_snapshot)?;
-        configure_preflight_connection(&connection)?;
-        let integrity = integrity_check_connection(&connection, IntegrityCheckKind::Quick)?;
-        if !integrity.is_healthy() {
-            return Err(StoreError::IntegrityCheckFailed {
-                details: integrity.failure_details(),
-            });
+            let read_write_snapshot = capture_database_security(&resolved_path)?;
+            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+            let mut connection = Connection::open_with_flags(&resolved_path, flags)?;
+            verify_database_security(&resolved_path, &read_write_snapshot)?;
+            configure_preflight_connection(&connection)?;
+            let integrity = integrity_check_connection(&connection, IntegrityCheckKind::Quick)?;
+            if !integrity.is_healthy() {
+                return Err(StoreError::IntegrityCheckFailed {
+                    details: integrity.failure_details(),
+                });
+            }
+            let source_version = migrations::preflight_existing(&connection)?;
+            if let Some(preparation) = &preparation {
+                if source_version != preparation.expected_version() {
+                    return Err(StoreError::PreV7BackupVersionMismatch {
+                        role: "source before migration",
+                        expected: preparation.expected_version(),
+                        observed: source_version,
+                    });
+                }
+            }
+            verify_database_security(&resolved_path, &read_write_snapshot)?;
+            let settings = configure_connection(&connection)?;
+            verify_database_security(&resolved_path, &read_write_snapshot)?;
+            let now_ms = current_time_ms()?;
+            migrate(&mut connection, now_ms)?;
+            migrations::reconcile_stale_scan_sessions(&mut connection, now_ms)?;
+            migrations::validate_current_schema(&connection)?;
+            let verified_settings = read_and_verify_settings(&connection)?;
+            if settings != verified_settings {
+                return Err(StoreError::SettingMismatch {
+                    name: "connection_settings",
+                    expected: format!("{settings:?}"),
+                    observed: format!("{verified_settings:?}"),
+                });
+            }
+            let integrity = integrity_check_connection(&connection, IntegrityCheckKind::Quick)?;
+            if !integrity.is_healthy() {
+                return Err(StoreError::IntegrityCheckFailed {
+                    details: integrity.failure_details(),
+                });
+            }
+            verify_database_security(&resolved_path, &read_write_snapshot)?;
+            Ok(Self {
+                connection,
+                database_path: resolved_path.clone(),
+                security_snapshot: read_write_snapshot,
+                settings,
+                store_instance_key: fresh_store_instance_key(),
+                live_core_sessions: HashSet::new(),
+            })
+        })();
+
+        match (result, retained_backup_path) {
+            (Err(source), Some(backup_path)) => Err(StoreError::PreV7MigrationFailed {
+                backup_path,
+                source: Box::new(source),
+            }),
+            (result, _) => result,
         }
-        migrations::preflight_existing(&connection)?;
-        verify_database_security(&resolved_path, &read_write_snapshot)?;
-        let settings = configure_connection(&connection)?;
-        verify_database_security(&resolved_path, &read_write_snapshot)?;
-        let now_ms = current_time_ms()?;
-        migrations::migrate(&mut connection, now_ms)?;
-        migrations::reconcile_stale_scan_sessions(&mut connection, now_ms)?;
-        migrations::validate_current_schema(&connection)?;
-        let verified_settings = read_and_verify_settings(&connection)?;
-        if settings != verified_settings {
-            return Err(StoreError::SettingMismatch {
-                name: "connection_settings",
-                expected: format!("{settings:?}"),
-                observed: format!("{verified_settings:?}"),
-            });
-        }
-        let integrity = integrity_check_connection(&connection, IntegrityCheckKind::Quick)?;
-        if !integrity.is_healthy() {
-            return Err(StoreError::IntegrityCheckFailed {
-                details: integrity.failure_details(),
-            });
-        }
-        verify_database_security(&resolved_path, &read_write_snapshot)?;
-        Ok(Self {
-            connection,
-            database_path: resolved_path,
-            security_snapshot: read_write_snapshot,
-            settings,
-        })
     }
 
     pub(crate) fn verify_bound_database(&self) -> Result<()> {
@@ -2732,6 +4348,19 @@ fn current_time_ms() -> Result<i64> {
     })
 }
 
+fn fresh_store_instance_key() -> [u8; 32] {
+    let counter = STORE_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.store-instance-key.v1\0");
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&counter.to_le_bytes());
+    if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        hasher.update(&duration.as_secs().to_le_bytes());
+        hasher.update(&duration.subsec_nanos().to_le_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
 fn query_observations_page(
     connection: &Connection,
     scan_run_id: i64,
@@ -3151,8 +4780,967 @@ fn require_current_core_session(
     Ok(())
 }
 
+fn require_current_time_core_session(
+    connection: &Connection,
+    guard: &RunEvidenceGuard,
+    core_session_id: &CoreSessionId,
+) -> Result<()> {
+    let mount_session_key = guard.mount_session_key.to_storage_hex();
+    let matches = connection.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM scan_core_sessions AS core \
+             JOIN scan_runs AS run \
+               ON run.id = core.scan_run_id AND run.volume_id = core.volume_id \
+             JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = core.scan_run_id \
+              AND session.volume_id = core.volume_id \
+              AND session.capability_profile_id = core.capability_profile_id \
+              AND session.namespace_profile_id = core.namespace_profile_id \
+             JOIN scan_jobs AS job \
+               ON job.id = session.scan_job_id AND job.volume_id = session.volume_id \
+              AND job.active_scan_run_id = run.id \
+             JOIN capability_profiles AS capability \
+               ON capability.id = session.capability_profile_id \
+              AND capability.volume_id = session.volume_id \
+             WHERE core.scan_run_id = ?1 \
+               AND core.capability_profile_id = ?2 \
+               AND core.core_session_id = ?3 \
+               AND run.state = 'completed' AND job.state = 'completed' \
+               AND core.trust_scope = 'current_core_session_only' \
+               AND core.engine_contract_version = 1 \
+               AND session.mount_session_key = ?4 COLLATE BINARY \
+               AND capability.mount_session_key = session.mount_session_key COLLATE BINARY \
+               AND capability.profile_hash_version = 2 \
+               AND capability.is_current = 1 \
+               AND capability.probe_status = 'complete' \
+               AND capability.can_read = 1 \
+         )",
+        rusqlite::params![
+            guard.scan_run_id,
+            guard.capability_profile_id,
+            core_session_id.as_bytes().as_slice(),
+            mount_session_key,
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !matches {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "current_time_core_session_guard",
+            id: guard.scan_run_id,
+        });
+    }
+    Ok(())
+}
+
+fn require_live_time_evidence_guard(
+    connection: &Connection,
+    guard: &TimeEvidenceGuard,
+    store_instance_key: &[u8; 32],
+) -> Result<()> {
+    if guard.store_instance_key() != store_instance_key {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "live_time_store_instance_guard",
+            id: guard.run().scan_run_id,
+        });
+    }
+    require_current_time_core_session(connection, guard.run(), guard.core_session_id())
+}
+
+fn require_sealed_time_analysis_scope(
+    connection: &Connection,
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+) -> Result<()> {
+    let matches = connection.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_analysis_builds AS build \
+             JOIN scan_time_sessions AS session ON session.id = build.time_session_id \
+             WHERE build.id = ?1 AND build.scan_run_id = ?2 \
+               AND build.exact_group_build_id = ?3 AND build.state = 'sealed' \
+               AND build.sealed_manifest_digest = build.expected_manifest_digest \
+               AND session.state IN ('complete', 'partial') \
+               AND session.sealed_manifest_digest = session.expected_manifest_digest \
+               AND session.sealed_outcome_manifest_digest IS NOT NULL \
+         )",
+        rusqlite::params![analysis_build_id, scan_run_id, exact_group_build_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !matches {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "sealed_capture_time_analysis_scope",
+            id: analysis_build_id,
+        });
+    }
+    Ok(())
+}
+
+fn require_sealed_time_metadata_report_scope(
+    connection: &Connection,
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+    source_ordinal: i64,
+    report_id: i64,
+) -> Result<()> {
+    require_sealed_time_analysis_scope(
+        connection,
+        scan_run_id,
+        exact_group_build_id,
+        analysis_build_id,
+    )?;
+    let matches = connection.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_analysis_sources AS source \
+             JOIN capture_time_analysis_builds AS build \
+               ON build.id = source.analysis_build_id \
+              AND build.scan_run_id = ?1 \
+              AND build.exact_group_build_id = ?2 \
+              AND build.state = 'sealed' \
+              AND build.sealed_manifest_digest = build.expected_manifest_digest \
+             JOIN scan_time_sessions AS session \
+               ON session.id = build.time_session_id \
+              AND session.state IN ('complete', 'partial') \
+              AND session.sealed_manifest_digest = session.expected_manifest_digest \
+              AND session.sealed_outcome_manifest_digest IS NOT NULL \
+             JOIN capture_time_group_outcomes AS outcome \
+               ON outcome.time_session_id = session.id \
+              AND outcome.exact_group_build_id = build.exact_group_build_id \
+              AND outcome.analysis_build_id = build.id \
+              AND outcome.outcome = 'evidence' \
+             JOIN capture_time_recommendations AS recommendation \
+               ON recommendation.analysis_build_id = build.id \
+              AND recommendation.evidence_only = 1 \
+              AND recommendation.write_authorized = 0 \
+              AND recommendation.keeper_observation_id IS NULL \
+              AND recommendation.time_donor_observation_id IS NULL \
+             JOIN metadata_extraction_reports AS report \
+               ON report.id = source.report_id \
+              AND report.time_session_id = session.id \
+              AND report.scan_run_id = build.scan_run_id \
+              AND report.exact_group_build_id = build.exact_group_build_id \
+              AND report.state = 'sealed' \
+              AND report.sealed_manifest_digest = report.expected_manifest_digest \
+             JOIN metadata_source_revalidations AS revalidation \
+               ON revalidation.report_id = report.id \
+              AND revalidation.time_session_id = report.time_session_id \
+              AND revalidation.scan_run_id = report.scan_run_id \
+              AND revalidation.exact_group_build_id = report.exact_group_build_id \
+              AND revalidation.metadata_probe_observation_id = \
+                  report.metadata_probe_observation_id \
+              AND revalidation.source_key = source.source_key \
+              AND revalidation.lineage_key = source.lineage_key \
+              AND revalidation.source_key_version = 2 \
+              AND revalidation.lineage_key_version = 1 \
+              AND revalidation.outcome = 'reextracted_pinned_exact' \
+              AND revalidation.descriptor_revalidated = 1 \
+              AND revalidation.path_revalidated = 1 \
+              AND revalidation.session_revalidated = 1 \
+              AND revalidation.trust_scope = 'historical_proof_only' \
+              AND revalidation.source_signature_before = \
+                  revalidation.source_signature_after \
+              AND revalidation.first_report_digest = \
+                  revalidation.second_report_digest \
+              AND revalidation.first_report_digest = report.retained_report_digest \
+             JOIN media_observation_snapshots AS observation \
+               ON observation.id = report.metadata_probe_observation_id \
+              AND observation.volume_id = report.volume_id \
+              AND observation.scan_run_id = report.scan_run_id \
+              AND observation.source_signature = \
+                  revalidation.source_signature_before \
+             WHERE source.analysis_build_id = ?3 \
+               AND source.ordinal = ?4 AND source.report_id = ?5 \
+               AND source.binding_status = 'reextracted_pinned_source' \
+         )",
+        rusqlite::params![
+            scan_run_id,
+            exact_group_build_id,
+            analysis_build_id,
+            source_ordinal,
+            report_id,
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !matches {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "sealed_capture_time_metadata_report_scope",
+            id: report_id,
+        });
+    }
+    Ok(())
+}
+
+fn checked_from_i64<T>(field: &'static str, value: i64) -> Result<T>
+where
+    T: TryFrom<i64>,
+{
+    T::try_from(value)
+        .map_err(|_| StoreError::invalid_input(field, "stored integer is outside the typed range"))
+}
+
+fn checked_optional_i16(field: &'static str, value: Option<i64>) -> Result<i16> {
+    checked_from_i64(
+        field,
+        value
+            .ok_or_else(|| StoreError::invalid_input(field, "stored value is unexpectedly NULL"))?,
+    )
+}
+
+fn checked_optional_u32(field: &'static str, value: Option<i64>) -> Result<u32> {
+    checked_from_i64(
+        field,
+        value
+            .ok_or_else(|| StoreError::invalid_input(field, "stored value is unexpectedly NULL"))?,
+    )
+}
+
+fn parse_capture_time_decision(value: &str) -> Result<CaptureTimeDecision> {
+    match value {
+        "no_usable_evidence" => Ok(CaptureTimeDecision::NoUsableEvidence),
+        "review_required" => Ok(CaptureTimeDecision::ReviewRequired),
+        "evidence_eligible" => Ok(CaptureTimeDecision::EvidenceEligible),
+        "conflict" => Ok(CaptureTimeDecision::Conflict),
+        _ => Err(StoreError::invalid_input(
+            "capture_time_decision",
+            "stored decision is not a v7 value",
+        )),
+    }
+}
+
+fn parse_capture_time_confidence(value: &str) -> Result<CaptureTimeConfidence> {
+    match value {
+        "conflict" => Ok(CaptureTimeConfidence::Conflict),
+        "low" => Ok(CaptureTimeConfidence::Low),
+        "medium" => Ok(CaptureTimeConfidence::Medium),
+        "high" => Ok(CaptureTimeConfidence::High),
+        _ => Err(StoreError::invalid_input(
+            "capture_time_confidence",
+            "stored confidence is not a v7 value",
+        )),
+    }
+}
+
+fn parse_evidence_kind_array(raw: &str) -> Result<Vec<CaptureTimeEvidenceKind>> {
+    let values = parse_canonical_string_array("evidence_kinds_json", raw)?;
+    values
+        .into_iter()
+        .map(|value| match value.as_str() {
+            "exif_date_time_original" => Ok(CaptureTimeEvidenceKind::ExifDateTimeOriginal),
+            "exif_create_date" => Ok(CaptureTimeEvidenceKind::ExifCreateDate),
+            "exif_modify_date" => Ok(CaptureTimeEvidenceKind::ExifModifyDate),
+            "quicktime_metadata_creation_date" => {
+                Ok(CaptureTimeEvidenceKind::QuickTimeMetadataCreationDate)
+            }
+            "quicktime_movie_header_creation_time" => {
+                Ok(CaptureTimeEvidenceKind::QuickTimeMovieHeaderCreationTime)
+            }
+            _ => Err(StoreError::invalid_input(
+                "evidence_kinds_json",
+                "stored evidence kind is not a v7 value",
+            )),
+        })
+        .collect()
+}
+
+fn parse_candidate_anomaly_array(raw: &str) -> Result<Vec<CaptureTimeCandidateAnomaly>> {
+    let values = parse_canonical_string_array("anomalies_json", raw)?;
+    values
+        .into_iter()
+        .map(|value| match value.as_str() {
+            "missing_offset" => Ok(CaptureTimeCandidateAnomaly::MissingOffset),
+            "sentinel_value" => Ok(CaptureTimeCandidateAnomaly::SentinelValue),
+            "obvious_future" => Ok(CaptureTimeCandidateAnomaly::ObviousFuture),
+            "outside_automatic_range" => Ok(CaptureTimeCandidateAnomaly::OutsideAutomaticRange),
+            "quicktime_epoch_semantic_uncertainty" => {
+                Ok(CaptureTimeCandidateAnomaly::QuickTimeEpochSemanticUncertainty)
+            }
+            "invalid_companion" => Ok(CaptureTimeCandidateAnomaly::InvalidCompanion),
+            _ => Err(StoreError::invalid_input(
+                "anomalies_json",
+                "stored anomaly is not a v7 value",
+            )),
+        })
+        .collect()
+}
+
+fn parse_evidence_blocker_array(raw: &str) -> Result<Vec<CaptureTimeEvidenceBlocker>> {
+    let values = parse_canonical_string_array("blockers_json", raw)?;
+    values
+        .into_iter()
+        .map(|value| match value.as_str() {
+            "confidence_below_high" => Ok(CaptureTimeEvidenceBlocker::ConfidenceBelowHigh),
+            "no_utc_instant" => Ok(CaptureTimeEvidenceBlocker::NoUtcInstant),
+            "evidence_conflict" => Ok(CaptureTimeEvidenceBlocker::EvidenceConflict),
+            "sentinel_value" => Ok(CaptureTimeEvidenceBlocker::SentinelValue),
+            "obvious_future" => Ok(CaptureTimeEvidenceBlocker::ObviousFuture),
+            "outside_automatic_range" => Ok(CaptureTimeEvidenceBlocker::OutsideAutomaticRange),
+            "quicktime_epoch_semantic_uncertainty" => {
+                Ok(CaptureTimeEvidenceBlocker::QuickTimeEpochSemanticUncertainty)
+            }
+            "invalid_evidence_present" => Ok(CaptureTimeEvidenceBlocker::InvalidEvidencePresent),
+            "extraction_report_untrusted" => {
+                Ok(CaptureTimeEvidenceBlocker::ExtractionReportUntrusted)
+            }
+            "source_not_revalidated" => Ok(CaptureTimeEvidenceBlocker::SourceNotRevalidated),
+            "multiple_strong_values_within_tolerance" => {
+                Ok(CaptureTimeEvidenceBlocker::MultipleStrongValuesWithinTolerance)
+            }
+            _ => Err(StoreError::invalid_input(
+                "blockers_json",
+                "stored evidence blocker is not a v7 value",
+            )),
+        })
+        .collect()
+}
+
+fn parse_canonical_string_array(field: &'static str, raw: &str) -> Result<Vec<String>> {
+    let values: Vec<String> = serde_json::from_str(raw)?;
+    if serde_json::to_string(&values)? != raw {
+        return Err(StoreError::invalid_input(
+            field,
+            "stored JSON array is not canonical minified JSON",
+        ));
+    }
+    let mut unique = HashSet::with_capacity(values.len());
+    if values.iter().any(|value| !unique.insert(value.as_str())) {
+        return Err(StoreError::invalid_input(
+            field,
+            "stored JSON array contains duplicate values",
+        ));
+    }
+    Ok(values)
+}
+
+fn parse_nonnegative_i64_array(raw: &str) -> Result<Vec<i64>> {
+    let values: Vec<i64> = serde_json::from_str(raw)?;
+    if serde_json::to_string(&values)? != raw || values.iter().any(|value| *value < 0) {
+        return Err(StoreError::invalid_input(
+            "observation_ordinals_json",
+            "stored ordinal array is non-canonical or contains a negative value",
+        ));
+    }
+    let mut unique = HashSet::with_capacity(values.len());
+    if values.iter().any(|value| !unique.insert(*value)) {
+        return Err(StoreError::invalid_input(
+            "observation_ordinals_json",
+            "stored ordinal array contains duplicates",
+        ));
+    }
+    Ok(values)
+}
+
+fn parse_time_source_key_array(raw: &str) -> Result<Vec<TimeSourceKey>> {
+    parse_canonical_string_array("source_keys_json", raw)?
+        .into_iter()
+        .map(|value| {
+            Ok(TimeSourceKey::from_runtime_evidence(
+                parse_lower_hex_32_for_read("source_keys_json", &value)?,
+            ))
+        })
+        .collect()
+}
+
+fn parse_time_lineage_key_array(raw: &str) -> Result<Vec<TimeLineageKey>> {
+    parse_canonical_string_array("lineage_keys_json", raw)?
+        .into_iter()
+        .map(|value| {
+            Ok(TimeLineageKey::from_runtime_evidence(
+                parse_lower_hex_32_for_read("lineage_keys_json", &value)?,
+            ))
+        })
+        .collect()
+}
+
+fn parse_lower_hex_32_for_read(field: &'static str, value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(StoreError::invalid_input(
+            field,
+            "stored key must be exactly 64 lowercase hexadecimal characters",
+        ));
+    }
+    let mut output = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = parse_hex_nibble_for_read(pair[0]);
+        let low = parse_hex_nibble_for_read(pair[1]);
+        output[index] = (high << 4) | low;
+    }
+    Ok(output)
+}
+
+fn parse_hex_nibble_for_read(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        _ => 0,
+    }
+}
+
+fn parse_file_time_relation(value: &str) -> Result<FileTimeRelation> {
+    match value {
+        "unavailable" => Ok(FileTimeRelation::Unavailable),
+        "not_compared" => Ok(FileTimeRelation::NotCompared),
+        "matches" => Ok(FileTimeRelation::Matches),
+        "differs" => Ok(FileTimeRelation::Differs),
+        "review_fs_precision_unknown" => Ok(FileTimeRelation::ReviewFsPrecisionUnknown),
+        _ => Err(StoreError::invalid_input(
+            "file_time_relation",
+            "stored relation is not a v7 value",
+        )),
+    }
+}
+
+fn parse_time_donor_eligibility(value: &str) -> Result<TimeDonorEligibility> {
+    match value {
+        "eligible" => Ok(TimeDonorEligibility::Eligible),
+        "ineligible" => Ok(TimeDonorEligibility::Ineligible),
+        "review_required" => Ok(TimeDonorEligibility::ReviewRequired),
+        _ => Err(StoreError::invalid_input(
+            "time_donor_eligibility",
+            "stored donor eligibility is not a v7 value",
+        )),
+    }
+}
+
+fn parse_stored_metadata_field_kind(value: &str) -> Result<StoredMetadataFieldKind> {
+    match value {
+        "exif_date_time_original" => Ok(StoredMetadataFieldKind::ExifDateTimeOriginal),
+        "exif_create_date" => Ok(StoredMetadataFieldKind::ExifCreateDate),
+        "exif_modify_date" => Ok(StoredMetadataFieldKind::ExifModifyDate),
+        "exif_offset_time_original" => Ok(StoredMetadataFieldKind::ExifOffsetTimeOriginal),
+        "exif_subsec_time_original" => Ok(StoredMetadataFieldKind::ExifSubSecTimeOriginal),
+        "quicktime_movie_header_creation_time" => {
+            Ok(StoredMetadataFieldKind::QuickTimeMovieHeaderCreationTime)
+        }
+        "quicktime_metadata_creation_date" => {
+            Ok(StoredMetadataFieldKind::QuickTimeMetadataCreationDate)
+        }
+        _ => Err(StoreError::invalid_input(
+            "metadata_field_kind",
+            "stored field kind is not a v7 value",
+        )),
+    }
+}
+
+fn parse_stored_metadata_encoding(value: &str) -> Result<StoredMetadataEncoding> {
+    match value {
+        "declared_ascii" => Ok(StoredMetadataEncoding::DeclaredAscii),
+        "validated_utf8" => Ok(StoredMetadataEncoding::ValidatedUtf8),
+        "unsigned_big_endian" => Ok(StoredMetadataEncoding::UnsignedBigEndian),
+        _ => Err(StoreError::invalid_input(
+            "metadata_encoding",
+            "stored metadata encoding is not a v7 value",
+        )),
+    }
+}
+
+fn parse_stored_metadata_container_kind(value: &str) -> Result<StoredMetadataContainerKind> {
+    match value {
+        "tiff" => Ok(StoredMetadataContainerKind::Tiff),
+        "jpeg_exif" => Ok(StoredMetadataContainerKind::JpegExif),
+        "iso_bmff" => Ok(StoredMetadataContainerKind::IsoBmff),
+        _ => Err(StoreError::invalid_input(
+            "metadata_container_kind",
+            "stored metadata container kind is not a v7 value",
+        )),
+    }
+}
+
+fn parse_stored_tiff_byte_order(value: &str) -> Result<StoredTiffByteOrder> {
+    match value {
+        "little_endian" => Ok(StoredTiffByteOrder::LittleEndian),
+        "big_endian" => Ok(StoredTiffByteOrder::BigEndian),
+        _ => Err(StoreError::invalid_input(
+            "metadata_tiff_byte_order",
+            "stored TIFF byte order is not a v7 value",
+        )),
+    }
+}
+
+fn parse_metadata_detected_format(value: &str) -> Result<MetadataDetectedFormat> {
+    match value {
+        "jpeg" => Ok(MetadataDetectedFormat::Jpeg),
+        "tiff" => Ok(MetadataDetectedFormat::Tiff),
+        "iso_bmff" => Ok(MetadataDetectedFormat::IsoBmff),
+        _ => Err(StoreError::invalid_input(
+            "metadata_detected_format",
+            "stored detected format is not a v7 value",
+        )),
+    }
+}
+
+fn parse_metadata_extraction_status(value: &str) -> Result<MetadataExtractionStatus> {
+    match value {
+        "extracted_unvalidated" => Ok(MetadataExtractionStatus::ExtractedUnvalidated),
+        "no_metadata" => Ok(MetadataExtractionStatus::NoMetadata),
+        "partial" => Ok(MetadataExtractionStatus::Partial),
+        "failed" => Ok(MetadataExtractionStatus::Failed),
+        "unsupported" => Ok(MetadataExtractionStatus::Unsupported),
+        _ => Err(StoreError::invalid_input(
+            "metadata_extraction_status",
+            "stored extraction status is not a v7 value",
+        )),
+    }
+}
+
+fn parse_stored_boolean(field: &'static str, value: i64) -> Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(StoreError::invalid_input(
+            field,
+            "stored boolean must be exactly 0 or 1",
+        )),
+    }
+}
+
+fn metadata_report_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<CaptureTimeMetadataReportRecord>> {
+    Ok((|| {
+        let retained_report_digest = MetadataReportDigest::from_runtime_evidence(fixed_32_bytes(
+            "metadata_retained_report_digest",
+            row.get(18)?,
+        )?);
+        let sealed_manifest_digest = TimeEvidenceManifestDigest::from_runtime_evidence(
+            fixed_32_bytes("metadata_sealed_manifest_digest", row.get(19)?)?,
+        );
+        let first_report_digest = MetadataReportDigest::from_runtime_evidence(fixed_32_bytes(
+            "metadata_first_report_digest",
+            row.get(20)?,
+        )?);
+        let second_report_digest = MetadataReportDigest::from_runtime_evidence(fixed_32_bytes(
+            "metadata_second_report_digest",
+            row.get(21)?,
+        )?);
+        let descriptor_revalidated =
+            parse_stored_boolean("metadata_descriptor_revalidated", row.get::<_, i64>(22)?)?;
+        let path_revalidated =
+            parse_stored_boolean("metadata_path_revalidated", row.get::<_, i64>(23)?)?;
+        let session_revalidated =
+            parse_stored_boolean("metadata_session_revalidated", row.get::<_, i64>(24)?)?;
+        let trust_scope = row.get::<_, String>(25)?;
+        let revalidated_at_ms = row.get::<_, i64>(26)?;
+        let finalized_at_ms = row.get::<_, Option<i64>>(27)?.ok_or_else(|| {
+            StoreError::invalid_input(
+                "metadata_report_finalized_at_ms",
+                "sealed report has no finalization timestamp",
+            )
+        })?;
+        if retained_report_digest != first_report_digest
+            || first_report_digest != second_report_digest
+            || !descriptor_revalidated
+            || !path_revalidated
+            || !session_revalidated
+            || trust_scope != "historical_proof_only"
+            || finalized_at_ms < revalidated_at_ms
+        {
+            return Err(StoreError::invalid_input(
+                "metadata_report_proof",
+                "sealed report does not retain the exact double-extraction and source-revalidation proof",
+            ));
+        }
+        Ok(CaptureTimeMetadataReportRecord {
+            analysis_build_id: row.get(0)?,
+            exact_group_build_id: row.get(1)?,
+            source_ordinal: row.get(2)?,
+            report_id: row.get(3)?,
+            observation_id: row.get(4)?,
+            display_path: row.get(5)?,
+            path_encoding: row.get(6)?,
+            probe_ordinal: row.get(7)?,
+            source_size_bytes: row.get(8)?,
+            report_parser_name: row.get(9)?,
+            report_parser_version: row.get(10)?,
+            detected_format: row
+                .get::<_, Option<String>>(11)?
+                .as_deref()
+                .map(parse_metadata_detected_format)
+                .transpose()?,
+            extraction_status: parse_metadata_extraction_status(&row.get::<_, String>(12)?)?,
+            field_count: row.get(13)?,
+            extraction_issue_count: row.get(14)?,
+            retained_field_bytes: row.get(15)?,
+            bytes_read: row.get(16)?,
+            read_operations: row.get(17)?,
+            retained_report_digest,
+            sealed_manifest_digest,
+            first_report_digest,
+            second_report_digest,
+            double_extraction_consistent: true,
+            descriptor_revalidated,
+            path_revalidated,
+            session_revalidated,
+            trust_scope,
+            revalidated_at_ms,
+            finalized_at_ms,
+            evidence_only: true,
+            write_authorized: false,
+        })
+    })())
+}
+
+#[derive(Debug)]
+struct MetadataRawDetailSqlRow {
+    observation_id: i64,
+    display_path: String,
+    path_encoding: String,
+    root_relative_path_raw: Vec<u8>,
+    probe_ordinal: i64,
+    source_size_bytes: i64,
+    report_parser_name: String,
+    report_parser_version: String,
+    detected_format: Option<String>,
+    extraction_status: String,
+    field_count: i64,
+    extraction_issue_count: i64,
+    retained_field_bytes: i64,
+    bytes_read: i64,
+    read_operations: i64,
+    retained_report_digest: Vec<u8>,
+    sealed_manifest_digest: Vec<u8>,
+    first_report_digest: Vec<u8>,
+    second_report_digest: Vec<u8>,
+    descriptor_revalidated: i64,
+    path_revalidated: i64,
+    session_revalidated: i64,
+    trust_scope: String,
+    revalidated_at_ms: i64,
+    finalized_at_ms: Option<i64>,
+    parser_name: String,
+    parser_version: String,
+    field_kind: String,
+    encoding: String,
+    byte_length: i64,
+    raw_bytes: Vec<u8>,
+    raw_digest: Vec<u8>,
+    absolute_offset: i64,
+    container_kind: String,
+    tiff_header_offset: Option<i64>,
+    tiff_ifd_offset: Option<i64>,
+    tiff_tag: Option<i64>,
+    tiff_byte_order: Option<String>,
+    jpeg_app1_offset: Option<i64>,
+    bmff_box_offset: Option<i64>,
+    bmff_box_path: Option<Vec<u8>>,
+}
+
+fn metadata_raw_detail_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetadataRawDetailSqlRow> {
+    Ok(MetadataRawDetailSqlRow {
+        observation_id: row.get(0)?,
+        display_path: row.get(1)?,
+        path_encoding: row.get(2)?,
+        root_relative_path_raw: row.get(3)?,
+        probe_ordinal: row.get(4)?,
+        source_size_bytes: row.get(5)?,
+        report_parser_name: row.get(6)?,
+        report_parser_version: row.get(7)?,
+        detected_format: row.get(8)?,
+        extraction_status: row.get(9)?,
+        field_count: row.get(10)?,
+        extraction_issue_count: row.get(11)?,
+        retained_field_bytes: row.get(12)?,
+        bytes_read: row.get(13)?,
+        read_operations: row.get(14)?,
+        retained_report_digest: row.get(15)?,
+        sealed_manifest_digest: row.get(16)?,
+        first_report_digest: row.get(17)?,
+        second_report_digest: row.get(18)?,
+        descriptor_revalidated: row.get(19)?,
+        path_revalidated: row.get(20)?,
+        session_revalidated: row.get(21)?,
+        trust_scope: row.get(22)?,
+        revalidated_at_ms: row.get(23)?,
+        finalized_at_ms: row.get(24)?,
+        parser_name: row.get(25)?,
+        parser_version: row.get(26)?,
+        field_kind: row.get(27)?,
+        encoding: row.get(28)?,
+        byte_length: row.get(29)?,
+        raw_bytes: row.get(30)?,
+        raw_digest: row.get(31)?,
+        absolute_offset: row.get(32)?,
+        container_kind: row.get(33)?,
+        tiff_header_offset: row.get(34)?,
+        tiff_ifd_offset: row.get(35)?,
+        tiff_tag: row.get(36)?,
+        tiff_byte_order: row.get(37)?,
+        jpeg_app1_offset: row.get(38)?,
+        bmff_box_offset: row.get(39)?,
+        bmff_box_path: row.get(40)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn metadata_raw_detail_from_row(
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+    source_ordinal: i64,
+    report_id: i64,
+    field_ordinal: i64,
+    field_id: i64,
+    row: MetadataRawDetailSqlRow,
+) -> Result<CaptureTimeMetadataFieldRawDetail> {
+    let retained_report_digest = MetadataReportDigest::from_runtime_evidence(fixed_32_bytes(
+        "metadata_retained_report_digest",
+        row.retained_report_digest,
+    )?);
+    let sealed_manifest_digest = TimeEvidenceManifestDigest::from_runtime_evidence(fixed_32_bytes(
+        "metadata_sealed_manifest_digest",
+        row.sealed_manifest_digest,
+    )?);
+    let first_report_digest = MetadataReportDigest::from_runtime_evidence(fixed_32_bytes(
+        "metadata_first_report_digest",
+        row.first_report_digest,
+    )?);
+    let second_report_digest = MetadataReportDigest::from_runtime_evidence(fixed_32_bytes(
+        "metadata_second_report_digest",
+        row.second_report_digest,
+    )?);
+    let raw_digest = MetadataReportDigest::from_runtime_evidence(fixed_32_bytes(
+        "metadata_field_raw_digest",
+        row.raw_digest,
+    )?);
+    let descriptor_revalidated = parse_stored_boolean(
+        "metadata_descriptor_revalidated",
+        row.descriptor_revalidated,
+    )?;
+    let path_revalidated = parse_stored_boolean("metadata_path_revalidated", row.path_revalidated)?;
+    let session_revalidated =
+        parse_stored_boolean("metadata_session_revalidated", row.session_revalidated)?;
+    let finalized_at_ms = row.finalized_at_ms.ok_or_else(|| {
+        StoreError::invalid_input(
+            "metadata_report_finalized_at_ms",
+            "sealed report has no finalization timestamp",
+        )
+    })?;
+    if retained_report_digest != first_report_digest
+        || first_report_digest != second_report_digest
+        || !descriptor_revalidated
+        || !path_revalidated
+        || !session_revalidated
+        || row.trust_scope != "historical_proof_only"
+        || finalized_at_ms < row.revalidated_at_ms
+    {
+        return Err(StoreError::invalid_input(
+            "metadata_report_proof",
+            "sealed report does not retain the exact double-extraction and source-revalidation proof",
+        ));
+    }
+    if row.raw_bytes.is_empty()
+        || row.raw_bytes.len() > MAX_OPAQUE_BLOB_BYTES
+        || row.byte_length != i64::try_from(row.raw_bytes.len()).unwrap_or(i64::MAX)
+        || blake3::hash(&row.raw_bytes).as_bytes() != raw_digest.as_bytes()
+    {
+        return Err(StoreError::invalid_input(
+            "metadata_field_raw_bytes",
+            "retained bytes fail the v7 length or BLAKE3 digest proof",
+        ));
+    }
+    let field_end = row
+        .absolute_offset
+        .checked_add(row.byte_length)
+        .ok_or_else(|| StoreError::invalid_input("metadata_field_locator", "range overflow"))?;
+    if row.absolute_offset < 0 || field_end > row.source_size_bytes {
+        return Err(StoreError::invalid_input(
+            "metadata_field_locator",
+            "retained field range is outside the sealed source size",
+        ));
+    }
+    let locator = metadata_field_raw_locator_from_columns(
+        row.source_size_bytes,
+        &row.container_kind,
+        row.tiff_header_offset,
+        row.tiff_ifd_offset,
+        row.tiff_tag,
+        row.tiff_byte_order.as_deref(),
+        row.jpeg_app1_offset,
+        row.bmff_box_offset,
+        row.bmff_box_path,
+    )?;
+    Ok(CaptureTimeMetadataFieldRawDetail {
+        scan_run_id,
+        exact_group_build_id,
+        analysis_build_id,
+        source_ordinal,
+        report_id,
+        field_ordinal,
+        field_id,
+        observation_id: row.observation_id,
+        display_path: row.display_path,
+        path_encoding: row.path_encoding,
+        root_relative_path_raw: row.root_relative_path_raw,
+        probe_ordinal: row.probe_ordinal,
+        source_size_bytes: row.source_size_bytes,
+        report_parser_name: row.report_parser_name,
+        report_parser_version: row.report_parser_version,
+        detected_format: row
+            .detected_format
+            .as_deref()
+            .map(parse_metadata_detected_format)
+            .transpose()?,
+        extraction_status: parse_metadata_extraction_status(&row.extraction_status)?,
+        field_count: row.field_count,
+        extraction_issue_count: row.extraction_issue_count,
+        retained_field_bytes: row.retained_field_bytes,
+        bytes_read: row.bytes_read,
+        read_operations: row.read_operations,
+        retained_report_digest,
+        sealed_manifest_digest,
+        first_report_digest,
+        second_report_digest,
+        double_extraction_consistent: true,
+        descriptor_revalidated,
+        path_revalidated,
+        session_revalidated,
+        trust_scope: row.trust_scope,
+        revalidated_at_ms: row.revalidated_at_ms,
+        finalized_at_ms,
+        evidence_only: true,
+        write_authorized: false,
+        parser_name: row.parser_name,
+        parser_version: row.parser_version,
+        field_kind: parse_stored_metadata_field_kind(&row.field_kind)?,
+        encoding: parse_stored_metadata_encoding(&row.encoding)?,
+        byte_length: row.byte_length,
+        raw_bytes: row.raw_bytes,
+        raw_digest,
+        absolute_offset: row.absolute_offset,
+        locator,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn metadata_field_raw_locator_from_columns(
+    source_size_bytes: i64,
+    container_kind: &str,
+    tiff_header_offset: Option<i64>,
+    tiff_ifd_offset: Option<i64>,
+    tiff_tag: Option<i64>,
+    tiff_byte_order: Option<&str>,
+    jpeg_app1_offset: Option<i64>,
+    bmff_box_offset: Option<i64>,
+    bmff_box_path: Option<Vec<u8>>,
+) -> Result<MetadataFieldRawLocator> {
+    match container_kind {
+        "tiff" => match (
+            tiff_header_offset,
+            tiff_ifd_offset,
+            tiff_tag,
+            tiff_byte_order,
+            jpeg_app1_offset,
+            bmff_box_offset,
+            bmff_box_path,
+        ) {
+            (
+                Some(header_offset),
+                Some(ifd_offset),
+                Some(tag),
+                Some(byte_order),
+                None,
+                None,
+                None,
+            ) if (0..=source_size_bytes).contains(&header_offset)
+                && (0..=source_size_bytes).contains(&ifd_offset) =>
+            {
+                Ok(MetadataFieldRawLocator::Tiff {
+                    header_offset,
+                    ifd_offset,
+                    tag: checked_from_i64("metadata_tiff_tag", tag)?,
+                    byte_order: parse_stored_tiff_byte_order(byte_order)?,
+                })
+            }
+            _ => Err(StoreError::invalid_input(
+                "metadata_field_locator",
+                "stored TIFF locator columns are incomplete or cross-container",
+            )),
+        },
+        "jpeg_exif" => match (
+            tiff_header_offset,
+            tiff_ifd_offset,
+            tiff_tag,
+            tiff_byte_order,
+            jpeg_app1_offset,
+            bmff_box_offset,
+            bmff_box_path,
+        ) {
+            (
+                Some(header_offset),
+                Some(ifd_offset),
+                Some(tag),
+                Some(byte_order),
+                Some(app1_offset),
+                None,
+                None,
+            ) if (0..=source_size_bytes).contains(&app1_offset)
+                && (0..=source_size_bytes).contains(&header_offset)
+                && (0..=source_size_bytes).contains(&ifd_offset) =>
+            {
+                Ok(MetadataFieldRawLocator::JpegExif {
+                    app1_offset,
+                    header_offset,
+                    ifd_offset,
+                    tag: checked_from_i64("metadata_tiff_tag", tag)?,
+                    byte_order: parse_stored_tiff_byte_order(byte_order)?,
+                })
+            }
+            _ => Err(StoreError::invalid_input(
+                "metadata_field_locator",
+                "stored JPEG Exif locator columns are incomplete or cross-container",
+            )),
+        },
+        "iso_bmff" => match (
+            tiff_header_offset,
+            tiff_ifd_offset,
+            tiff_tag,
+            tiff_byte_order,
+            jpeg_app1_offset,
+            bmff_box_offset,
+            bmff_box_path,
+        ) {
+            (None, None, None, None, None, Some(box_offset), Some(box_path_raw))
+                if (0..=source_size_bytes).contains(&box_offset)
+                    && (4..=256).contains(&box_path_raw.len())
+                    && box_path_raw.len() % 4 == 0 =>
+            {
+                Ok(MetadataFieldRawLocator::IsoBmff {
+                    box_offset,
+                    box_path_raw,
+                })
+            }
+            _ => Err(StoreError::invalid_input(
+                "metadata_field_locator",
+                "stored ISO-BMFF locator columns are incomplete or cross-container",
+            )),
+        },
+        _ => Err(StoreError::invalid_input(
+            "metadata_container_kind",
+            "stored metadata container kind is not a v7 value",
+        )),
+    }
+}
+
 fn validated_keyset_limit(limit: u32) -> Result<i64> {
     validated_page(None, limit).map(|(_, fetch_limit)| fetch_limit)
+}
+
+fn validated_metadata_page_limit(
+    limit: u32,
+    endpoint_max: u32,
+    endpoint: &'static str,
+) -> Result<i64> {
+    if limit == 0 || limit > endpoint_max {
+        return Err(StoreError::invalid_input(
+            "limit",
+            format!("{endpoint} page size must be in 1..={endpoint_max}"),
+        ));
+    }
+    Ok(i64::from(limit) + 1)
 }
 
 fn validate_observation_cursor(
@@ -3474,6 +6062,207 @@ fn validate_duplicate_group_cursor(
     }
 }
 
+fn validate_time_probe_scope_cursor(
+    scan_run_id: i64,
+    cursor: Option<&VerifiedTimeProbeScopeCursor>,
+) -> Result<i64> {
+    match cursor {
+        None => Ok(0),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id => Err(StoreError::invalid_input(
+            "cursor",
+            "time-probe scope cursor belongs to a different scan run",
+        )),
+        Some(cursor) if cursor.last_group_build_id <= 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "time-probe scope cursor contains an invalid group key",
+        )),
+        Some(cursor) => Ok(cursor.last_group_build_id),
+    }
+}
+
+fn validate_capture_time_summary_cursor(
+    scan_run_id: i64,
+    cursor: Option<&CaptureTimeSummaryCursor>,
+) -> Result<i64> {
+    match cursor {
+        None => Ok(0),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor) if cursor.scan_run_id != scan_run_id => Err(StoreError::invalid_input(
+            "cursor",
+            "capture-time summary cursor belongs to a different scan run",
+        )),
+        Some(cursor) if cursor.last_exact_group_build_id <= 0 => Err(StoreError::invalid_input(
+            "cursor",
+            "capture-time summary cursor contains an invalid group id",
+        )),
+        Some(cursor) => Ok(cursor.last_exact_group_build_id),
+    }
+}
+
+fn validate_capture_time_candidate_cursor(
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+    cursor: Option<&CaptureTimeCandidateCursor>,
+) -> Result<i64> {
+    validate_capture_time_detail_cursor(
+        scan_run_id,
+        exact_group_build_id,
+        analysis_build_id,
+        cursor.map(|value| {
+            (
+                value.cursor_version,
+                value.scan_run_id,
+                value.exact_group_build_id,
+                value.analysis_build_id,
+                value.last_ordinal,
+            )
+        }),
+        "candidate",
+    )
+}
+
+fn validate_capture_time_member_cursor(
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+    cursor: Option<&CaptureTimeMemberCursor>,
+) -> Result<i64> {
+    validate_capture_time_detail_cursor(
+        scan_run_id,
+        exact_group_build_id,
+        analysis_build_id,
+        cursor.map(|value| {
+            (
+                value.cursor_version,
+                value.scan_run_id,
+                value.exact_group_build_id,
+                value.analysis_build_id,
+                value.last_member_ordinal,
+            )
+        }),
+        "member",
+    )
+}
+
+fn validate_capture_time_issue_cursor(
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+    cursor: Option<&CaptureTimeIssueCursor>,
+) -> Result<i64> {
+    validate_capture_time_detail_cursor(
+        scan_run_id,
+        exact_group_build_id,
+        analysis_build_id,
+        cursor.map(|value| {
+            (
+                value.cursor_version,
+                value.scan_run_id,
+                value.exact_group_build_id,
+                value.analysis_build_id,
+                value.last_ordinal,
+            )
+        }),
+        "issue",
+    )
+}
+
+fn validate_metadata_report_cursor(
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+    cursor: Option<&MetadataReportCursor>,
+) -> Result<(i64, i64)> {
+    match cursor {
+        None => Ok((-1, 0)),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor)
+            if cursor.scan_run_id != scan_run_id
+                || cursor.exact_group_build_id != exact_group_build_id
+                || cursor.analysis_build_id != analysis_build_id =>
+        {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "metadata report cursor belongs to a different evidence scope",
+            ))
+        }
+        Some(cursor) if cursor.last_source_ordinal < 0 || cursor.last_report_id <= 0 => Err(
+            StoreError::invalid_input("cursor", "metadata report cursor contains an invalid key"),
+        ),
+        Some(cursor) => Ok((cursor.last_source_ordinal, cursor.last_report_id)),
+    }
+}
+
+fn validate_metadata_field_cursor(
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+    source_ordinal: i64,
+    report_id: i64,
+    cursor: Option<&MetadataFieldCursor>,
+) -> Result<(i64, i64)> {
+    match cursor {
+        None => Ok((-1, 0)),
+        Some(cursor) if cursor.cursor_version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(cursor.cursor_version))
+        }
+        Some(cursor)
+            if cursor.scan_run_id != scan_run_id
+                || cursor.exact_group_build_id != exact_group_build_id
+                || cursor.analysis_build_id != analysis_build_id
+                || cursor.source_ordinal != source_ordinal
+                || cursor.report_id != report_id =>
+        {
+            Err(StoreError::invalid_input(
+                "cursor",
+                "metadata field cursor belongs to a different report scope",
+            ))
+        }
+        Some(cursor) if cursor.last_field_ordinal < 0 || cursor.last_field_id <= 0 => Err(
+            StoreError::invalid_input("cursor", "metadata field cursor contains an invalid key"),
+        ),
+        Some(cursor) => Ok((cursor.last_field_ordinal, cursor.last_field_id)),
+    }
+}
+
+fn validate_capture_time_detail_cursor(
+    scan_run_id: i64,
+    exact_group_build_id: i64,
+    analysis_build_id: i64,
+    cursor: Option<(i64, i64, i64, i64, i64)>,
+    endpoint: &'static str,
+) -> Result<i64> {
+    match cursor {
+        None => Ok(-1),
+        Some((version, _, _, _, _)) if version != KEYSET_CURSOR_VERSION => {
+            Err(unsupported_cursor_version(version))
+        }
+        Some((_, run_id, group_id, build_id, _))
+            if run_id != scan_run_id
+                || group_id != exact_group_build_id
+                || build_id != analysis_build_id =>
+        {
+            Err(StoreError::invalid_input(
+                "cursor",
+                format!("capture-time {endpoint} cursor belongs to a different scope"),
+            ))
+        }
+        Some((_, _, _, _, ordinal)) if ordinal < 0 => Err(StoreError::invalid_input(
+            "cursor",
+            format!("capture-time {endpoint} cursor has a negative ordinal"),
+        )),
+        Some((_, _, _, _, ordinal)) => Ok(ordinal),
+    }
+}
+
 fn validate_duplicate_group_member_cursor(
     scan_run_id: i64,
     group_build_id: i64,
@@ -3618,6 +6407,16 @@ fn validate_positive_read_id(field: &'static str, value: i64) -> Result<()> {
     Ok(())
 }
 
+fn validate_nonnegative_read_id(field: &'static str, value: i64) -> Result<()> {
+    if value < 0 {
+        return Err(StoreError::invalid_input(
+            field,
+            "value must be non-negative",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -3630,7 +6429,26 @@ mod tests {
         Store,
     };
     use crate::StoreError;
+    use rusqlite::{Connection, TransactionBehavior};
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    const PRE_V7_TEST_TABLES_REVERSE: [&str; 13] = [
+        "capture_time_recommendations",
+        "capture_time_member_assessments",
+        "capture_time_policy_issues",
+        "capture_time_candidates",
+        "capture_time_observations",
+        "capture_time_analysis_sources",
+        "capture_time_analysis_builds",
+        "metadata_source_revalidations",
+        "metadata_extraction_issues",
+        "metadata_extraction_fields",
+        "metadata_extraction_reports",
+        "capture_time_group_outcomes",
+        "scan_time_sessions",
+    ];
 
     #[test]
     fn initialization_faults_never_publish_the_final_path() -> crate::Result<()> {
@@ -3699,6 +6517,367 @@ mod tests {
         // public API rejects verbatim/device namespaces, so reopen through the
         // caller's ordinary disk path while checking the same published file.
         Store::open_existing(public_database)?.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn pre_v7_backup_failure_prevents_read_write_open_and_migration() -> crate::Result<()> {
+        let temporary = TempDir::new()
+            .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
+        let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
+            StoreError::io(
+                "canonicalizing pre-v7 test directory",
+                temporary.path(),
+                error,
+            )
+        })?;
+        let database = parent.join("backup-failure-v6.sqlite3");
+        create_managed_v6_fixture(&database)?;
+        let before = read_v6_health(&database)?;
+        assert_eq!(before, (6, 6, "ok".into(), 0));
+        let before_bytes = std::fs::read(&database)
+            .map_err(|error| StoreError::io("reading v6 fixture", &database, error))?;
+        let backup_called = Cell::new(false);
+        let migration_called = Cell::new(false);
+
+        let result = Store::open_inner_with_operations(
+            &database,
+            false,
+            false,
+            |_| {
+                backup_called.set(true);
+                Err(StoreError::BackupWorkLimit { steps: 0 })
+            },
+            |_, _| {
+                migration_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(StoreError::BackupWorkLimit { steps: 0 })
+        ));
+        assert!(backup_called.get());
+        assert!(!migration_called.get());
+        assert_eq!(read_v6_health(&database)?, before);
+        assert_eq!(
+            std::fs::read(&database).map_err(|error| StoreError::io(
+                "rereading v6 fixture",
+                &database,
+                error
+            ))?,
+            before_bytes
+        );
+        assert!(pre_v7_test_backups(&parent)?.is_empty());
+        assert_database_sidecars_absent_for_test(&database)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pre_v7_source_path_replacement_after_backup_never_reaches_read_write_open(
+    ) -> crate::Result<()> {
+        let temporary = TempDir::new()
+            .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
+        let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
+            StoreError::io(
+                "canonicalizing pre-v7 identity test directory",
+                temporary.path(),
+                error,
+            )
+        })?;
+        let database = parent.join("identity-v6.sqlite3");
+        let moved = parent.join("identity-original.sqlite3");
+        create_managed_v6_fixture(&database)?;
+        let migration_called = Cell::new(false);
+
+        let result = Store::open_inner_with_operations(
+            &database,
+            false,
+            false,
+            |source_path| {
+                let prepared =
+                    crate::backup::prepare_existing_database_before_sqlite_open(source_path)?;
+                std::fs::rename(source_path, &moved).map_err(|error| {
+                    StoreError::io("moving pre-v7 identity fixture", source_path, error)
+                })?;
+                std::fs::File::create(source_path).map_err(|error| {
+                    StoreError::io("replacing pre-v7 identity fixture", source_path, error)
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(source_path, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|error| {
+                        StoreError::io("setting pre-v7 replacement permissions", source_path, error)
+                    })?;
+                }
+                Ok(prepared)
+            },
+            |_, _| {
+                migration_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(
+            matches!(&result, Err(StoreError::PreV7MigrationFailed { .. })),
+            "unexpected identity result: {:?}",
+            result.as_ref().err()
+        );
+        assert!(!migration_called.get());
+        assert_eq!(read_v6_health(&moved)?, (6, 6, "ok".into(), 0));
+        Ok(())
+    }
+
+    #[test]
+    fn migration_fault_rolls_back_source_and_preserves_verified_pre_v7_backup() -> crate::Result<()>
+    {
+        let temporary = TempDir::new()
+            .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
+        let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
+            StoreError::io(
+                "canonicalizing pre-v7 test directory",
+                temporary.path(),
+                error,
+            )
+        })?;
+        let database = parent.join("migration-fault-v6.sqlite3");
+        create_managed_v6_fixture(&database)?;
+        let before = read_v6_health(&database)?;
+        assert_eq!(before, (6, 6, "ok".into(), 0));
+
+        let result = Store::open_inner_with_operations(
+            &database,
+            false,
+            false,
+            crate::backup::prepare_existing_database_before_sqlite_open,
+            |connection, _| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(
+                    "CREATE TABLE injected_partial_migration (id INTEGER PRIMARY KEY) STRICT; \
+                     INSERT INTO deliberately_missing_table DEFAULT VALUES;",
+                )?;
+                transaction.commit()?;
+                Ok(())
+            },
+        );
+
+        let retained_backup = match &result {
+            Err(StoreError::PreV7MigrationFailed {
+                backup_path,
+                source,
+            }) if matches!(source.as_ref(), StoreError::Sqlite(_)) => backup_path.clone(),
+            _ => panic!("unexpected migration result: {:?}", result.as_ref().err()),
+        };
+        assert_eq!(read_v6_health(&database)?, before);
+        let connection = Connection::open(&database)?;
+        let partial_table_count: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'injected_partial_migration'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(partial_table_count, 0);
+        connection
+            .close()
+            .map_err(|(_, error)| StoreError::from(error))?;
+
+        let backups = pre_v7_test_backups(&parent)?;
+        assert_eq!(backups.len(), 1);
+        assert_eq!(retained_backup, backups[0]);
+        assert!(retained_backup.is_file());
+        assert_eq!(read_v6_health(&backups[0])?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_staging_does_not_change_any_source_family_bytes() -> crate::Result<()> {
+        let temporary = TempDir::new()
+            .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
+        let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
+            StoreError::io(
+                "canonicalizing WAL staging test directory",
+                temporary.path(),
+                error,
+            )
+        })?;
+        let database = parent.join("wal-staging-v6.sqlite3");
+        create_managed_v6_fixture(&database)?;
+        let connection = Connection::open(&database)?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        assert!(journal_mode.eq_ignore_ascii_case("wal"));
+        connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+        connection.execute_batch(
+            "BEGIN IMMEDIATE; \
+             UPDATE guiying_schema_migrations \
+             SET applied_at_ms = 424242 WHERE version = 1; \
+             COMMIT;",
+        )?;
+        let shm = database_family_test_path(&database, "-shm");
+        if shm.exists() {
+            std::fs::remove_file(&shm)
+                .map_err(|error| StoreError::io("removing WAL test SHM", &shm, error))?;
+        }
+        let before = read_database_family_bytes_for_test(&database)?;
+
+        let prepared = crate::backup::prepare_existing_database_before_sqlite_open(&database)?;
+
+        assert_eq!(prepared.expected_version(), 6);
+        assert_eq!(read_database_family_bytes_for_test(&database)?, before);
+        let backup_path = prepared
+            .backup_path()
+            .ok_or_else(|| StoreError::invalid_input("pre_v7_backup", "WAL snapshot missing"))?;
+        assert_eq!(read_v6_health(backup_path)?, (6, 6, "ok".into(), 0));
+        let applied_at: i64 = Connection::open(backup_path)?.query_row(
+            "SELECT applied_at_ms FROM guiying_schema_migrations WHERE version = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(applied_at, 424_242);
+        drop(prepared);
+        connection
+            .close()
+            .map_err(|(_, error)| StoreError::from(error))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hot_journal_staging_does_not_change_any_source_family_bytes() -> crate::Result<()> {
+        let temporary = TempDir::new()
+            .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
+        let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
+            StoreError::io(
+                "canonicalizing journal staging test directory",
+                temporary.path(),
+                error,
+            )
+        })?;
+        let database = parent.join("journal-staging-v6.sqlite3");
+        create_managed_v6_fixture(&database)?;
+        let connection = Connection::open(&database)?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+        assert!(journal_mode.eq_ignore_ascii_case("delete"));
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.execute_batch(
+            "BEGIN IMMEDIATE; \
+             UPDATE guiying_schema_migrations \
+             SET checksum = zeroblob(32) WHERE version = 1;",
+        )?;
+        connection.cache_flush()?;
+        let journal = database_family_test_path(&database, "-journal");
+        assert!(
+            std::fs::metadata(&journal)
+                .map_err(|error| StoreError::io(
+                    "reading hot journal test fixture",
+                    &journal,
+                    error
+                ))?
+                .len()
+                > 512
+        );
+        let before = read_database_family_bytes_for_test(&database)?;
+
+        let prepared = crate::backup::prepare_existing_database_before_sqlite_open(&database)?;
+
+        assert_eq!(prepared.expected_version(), 6);
+        assert_eq!(read_database_family_bytes_for_test(&database)?, before);
+        let backup_path = prepared.backup_path().ok_or_else(|| {
+            StoreError::invalid_input("pre_v7_backup", "journal snapshot missing")
+        })?;
+        assert_eq!(read_v6_health(backup_path)?, (6, 6, "ok".into(), 0));
+        drop(prepared);
+        connection.execute_batch("ROLLBACK;")?;
+        connection
+            .close()
+            .map_err(|(_, error)| StoreError::from(error))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_v7_staging_backup_sync_and_publish_faults_leave_source_untouched() -> crate::Result<()> {
+        use crate::backup::BackupFaultPoint;
+
+        let fault_points = [
+            BackupFaultPoint::StagingWrite,
+            BackupFaultPoint::StagingFileSync,
+            BackupFaultPoint::StagingDirectorySync,
+            BackupFaultPoint::OnlineBackup,
+            BackupFaultPoint::Publish,
+        ];
+        for (index, fault_point) in fault_points.into_iter().enumerate() {
+            let temporary = TempDir::new()
+                .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
+            let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
+                StoreError::io(
+                    "canonicalizing pre-v7 fault test directory",
+                    temporary.path(),
+                    error,
+                )
+            })?;
+            let database = parent.join(format!("fault-{index}-v6.sqlite3"));
+            create_managed_v6_fixture(&database)?;
+            let before = read_database_family_bytes_for_test(&database)?;
+            crate::backup::set_test_backup_fault(fault_point);
+
+            let result = crate::backup::prepare_existing_database_before_sqlite_open(&database);
+
+            assert!(
+                matches!(result, Err(StoreError::Io { .. })),
+                "unexpected {fault_point:?} result: {:?}",
+                result.err()
+            );
+            assert_eq!(read_database_family_bytes_for_test(&database)?, before);
+            assert!(pre_v7_test_backups(&parent)?.is_empty());
+            let leaked_private_temporary = std::fs::read_dir(&parent)
+                .map_err(|error| {
+                    StoreError::io("reading pre-v7 fault test directory", &parent, error)
+                })?
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .any(|name| name.starts_with(".guiying-pre-v7-stage-") || name.starts_with(".tmp"));
+            assert!(
+                !leaked_private_temporary,
+                "{fault_point:?} left a staging or backup temporary behind"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_current_v7_uses_raw_header_fast_path_without_staging() -> crate::Result<()> {
+        let temporary = TempDir::new()
+            .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
+        let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
+            StoreError::io(
+                "canonicalizing current-v7 fast-path test directory",
+                temporary.path(),
+                error,
+            )
+        })?;
+        let database = parent.join("current-v7.sqlite3");
+        Store::open_or_create(&database)?.close()?;
+        assert_database_sidecars_absent_for_test(&database)?;
+        crate::backup::set_test_backup_fault(crate::backup::BackupFaultPoint::StagingWrite);
+
+        let result = crate::backup::prepare_existing_database_before_sqlite_open(&database);
+        crate::backup::clear_test_backup_fault();
+        let prepared = result?;
+
+        assert_eq!(
+            prepared.expected_version(),
+            crate::migrations::LATEST_SCHEMA_VERSION
+        );
+        assert!(prepared.backup_path().is_none());
+        prepared.verify_before_read_write()?;
+        assert!(pre_v7_test_backups(&parent)?.is_empty());
         Ok(())
     }
 
@@ -3796,6 +6975,132 @@ mod tests {
             Store::open_existing(&database),
             Err(StoreError::UnsafeDatabasePermissions { .. })
         ));
+        Ok(())
+    }
+
+    fn create_managed_v6_fixture(path: &Path) -> crate::Result<()> {
+        Store::open_or_create(path)?.close()?;
+        let connection = Connection::open(path)?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.execute_batch(
+            "DROP INDEX ux_exact_group_build_members_probe_binding_v7; \
+             DROP INDEX ux_exact_group_build_members_assessment_binding_v7;",
+        )?;
+        for table in PRE_V7_TEST_TABLES_REVERSE {
+            connection.execute_batch(&format!("DROP TABLE {table};"))?;
+        }
+        let deleted = connection.execute(
+            "DELETE FROM guiying_schema_migrations WHERE version = 7",
+            [],
+        )?;
+        assert_eq!(deleted, 1);
+        connection.pragma_update(None, "user_version", 6)?;
+        connection
+            .close()
+            .map_err(|(_, error)| StoreError::from(error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path)
+                .map_err(|error| StoreError::io("reading v6 fixture permissions", path, error))?
+                .permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(path, permissions)
+                .map_err(|error| StoreError::io("setting v6 fixture permissions", path, error))?;
+        }
+        Ok(())
+    }
+
+    fn read_v6_health(path: &Path) -> crate::Result<(i64, i64, String, i64)> {
+        let connection = Connection::open(path)?;
+        let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let migration_count = connection.query_row(
+            "SELECT count(*) FROM guiying_schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        let integrity = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let foreign_key_violations =
+            connection.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        connection
+            .close()
+            .map_err(|(_, error)| StoreError::from(error))?;
+        Ok((version, migration_count, integrity, foreign_key_violations))
+    }
+
+    fn pre_v7_test_backups(parent: &Path) -> crate::Result<Vec<PathBuf>> {
+        let entries = std::fs::read_dir(parent)
+            .map_err(|error| StoreError::io("reading pre-v7 backup directory", parent, error))?;
+        let mut backups = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                StoreError::io("reading pre-v7 backup directory entry", parent, error)
+            })?;
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".guiying-pre-v7-v6-"))
+            {
+                backups.push(path);
+            }
+        }
+        backups.sort();
+        Ok(backups)
+    }
+
+    #[cfg(unix)]
+    fn read_database_family_bytes_for_test(
+        database: &Path,
+    ) -> crate::Result<Vec<(PathBuf, Vec<u8>)>> {
+        let mut family = Vec::new();
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let path = database_family_test_path(database, suffix);
+            match std::fs::read(&path) {
+                Ok(bytes) => family.push((path, bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(StoreError::io(
+                        "reading database family test fixture",
+                        path,
+                        error,
+                    ));
+                }
+            }
+        }
+        Ok(family)
+    }
+
+    #[cfg(unix)]
+    fn database_family_test_path(database: &Path, suffix: &str) -> PathBuf {
+        let mut path = database.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    fn assert_database_sidecars_absent_for_test(database: &Path) -> crate::Result<()> {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut name = database.as_os_str().to_os_string();
+            name.push(suffix);
+            let sidecar = PathBuf::from(name);
+            match std::fs::symlink_metadata(&sidecar) {
+                Ok(_) => {
+                    return Err(StoreError::MigrationHistoryMismatch(format!(
+                        "test source unexpectedly gained sidecar {sidecar:?}"
+                    )))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(StoreError::io(
+                        "checking pre-v7 test source sidecar",
+                        sidecar,
+                        error,
+                    ))
+                }
+            }
+        }
         Ok(())
     }
 }

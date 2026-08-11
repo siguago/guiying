@@ -1,16 +1,27 @@
+use std::collections::BTreeMap;
+
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::error::{Result, StoreError};
 use crate::model::{
-    BeginExactGroupInput, CapabilityProfileInput, CoreDirectoryObservationInput,
-    CoreFileObservationInput, CoreSessionId, CoreSessionInput, CoverageOutcomeInput,
-    CoverageStatus, ExactGroupKey, ExactGroupManifestMember, ExactGroupMemberInput,
-    ExactVerificationEdgeInput, FileTimestampParts, FreshFingerprintInput, FreshFingerprintKind,
-    ManifestDigest, MediaFileInput, MountSessionKey, NamespaceProfileInput, NewBoundScanRun,
-    NewScanIssue, NewScanJob, NewScanReport, NewScanRun, NewScopedScanJob, ObservationInput,
-    RunEvidenceGuard, ScanCheckpointInput, ScanStage, SourceSignature, VerifiedExactGroup,
-    VolumeInput, MAX_IDENTIFIER_BYTES, MAX_JSON_BYTES, MAX_OPAQUE_BLOB_BYTES, MAX_PATH_BYTES,
-    MAX_TEXT_BYTES,
+    BeginCaptureTimeAnalysisInput, BeginExactGroupInput, BeginMetadataReportInput,
+    BeginTimeSessionInput, CapabilityProfileInput, CaptureTimeAnalysisManifestPlan,
+    CaptureTimeAnalysisSourceInput, CaptureTimeCandidateInput, CaptureTimeDecision,
+    CaptureTimeMemberAssessmentInput, CaptureTimeObservationInput,
+    CaptureTimeObservationInterpretationInput, CaptureTimePolicyIssueInput,
+    CaptureTimeRecommendationInput, CoreDirectoryObservationInput, CoreFileObservationInput,
+    CoreSessionId, CoreSessionInput, CoverageOutcomeInput, CoverageStatus, ExactGroupKey,
+    ExactGroupManifestMember, ExactGroupMemberInput, ExactVerificationEdgeInput,
+    FileTimestampParts, FreshFingerprintInput, FreshFingerprintKind, ManifestDigest,
+    MediaFileInput, MetadataContainerLocator, MetadataExtractionIssueInput, MetadataFieldInput,
+    MetadataReportManifestPlan, MetadataSourceRevalidationInput, MountSessionKey,
+    NamespaceProfileInput, NewBoundScanRun, NewScanIssue, NewScanJob, NewScanReport, NewScanRun,
+    NewScopedScanJob, ObservationInput, RecordTimeGroupOutcomeInput, RunEvidenceGuard,
+    ScanCheckpointInput, ScanStage, SourceSignature, TimeEvidenceGuard, TimeEvidenceManifestDigest,
+    TimeExactFingerprintMaterial, TimeLineageKey, TimeSessionOutcome, TimeSourceKey,
+    TimeSourceKeyMaterial, VerifiedExactGroup, VolumeInput, MAX_IDENTIFIER_BYTES, MAX_JSON_BYTES,
+    MAX_OPAQUE_BLOB_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES, MAX_TIME_EVIDENCE_BATCH,
+    MAX_TIME_EVIDENCE_PAGE_BYTES,
 };
 
 const MAX_V5_WRITE_BATCH: usize = 128;
@@ -18,19 +29,40 @@ const MAX_V5_WRITE_BATCH: usize = 128;
 /// Repository operations scoped to one short SQLite write transaction.
 pub struct RepositoryTx<'transaction> {
     transaction: &'transaction Transaction<'transaction>,
+    store_instance_key: [u8; 32],
     poisoned: bool,
+    bound_core_sessions: Vec<(i64, [u8; 32])>,
 }
 
 impl<'transaction> RepositoryTx<'transaction> {
+    #[cfg(test)]
     pub(crate) fn new(transaction: &'transaction Transaction<'transaction>) -> Self {
         Self {
             transaction,
+            store_instance_key: [0; 32],
             poisoned: false,
+            bound_core_sessions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn new_bound(
+        transaction: &'transaction Transaction<'transaction>,
+        store_instance_key: [u8; 32],
+    ) -> Self {
+        Self {
+            transaction,
+            store_instance_key,
+            poisoned: false,
+            bound_core_sessions: Vec::new(),
         }
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    pub(crate) fn take_bound_core_sessions(&mut self) -> Vec<(i64, [u8; 32])> {
+        std::mem::take(&mut self.bound_core_sessions)
     }
 
     fn run_mutator<T>(
@@ -320,6 +352,232 @@ impl<'transaction> RepositoryTx<'transaction> {
         })
     }
 
+    pub fn begin_time_session(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        input: &BeginTimeSessionInput,
+    ) -> Result<i64> {
+        self.run_mutator(|repository| repository.begin_time_session_impl(guard, input))
+    }
+
+    pub fn finalize_time_session(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        time_session_id: i64,
+        outcome: TimeSessionOutcome,
+        finalized_at_ms: i64,
+    ) -> Result<TimeEvidenceManifestDigest> {
+        self.run_mutator(|repository| {
+            repository.finalize_time_session_impl(guard, time_session_id, outcome, finalized_at_ms)
+        })
+    }
+
+    pub fn record_time_group_non_evidence_outcome(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        input: &RecordTimeGroupOutcomeInput,
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.record_time_group_non_evidence_outcome_impl(guard, input)
+        })
+    }
+
+    pub fn abandon_time_session(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        time_session_id: i64,
+        abandoned_at_ms: i64,
+        reason_code: &str,
+        reason_message: Option<&str>,
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.abandon_time_session_impl(
+                guard,
+                time_session_id,
+                abandoned_at_ms,
+                reason_code,
+                reason_message,
+            )
+        })
+    }
+
+    pub fn begin_metadata_report(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        input: &BeginMetadataReportInput,
+    ) -> Result<i64> {
+        self.run_mutator(|repository| repository.begin_metadata_report_impl(guard, input))
+    }
+
+    pub fn append_metadata_fields_batch(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        report_id: i64,
+        inputs: &[MetadataFieldInput],
+    ) -> Result<Vec<i64>> {
+        self.run_mutator(|repository| {
+            repository.append_metadata_fields_batch_impl(guard, report_id, inputs)
+        })
+    }
+
+    pub fn append_metadata_issues_batch(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        report_id: i64,
+        inputs: &[MetadataExtractionIssueInput],
+    ) -> Result<Vec<i64>> {
+        self.run_mutator(|repository| {
+            repository.append_metadata_issues_batch_impl(guard, report_id, inputs)
+        })
+    }
+
+    pub fn seal_metadata_report(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        report_id: i64,
+        revalidation: &MetadataSourceRevalidationInput,
+        finalized_at_ms: i64,
+    ) -> Result<TimeEvidenceManifestDigest> {
+        self.run_mutator(|repository| {
+            repository.seal_metadata_report_impl(guard, report_id, revalidation, finalized_at_ms)
+        })
+    }
+
+    pub fn abandon_metadata_report(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        report_id: i64,
+        abandoned_at_ms: i64,
+        reason_code: &str,
+        reason_message: Option<&str>,
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.abandon_metadata_report_impl(
+                guard,
+                report_id,
+                abandoned_at_ms,
+                reason_code,
+                reason_message,
+            )
+        })
+    }
+
+    pub fn begin_capture_time_analysis(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        input: &BeginCaptureTimeAnalysisInput,
+    ) -> Result<i64> {
+        self.run_mutator(|repository| repository.begin_capture_time_analysis_impl(guard, input))
+    }
+
+    pub fn append_capture_time_sources_batch(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimeAnalysisSourceInput],
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.append_capture_time_sources_batch_impl(guard, analysis_build_id, inputs)
+        })
+    }
+
+    pub fn append_capture_time_observations_batch(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimeObservationInput],
+    ) -> Result<Vec<i64>> {
+        self.run_mutator(|repository| {
+            repository.append_capture_time_observations_batch_impl(guard, analysis_build_id, inputs)
+        })
+    }
+
+    pub fn append_capture_time_candidates_batch(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimeCandidateInput],
+    ) -> Result<Vec<i64>> {
+        self.run_mutator(|repository| {
+            repository.append_capture_time_candidates_batch_impl(guard, analysis_build_id, inputs)
+        })
+    }
+
+    pub fn append_capture_time_policy_issues_batch(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimePolicyIssueInput],
+    ) -> Result<Vec<i64>> {
+        self.run_mutator(|repository| {
+            repository.append_capture_time_policy_issues_batch_impl(
+                guard,
+                analysis_build_id,
+                inputs,
+            )
+        })
+    }
+
+    pub fn append_capture_time_members_batch(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimeMemberAssessmentInput],
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.append_capture_time_members_batch_impl(guard, analysis_build_id, inputs)
+        })
+    }
+
+    pub fn append_capture_time_recommendation(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        input: &CaptureTimeRecommendationInput,
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.append_capture_time_recommendation_impl(guard, analysis_build_id, input)
+        })
+    }
+
+    pub fn seal_capture_time_analysis(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        decision: CaptureTimeDecision,
+        selected_candidate_ordinal: Option<i64>,
+        finalized_at_ms: i64,
+    ) -> Result<TimeEvidenceManifestDigest> {
+        self.run_mutator(|repository| {
+            repository.seal_capture_time_analysis_impl(
+                guard,
+                analysis_build_id,
+                decision,
+                selected_candidate_ordinal,
+                finalized_at_ms,
+            )
+        })
+    }
+
+    pub fn abandon_capture_time_analysis(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        abandoned_at_ms: i64,
+        reason_code: &str,
+        reason_message: Option<&str>,
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.abandon_capture_time_analysis_impl(
+                guard,
+                analysis_build_id,
+                abandoned_at_ms,
+                reason_code,
+                reason_message,
+            )
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn transition_scan_job_and_run(
         &mut self,
@@ -371,6 +629,2392 @@ impl<'transaction> RepositoryTx<'transaction> {
                 last_error,
             )
         })
+    }
+
+    // These fail-closed implementation slots keep downstream crates buildable
+    // while the v7 SQL contract is wired below. They are replaced in-place by
+    // the transactional implementations before this API is exported.
+    fn begin_time_session_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        input: &BeginTimeSessionInput,
+    ) -> Result<i64> {
+        let context = self.validate_time_evidence_guard(guard)?;
+        let earliest_created_at_ms = self
+            .transaction
+            .query_row(
+                "SELECT max(core.bound_at_ms, exact_seal.sealed_at_ms) \
+                 FROM scan_core_sessions AS core \
+                 JOIN scan_stage_seals AS exact_seal \
+                   ON exact_seal.scan_run_id = core.scan_run_id \
+                  AND exact_seal.volume_id = core.volume_id \
+                  AND exact_seal.stage = 'exact_verification' \
+                 WHERE core.scan_run_id = ?1 AND core.volume_id = ?2 \
+                   AND core.core_session_id = ?3",
+                params![
+                    guard.run().scan_run_id,
+                    context.volume_id,
+                    guard.core_session_id().as_bytes().as_slice(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::ConcurrencyConflict {
+                    entity: "time_session_chronology_guard",
+                    id: guard.run().scan_run_id,
+                },
+                other => StoreError::from(other),
+            })?;
+        if input.created_at_ms < earliest_created_at_ms {
+            return Err(StoreError::invalid_input(
+                "created_at_ms",
+                "time session creation predates its bound core or exact-verification seal",
+            ));
+        }
+        let (group_count, manifest) =
+            recompute_time_session_scope_manifest(self.transaction, guard.run().scan_run_id)?;
+        if group_count != input.expected_group_count || manifest != input.expected_manifest_digest {
+            return Err(StoreError::invalid_input(
+                "time_session_manifest",
+                "caller scope does not match the sealed verified exact-group set",
+            ));
+        }
+        if let Some((id, matches)) = self
+            .transaction
+            .query_row(
+                "SELECT id, time_session_key = ?2 AND core_session_id = ?3 \
+                     AND expected_group_count = ?4 AND max_total_read_bytes = ?5 \
+                     AND max_probe_count_per_group = ?6 \
+                     AND max_report_total_bytes_read = ?7 \
+                     AND max_report_read_operations = ?8 \
+                     AND max_report_retained_field_bytes = ?9 \
+                     AND max_report_fields = ?10 AND max_report_issues = ?11 \
+                     AND expected_manifest_digest = ?12 AND created_at_ms = ?13 \
+                     AND volume_id = ?14 AND schema_contract_version = 1 \
+                     AND scope_manifest_version = 1 AND outcome_manifest_version = 2 \
+                 FROM scan_time_sessions WHERE scan_run_id = ?1",
+                params![
+                    guard.run().scan_run_id,
+                    input.time_session_key.as_bytes().as_slice(),
+                    guard.core_session_id().as_bytes().as_slice(),
+                    input.expected_group_count,
+                    input.budget.max_total_read_bytes,
+                    input.budget.max_probe_count_per_group,
+                    input.budget.max_report_total_bytes_read,
+                    input.budget.max_report_read_operations,
+                    input.budget.max_report_retained_field_bytes,
+                    input.budget.max_report_fields,
+                    input.budget.max_report_issues,
+                    input.expected_manifest_digest.as_bytes().as_slice(),
+                    input.created_at_ms,
+                    context.volume_id,
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?
+        {
+            return if matches {
+                Ok(id)
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "time_session",
+                    key: guard.run().scan_run_id.to_string(),
+                })
+            };
+        }
+        self.transaction.execute(
+            "INSERT INTO scan_time_sessions ( \
+                 time_session_key, volume_id, scan_run_id, core_session_id, \
+                 schema_contract_version, expected_group_count, max_total_read_bytes, \
+                 max_probe_count_per_group, max_report_total_bytes_read, \
+                 max_report_read_operations, max_report_retained_field_bytes, \
+                 max_report_fields, max_report_issues, expected_manifest_digest, created_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                input.time_session_key.as_bytes().as_slice(),
+                context.volume_id,
+                guard.run().scan_run_id,
+                guard.core_session_id().as_bytes().as_slice(),
+                input.expected_group_count,
+                input.budget.max_total_read_bytes,
+                input.budget.max_probe_count_per_group,
+                input.budget.max_report_total_bytes_read,
+                input.budget.max_report_read_operations,
+                input.budget.max_report_retained_field_bytes,
+                input.budget.max_report_fields,
+                input.budget.max_report_issues,
+                input.expected_manifest_digest.as_bytes().as_slice(),
+                input.created_at_ms,
+            ],
+        )?;
+        Ok(self.transaction.last_insert_rowid())
+    }
+
+    fn finalize_time_session_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        time_session_id: i64,
+        outcome: TimeSessionOutcome,
+        finalized_at_ms: i64,
+    ) -> Result<TimeEvidenceManifestDigest> {
+        self.validate_time_evidence_guard(guard)?;
+        require_positive("time_session_id", time_session_id)?;
+        require_nonnegative("finalized_at_ms", finalized_at_ms)?;
+        let session = self.transaction.query_row(
+            "SELECT scan_run_id, core_session_id, state, expected_group_count, \
+                    evidence_group_count, unavailable_group_count, failed_group_count, \
+                    max_total_read_bytes, expected_manifest_digest, sealed_manifest_digest, \
+                    sealed_outcome_manifest_digest, created_at_ms, finalized_at_ms \
+             FROM scan_time_sessions WHERE id = ?1",
+            [time_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                ))
+            },
+        )?;
+        if session.0 != guard.run().scan_run_id
+            || session.1.as_slice() != guard.core_session_id().as_bytes()
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "time_session_guard",
+                id: time_session_id,
+            });
+        }
+        let expected_scope =
+            TimeEvidenceManifestDigest::from_runtime_evidence(fixed_32_from_sql(session.8, 8)?);
+        let (scope_count, observed_scope) =
+            recompute_time_session_scope_manifest(self.transaction, session.0)?;
+        if scope_count != session.3 || observed_scope != expected_scope {
+            return Err(StoreError::invalid_input(
+                "time_session_scope_manifest",
+                "the current verified exact-group scope differs from the frozen session scope",
+            ));
+        }
+        let open_child_count = self.transaction.query_row(
+            "SELECT \
+                 (SELECT count(*) FROM metadata_extraction_reports \
+                  WHERE time_session_id = ?1 AND state = 'draft') + \
+                 (SELECT count(*) FROM capture_time_analysis_builds \
+                  WHERE time_session_id = ?1 AND state = 'draft')",
+            [time_session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if open_child_count != 0 {
+            return Err(StoreError::invalid_input(
+                "time_session_children",
+                "all metadata reports and analyses must be terminal before session finalization",
+            ));
+        }
+        let mut total_report_read_bytes = 0_i64;
+        let mut statement = self.transaction.prepare(
+            "SELECT usage_bytes_read FROM metadata_extraction_reports \
+             WHERE time_session_id = ?1 ORDER BY id",
+        )?;
+        let mut rows = statement.query([time_session_id])?;
+        while let Some(row) = rows.next()? {
+            let bytes = row.get::<_, i64>(0)?;
+            if bytes < 0 {
+                return Err(StoreError::invalid_input(
+                    "metadata_report_usage",
+                    "stored report read usage is negative",
+                ));
+            }
+            total_report_read_bytes =
+                total_report_read_bytes.checked_add(bytes).ok_or_else(|| {
+                    StoreError::invalid_input("max_total_read_bytes", "read usage sum overflow")
+                })?;
+        }
+        if total_report_read_bytes > session.7 / 2 {
+            return Err(StoreError::invalid_input(
+                "max_total_read_bytes",
+                "two pinned extraction passes exceed the frozen session read budget",
+            ));
+        }
+        let counts = self.transaction.query_row(
+            "SELECT \
+                 sum(CASE WHEN outcome = 'evidence' THEN 1 ELSE 0 END), \
+                 sum(CASE WHEN outcome = 'unavailable' THEN 1 ELSE 0 END), \
+                 sum(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END), count(*) \
+             FROM capture_time_group_outcomes WHERE time_session_id = ?1",
+            [time_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        if counts.3 > session.3
+            || (outcome == TimeSessionOutcome::Complete && counts.3 != session.3)
+        {
+            return Err(StoreError::invalid_input(
+                "time_session_outcomes",
+                "complete sessions require one outcome per frozen group and partial sessions cannot exceed scope",
+            ));
+        }
+        let missing_sealed_analysis_outcome = self.transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM capture_time_analysis_builds AS build \
+                 WHERE build.time_session_id = ?1 AND build.state = 'sealed' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM capture_time_group_outcomes AS group_outcome \
+                       WHERE group_outcome.time_session_id = build.time_session_id \
+                         AND group_outcome.exact_group_build_id = build.exact_group_build_id \
+                         AND group_outcome.outcome = 'evidence' \
+                         AND group_outcome.analysis_build_id = build.id \
+                   ) \
+             )",
+            [time_session_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if missing_sealed_analysis_outcome {
+            return Err(StoreError::invalid_input(
+                "time_session_outcomes",
+                "a sealed analysis is missing its immutable evidence outcome",
+            ));
+        }
+        let latest_child_ms = self.transaction.query_row(
+            "SELECT max(value) FROM ( \
+                 SELECT created_at_ms AS value FROM scan_time_sessions WHERE id = ?1 \
+                 UNION ALL SELECT finalized_at_ms FROM metadata_extraction_reports \
+                     WHERE time_session_id = ?1 AND finalized_at_ms IS NOT NULL \
+                 UNION ALL SELECT finalized_at_ms FROM capture_time_analysis_builds \
+                     WHERE time_session_id = ?1 AND finalized_at_ms IS NOT NULL \
+                 UNION ALL SELECT created_at_ms FROM capture_time_group_outcomes \
+                     WHERE time_session_id = ?1 \
+             )",
+            [time_session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if finalized_at_ms < latest_child_ms {
+            return Err(StoreError::invalid_input(
+                "finalized_at_ms",
+                "session finalization predates retained terminal evidence",
+            ));
+        }
+        let outcome_manifest = recompute_time_session_outcome_manifest_for_terminal(
+            self.transaction,
+            time_session_id,
+            outcome.as_storage_str(),
+            finalized_at_ms,
+        )?;
+        if matches!(session.2.as_str(), "complete" | "partial") {
+            return if session.2 == outcome.as_storage_str()
+                && session.4 == Some(counts.0)
+                && session.5 == Some(counts.1)
+                && session.6 == Some(counts.2)
+                && session
+                    .9
+                    .as_deref()
+                    .is_some_and(|value| value == observed_scope.as_bytes())
+                && session
+                    .10
+                    .as_deref()
+                    .is_some_and(|value| value == outcome_manifest.as_bytes())
+                && session.12 == Some(finalized_at_ms)
+            {
+                Ok(outcome_manifest)
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "time_session_finalization",
+                    key: time_session_id.to_string(),
+                })
+            };
+        }
+        if session.2 != "draft" || finalized_at_ms < session.11 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "draft_time_session",
+                id: time_session_id,
+            });
+        }
+        let changed = self.transaction.execute(
+            "UPDATE scan_time_sessions \
+             SET state = ?2, evidence_group_count = ?3, unavailable_group_count = ?4, \
+                 failed_group_count = ?5, sealed_manifest_digest = ?6, \
+                 sealed_outcome_manifest_digest = ?7, finalized_at_ms = ?8 \
+             WHERE id = ?1 AND state = 'draft'",
+            params![
+                time_session_id,
+                outcome.as_storage_str(),
+                counts.0,
+                counts.1,
+                counts.2,
+                observed_scope.as_bytes().as_slice(),
+                outcome_manifest.as_bytes().as_slice(),
+                finalized_at_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "time_session_finalization",
+                id: time_session_id,
+            });
+        }
+        Ok(outcome_manifest)
+    }
+
+    fn record_time_group_non_evidence_outcome_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        input: &RecordTimeGroupOutcomeInput,
+    ) -> Result<()> {
+        let context = self.validate_time_evidence_guard(guard)?;
+        let session_matches = self.transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM scan_time_sessions AS session \
+                 JOIN exact_group_builds AS exact_build \
+                   ON exact_build.id = ?2 AND exact_build.volume_id = session.volume_id \
+                  AND exact_build.scan_run_id = session.scan_run_id \
+                  AND exact_build.state = 'verified' \
+                 WHERE session.id = ?1 AND session.volume_id = ?3 \
+                   AND session.scan_run_id = ?4 AND session.core_session_id = ?5 \
+                   AND session.state = 'draft' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM capture_time_analysis_builds AS build \
+                       WHERE build.time_session_id = session.id \
+                         AND build.exact_group_build_id = exact_build.id \
+                         AND build.state = 'sealed' \
+                   ) \
+             )",
+            params![
+                input.time_session_id,
+                input.exact_group_build_id,
+                context.volume_id,
+                guard.run().scan_run_id,
+                guard.core_session_id().as_bytes().as_slice(),
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !session_matches {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "draft_time_group_outcome_guard",
+                id: input.exact_group_build_id,
+            });
+        }
+        let latest_group_evidence_ms = latest_time_group_terminal_evidence_ms(
+            self.transaction,
+            input.time_session_id,
+            input.exact_group_build_id,
+        )?;
+        if input.created_at_ms < latest_group_evidence_ms {
+            return Err(StoreError::invalid_input(
+                "created_at_ms",
+                "group outcome predates retained terminal report or analysis evidence",
+            ));
+        }
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT outcome, analysis_build_id, reason_code, created_at_ms \
+                 FROM capture_time_group_outcomes \
+                 WHERE time_session_id = ?1 AND exact_group_build_id = ?2",
+                params![input.time_session_id, input.exact_group_build_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            return if existing.0 == input.outcome.as_storage_str()
+                && existing.1.is_none()
+                && existing.2 == input.reason_code
+                && existing.3 == input.created_at_ms
+            {
+                Ok(())
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "time_group_outcome",
+                    key: format!("{}:{}", input.time_session_id, input.exact_group_build_id),
+                })
+            };
+        }
+        self.transaction.execute(
+            "INSERT INTO capture_time_group_outcomes ( \
+                 time_session_id, exact_group_build_id, volume_id, scan_run_id, outcome, \
+                 analysis_build_id, reason_code, created_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+            params![
+                input.time_session_id,
+                input.exact_group_build_id,
+                context.volume_id,
+                guard.run().scan_run_id,
+                input.outcome.as_storage_str(),
+                input.reason_code,
+                input.created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn abandon_time_session_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        time_session_id: i64,
+        abandoned_at_ms: i64,
+        reason_code: &str,
+        reason_message: Option<&str>,
+    ) -> Result<()> {
+        self.validate_time_evidence_guard(guard)?;
+        require_positive("time_session_id", time_session_id)?;
+        require_nonnegative("abandoned_at_ms", abandoned_at_ms)?;
+        require_bounded_nonempty("reason_code", reason_code, 256)?;
+        validate_optional_bounded("reason_message", reason_message, MAX_TEXT_BYTES)?;
+        let stored = self.transaction.query_row(
+            "SELECT scan_run_id, core_session_id, state, abandon_reason_code, \
+                    abandon_reason_message, created_at_ms, finalized_at_ms \
+             FROM scan_time_sessions WHERE id = ?1",
+            [time_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            },
+        )?;
+        if stored.0 != guard.run().scan_run_id
+            || stored.1.as_slice() != guard.core_session_id().as_bytes()
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "time_session_guard",
+                id: time_session_id,
+            });
+        }
+        if stored.2 == "abandoned" {
+            return if stored.3.as_deref() == Some(reason_code)
+                && stored.4.as_deref() == reason_message
+                && stored.6 == Some(abandoned_at_ms)
+            {
+                Ok(())
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "time_session_abandonment",
+                    key: time_session_id.to_string(),
+                })
+            };
+        }
+        if stored.2 != "draft" || abandoned_at_ms < stored.5 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "draft_time_session",
+                id: time_session_id,
+            });
+        }
+        let open_child_count = self.transaction.query_row(
+            "SELECT \
+                 (SELECT count(*) FROM metadata_extraction_reports \
+                  WHERE time_session_id = ?1 AND state = 'draft') + \
+                 (SELECT count(*) FROM capture_time_analysis_builds \
+                  WHERE time_session_id = ?1 AND state = 'draft')",
+            [time_session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if open_child_count != 0 {
+            return Err(StoreError::invalid_input(
+                "time_session_children",
+                "draft reports and analyses must be explicitly abandoned before the session",
+            ));
+        }
+        let latest_child_ms = self.transaction.query_row(
+            "SELECT max(value) FROM ( \
+                 SELECT created_at_ms AS value FROM scan_time_sessions WHERE id = ?1 \
+                 UNION ALL SELECT finalized_at_ms FROM metadata_extraction_reports \
+                     WHERE time_session_id = ?1 AND finalized_at_ms IS NOT NULL \
+                 UNION ALL SELECT finalized_at_ms FROM capture_time_analysis_builds \
+                     WHERE time_session_id = ?1 AND finalized_at_ms IS NOT NULL \
+                 UNION ALL SELECT created_at_ms FROM capture_time_group_outcomes \
+                     WHERE time_session_id = ?1 \
+             )",
+            [time_session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if abandoned_at_ms < latest_child_ms {
+            return Err(StoreError::invalid_input(
+                "abandoned_at_ms",
+                "session abandonment predates retained terminal evidence",
+            ));
+        }
+        let changed = self.transaction.execute(
+            "UPDATE scan_time_sessions \
+             SET state = 'abandoned', abandon_reason_code = ?2, \
+                 abandon_reason_message = ?3, finalized_at_ms = ?4 \
+             WHERE id = ?1 AND state = 'draft'",
+            params![
+                time_session_id,
+                reason_code,
+                reason_message,
+                abandoned_at_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "time_session_abandonment",
+                id: time_session_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn begin_metadata_report_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        input: &BeginMetadataReportInput,
+    ) -> Result<i64> {
+        let context = self.validate_time_evidence_guard(guard)?;
+        validate_metadata_report_input(input)?;
+        let session_header = self
+            .transaction
+            .query_row(
+                "SELECT created_at_ms, max_probe_count_per_group \
+                 FROM scan_time_sessions \
+                 WHERE id = ?1 AND volume_id = ?2 AND scan_run_id = ?3 \
+                   AND core_session_id = ?4 AND state = 'draft'",
+                params![
+                    input.time_session_id,
+                    context.volume_id,
+                    guard.run().scan_run_id,
+                    guard.core_session_id().as_bytes().as_slice(),
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((session_created_at_ms, max_probe_count)) = session_header else {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "draft_time_session",
+                id: input.time_session_id,
+            });
+        };
+        if input.created_at_ms < session_created_at_ms {
+            return Err(StoreError::invalid_input(
+                "created_at_ms",
+                "metadata report creation predates its time session",
+            ));
+        }
+        if input.probe_ordinal >= max_probe_count {
+            return Err(StoreError::invalid_input(
+                "probe_ordinal",
+                "metadata probe ordinal exceeds the frozen per-group probe budget",
+            ));
+        }
+        let probe_is_exact_member = self.transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM scan_time_sessions AS time_session \
+                 JOIN exact_group_builds AS exact_build \
+                   ON exact_build.id = ?2 AND exact_build.volume_id = time_session.volume_id \
+                  AND exact_build.scan_run_id = time_session.scan_run_id \
+                  AND exact_build.state = 'verified' \
+                 JOIN exact_group_build_members AS member \
+                   ON member.exact_group_build_id = exact_build.id \
+                  AND member.volume_id = exact_build.volume_id \
+                  AND member.scan_run_id = exact_build.scan_run_id \
+                  AND member.media_observation_snapshot_id = ?3 \
+                  AND member.observation_fingerprint_id = ?4 \
+                 JOIN observation_fingerprints AS fingerprint \
+                   ON fingerprint.id = member.observation_fingerprint_id \
+                  AND fingerprint.media_observation_snapshot_id = member.media_observation_snapshot_id \
+                  AND fingerprint.fingerprint_kind = 'exact_bytes' \
+                  AND fingerprint.read_origin = 'full_hash_read' \
+                 WHERE time_session.id = ?1 AND time_session.state = 'draft' \
+                   AND time_session.scan_run_id = ?5 AND time_session.volume_id = ?6 \
+                   AND time_session.core_session_id = ?7 \
+             )",
+            params![
+                input.time_session_id,
+                input.exact_group_build_id,
+                input.metadata_probe_observation_id,
+                input.metadata_probe_fingerprint_id,
+                guard.run().scan_run_id,
+                context.volume_id,
+                guard.core_session_id().as_bytes().as_slice(),
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !probe_is_exact_member {
+            return Err(StoreError::invalid_input(
+                "metadata_probe",
+                "report probe must be a full-read exact fingerprint member of the sealed group",
+            ));
+        }
+        if let Some((id, matches)) = self
+            .transaction
+            .query_row(
+                "SELECT id, metadata_probe_observation_id = ?4 \
+                     AND metadata_probe_fingerprint_id = ?5 \
+                     AND source_size_bytes = ?6 AND retained_report_digest = ?7 \
+                     AND expected_manifest_digest = ?8 AND expected_field_count = ?9 \
+                     AND expected_issue_count = ?10 \
+                     AND expected_retained_field_bytes = ?11 \
+                     AND report_parser_name = ?12 AND report_parser_version = ?13 \
+                     AND detected_format IS ?14 AND extraction_status = ?15 \
+                     AND effective_max_total_bytes_read = ?16 \
+                     AND effective_max_read_operations = ?17 \
+                     AND effective_max_retained_field_bytes = ?18 \
+                     AND effective_max_field_bytes = ?19 AND effective_max_fields = ?20 \
+                     AND effective_max_jpeg_segments = ?21 \
+                     AND effective_max_ifd_entries = ?22 AND effective_max_ifd_depth = ?23 \
+                     AND effective_max_bmff_boxes = ?24 AND effective_max_bmff_depth = ?25 \
+                     AND usage_bytes_read = ?26 AND usage_read_operations = ?27 \
+                     AND usage_retained_field_bytes = ?28 AND usage_fields_emitted = ?29 \
+                     AND usage_jpeg_segments_visited = ?30 \
+                     AND usage_ifd_entries_visited = ?31 \
+                     AND usage_bmff_boxes_visited = ?32 \
+                     AND usage_max_depth_observed = ?33 AND created_at_ms = ?34 \
+                     AND volume_id = ?35 AND scan_run_id = ?36 AND core_session_id = ?37 \
+                     AND manifest_version = 1 \
+                 FROM metadata_extraction_reports \
+                 WHERE time_session_id = ?1 AND exact_group_build_id = ?2 AND probe_ordinal = ?3",
+                params![
+                    input.time_session_id,
+                    input.exact_group_build_id,
+                    input.probe_ordinal,
+                    input.metadata_probe_observation_id,
+                    input.metadata_probe_fingerprint_id,
+                    input.source_size_bytes,
+                    input.retained_report_digest.as_bytes().as_slice(),
+                    input.expected_manifest_digest.as_bytes().as_slice(),
+                    input.expected_field_count,
+                    input.expected_issue_count,
+                    input.expected_retained_field_bytes,
+                    input.parser.name,
+                    input.parser.version,
+                    input.detected_format.map(|value| value.as_storage_str()),
+                    input.extraction_status.as_storage_str(),
+                    input.limits.total_bytes_read,
+                    input.limits.read_operations,
+                    input.limits.retained_field_bytes,
+                    input.limits.field_bytes,
+                    input.limits.fields,
+                    input.limits.jpeg_segments,
+                    input.limits.ifd_entries,
+                    input.limits.ifd_depth,
+                    input.limits.bmff_boxes,
+                    input.limits.bmff_depth,
+                    input.usage.bytes_read,
+                    input.usage.read_operations,
+                    input.usage.retained_field_bytes,
+                    input.usage.fields_emitted,
+                    input.usage.jpeg_segments_visited,
+                    input.usage.ifd_entries_visited,
+                    input.usage.bmff_boxes_visited,
+                    input.usage.max_depth_observed,
+                    input.created_at_ms,
+                    context.volume_id,
+                    guard.run().scan_run_id,
+                    guard.core_session_id().as_bytes().as_slice(),
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?
+        {
+            return if matches {
+                Ok(id)
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "metadata_report",
+                    key: format!(
+                        "{}:{}:{}",
+                        input.time_session_id, input.exact_group_build_id, input.probe_ordinal
+                    ),
+                })
+            };
+        }
+        self.transaction.execute(
+            "INSERT INTO metadata_extraction_reports ( \
+                 time_session_id, volume_id, scan_run_id, core_session_id, exact_group_build_id, \
+                 metadata_probe_observation_id, metadata_probe_fingerprint_id, probe_ordinal, \
+                 source_size_bytes, report_parser_name, report_parser_version, detected_format, \
+                 extraction_status, effective_max_total_bytes_read, \
+                 effective_max_read_operations, effective_max_retained_field_bytes, \
+                 effective_max_field_bytes, effective_max_fields, effective_max_jpeg_segments, \
+                 effective_max_ifd_entries, effective_max_ifd_depth, effective_max_bmff_boxes, \
+                 effective_max_bmff_depth, usage_bytes_read, usage_read_operations, \
+                 usage_retained_field_bytes, usage_fields_emitted, usage_jpeg_segments_visited, \
+                 usage_ifd_entries_visited, usage_bmff_boxes_visited, usage_max_depth_observed, \
+                 expected_field_count, expected_issue_count, expected_retained_field_bytes, \
+                 retained_report_digest, expected_manifest_digest, created_at_ms \
+             ) VALUES ( \
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
+                 ?31, ?32, ?33, ?34, ?35, ?36, ?37 \
+             )",
+            params![
+                input.time_session_id,
+                context.volume_id,
+                guard.run().scan_run_id,
+                guard.core_session_id().as_bytes().as_slice(),
+                input.exact_group_build_id,
+                input.metadata_probe_observation_id,
+                input.metadata_probe_fingerprint_id,
+                input.probe_ordinal,
+                input.source_size_bytes,
+                input.parser.name,
+                input.parser.version,
+                input.detected_format.map(|value| value.as_storage_str()),
+                input.extraction_status.as_storage_str(),
+                input.limits.total_bytes_read,
+                input.limits.read_operations,
+                input.limits.retained_field_bytes,
+                input.limits.field_bytes,
+                input.limits.fields,
+                input.limits.jpeg_segments,
+                input.limits.ifd_entries,
+                input.limits.ifd_depth,
+                input.limits.bmff_boxes,
+                input.limits.bmff_depth,
+                input.usage.bytes_read,
+                input.usage.read_operations,
+                input.usage.retained_field_bytes,
+                input.usage.fields_emitted,
+                input.usage.jpeg_segments_visited,
+                input.usage.ifd_entries_visited,
+                input.usage.bmff_boxes_visited,
+                input.usage.max_depth_observed,
+                input.expected_field_count,
+                input.expected_issue_count,
+                input.expected_retained_field_bytes,
+                input.retained_report_digest.as_bytes().as_slice(),
+                input.expected_manifest_digest.as_bytes().as_slice(),
+                input.created_at_ms,
+            ],
+        )?;
+        Ok(self.transaction.last_insert_rowid())
+    }
+
+    fn append_metadata_fields_batch_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        report_id: i64,
+        inputs: &[MetadataFieldInput],
+    ) -> Result<Vec<i64>> {
+        self.validate_time_evidence_guard(guard)?;
+        validate_time_batch("metadata_fields", inputs.len())?;
+        require_draft_report_for_guard(self.transaction, guard, report_id)?;
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            validate_metadata_field_input(input)?;
+            let locator = StoredLocatorColumns::from(&input.locator.container);
+            let existing = self
+                .transaction
+                .query_row(
+                    "SELECT id, parser_name, parser_version, field_kind, encoding, \
+                            absolute_offset, byte_len, raw_bytes, raw_digest, container_kind, \
+                            tiff_header_offset, tiff_ifd_offset, tiff_tag, tiff_byte_order, \
+                            jpeg_app1_offset, bmff_box_offset, bmff_box_path, created_at_ms \
+                     FROM metadata_extraction_fields WHERE report_id = ?1 AND ordinal = ?2",
+                    params![report_id, input.ordinal],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, Option<i64>>(10)?,
+                            row.get::<_, Option<i64>>(11)?,
+                            row.get::<_, Option<i64>>(12)?,
+                            row.get::<_, Option<String>>(13)?,
+                            row.get::<_, Option<i64>>(14)?,
+                            row.get::<_, Option<i64>>(15)?,
+                            row.get::<_, Option<Vec<u8>>>(16)?,
+                            row.get::<_, i64>(17)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                let matches = existing.1 == input.parser.name
+                    && existing.2 == input.parser.version
+                    && existing.3 == input.field_kind.as_storage_str()
+                    && existing.4 == input.encoding.as_storage_str()
+                    && existing.5 == input.locator.absolute_offset
+                    && existing.6 == input.locator.byte_len
+                    && existing.7 == input.raw_bytes
+                    && existing.8.as_slice() == input.raw_digest.as_bytes()
+                    && existing.9 == locator.kind
+                    && existing.10 == locator.tiff_header_offset
+                    && existing.11 == locator.tiff_ifd_offset
+                    && existing.12 == locator.tiff_tag
+                    && existing.13.as_deref() == locator.tiff_byte_order
+                    && existing.14 == locator.jpeg_app1_offset
+                    && existing.15 == locator.bmff_box_offset
+                    && existing.16.as_deref() == locator.bmff_box_path
+                    && existing.17 == input.created_at_ms;
+                if !matches {
+                    return Err(StoreError::IdempotencyConflict {
+                        entity: "metadata_field",
+                        key: format!("{report_id}:{}", input.ordinal),
+                    });
+                }
+                ids.push(existing.0);
+                continue;
+            }
+            self.transaction.execute(
+                "INSERT INTO metadata_extraction_fields ( \
+                     report_id, ordinal, parser_name, parser_version, field_kind, encoding, \
+                     absolute_offset, byte_len, raw_bytes, raw_digest, container_kind, \
+                     tiff_header_offset, tiff_ifd_offset, tiff_tag, tiff_byte_order, \
+                     jpeg_app1_offset, bmff_box_offset, bmff_box_path, created_at_ms \
+                 ) VALUES ( \
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, ?18, ?19 \
+                 )",
+                params![
+                    report_id,
+                    input.ordinal,
+                    input.parser.name,
+                    input.parser.version,
+                    input.field_kind.as_storage_str(),
+                    input.encoding.as_storage_str(),
+                    input.locator.absolute_offset,
+                    input.locator.byte_len,
+                    input.raw_bytes,
+                    input.raw_digest.as_bytes().as_slice(),
+                    locator.kind,
+                    locator.tiff_header_offset,
+                    locator.tiff_ifd_offset,
+                    locator.tiff_tag,
+                    locator.tiff_byte_order,
+                    locator.jpeg_app1_offset,
+                    locator.bmff_box_offset,
+                    locator.bmff_box_path,
+                    input.created_at_ms,
+                ],
+            )?;
+            ids.push(self.transaction.last_insert_rowid());
+        }
+        Ok(ids)
+    }
+
+    fn append_metadata_issues_batch_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        report_id: i64,
+        inputs: &[MetadataExtractionIssueInput],
+    ) -> Result<Vec<i64>> {
+        self.validate_time_evidence_guard(guard)?;
+        validate_time_batch("metadata_issues", inputs.len())?;
+        require_draft_report_for_guard(self.transaction, guard, report_id)?;
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let existing = self
+                .transaction
+                .query_row(
+                    "SELECT id, parser_name, parser_version, issue_code, source_offset, context, \
+                            created_at_ms \
+                     FROM metadata_extraction_issues WHERE report_id = ?1 AND ordinal = ?2",
+                    params![report_id, input.ordinal],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing.1 != input.parser.name
+                    || existing.2 != input.parser.version
+                    || existing.3 != input.issue_code.as_storage_str()
+                    || existing.4 != input.source_offset
+                    || existing.5 != input.context
+                    || existing.6 != input.created_at_ms
+                {
+                    return Err(StoreError::IdempotencyConflict {
+                        entity: "metadata_issue",
+                        key: format!("{report_id}:{}", input.ordinal),
+                    });
+                }
+                ids.push(existing.0);
+                continue;
+            }
+            self.transaction.execute(
+                "INSERT INTO metadata_extraction_issues ( \
+                     report_id, ordinal, parser_name, parser_version, issue_code, source_offset, \
+                     context, created_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    report_id,
+                    input.ordinal,
+                    input.parser.name,
+                    input.parser.version,
+                    input.issue_code.as_storage_str(),
+                    input.source_offset,
+                    input.context,
+                    input.created_at_ms,
+                ],
+            )?;
+            ids.push(self.transaction.last_insert_rowid());
+        }
+        Ok(ids)
+    }
+
+    fn seal_metadata_report_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        report_id: i64,
+        revalidation: &MetadataSourceRevalidationInput,
+        finalized_at_ms: i64,
+    ) -> Result<TimeEvidenceManifestDigest> {
+        self.validate_time_evidence_guard(guard)?;
+        require_positive("report_id", report_id)?;
+        require_nonnegative("finalized_at_ms", finalized_at_ms)?;
+        let report = self.transaction.query_row(
+            "SELECT time_session_id, volume_id, scan_run_id, core_session_id, \
+                    exact_group_build_id, metadata_probe_observation_id, retained_report_digest, \
+                    expected_manifest_digest, sealed_manifest_digest, state, created_at_ms, \
+                    finalized_at_ms \
+             FROM metadata_extraction_reports WHERE id = ?1",
+            [report_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                ))
+            },
+        )?;
+        if report.2 != guard.run().scan_run_id
+            || report.3.as_slice() != guard.core_session_id().as_bytes()
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "metadata_report_guard",
+                id: report_id,
+            });
+        }
+        let latest_extraction_ms =
+            latest_metadata_report_extraction_ms(self.transaction, report_id)?;
+        let expected =
+            TimeEvidenceManifestDigest::from_runtime_evidence(fixed_32_from_sql(report.7, 7)?);
+        if report.9 == "sealed" {
+            let (expected_source_key, expected_lineage_key) =
+                recompute_metadata_source_keys(self.transaction, report_id)?;
+            if revalidation.source_key != expected_source_key
+                || revalidation.lineage_key != expected_lineage_key
+                || report.11 != Some(finalized_at_ms)
+            {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "metadata_report_seal",
+                    key: report_id.to_string(),
+                });
+            }
+            let stored_revalidation = self.transaction.query_row(
+                "SELECT source_key, lineage_key, source_signature_before, \
+                        source_signature_after, first_report_digest, second_report_digest, \
+                        revalidated_at_ms \
+                 FROM metadata_source_revalidations WHERE report_id = ?1",
+                [report_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )?;
+            if stored_revalidation.0.as_slice() != revalidation.source_key.as_bytes()
+                || stored_revalidation.1.as_slice() != revalidation.lineage_key.as_bytes()
+                || stored_revalidation.2.as_slice()
+                    != revalidation.source_signature_before.as_bytes()
+                || stored_revalidation.3.as_slice()
+                    != revalidation.source_signature_after.as_bytes()
+                || stored_revalidation.4.as_slice() != revalidation.first_report_digest.as_bytes()
+                || stored_revalidation.5.as_slice() != revalidation.second_report_digest.as_bytes()
+                || stored_revalidation.6 != revalidation.revalidated_at_ms
+            {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "metadata_report_seal",
+                    key: report_id.to_string(),
+                });
+            }
+            if stored_revalidation.6 < latest_extraction_ms
+                || report.11.is_none()
+                || report
+                    .11
+                    .is_some_and(|sealed_at_ms| sealed_at_ms < stored_revalidation.6)
+            {
+                return Err(StoreError::invalid_input(
+                    "metadata_report_chronology",
+                    "sealed report predates retained extraction or source revalidation evidence",
+                ));
+            }
+            let observed = recompute_metadata_report_manifest(self.transaction, report_id)?;
+            return if observed == expected
+                && report
+                    .8
+                    .as_deref()
+                    .is_some_and(|digest| digest == expected.as_bytes())
+            {
+                Ok(observed)
+            } else {
+                Err(StoreError::invalid_input(
+                    "metadata_report_manifest",
+                    "sealed report manifest no longer matches its expected digest",
+                ))
+            };
+        }
+        if report.9 != "draft" {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "draft_metadata_report",
+                id: report_id,
+            });
+        }
+        if revalidation.revalidated_at_ms < latest_extraction_ms {
+            return Err(StoreError::invalid_input(
+                "revalidated_at_ms",
+                "source revalidation predates retained metadata fields or issues",
+            ));
+        }
+        if finalized_at_ms < revalidation.revalidated_at_ms {
+            return Err(StoreError::invalid_input(
+                "finalized_at_ms",
+                "report finalization predates retained extraction or source revalidation evidence",
+            ));
+        }
+        if report.6.as_slice() != revalidation.first_report_digest.as_bytes()
+            || revalidation.first_report_digest != revalidation.second_report_digest
+        {
+            return Err(StoreError::invalid_input(
+                "metadata_revalidation",
+                "revalidation digest does not reproduce the retained report",
+            ));
+        }
+        let (expected_source_key, expected_lineage_key) =
+            recompute_metadata_source_keys(self.transaction, report_id)?;
+        if revalidation.source_key != expected_source_key
+            || revalidation.lineage_key != expected_lineage_key
+        {
+            return Err(StoreError::invalid_input(
+                "metadata_revalidation_identity",
+                "source or lineage key does not match the persisted exact probe graph",
+            ));
+        }
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT source_key, lineage_key, source_signature_before, source_signature_after, \
+                        first_report_digest, second_report_digest, revalidated_at_ms \
+                 FROM metadata_source_revalidations WHERE report_id = ?1",
+                [report_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.0.as_slice() != revalidation.source_key.as_bytes()
+                || existing.1.as_slice() != revalidation.lineage_key.as_bytes()
+                || existing.2.as_slice() != revalidation.source_signature_before.as_bytes()
+                || existing.3.as_slice() != revalidation.source_signature_after.as_bytes()
+                || existing.4.as_slice() != revalidation.first_report_digest.as_bytes()
+                || existing.5.as_slice() != revalidation.second_report_digest.as_bytes()
+                || existing.6 != revalidation.revalidated_at_ms
+            {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "metadata_source_revalidation",
+                    key: report_id.to_string(),
+                });
+            }
+        } else {
+            self.transaction.execute(
+                "INSERT INTO metadata_source_revalidations ( \
+                     report_id, time_session_id, volume_id, scan_run_id, core_session_id, \
+                     exact_group_build_id, metadata_probe_observation_id, source_key, \
+                     source_key_version, lineage_key, lineage_key_version, \
+                     source_signature_before, source_signature_after, first_report_digest, \
+                     second_report_digest, outcome, descriptor_revalidated, path_revalidated, \
+                     session_revalidated, trust_scope, revalidated_at_ms \
+                 ) VALUES ( \
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 2, ?9, 1, ?10, ?11, ?12, ?13, \
+                     'reextracted_pinned_exact', 1, 1, 1, 'historical_proof_only', ?14 \
+                 )",
+                params![
+                    report_id,
+                    report.0,
+                    report.1,
+                    report.2,
+                    report.3,
+                    report.4,
+                    report.5,
+                    revalidation.source_key.as_bytes().as_slice(),
+                    revalidation.lineage_key.as_bytes().as_slice(),
+                    revalidation.source_signature_before.as_bytes().as_slice(),
+                    revalidation.source_signature_after.as_bytes().as_slice(),
+                    revalidation.first_report_digest.as_bytes().as_slice(),
+                    revalidation.second_report_digest.as_bytes().as_slice(),
+                    revalidation.revalidated_at_ms,
+                ],
+            )?;
+        }
+        let observed = recompute_metadata_report_manifest(self.transaction, report_id)?;
+        if observed != expected {
+            return Err(StoreError::invalid_input(
+                "metadata_report_manifest",
+                "database-streamed report manifest differs from the frozen expected digest",
+            ));
+        }
+        let changed = self.transaction.execute(
+            "UPDATE metadata_extraction_reports \
+             SET state = 'sealed', sealed_manifest_digest = ?2, finalized_at_ms = ?3 \
+             WHERE id = ?1 AND state = 'draft'",
+            params![report_id, observed.as_bytes().as_slice(), finalized_at_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "metadata_report_seal",
+                id: report_id,
+            });
+        }
+        Ok(observed)
+    }
+
+    fn abandon_metadata_report_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        report_id: i64,
+        abandoned_at_ms: i64,
+        reason_code: &str,
+        reason_message: Option<&str>,
+    ) -> Result<()> {
+        self.validate_time_evidence_guard(guard)?;
+        require_positive("report_id", report_id)?;
+        require_nonnegative("abandoned_at_ms", abandoned_at_ms)?;
+        require_bounded_nonempty("reason_code", reason_code, 256)?;
+        validate_optional_bounded("reason_message", reason_message, MAX_TEXT_BYTES)?;
+        let stored = self.transaction.query_row(
+            "SELECT scan_run_id, core_session_id, state, abandon_reason_code, \
+                    abandon_reason_message, created_at_ms, finalized_at_ms, \
+                    max(created_at_ms, \
+                        COALESCE((SELECT max(created_at_ms) FROM metadata_extraction_fields \
+                                  WHERE report_id = metadata_extraction_reports.id), created_at_ms), \
+                        COALESCE((SELECT max(created_at_ms) FROM metadata_extraction_issues \
+                                  WHERE report_id = metadata_extraction_reports.id), created_at_ms), \
+                        COALESCE((SELECT max(revalidated_at_ms) \
+                                  FROM metadata_source_revalidations \
+                                  WHERE report_id = metadata_extraction_reports.id), created_at_ms)) \
+             FROM metadata_extraction_reports WHERE id = ?1",
+            [report_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )?;
+        if stored.0 != guard.run().scan_run_id
+            || stored.1.as_slice() != guard.core_session_id().as_bytes()
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "metadata_report_guard",
+                id: report_id,
+            });
+        }
+        if stored.2 == "abandoned" {
+            if stored.6.is_none() || stored.6.is_some_and(|value| value < stored.7) {
+                return Err(StoreError::invalid_input(
+                    "metadata_report_chronology",
+                    "abandoned report predates retained extraction or revalidation evidence",
+                ));
+            }
+            return if stored.3.as_deref() == Some(reason_code)
+                && stored.4.as_deref() == reason_message
+                && stored.6 == Some(abandoned_at_ms)
+            {
+                Ok(())
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "metadata_report_abandonment",
+                    key: report_id.to_string(),
+                })
+            };
+        }
+        if stored.2 != "draft" {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "draft_metadata_report",
+                id: report_id,
+            });
+        }
+        if abandoned_at_ms < stored.7 {
+            return Err(StoreError::invalid_input(
+                "abandoned_at_ms",
+                "report abandonment predates retained extraction or revalidation evidence",
+            ));
+        }
+        let changed = self.transaction.execute(
+            "UPDATE metadata_extraction_reports \
+             SET state = 'abandoned', abandon_reason_code = ?2, \
+                 abandon_reason_message = ?3, finalized_at_ms = ?4 \
+             WHERE id = ?1 AND scan_run_id = ?5 AND core_session_id = ?6 AND state = 'draft'",
+            params![
+                report_id,
+                reason_code,
+                reason_message,
+                abandoned_at_ms,
+                guard.run().scan_run_id,
+                guard.core_session_id().as_bytes().as_slice(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "metadata_report_abandonment",
+                id: report_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn begin_capture_time_analysis_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        input: &BeginCaptureTimeAnalysisInput,
+    ) -> Result<i64> {
+        let context = self.validate_time_evidence_guard(guard)?;
+        let observed_context_digest =
+            compute_time_policy_context_digest(&input.policy_context_json)?;
+        if observed_context_digest != input.policy_context_digest {
+            return Err(StoreError::invalid_input(
+                "policy_context_digest",
+                "policy context digest does not match canonical JSON",
+            ));
+        }
+        let policy_context_json = serialize_canonical_json(&input.policy_context_json)?;
+        if policy_context_json.len() > MAX_JSON_BYTES {
+            return Err(StoreError::invalid_input(
+                "policy_context_json",
+                "canonical policy context exceeds 1 MiB",
+            ));
+        }
+        let session_created_at_ms = self
+            .transaction
+            .query_row(
+                "SELECT time_session.created_at_ms \
+                 FROM scan_time_sessions AS time_session \
+                 JOIN exact_group_builds AS exact_build \
+                   ON exact_build.id = ?2 \
+                  AND exact_build.volume_id = time_session.volume_id \
+                  AND exact_build.scan_run_id = time_session.scan_run_id \
+                  AND exact_build.state = 'verified' \
+                 WHERE time_session.id = ?1 AND time_session.volume_id = ?3 \
+                   AND time_session.scan_run_id = ?4 AND time_session.core_session_id = ?5 \
+                   AND time_session.state = 'draft'",
+                params![
+                    input.time_session_id,
+                    input.exact_group_build_id,
+                    context.volume_id,
+                    guard.run().scan_run_id,
+                    guard.core_session_id().as_bytes().as_slice(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::ConcurrencyConflict {
+                    entity: "capture_time_analysis_scope",
+                    id: input.exact_group_build_id,
+                },
+                other => StoreError::from(other),
+            })?;
+        if input.created_at_ms < session_created_at_ms {
+            return Err(StoreError::invalid_input(
+                "created_at_ms",
+                "capture-time analysis creation predates its time session",
+            ));
+        }
+        if let Some((id, matches)) = self
+            .transaction
+            .query_row(
+                "SELECT id, policy_name = ?3 AND policy_version = ?4 \
+                     AND policy_context_json = ?5 AND policy_context_digest = ?6 \
+                     AND expected_source_count = ?7 AND expected_observation_count = ?8 \
+                     AND expected_candidate_count = ?9 AND expected_issue_count = ?10 \
+                     AND expected_member_count = ?11 AND expected_recommendation_count = ?12 \
+                     AND expected_manifest_digest = ?13 AND created_at_ms = ?14 \
+                     AND volume_id = ?15 AND scan_run_id = ?16 AND manifest_version = 1 \
+                 FROM capture_time_analysis_builds \
+                 WHERE time_session_id = ?1 AND exact_group_build_id = ?2",
+                params![
+                    input.time_session_id,
+                    input.exact_group_build_id,
+                    input.policy_name,
+                    input.policy_version,
+                    policy_context_json,
+                    input.policy_context_digest.as_bytes().as_slice(),
+                    input.expected_source_count,
+                    input.expected_observation_count,
+                    input.expected_candidate_count,
+                    input.expected_issue_count,
+                    input.expected_member_count,
+                    input.expected_recommendation_count,
+                    input.expected_manifest_digest.as_bytes().as_slice(),
+                    input.created_at_ms,
+                    context.volume_id,
+                    guard.run().scan_run_id,
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?
+        {
+            return if matches {
+                Ok(id)
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "capture_time_analysis",
+                    key: format!("{}:{}", input.time_session_id, input.exact_group_build_id),
+                })
+            };
+        }
+        self.transaction.execute(
+            "INSERT INTO capture_time_analysis_builds ( \
+                 time_session_id, volume_id, scan_run_id, exact_group_build_id, policy_name, \
+                 policy_version, policy_context_json, policy_context_digest, \
+                 expected_source_count, expected_observation_count, expected_candidate_count, \
+                 expected_issue_count, expected_member_count, expected_recommendation_count, \
+                 expected_manifest_digest, created_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                input.time_session_id,
+                context.volume_id,
+                guard.run().scan_run_id,
+                input.exact_group_build_id,
+                input.policy_name,
+                input.policy_version,
+                policy_context_json,
+                input.policy_context_digest.as_bytes().as_slice(),
+                input.expected_source_count,
+                input.expected_observation_count,
+                input.expected_candidate_count,
+                input.expected_issue_count,
+                input.expected_member_count,
+                input.expected_recommendation_count,
+                input.expected_manifest_digest.as_bytes().as_slice(),
+                input.created_at_ms,
+            ],
+        )?;
+        Ok(self.transaction.last_insert_rowid())
+    }
+
+    fn append_capture_time_sources_batch_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimeAnalysisSourceInput],
+    ) -> Result<()> {
+        self.validate_time_evidence_guard(guard)?;
+        validate_time_batch("capture_time_sources", inputs.len())?;
+        require_draft_analysis_for_guard(self.transaction, guard, analysis_build_id)?;
+        for input in inputs {
+            let existing = self
+                .transaction
+                .query_row(
+                    "SELECT report_id, source_key, lineage_key, binding_status, created_at_ms \
+                     FROM capture_time_analysis_sources \
+                     WHERE analysis_build_id = ?1 AND ordinal = ?2",
+                    params![analysis_build_id, input.ordinal],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing.0 != input.report_id
+                    || existing.1.as_slice() != input.source_key.as_bytes()
+                    || existing.2.as_slice() != input.lineage_key.as_bytes()
+                    || existing.3 != "reextracted_pinned_source"
+                    || existing.4 != input.created_at_ms
+                {
+                    return Err(StoreError::IdempotencyConflict {
+                        entity: "capture_time_source",
+                        key: format!("{analysis_build_id}:{}", input.ordinal),
+                    });
+                }
+                continue;
+            }
+            self.transaction.execute(
+                "INSERT INTO capture_time_analysis_sources ( \
+                     analysis_build_id, ordinal, report_id, source_key, lineage_key, \
+                     binding_status, created_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reextracted_pinned_source', ?6)",
+                params![
+                    analysis_build_id,
+                    input.ordinal,
+                    input.report_id,
+                    input.source_key.as_bytes().as_slice(),
+                    input.lineage_key.as_bytes().as_slice(),
+                    input.created_at_ms,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn append_capture_time_observations_batch_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimeObservationInput],
+    ) -> Result<Vec<i64>> {
+        self.validate_time_evidence_guard(guard)?;
+        validate_time_batch("capture_time_observations", inputs.len())?;
+        require_draft_analysis_for_guard(self.transaction, guard, analysis_build_id)?;
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let columns = StoredInterpretationColumns::from(&input.interpretation);
+            self.transaction.execute(
+                "INSERT INTO capture_time_observations ( \
+                     analysis_build_id, ordinal, source_ordinal, report_id, metadata_field_id, \
+                     interpretation_kind, wall_year, wall_month, wall_day, wall_hour, wall_minute, \
+                     wall_second, wall_nanosecond, semantic_kind, offset_kind, utc_offset_minutes, \
+                     utc_seconds_decimal, utc_nanoseconds, normalized_precision_ns, \
+                     parsed_offset_minutes, subsecond_nanosecond, subsecond_digits, \
+                     subsecond_precision_ns, rejection_code, created_at_ms \
+                 ) SELECT ?1, ?2, ?3, field.report_id, field.id, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+                          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23 \
+                   FROM metadata_extraction_fields AS field WHERE field.id = ?24 \
+                 ON CONFLICT(analysis_build_id, ordinal) DO NOTHING",
+                params![
+                    analysis_build_id,
+                    input.ordinal,
+                    input.source_ordinal,
+                    columns.kind,
+                    columns.wall_year,
+                    columns.wall_month,
+                    columns.wall_day,
+                    columns.wall_hour,
+                    columns.wall_minute,
+                    columns.wall_second,
+                    columns.wall_nanosecond,
+                    columns.semantic_kind,
+                    columns.offset_kind,
+                    columns.utc_offset_minutes,
+                    columns.utc_seconds_decimal,
+                    columns.utc_nanoseconds,
+                    columns.normalized_precision_ns,
+                    columns.parsed_offset_minutes,
+                    columns.subsecond_nanosecond,
+                    columns.subsecond_digits,
+                    columns.subsecond_precision_ns,
+                    columns.rejection_code,
+                    input.created_at_ms,
+                    input.metadata_field_id,
+                ],
+            )?;
+            let row = self.transaction.query_row(
+                "SELECT id, metadata_field_id = ?3 AND source_ordinal = ?4 \
+                     AND interpretation_kind = ?5 AND wall_year IS ?6 AND wall_month IS ?7 \
+                     AND wall_day IS ?8 AND wall_hour IS ?9 AND wall_minute IS ?10 \
+                     AND wall_second IS ?11 AND wall_nanosecond IS ?12 \
+                     AND semantic_kind IS ?13 AND offset_kind IS ?14 \
+                     AND utc_offset_minutes IS ?15 AND utc_seconds_decimal IS ?16 \
+                     AND utc_nanoseconds IS ?17 AND normalized_precision_ns IS ?18 \
+                     AND parsed_offset_minutes IS ?19 AND subsecond_nanosecond IS ?20 \
+                     AND subsecond_digits IS ?21 AND subsecond_precision_ns IS ?22 \
+                     AND rejection_code IS ?23 AND created_at_ms = ?24 \
+                 FROM capture_time_observations \
+                 WHERE analysis_build_id = ?1 AND ordinal = ?2",
+                params![
+                    analysis_build_id,
+                    input.ordinal,
+                    input.metadata_field_id,
+                    input.source_ordinal,
+                    columns.kind,
+                    columns.wall_year,
+                    columns.wall_month,
+                    columns.wall_day,
+                    columns.wall_hour,
+                    columns.wall_minute,
+                    columns.wall_second,
+                    columns.wall_nanosecond,
+                    columns.semantic_kind,
+                    columns.offset_kind,
+                    columns.utc_offset_minutes,
+                    columns.utc_seconds_decimal,
+                    columns.utc_nanoseconds,
+                    columns.normalized_precision_ns,
+                    columns.parsed_offset_minutes,
+                    columns.subsecond_nanosecond,
+                    columns.subsecond_digits,
+                    columns.subsecond_precision_ns,
+                    columns.rejection_code,
+                    input.created_at_ms,
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )?;
+            if !row.1 {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "capture_time_observation",
+                    key: format!("{analysis_build_id}:{}", input.ordinal),
+                });
+            }
+            ids.push(row.0);
+        }
+        Ok(ids)
+    }
+
+    fn append_capture_time_candidates_batch_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimeCandidateInput],
+    ) -> Result<Vec<i64>> {
+        self.validate_time_evidence_guard(guard)?;
+        validate_time_batch("capture_time_candidates", inputs.len())?;
+        require_draft_analysis_for_guard(self.transaction, guard, analysis_build_id)?;
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            validate_candidate_references(self.transaction, analysis_build_id, input)?;
+            if input.evidence_gate.as_storage_str() == "eligible" {
+                validate_eligible_candidate_support(
+                    self.transaction,
+                    &CandidateSupportClaim::from_input(analysis_build_id, input),
+                )?;
+            }
+            let wall = input.timestamp.wall_time();
+            let evidence_kinds_json = serde_json::to_string(
+                &input
+                    .evidence_kinds
+                    .iter()
+                    .map(|value| value.as_storage_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            let source_keys_json = serde_json::to_string(
+                &input
+                    .source_keys
+                    .iter()
+                    .map(|value| lower_hex(value.as_bytes()))
+                    .collect::<Vec<_>>(),
+            )?;
+            let lineage_keys_json = serde_json::to_string(
+                &input
+                    .lineage_keys
+                    .iter()
+                    .map(|value| lower_hex(value.as_bytes()))
+                    .collect::<Vec<_>>(),
+            )?;
+            let observation_ordinals_json = serde_json::to_string(&input.observation_ordinals)?;
+            let anomalies_json = serde_json::to_string(
+                &input
+                    .anomalies
+                    .iter()
+                    .map(|value| value.as_storage_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            let blockers_json = serde_json::to_string(
+                &input
+                    .evidence_gate
+                    .blockers()
+                    .iter()
+                    .map(|value| value.as_storage_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            for (field, value) in [
+                ("evidence_kinds_json", &evidence_kinds_json),
+                ("source_keys_json", &source_keys_json),
+                ("lineage_keys_json", &lineage_keys_json),
+                ("observation_ordinals_json", &observation_ordinals_json),
+                ("anomalies_json", &anomalies_json),
+                ("blockers_json", &blockers_json),
+            ] {
+                if value.len() > MAX_JSON_BYTES {
+                    return Err(StoreError::invalid_input(
+                        field,
+                        "candidate JSON exceeds 1 MiB",
+                    ));
+                }
+            }
+            self.transaction.execute(
+                "INSERT INTO capture_time_candidates ( \
+                     analysis_build_id, ordinal, wall_year, wall_month, wall_day, wall_hour, \
+                     wall_minute, wall_second, wall_nanosecond, semantic_kind, offset_kind, \
+                     utc_offset_minutes, utc_seconds_decimal, utc_nanoseconds, precision_ns, \
+                     confidence, evidence_gate, evidence_kinds_json, source_keys_json, \
+                     lineage_keys_json, observation_ordinals_json, anomalies_json, blockers_json, \
+                     created_at_ms \
+                 ) VALUES ( \
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24 \
+                 ) ON CONFLICT(analysis_build_id, ordinal) DO NOTHING",
+                params![
+                    analysis_build_id,
+                    input.ordinal,
+                    i64::from(wall.year()),
+                    i64::from(wall.month()),
+                    i64::from(wall.day()),
+                    i64::from(wall.hour()),
+                    i64::from(wall.minute()),
+                    i64::from(wall.second()),
+                    i64::from(wall.nanosecond()),
+                    input.timestamp.semantic_kind().as_storage_str(),
+                    input.timestamp.offset_kind().as_storage_str(),
+                    input.timestamp.utc_offset_minutes().map(i64::from),
+                    input.timestamp.utc_seconds_decimal(),
+                    input.timestamp.utc_nanoseconds().map(i64::from),
+                    i64::from(input.timestamp.precision_ns()),
+                    input.confidence.as_storage_str(),
+                    input.evidence_gate.as_storage_str(),
+                    evidence_kinds_json,
+                    source_keys_json,
+                    lineage_keys_json,
+                    observation_ordinals_json,
+                    anomalies_json,
+                    blockers_json,
+                    input.created_at_ms,
+                ],
+            )?;
+            let stored = self.transaction.query_row(
+                "SELECT id, wall_year = ?3 AND wall_month = ?4 AND wall_day = ?5 \
+                     AND wall_hour = ?6 AND wall_minute = ?7 AND wall_second = ?8 \
+                     AND wall_nanosecond = ?9 AND semantic_kind = ?10 AND offset_kind = ?11 \
+                     AND utc_offset_minutes IS ?12 AND utc_seconds_decimal IS ?13 \
+                     AND utc_nanoseconds IS ?14 AND precision_ns = ?15 AND confidence = ?16 \
+                     AND evidence_gate = ?17 AND evidence_kinds_json = ?18 \
+                     AND source_keys_json = ?19 AND lineage_keys_json = ?20 \
+                     AND observation_ordinals_json = ?21 AND anomalies_json = ?22 \
+                     AND blockers_json = ?23 AND created_at_ms = ?24 \
+                 FROM capture_time_candidates WHERE analysis_build_id = ?1 AND ordinal = ?2",
+                params![
+                    analysis_build_id,
+                    input.ordinal,
+                    i64::from(wall.year()),
+                    i64::from(wall.month()),
+                    i64::from(wall.day()),
+                    i64::from(wall.hour()),
+                    i64::from(wall.minute()),
+                    i64::from(wall.second()),
+                    i64::from(wall.nanosecond()),
+                    input.timestamp.semantic_kind().as_storage_str(),
+                    input.timestamp.offset_kind().as_storage_str(),
+                    input.timestamp.utc_offset_minutes().map(i64::from),
+                    input.timestamp.utc_seconds_decimal(),
+                    input.timestamp.utc_nanoseconds().map(i64::from),
+                    i64::from(input.timestamp.precision_ns()),
+                    input.confidence.as_storage_str(),
+                    input.evidence_gate.as_storage_str(),
+                    evidence_kinds_json,
+                    source_keys_json,
+                    lineage_keys_json,
+                    observation_ordinals_json,
+                    anomalies_json,
+                    blockers_json,
+                    input.created_at_ms,
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )?;
+            if !stored.1 {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "capture_time_candidate",
+                    key: format!("{analysis_build_id}:{}", input.ordinal),
+                });
+            }
+            ids.push(stored.0);
+        }
+        Ok(ids)
+    }
+
+    fn append_capture_time_policy_issues_batch_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimePolicyIssueInput],
+    ) -> Result<Vec<i64>> {
+        self.validate_time_evidence_guard(guard)?;
+        validate_time_batch("capture_time_policy_issues", inputs.len())?;
+        require_draft_analysis_for_guard(self.transaction, guard, analysis_build_id)?;
+        let mut ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            validate_policy_issue_references(self.transaction, analysis_build_id, input)?;
+            let observation_ordinals_json = serde_json::to_string(&input.observation_ordinals)?;
+            let source_keys_json = serde_json::to_string(
+                &input
+                    .source_keys
+                    .iter()
+                    .map(|value| lower_hex(value.as_bytes()))
+                    .collect::<Vec<_>>(),
+            )?;
+            let lineage_keys_json = serde_json::to_string(
+                &input
+                    .lineage_keys
+                    .iter()
+                    .map(|value| lower_hex(value.as_bytes()))
+                    .collect::<Vec<_>>(),
+            )?;
+            self.transaction.execute(
+                "INSERT INTO capture_time_policy_issues ( \
+                     analysis_build_id, ordinal, issue_code, field_kind, \
+                     observation_ordinals_json, source_keys_json, lineage_keys_json, context, \
+                     created_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(analysis_build_id, ordinal) DO NOTHING",
+                params![
+                    analysis_build_id,
+                    input.ordinal,
+                    input.code,
+                    input.field_kind.map(|value| value.as_storage_str()),
+                    observation_ordinals_json,
+                    source_keys_json,
+                    lineage_keys_json,
+                    input.context,
+                    input.created_at_ms,
+                ],
+            )?;
+            let stored = self.transaction.query_row(
+                "SELECT id, issue_code = ?3 AND field_kind IS ?4 \
+                     AND observation_ordinals_json = ?5 AND source_keys_json = ?6 \
+                     AND lineage_keys_json = ?7 AND context = ?8 AND created_at_ms = ?9 \
+                 FROM capture_time_policy_issues \
+                 WHERE analysis_build_id = ?1 AND ordinal = ?2",
+                params![
+                    analysis_build_id,
+                    input.ordinal,
+                    input.code,
+                    input.field_kind.map(|value| value.as_storage_str()),
+                    observation_ordinals_json,
+                    source_keys_json,
+                    lineage_keys_json,
+                    input.context,
+                    input.created_at_ms,
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )?;
+            if !stored.1 {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "capture_time_policy_issue",
+                    key: format!("{analysis_build_id}:{}", input.ordinal),
+                });
+            }
+            ids.push(stored.0);
+        }
+        Ok(ids)
+    }
+
+    fn append_capture_time_members_batch_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        inputs: &[CaptureTimeMemberAssessmentInput],
+    ) -> Result<()> {
+        let context = self.validate_time_evidence_guard(guard)?;
+        validate_time_batch("capture_time_members", inputs.len())?;
+        require_draft_analysis_for_guard(self.transaction, guard, analysis_build_id)?;
+        let exact_group_build_id = self.transaction.query_row(
+            "SELECT exact_group_build_id FROM capture_time_analysis_builds WHERE id = ?1",
+            [analysis_build_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        for input in inputs {
+            let candidate = input
+                .candidate_ordinal
+                .map(|ordinal| {
+                    self.transaction
+                        .query_row(
+                            "SELECT id, utc_seconds_decimal, utc_nanoseconds, precision_ns \
+                             FROM capture_time_candidates \
+                             WHERE analysis_build_id = ?1 AND ordinal = ?2 \
+                               AND evidence_gate = 'eligible' AND semantic_kind = 'utc'",
+                            params![analysis_build_id, ordinal],
+                            |row| {
+                                Ok(StoredMemberCandidate {
+                                    id: row.get(0)?,
+                                    utc_seconds_decimal: row.get(1)?,
+                                    utc_nanoseconds: row.get(2)?,
+                                    precision_ns: row.get(3)?,
+                                })
+                            },
+                        )
+                        .map_err(|error| match error {
+                            rusqlite::Error::QueryReturnedNoRows => StoreError::invalid_input(
+                                "member_candidate_ordinal",
+                                "member candidate must be eligible UTC evidence in its analysis",
+                            ),
+                            other => StoreError::from(other),
+                        })
+                })
+                .transpose()?;
+            let candidate_id = candidate.as_ref().map(|candidate| candidate.id);
+            let observation = self
+                .transaction
+                .query_row(
+                    "SELECT observation.birth_time_seconds, observation.birth_time_nanoseconds, \
+                            observation.modified_time_seconds, \
+                            observation.modified_time_nanoseconds, \
+                            observation.timestamp_granularity_ns \
+                     FROM exact_group_build_members AS member \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.id = member.media_observation_snapshot_id \
+                      AND observation.volume_id = member.volume_id \
+                      AND observation.scan_run_id = member.scan_run_id \
+                     WHERE member.exact_group_build_id = ?1 AND member.ordinal = ?2 \
+                       AND member.media_observation_snapshot_id = ?3",
+                    params![
+                        exact_group_build_id,
+                        input.member_ordinal,
+                        input.media_observation_snapshot_id,
+                    ],
+                    |row| {
+                        Ok(StoredMemberObservation {
+                            birth_time_seconds: row.get(0)?,
+                            birth_time_nanoseconds: row.get(1)?,
+                            modified_time_seconds: row.get(2)?,
+                            modified_time_nanoseconds: row.get(3)?,
+                            timestamp_granularity_ns: row.get(4)?,
+                        })
+                    },
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => StoreError::invalid_input(
+                        "capture_time_member",
+                        "assessment does not identify the exact member at its ordinal",
+                    ),
+                    other => StoreError::from(other),
+                })?;
+            validate_member_assessment_policy(input, candidate.as_ref(), &observation)?;
+            let existing = self
+                .transaction
+                .query_row(
+                    "SELECT media_observation_snapshot_id, candidate_id, birth_time_relation, \
+                            modified_time_relation, donor_eligibility, reason_code, created_at_ms \
+                     FROM capture_time_member_assessments \
+                     WHERE analysis_build_id = ?1 AND member_ordinal = ?2",
+                    params![analysis_build_id, input.member_ordinal],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing.0 != input.media_observation_snapshot_id
+                    || existing.1 != candidate_id
+                    || existing.2 != input.birth_time_relation.as_storage_str()
+                    || existing.3 != input.modified_time_relation.as_storage_str()
+                    || existing.4 != input.donor_eligibility.as_storage_str()
+                    || existing.5 != input.reason_code
+                    || existing.6 != input.created_at_ms
+                {
+                    return Err(StoreError::IdempotencyConflict {
+                        entity: "capture_time_member",
+                        key: format!("{analysis_build_id}:{}", input.member_ordinal),
+                    });
+                }
+                continue;
+            }
+            self.transaction.execute(
+                "INSERT INTO capture_time_member_assessments ( \
+                     analysis_build_id, member_ordinal, volume_id, scan_run_id, \
+                     exact_group_build_id, media_observation_snapshot_id, candidate_id, \
+                     birth_time_relation, modified_time_relation, donor_eligibility, \
+                     reason_code, created_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    analysis_build_id,
+                    input.member_ordinal,
+                    context.volume_id,
+                    guard.run().scan_run_id,
+                    exact_group_build_id,
+                    input.media_observation_snapshot_id,
+                    candidate_id,
+                    input.birth_time_relation.as_storage_str(),
+                    input.modified_time_relation.as_storage_str(),
+                    input.donor_eligibility.as_storage_str(),
+                    input.reason_code,
+                    input.created_at_ms,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn append_capture_time_recommendation_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        input: &CaptureTimeRecommendationInput,
+    ) -> Result<()> {
+        let context = self.validate_time_evidence_guard(guard)?;
+        require_draft_analysis_for_guard(self.transaction, guard, analysis_build_id)?;
+        if input.keeper_observation_id.is_some()
+            || input.time_donor_observation_id.is_some()
+            || input.candidate_id.is_some()
+            || input.keeper_policy_name.is_some()
+            || input.keeper_policy_version.is_some()
+            || input.time_donor_policy_name.is_some()
+            || input.time_donor_policy_version.is_some()
+        {
+            return Err(StoreError::invalid_input(
+                "capture_time_recommendation",
+                "v7 has no keeper policy; keeper, donor, candidate, and policy identities must all be absent",
+            ));
+        }
+        let exact_group_build_id = self.transaction.query_row(
+            "SELECT exact_group_build_id FROM capture_time_analysis_builds WHERE id = ?1",
+            [analysis_build_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT keeper_observation_id, time_donor_observation_id, candidate_id, \
+                        keeper_policy_name, keeper_policy_version, time_donor_policy_name, \
+                        time_donor_policy_version, evidence_only, write_authorized, reason_code, \
+                        created_at_ms \
+                 FROM capture_time_recommendations WHERE analysis_build_id = ?1",
+                [analysis_build_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            return if existing.0.is_none()
+                && existing.1.is_none()
+                && existing.2.is_none()
+                && existing.3.is_none()
+                && existing.4.is_none()
+                && existing.5.is_none()
+                && existing.6.is_none()
+                && existing.7 == 1
+                && existing.8 == 0
+                && existing.9 == input.reason_code
+                && existing.10 == input.created_at_ms
+            {
+                Ok(())
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "capture_time_recommendation",
+                    key: analysis_build_id.to_string(),
+                })
+            };
+        }
+        self.transaction.execute(
+            "INSERT INTO capture_time_recommendations ( \
+                 analysis_build_id, volume_id, scan_run_id, exact_group_build_id, \
+                 keeper_observation_id, time_donor_observation_id, candidate_id, \
+                 keeper_policy_name, keeper_policy_version, time_donor_policy_name, \
+                 time_donor_policy_version, evidence_only, write_authorized, reason_code, \
+                 created_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, 0, ?5, ?6)",
+            params![
+                analysis_build_id,
+                context.volume_id,
+                guard.run().scan_run_id,
+                exact_group_build_id,
+                input.reason_code,
+                input.created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn seal_capture_time_analysis_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        decision: CaptureTimeDecision,
+        selected_candidate_ordinal: Option<i64>,
+        finalized_at_ms: i64,
+    ) -> Result<TimeEvidenceManifestDigest> {
+        self.validate_time_evidence_guard(guard)?;
+        require_positive("analysis_build_id", analysis_build_id)?;
+        require_nonnegative("finalized_at_ms", finalized_at_ms)?;
+        let selected_required = matches!(
+            decision,
+            CaptureTimeDecision::ReviewRequired | CaptureTimeDecision::EvidenceEligible
+        );
+        if selected_required != selected_candidate_ordinal.is_some()
+            || selected_candidate_ordinal.is_some_and(|ordinal| ordinal < 0)
+        {
+            return Err(StoreError::invalid_input(
+                "selected_candidate_ordinal",
+                "review/evidence decisions require one non-negative candidate ordinal; conflict/no-evidence decisions forbid it",
+            ));
+        }
+        let build = self.transaction.query_row(
+            "SELECT build.time_session_id, build.exact_group_build_id, build.scan_run_id, \
+                    time_session.core_session_id, build.expected_source_count, \
+                    build.expected_observation_count, build.expected_candidate_count, \
+                    build.expected_issue_count, build.expected_member_count, \
+                    build.expected_recommendation_count, build.expected_manifest_digest, \
+                    build.sealed_manifest_digest, build.state, build.decision, \
+                    build.selected_candidate_ordinal, build.created_at_ms, build.finalized_at_ms \
+             FROM capture_time_analysis_builds AS build \
+             JOIN scan_time_sessions AS time_session ON time_session.id = build.time_session_id \
+             WHERE build.id = ?1",
+            [analysis_build_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                    row.get::<_, Option<Vec<u8>>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
+                ))
+            },
+        )?;
+        if build.2 != guard.run().scan_run_id
+            || build.3.as_slice() != guard.core_session_id().as_bytes()
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "capture_time_analysis_guard",
+                id: analysis_build_id,
+            });
+        }
+        validate_capture_time_candidate_supports_for_analysis(
+            self.transaction,
+            Some(analysis_build_id),
+        )?;
+        let latest_child_ms =
+            latest_capture_time_analysis_child_ms(self.transaction, analysis_build_id)?;
+        let latest_group_evidence_ms =
+            latest_time_group_terminal_evidence_ms(self.transaction, build.0, build.1)?;
+        let latest_evidence_ms = latest_child_ms.max(latest_group_evidence_ms);
+        let expected =
+            TimeEvidenceManifestDigest::from_runtime_evidence(fixed_32_from_sql(build.10, 10)?);
+        let observed =
+            recompute_capture_time_analysis_manifest(self.transaction, analysis_build_id)?;
+        if build.12 == "sealed" {
+            let outcome_matches = self.transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM capture_time_group_outcomes \
+                               WHERE time_session_id = ?1 AND exact_group_build_id = ?2 \
+                                 AND outcome = 'evidence' AND analysis_build_id = ?3 \
+                                 AND reason_code = 'sealed_analysis_evidence' \
+                                 AND created_at_ms = ?4)",
+                params![build.0, build.1, analysis_build_id, finalized_at_ms],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if build.16.is_none() || build.16.is_some_and(|value| value < latest_evidence_ms) {
+                return Err(StoreError::invalid_input(
+                    "capture_time_analysis_chronology",
+                    "sealed analysis predates retained child or group evidence",
+                ));
+            }
+            return if build.13.as_deref() == Some(decision.as_storage_str())
+                && build.14 == selected_candidate_ordinal
+                && build.16 == Some(finalized_at_ms)
+                && build
+                    .11
+                    .as_deref()
+                    .is_some_and(|digest| digest == expected.as_bytes())
+                && observed == expected
+                && outcome_matches
+            {
+                Ok(observed)
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "capture_time_analysis_seal",
+                    key: analysis_build_id.to_string(),
+                })
+            };
+        }
+        if build.12 != "draft" {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "draft_capture_time_analysis",
+                id: analysis_build_id,
+            });
+        }
+        if finalized_at_ms < latest_evidence_ms {
+            return Err(StoreError::invalid_input(
+                "finalized_at_ms",
+                "analysis finalization predates retained child or group evidence",
+            ));
+        }
+        require_draft_analysis_for_guard(self.transaction, guard, analysis_build_id)?;
+        let counts = self.transaction.query_row(
+            "SELECT \
+                 (SELECT count(*) FROM capture_time_analysis_sources WHERE analysis_build_id = ?1), \
+                 (SELECT count(*) FROM capture_time_observations WHERE analysis_build_id = ?1), \
+                 (SELECT count(*) FROM capture_time_candidates WHERE analysis_build_id = ?1), \
+                 (SELECT count(*) FROM capture_time_policy_issues WHERE analysis_build_id = ?1), \
+                 (SELECT count(*) FROM capture_time_member_assessments WHERE analysis_build_id = ?1), \
+                 (SELECT count(*) FROM capture_time_recommendations WHERE analysis_build_id = ?1)",
+            [analysis_build_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        if counts != (build.4, build.5, build.6, build.7, build.8, build.9) {
+            return Err(StoreError::invalid_input(
+                "capture_time_analysis_counts",
+                "database evidence counts do not match the frozen analysis header",
+            ));
+        }
+        if let Some(ordinal) = selected_candidate_ordinal {
+            let eligible = self
+                .transaction
+                .query_row(
+                    "SELECT evidence_gate = 'eligible' FROM capture_time_candidates \
+                 WHERE analysis_build_id = ?1 AND ordinal = ?2",
+                    params![analysis_build_id, ordinal],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => StoreError::invalid_input(
+                        "selected_candidate_ordinal",
+                        "selected candidate is absent from the analysis",
+                    ),
+                    other => StoreError::from(other),
+                })?;
+            if decision == CaptureTimeDecision::EvidenceEligible && !eligible {
+                return Err(StoreError::invalid_input(
+                    "selected_candidate_ordinal",
+                    "evidence-eligible decision requires an eligible selected candidate",
+                ));
+            }
+        }
+        if observed != expected {
+            return Err(StoreError::invalid_input(
+                "capture_time_analysis_manifest",
+                "database-streamed analysis manifest differs from the frozen expected digest",
+            ));
+        }
+        let changed = self.transaction.execute(
+            "UPDATE capture_time_analysis_builds \
+             SET state = 'sealed', decision = ?2, selected_candidate_ordinal = ?3, \
+                 sealed_manifest_digest = ?4, finalized_at_ms = ?5 \
+             WHERE id = ?1 AND state = 'draft'",
+            params![
+                analysis_build_id,
+                decision.as_storage_str(),
+                selected_candidate_ordinal,
+                observed.as_bytes().as_slice(),
+                finalized_at_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "capture_time_analysis_seal",
+                id: analysis_build_id,
+            });
+        }
+        self.transaction.execute(
+            "INSERT INTO capture_time_group_outcomes ( \
+                 time_session_id, exact_group_build_id, volume_id, scan_run_id, outcome, \
+                 analysis_build_id, reason_code, created_at_ms \
+             ) SELECT time_session_id, exact_group_build_id, volume_id, scan_run_id, \
+                      'evidence', id, 'sealed_analysis_evidence', ?2 \
+               FROM capture_time_analysis_builds WHERE id = ?1",
+            params![analysis_build_id, finalized_at_ms],
+        )?;
+        Ok(observed)
+    }
+
+    fn abandon_capture_time_analysis_impl(
+        &mut self,
+        guard: &TimeEvidenceGuard,
+        analysis_build_id: i64,
+        abandoned_at_ms: i64,
+        reason_code: &str,
+        reason_message: Option<&str>,
+    ) -> Result<()> {
+        self.validate_time_evidence_guard(guard)?;
+        require_positive("analysis_build_id", analysis_build_id)?;
+        require_nonnegative("abandoned_at_ms", abandoned_at_ms)?;
+        require_bounded_nonempty("reason_code", reason_code, 256)?;
+        validate_optional_bounded("reason_message", reason_message, MAX_TEXT_BYTES)?;
+        let stored = self.transaction.query_row(
+            "SELECT build.time_session_id, build.exact_group_build_id, build.scan_run_id, \
+                    time_session.core_session_id, build.state, build.abandon_reason_code, \
+                    build.abandon_reason_message, build.created_at_ms, build.finalized_at_ms \
+             FROM capture_time_analysis_builds AS build \
+             JOIN scan_time_sessions AS time_session ON time_session.id = build.time_session_id \
+             WHERE build.id = ?1",
+            [analysis_build_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                ))
+            },
+        )?;
+        if stored.2 != guard.run().scan_run_id
+            || stored.3.as_slice() != guard.core_session_id().as_bytes()
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "capture_time_analysis_guard",
+                id: analysis_build_id,
+            });
+        }
+        let latest_child_ms =
+            latest_capture_time_analysis_child_ms(self.transaction, analysis_build_id)?;
+        let latest_group_evidence_ms =
+            latest_time_group_terminal_evidence_ms(self.transaction, stored.0, stored.1)?;
+        let latest_evidence_ms = latest_child_ms.max(latest_group_evidence_ms);
+        if stored.4 == "abandoned" {
+            let outcome_matches = self.transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM capture_time_group_outcomes \
+                               WHERE time_session_id = ?1 AND exact_group_build_id = ?2 \
+                                 AND outcome = 'failed' AND analysis_build_id IS NULL \
+                                 AND reason_code = ?3 AND created_at_ms = ?4)",
+                params![stored.0, stored.1, reason_code, abandoned_at_ms],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if stored.8.is_none() || stored.8.is_some_and(|value| value < latest_evidence_ms) {
+                return Err(StoreError::invalid_input(
+                    "capture_time_analysis_chronology",
+                    "abandoned analysis predates retained child or group evidence",
+                ));
+            }
+            return if stored.5.as_deref() == Some(reason_code)
+                && stored.6.as_deref() == reason_message
+                && stored.8 == Some(abandoned_at_ms)
+                && outcome_matches
+            {
+                Ok(())
+            } else {
+                Err(StoreError::IdempotencyConflict {
+                    entity: "capture_time_analysis_abandonment",
+                    key: analysis_build_id.to_string(),
+                })
+            };
+        }
+        if stored.4 != "draft" {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "draft_capture_time_analysis",
+                id: analysis_build_id,
+            });
+        }
+        if abandoned_at_ms < latest_evidence_ms {
+            return Err(StoreError::invalid_input(
+                "abandoned_at_ms",
+                "analysis abandonment predates retained child or group evidence",
+            ));
+        }
+        require_draft_analysis_for_guard(self.transaction, guard, analysis_build_id)?;
+        let changed = self.transaction.execute(
+            "UPDATE capture_time_analysis_builds \
+             SET state = 'abandoned', abandon_reason_code = ?2, \
+                 abandon_reason_message = ?3, finalized_at_ms = ?4 \
+             WHERE id = ?1 AND state = 'draft'",
+            params![
+                analysis_build_id,
+                reason_code,
+                reason_message,
+                abandoned_at_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "capture_time_analysis_abandonment",
+                id: analysis_build_id,
+            });
+        }
+        self.transaction.execute(
+            "INSERT INTO capture_time_group_outcomes ( \
+                 time_session_id, exact_group_build_id, volume_id, scan_run_id, outcome, \
+                 analysis_build_id, reason_code, created_at_ms \
+             ) SELECT time_session_id, exact_group_build_id, volume_id, scan_run_id, \
+                      'failed', NULL, ?2, ?3 \
+               FROM capture_time_analysis_builds WHERE id = ?1",
+            params![analysis_build_id, reason_code, abandoned_at_ms],
+        )?;
+        Ok(())
     }
 
     fn register_namespace_profile_impl(&mut self, input: &NamespaceProfileInput) -> Result<i64> {
@@ -984,6 +3628,8 @@ impl<'transaction> RepositoryTx<'transaction> {
                 && existing.9.as_slice() == input.root_source_signature.as_bytes()
                 && existing.10 == input.bound_at_ms;
             if matches {
+                self.bound_core_sessions
+                    .push((guard.scan_run_id, input.core_session_id.into_bytes()));
                 return Ok(());
             }
             return Err(StoreError::IdempotencyConflict {
@@ -1010,6 +3656,8 @@ impl<'transaction> RepositoryTx<'transaction> {
                 input.bound_at_ms,
             ],
         )?;
+        self.bound_core_sessions
+            .push((guard.scan_run_id, input.core_session_id.into_bytes()));
         Ok(())
     }
 
@@ -1866,6 +4514,49 @@ impl<'transaction> RepositoryTx<'transaction> {
             return Err(StoreError::ConcurrencyConflict {
                 entity: "core_session_evidence_guard",
                 id: guard.scan_run_id,
+            });
+        }
+        Ok(context)
+    }
+
+    fn validate_time_evidence_guard(&self, guard: &TimeEvidenceGuard) -> Result<BoundRunContext> {
+        if self.store_instance_key == [0; 32]
+            || guard.store_instance_key() != &self.store_instance_key
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "live_time_store_instance_guard",
+                id: guard.run().scan_run_id,
+            });
+        }
+        let context = self.validate_v5_bound_run_guard(guard.run())?;
+        if context.run_state != "completed" || context.job_state != "completed" {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "completed_time_evidence_guard",
+                id: guard.run().scan_run_id,
+            });
+        }
+        let matches = self.transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM scan_core_sessions \
+                 WHERE scan_run_id = ?1 AND volume_id = ?2 \
+                   AND capability_profile_id = ?3 AND namespace_profile_id = ?4 \
+                   AND core_session_id = ?5 \
+                   AND trust_scope = 'current_core_session_only' \
+                   AND engine_contract_version = 1 \
+             )",
+            params![
+                guard.run().scan_run_id,
+                context.volume_id,
+                context.capability_profile_id,
+                context.namespace_profile_id,
+                guard.core_session_id().as_bytes().as_slice(),
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !matches {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "time_core_session_evidence_guard",
+                id: guard.run().scan_run_id,
             });
         }
         Ok(context)
@@ -5402,6 +8093,695 @@ fn hash_length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn recompute_time_session_scope_manifest(
+    connection: &Connection,
+    scan_run_id: i64,
+) -> Result<(i64, TimeEvidenceManifestDigest)> {
+    require_positive("scan_run_id", scan_run_id)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.time-session-exact-scope.v1\0");
+    hasher.update(&scan_run_id.to_le_bytes());
+    let mut count = 0_i64;
+    let mut statement = connection.prepare(
+        "SELECT id, group_key, expected_member_count, expected_manifest_digest \
+         FROM exact_group_builds \
+         WHERE scan_run_id = ?1 AND state = 'verified' ORDER BY id",
+    )?;
+    let mut rows = statement.query([scan_run_id])?;
+    while let Some(row) = rows.next()? {
+        let build_id = row.get::<_, i64>(0)?;
+        let group_key = row.get::<_, Vec<u8>>(1)?;
+        let member_count = row.get::<_, i64>(2)?;
+        let manifest = row.get::<_, Vec<u8>>(3)?;
+        if group_key.len() != 32 || manifest.len() != 32 || member_count < 2 {
+            return Err(StoreError::invalid_input(
+                "time_session_manifest",
+                "stored verified exact group is malformed",
+            ));
+        }
+        hasher.update(&build_id.to_le_bytes());
+        hasher.update(&group_key);
+        hasher.update(&member_count.to_le_bytes());
+        hasher.update(&manifest);
+        count = count.checked_add(1).ok_or_else(|| {
+            StoreError::invalid_input("expected_group_count", "group count overflow")
+        })?;
+    }
+    hasher.update(&count.to_le_bytes());
+    Ok((
+        count,
+        TimeEvidenceManifestDigest::from_runtime_evidence(*hasher.finalize().as_bytes()),
+    ))
+}
+
+pub(crate) fn recompute_time_session_outcome_manifest(
+    connection: &Connection,
+    time_session_id: i64,
+) -> Result<TimeEvidenceManifestDigest> {
+    require_positive("time_session_id", time_session_id)?;
+    let terminal = connection
+        .query_row(
+            "SELECT state, finalized_at_ms FROM scan_time_sessions WHERE id = ?1",
+            [time_session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::ConcurrencyConflict {
+                entity: "time_session_outcome_manifest",
+                id: time_session_id,
+            },
+            other => StoreError::from(other),
+        })?;
+    let Some(finalized_at_ms) = terminal.1 else {
+        return Err(StoreError::invalid_input(
+            "time_session_outcome_manifest",
+            "outcome manifest requires a complete or partial terminal session",
+        ));
+    };
+    if !matches!(terminal.0.as_str(), "complete" | "partial") {
+        return Err(StoreError::invalid_input(
+            "time_session_outcome_manifest",
+            "outcome manifest requires a complete or partial terminal session",
+        ));
+    }
+    recompute_time_session_outcome_manifest_for_terminal(
+        connection,
+        time_session_id,
+        &terminal.0,
+        finalized_at_ms,
+    )
+}
+
+fn recompute_time_session_outcome_manifest_for_terminal(
+    connection: &Connection,
+    time_session_id: i64,
+    terminal_state: &str,
+    finalized_at_ms: i64,
+) -> Result<TimeEvidenceManifestDigest> {
+    require_positive("time_session_id", time_session_id)?;
+    require_nonnegative("finalized_at_ms", finalized_at_ms)?;
+    if !matches!(terminal_state, "complete" | "partial") {
+        return Err(StoreError::invalid_input(
+            "time_session_state",
+            "outcome manifest requires complete or partial terminal state",
+        ));
+    }
+    let (scan_run_id, expected_group_count, expected_scope_manifest) = connection
+        .query_row(
+            "SELECT scan_run_id, expected_group_count, expected_manifest_digest \
+             FROM scan_time_sessions WHERE id = ?1",
+            [time_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::ConcurrencyConflict {
+                entity: "time_session_outcome_manifest",
+                id: time_session_id,
+            },
+            other => StoreError::from(other),
+        })?;
+    if expected_scope_manifest.len() != 32 {
+        return Err(StoreError::invalid_input(
+            "time_session_outcome_manifest",
+            "frozen exact-scope digest is malformed",
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.time-session-outcomes.v2\0");
+    hasher.update(&time_session_id.to_le_bytes());
+    hasher.update(&scan_run_id.to_le_bytes());
+    let mut evidence_count = 0_i64;
+    let mut unavailable_count = 0_i64;
+    let mut failed_count = 0_i64;
+    let mut statement = connection.prepare(
+        "SELECT outcome.exact_group_build_id, outcome.outcome, outcome.analysis_build_id, \
+                outcome.reason_code, outcome.created_at_ms, build.sealed_manifest_digest, \
+                build.decision, build.selected_candidate_ordinal, build.finalized_at_ms, \
+                build.time_session_id, build.exact_group_build_id, build.state \
+         FROM capture_time_group_outcomes AS outcome \
+         LEFT JOIN capture_time_analysis_builds AS build ON build.id = outcome.analysis_build_id \
+         WHERE outcome.time_session_id = ?1 ORDER BY outcome.exact_group_build_id",
+    )?;
+    let mut rows = statement.query([time_session_id])?;
+    while let Some(row) = rows.next()? {
+        let group_id = row.get::<_, i64>(0)?;
+        let outcome = row.get::<_, String>(1)?;
+        let analysis_id = row.get::<_, Option<i64>>(2)?;
+        let reason_code = row.get::<_, String>(3)?;
+        let created_at_ms = row.get::<_, i64>(4)?;
+        let analysis_manifest = row.get::<_, Option<Vec<u8>>>(5)?;
+        let analysis_decision = row.get::<_, Option<String>>(6)?;
+        let selected_candidate_ordinal = row.get::<_, Option<i64>>(7)?;
+        let analysis_finalized_at_ms = row.get::<_, Option<i64>>(8)?;
+        let analysis_time_session_id = row.get::<_, Option<i64>>(9)?;
+        let analysis_group_id = row.get::<_, Option<i64>>(10)?;
+        let analysis_state = row.get::<_, Option<String>>(11)?;
+        match outcome.as_str() {
+            "evidence" => {
+                evidence_count = evidence_count.checked_add(1).ok_or_else(|| {
+                    StoreError::invalid_input("evidence_group_count", "count overflow")
+                })?;
+                if analysis_id.is_none()
+                    || !matches!(analysis_manifest.as_deref(), Some(value) if value.len() == 32)
+                    || !matches!(
+                        analysis_decision.as_deref(),
+                        Some(
+                            "no_usable_evidence"
+                                | "review_required"
+                                | "evidence_eligible"
+                                | "conflict"
+                        )
+                    )
+                    || analysis_finalized_at_ms.is_none()
+                    || analysis_time_session_id != Some(time_session_id)
+                    || analysis_group_id != Some(group_id)
+                    || analysis_state.as_deref() != Some("sealed")
+                {
+                    return Err(StoreError::invalid_input(
+                        "time_session_outcome_manifest",
+                        "evidence outcome lacks its complete sealed analysis decision",
+                    ));
+                }
+            }
+            "unavailable" => {
+                unavailable_count = unavailable_count.checked_add(1).ok_or_else(|| {
+                    StoreError::invalid_input("unavailable_group_count", "count overflow")
+                })?;
+                if analysis_id.is_some() {
+                    return Err(StoreError::invalid_input(
+                        "time_session_outcome_manifest",
+                        "unavailable outcome must not reference an analysis",
+                    ));
+                }
+            }
+            "failed" => {
+                failed_count = failed_count.checked_add(1).ok_or_else(|| {
+                    StoreError::invalid_input("failed_group_count", "count overflow")
+                })?;
+                if analysis_id.is_some() {
+                    return Err(StoreError::invalid_input(
+                        "time_session_outcome_manifest",
+                        "failed outcome must not reference an analysis",
+                    ));
+                }
+            }
+            _ => {
+                return Err(StoreError::invalid_input(
+                    "time_session_outcome_manifest",
+                    "stored group outcome is not a v7 value",
+                ));
+            }
+        }
+        hasher.update(&group_id.to_le_bytes());
+        hash_length_prefixed(&mut hasher, outcome.as_bytes())?;
+        match analysis_id {
+            Some(value) => {
+                hasher.update(&[1]);
+                hasher.update(&value.to_le_bytes());
+                hasher.update(analysis_manifest.as_deref().ok_or_else(|| {
+                    StoreError::invalid_input(
+                        "time_session_outcome_manifest",
+                        "evidence analysis manifest is absent",
+                    )
+                })?);
+                hash_length_prefixed(
+                    &mut hasher,
+                    analysis_decision
+                        .as_deref()
+                        .ok_or_else(|| {
+                            StoreError::invalid_input(
+                                "time_session_outcome_manifest",
+                                "evidence analysis decision is absent",
+                            )
+                        })?
+                        .as_bytes(),
+                )?;
+                match selected_candidate_ordinal {
+                    Some(ordinal) => {
+                        hasher.update(&[1]);
+                        hasher.update(&ordinal.to_le_bytes());
+                    }
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                }
+                hasher.update(
+                    &analysis_finalized_at_ms
+                        .ok_or_else(|| {
+                            StoreError::invalid_input(
+                                "time_session_outcome_manifest",
+                                "evidence analysis terminal time is absent",
+                            )
+                        })?
+                        .to_le_bytes(),
+                );
+                hash_length_prefixed(&mut hasher, b"member_filesystem_times")?;
+                let mut member_count = 0_i64;
+                let mut member_statement = connection.prepare(
+                    "SELECT member.member_ordinal, member.media_observation_snapshot_id, \
+                            observation.birth_time_seconds, observation.birth_time_nanoseconds, \
+                            observation.modified_time_seconds, \
+                            observation.modified_time_nanoseconds, \
+                            observation.timestamp_granularity_ns \
+                     FROM capture_time_member_assessments AS member \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.id = member.media_observation_snapshot_id \
+                      AND observation.scan_run_id = member.scan_run_id \
+                      AND observation.volume_id = member.volume_id \
+                     WHERE member.analysis_build_id = ?1 ORDER BY member.member_ordinal",
+                )?;
+                let mut member_rows = member_statement.query([value])?;
+                while let Some(member_row) = member_rows.next()? {
+                    hasher.update(&[0xa7]);
+                    hasher.update(&member_row.get::<_, i64>(0)?.to_le_bytes());
+                    hasher.update(&member_row.get::<_, i64>(1)?.to_le_bytes());
+                    hash_optional_i64(&mut hasher, member_row.get(2)?);
+                    hash_optional_i64(&mut hasher, member_row.get(3)?);
+                    hasher.update(&member_row.get::<_, i64>(4)?.to_le_bytes());
+                    hasher.update(&member_row.get::<_, i64>(5)?.to_le_bytes());
+                    hash_optional_i64(&mut hasher, member_row.get(6)?);
+                    member_count = member_count.checked_add(1).ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "time_session_outcome_manifest",
+                            "analysis member count overflow",
+                        )
+                    })?;
+                    if member_count > 8_192 {
+                        return Err(StoreError::invalid_input(
+                            "time_session_outcome_manifest",
+                            "analysis member count exceeds the v7 hard bound",
+                        ));
+                    }
+                }
+                hasher.update(&member_count.to_le_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hash_length_prefixed(&mut hasher, reason_code.as_bytes())?;
+        hasher.update(&created_at_ms.to_le_bytes());
+    }
+    hasher.update(&evidence_count.to_le_bytes());
+    hasher.update(&unavailable_count.to_le_bytes());
+    hasher.update(&failed_count.to_le_bytes());
+    hash_length_prefixed(&mut hasher, terminal_state.as_bytes())?;
+    hasher.update(&expected_group_count.to_le_bytes());
+    hasher.update(&expected_scope_manifest);
+    hasher.update(&finalized_at_ms.to_le_bytes());
+    Ok(TimeEvidenceManifestDigest::from_runtime_evidence(
+        *hasher.finalize().as_bytes(),
+    ))
+}
+
+fn hash_optional_i64(hasher: &mut blake3::Hasher, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hasher.update(&value.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn hash_sqlite_query_by_id(
+    connection: &Connection,
+    hasher: &mut blake3::Hasher,
+    label: &[u8],
+    sql: &str,
+    id: i64,
+) -> Result<i64> {
+    hash_length_prefixed(hasher, label)?;
+    let mut statement = connection.prepare(sql)?;
+    let column_count = statement.column_count();
+    let mut rows = statement.query([id])?;
+    let mut count = 0_i64;
+    while let Some(row) = rows.next()? {
+        hasher.update(&[0xa5]);
+        for column in 0..column_count {
+            use rusqlite::types::ValueRef;
+            match row.get_ref(column)? {
+                ValueRef::Null => {
+                    hasher.update(&[0]);
+                }
+                ValueRef::Integer(value) => {
+                    hasher.update(&[1]);
+                    hasher.update(&value.to_le_bytes());
+                }
+                ValueRef::Real(_) => {
+                    return Err(StoreError::invalid_input(
+                        "time_evidence_manifest",
+                        "REAL values are forbidden in evidence manifests",
+                    ));
+                }
+                ValueRef::Text(value) => {
+                    hasher.update(&[3]);
+                    hash_length_prefixed(hasher, value)?;
+                }
+                ValueRef::Blob(value) => {
+                    hasher.update(&[4]);
+                    hash_length_prefixed(hasher, value)?;
+                }
+            }
+        }
+        count = count.checked_add(1).ok_or_else(|| {
+            StoreError::invalid_input("time_evidence_manifest", "row count overflow")
+        })?;
+    }
+    hasher.update(&[0x5a]);
+    hasher.update(&count.to_le_bytes());
+    Ok(count)
+}
+
+pub(crate) fn recompute_metadata_report_manifest(
+    connection: &Connection,
+    report_id: i64,
+) -> Result<TimeEvidenceManifestDigest> {
+    require_positive("report_id", report_id)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.metadata-report-manifest.v1\0");
+    let header_count = hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"header",
+        "SELECT time_session_id, scan_run_id, core_session_id, \
+                exact_group_build_id, metadata_probe_observation_id, \
+                metadata_probe_fingerprint_id, probe_ordinal, source_size_bytes, \
+                report_parser_name, report_parser_version, detected_format, extraction_status, \
+                effective_max_total_bytes_read, effective_max_read_operations, \
+                effective_max_retained_field_bytes, effective_max_field_bytes, \
+                effective_max_fields, effective_max_jpeg_segments, effective_max_ifd_entries, \
+                effective_max_ifd_depth, effective_max_bmff_boxes, effective_max_bmff_depth, \
+                usage_bytes_read, usage_read_operations, usage_retained_field_bytes, \
+                usage_fields_emitted, usage_jpeg_segments_visited, usage_ifd_entries_visited, \
+                usage_bmff_boxes_visited, usage_max_depth_observed, expected_field_count, \
+                expected_issue_count, expected_retained_field_bytes, retained_report_digest, \
+                created_at_ms \
+         FROM metadata_extraction_reports WHERE id = ?1",
+        report_id,
+    )?;
+    if header_count != 1 {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "metadata_report_manifest",
+            id: report_id,
+        });
+    }
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"fields",
+        "SELECT ordinal, parser_name, parser_version, field_kind, encoding, absolute_offset, \
+                byte_len, raw_bytes, raw_digest, container_kind, tiff_header_offset, \
+                tiff_ifd_offset, tiff_tag, tiff_byte_order, jpeg_app1_offset, bmff_box_offset, \
+                bmff_box_path, created_at_ms \
+         FROM metadata_extraction_fields WHERE report_id = ?1 ORDER BY ordinal, id",
+        report_id,
+    )?;
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"issues",
+        "SELECT ordinal, parser_name, parser_version, issue_code, source_offset, context, \
+                created_at_ms \
+         FROM metadata_extraction_issues WHERE report_id = ?1 ORDER BY ordinal, id",
+        report_id,
+    )?;
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"revalidation",
+        "SELECT time_session_id, scan_run_id, core_session_id, exact_group_build_id, \
+                metadata_probe_observation_id, source_key, source_key_version, lineage_key, \
+                lineage_key_version, source_signature_before, source_signature_after, \
+                first_report_digest, second_report_digest, outcome, \
+                descriptor_revalidated, path_revalidated, session_revalidated, trust_scope, \
+                revalidated_at_ms \
+         FROM metadata_source_revalidations WHERE report_id = ?1 ORDER BY id",
+        report_id,
+    )?;
+    Ok(TimeEvidenceManifestDigest::from_runtime_evidence(
+        *hasher.finalize().as_bytes(),
+    ))
+}
+
+pub(crate) fn recompute_capture_time_analysis_manifest(
+    connection: &Connection,
+    analysis_build_id: i64,
+) -> Result<TimeEvidenceManifestDigest> {
+    require_positive("analysis_build_id", analysis_build_id)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.capture-time-analysis-manifest.v1\0");
+    let header_count = hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"header",
+        "SELECT time_session_id, scan_run_id, exact_group_build_id, policy_name, \
+                policy_version, policy_context_json, policy_context_digest, \
+                expected_source_count, expected_observation_count, expected_candidate_count, \
+                expected_issue_count, expected_member_count, expected_recommendation_count, \
+                created_at_ms \
+         FROM capture_time_analysis_builds WHERE id = ?1",
+        analysis_build_id,
+    )?;
+    if header_count != 1 {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "capture_time_analysis_manifest",
+            id: analysis_build_id,
+        });
+    }
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"sources",
+        "SELECT ordinal, report_id, source_key, lineage_key, binding_status, created_at_ms \
+         FROM capture_time_analysis_sources WHERE analysis_build_id = ?1 \
+         ORDER BY ordinal, report_id",
+        analysis_build_id,
+    )?;
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"observations",
+        "SELECT ordinal, source_ordinal, report_id, metadata_field_id, interpretation_kind, \
+                wall_year, wall_month, wall_day, wall_hour, wall_minute, wall_second, \
+                wall_nanosecond, semantic_kind, offset_kind, utc_offset_minutes, \
+                utc_seconds_decimal, utc_nanoseconds, normalized_precision_ns, \
+                parsed_offset_minutes, subsecond_nanosecond, subsecond_digits, \
+                subsecond_precision_ns, rejection_code, created_at_ms \
+         FROM capture_time_observations WHERE analysis_build_id = ?1 ORDER BY ordinal, id",
+        analysis_build_id,
+    )?;
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"candidates",
+        "SELECT ordinal, wall_year, wall_month, wall_day, wall_hour, wall_minute, wall_second, \
+                wall_nanosecond, semantic_kind, offset_kind, utc_offset_minutes, \
+                utc_seconds_decimal, utc_nanoseconds, precision_ns, confidence, evidence_gate, \
+                evidence_kinds_json, source_keys_json, lineage_keys_json, \
+                observation_ordinals_json, anomalies_json, blockers_json, created_at_ms \
+         FROM capture_time_candidates WHERE analysis_build_id = ?1 ORDER BY ordinal, id",
+        analysis_build_id,
+    )?;
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"policy-issues",
+        "SELECT ordinal, issue_code, field_kind, observation_ordinals_json, source_keys_json, \
+                lineage_keys_json, context, created_at_ms \
+         FROM capture_time_policy_issues WHERE analysis_build_id = ?1 ORDER BY ordinal, id",
+        analysis_build_id,
+    )?;
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"members",
+        "SELECT member.member_ordinal, member.media_observation_snapshot_id, candidate.ordinal, \
+                member.birth_time_relation, member.modified_time_relation, \
+                member.donor_eligibility, member.reason_code, member.created_at_ms \
+         FROM capture_time_member_assessments AS member \
+         LEFT JOIN capture_time_candidates AS candidate \
+           ON candidate.analysis_build_id = member.analysis_build_id \
+          AND candidate.id = member.candidate_id \
+         WHERE member.analysis_build_id = ?1 ORDER BY member.member_ordinal",
+        analysis_build_id,
+    )?;
+    hash_sqlite_query_by_id(
+        connection,
+        &mut hasher,
+        b"recommendation",
+        "SELECT recommendation.keeper_observation_id, \
+                recommendation.time_donor_observation_id, candidate.ordinal, \
+                recommendation.keeper_policy_name, recommendation.keeper_policy_version, \
+                recommendation.time_donor_policy_name, \
+                recommendation.time_donor_policy_version, recommendation.evidence_only, \
+                recommendation.write_authorized, recommendation.reason_code, \
+                recommendation.created_at_ms \
+         FROM capture_time_recommendations AS recommendation \
+         LEFT JOIN capture_time_candidates AS candidate \
+           ON candidate.analysis_build_id = recommendation.analysis_build_id \
+          AND candidate.id = recommendation.candidate_id \
+         WHERE recommendation.analysis_build_id = ?1 ORDER BY recommendation.analysis_build_id",
+        analysis_build_id,
+    )?;
+    Ok(TimeEvidenceManifestDigest::from_runtime_evidence(
+        *hasher.finalize().as_bytes(),
+    ))
+}
+
+/// Rebuilds the v2 source key and v1 copy-lineage key exclusively from the
+/// immutable persisted run/core/root/group/member/fingerprint graph.
+pub(crate) fn recompute_metadata_source_keys(
+    connection: &Connection,
+    report_id: i64,
+) -> Result<(TimeSourceKey, TimeLineageKey)> {
+    require_positive("report_id", report_id)?;
+    let raw = connection
+        .query_row(
+            "SELECT report.scan_run_id, report.core_session_id, \
+                    run_session.mount_session_key, run_session.root_scope_key, \
+                    run_session.stable_root_path_key, run_session.root_object_signature, \
+                    namespace_path.stable_path_key, observation.source_signature, \
+                    observation.id, fingerprint.id, exact_build.group_key, \
+                    exact_build.expected_manifest_digest, fingerprint.algorithm, \
+                    fingerprint.algorithm_version, fingerprint.parameters_hash, \
+                    fingerprint.observed_size_bytes, fingerprint.digest \
+             FROM metadata_extraction_reports AS report \
+             JOIN exact_group_builds AS exact_build \
+               ON exact_build.id = report.exact_group_build_id \
+              AND exact_build.volume_id = report.volume_id \
+              AND exact_build.scan_run_id = report.scan_run_id \
+              AND exact_build.state = 'verified' \
+             JOIN exact_group_build_members AS member \
+               ON member.exact_group_build_id = exact_build.id \
+              AND member.volume_id = exact_build.volume_id \
+              AND member.scan_run_id = exact_build.scan_run_id \
+              AND member.media_observation_snapshot_id = report.metadata_probe_observation_id \
+              AND member.observation_fingerprint_id = report.metadata_probe_fingerprint_id \
+             JOIN media_observation_snapshots AS observation \
+               ON observation.id = member.media_observation_snapshot_id \
+              AND observation.volume_id = member.volume_id \
+              AND observation.scan_run_id = member.scan_run_id \
+             JOIN media_namespace_paths AS namespace_path \
+               ON namespace_path.id = observation.media_namespace_path_id \
+              AND namespace_path.volume_id = observation.volume_id \
+              AND namespace_path.media_file_id = observation.media_file_id \
+              AND namespace_path.namespace_profile_id = observation.namespace_profile_id \
+             JOIN observation_fingerprints AS fingerprint \
+               ON fingerprint.id = member.observation_fingerprint_id \
+              AND fingerprint.media_observation_snapshot_id = observation.id \
+              AND fingerprint.volume_id = observation.volume_id \
+              AND fingerprint.scan_run_id = observation.scan_run_id \
+              AND fingerprint.fingerprint_kind = 'exact_bytes' \
+              AND fingerprint.read_origin = 'full_hash_read' \
+              AND fingerprint.source_signature_before = observation.source_signature \
+              AND fingerprint.source_signature_after = observation.source_signature \
+             JOIN scan_run_sessions AS run_session \
+               ON run_session.scan_run_id = report.scan_run_id \
+              AND run_session.volume_id = report.volume_id \
+             JOIN scan_core_sessions AS core \
+               ON core.scan_run_id = report.scan_run_id \
+              AND core.volume_id = report.volume_id \
+              AND core.core_session_id = report.core_session_id \
+              AND core.root_object_signature = run_session.root_object_signature \
+             WHERE report.id = ?1",
+            [report_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, Vec<u8>>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Vec<u8>>(16)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::ConcurrencyConflict {
+                entity: "metadata_report_source_identity",
+                id: report_id,
+            },
+            other => StoreError::from(other),
+        })?;
+    let exact_fingerprint = TimeExactFingerprintMaterial::new(
+        raw.12,
+        raw.13,
+        crate::model::ParametersHash::from_runtime_evidence(fixed_32_from_sql(raw.14, 14)?),
+        raw.15,
+        raw.16,
+    )?;
+    let source_material = TimeSourceKeyMaterial::new(
+        1,
+        raw.0,
+        crate::model::CoreSessionId::from_runtime_evidence(fixed_32_from_sql(raw.1, 1)?),
+        MountSessionKey::from_runtime_evidence(parse_lower_hex_32("mount_session_key", &raw.2)?),
+        crate::model::RootScopeKey::from_volume_adapter(fixed_32_from_sql(raw.3, 3)?),
+        crate::model::StablePathKey::from_volume_adapter(fixed_32_from_sql(raw.4, 4)?),
+        crate::model::RootObjectSignature::from_volume_adapter(fixed_32_from_sql(raw.5, 5)?),
+        crate::model::StablePathKey::from_volume_adapter(fixed_32_from_sql(raw.6, 6)?),
+        SourceSignature::from_runtime_evidence(fixed_32_from_sql(raw.7, 7)?),
+        raw.8,
+        raw.9,
+        ExactGroupKey::from_runtime_evidence(fixed_32_from_sql(raw.10, 10)?),
+        ManifestDigest::from_runtime_evidence(fixed_32_from_sql(raw.11, 11)?),
+        exact_fingerprint,
+    )?;
+    Ok((
+        compute_time_source_key(&source_material),
+        compute_time_lineage_key(source_material.exact_fingerprint()),
+    ))
+}
+
+fn parse_lower_hex_32(field: &'static str, value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(StoreError::invalid_input(
+            field,
+            "expected exactly 64 lowercase hexadecimal characters",
+        ));
+    }
+    let mut output = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        output[index] =
+            (decode_lower_hex_nibble(pair[0])? << 4) | decode_lower_hex_nibble(pair[1])?;
+    }
+    Ok(output)
+}
+
+fn decode_lower_hex_nibble(value: u8) -> Result<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(StoreError::invalid_input(
+            "hex",
+            "invalid lowercase hexadecimal digit",
+        )),
+    }
+}
+
 fn fixed_32_from_sql(bytes: Vec<u8>, column: usize) -> rusqlite::Result<[u8; 32]> {
     bytes.try_into().map_err(|bytes: Vec<u8>| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -5421,6 +8801,1717 @@ fn checked_u64(field: &'static str, value: i64) -> Result<u64> {
 
 fn checked_u32(field: &'static str, value: i64) -> Result<u32> {
     u32::try_from(value).map_err(|_| StoreError::invalid_input(field, "value exceeds u32"))
+}
+
+struct StoredLocatorColumns<'a> {
+    kind: &'static str,
+    tiff_header_offset: Option<i64>,
+    tiff_ifd_offset: Option<i64>,
+    tiff_tag: Option<i64>,
+    tiff_byte_order: Option<&'static str>,
+    jpeg_app1_offset: Option<i64>,
+    bmff_box_offset: Option<i64>,
+    bmff_box_path: Option<&'a [u8]>,
+}
+
+struct StoredInterpretationColumns<'a> {
+    kind: &'static str,
+    wall_year: Option<i64>,
+    wall_month: Option<i64>,
+    wall_day: Option<i64>,
+    wall_hour: Option<i64>,
+    wall_minute: Option<i64>,
+    wall_second: Option<i64>,
+    wall_nanosecond: Option<i64>,
+    semantic_kind: Option<&'static str>,
+    offset_kind: Option<&'static str>,
+    utc_offset_minutes: Option<i64>,
+    utc_seconds_decimal: Option<&'a str>,
+    utc_nanoseconds: Option<i64>,
+    normalized_precision_ns: Option<i64>,
+    parsed_offset_minutes: Option<i64>,
+    subsecond_nanosecond: Option<i64>,
+    subsecond_digits: Option<i64>,
+    subsecond_precision_ns: Option<i64>,
+    rejection_code: Option<&'a str>,
+}
+
+impl<'a> From<&'a CaptureTimeObservationInterpretationInput> for StoredInterpretationColumns<'a> {
+    fn from(value: &'a CaptureTimeObservationInterpretationInput) -> Self {
+        let mut columns = Self {
+            kind: value.as_storage_str(),
+            wall_year: None,
+            wall_month: None,
+            wall_day: None,
+            wall_hour: None,
+            wall_minute: None,
+            wall_second: None,
+            wall_nanosecond: None,
+            semantic_kind: None,
+            offset_kind: None,
+            utc_offset_minutes: None,
+            utc_seconds_decimal: None,
+            utc_nanoseconds: None,
+            normalized_precision_ns: None,
+            parsed_offset_minutes: None,
+            subsecond_nanosecond: None,
+            subsecond_digits: None,
+            subsecond_precision_ns: None,
+            rejection_code: None,
+        };
+        match value {
+            CaptureTimeObservationInterpretationInput::Timestamp(timestamp) => {
+                let wall = timestamp.wall_time();
+                columns.wall_year = Some(i64::from(wall.year()));
+                columns.wall_month = Some(i64::from(wall.month()));
+                columns.wall_day = Some(i64::from(wall.day()));
+                columns.wall_hour = Some(i64::from(wall.hour()));
+                columns.wall_minute = Some(i64::from(wall.minute()));
+                columns.wall_second = Some(i64::from(wall.second()));
+                columns.wall_nanosecond = Some(i64::from(wall.nanosecond()));
+                columns.semantic_kind = Some(timestamp.semantic_kind().as_storage_str());
+                columns.offset_kind = Some(timestamp.offset_kind().as_storage_str());
+                columns.utc_offset_minutes = timestamp.utc_offset_minutes().map(i64::from);
+                columns.utc_seconds_decimal = timestamp.utc_seconds_decimal();
+                columns.utc_nanoseconds = timestamp.utc_nanoseconds().map(i64::from);
+                columns.normalized_precision_ns = Some(i64::from(timestamp.precision_ns()));
+            }
+            CaptureTimeObservationInterpretationInput::Offset { minutes } => {
+                columns.parsed_offset_minutes = Some(i64::from(*minutes));
+            }
+            CaptureTimeObservationInterpretationInput::Subsecond {
+                nanosecond,
+                digits,
+                precision_ns,
+            } => {
+                columns.subsecond_nanosecond = Some(i64::from(*nanosecond));
+                columns.subsecond_digits = Some(i64::from(*digits));
+                columns.subsecond_precision_ns = Some(i64::from(*precision_ns));
+            }
+            CaptureTimeObservationInterpretationInput::Rejected { code } => {
+                columns.rejection_code = Some(code);
+            }
+        }
+        columns
+    }
+}
+
+impl<'a> From<&'a MetadataContainerLocator> for StoredLocatorColumns<'a> {
+    fn from(value: &'a MetadataContainerLocator) -> Self {
+        match value {
+            MetadataContainerLocator::Tiff {
+                header_offset,
+                ifd_offset,
+                tag,
+                byte_order,
+            } => Self {
+                kind: "tiff",
+                tiff_header_offset: Some(*header_offset),
+                tiff_ifd_offset: Some(*ifd_offset),
+                tiff_tag: Some(*tag),
+                tiff_byte_order: Some(byte_order.as_storage_str()),
+                jpeg_app1_offset: None,
+                bmff_box_offset: None,
+                bmff_box_path: None,
+            },
+            MetadataContainerLocator::JpegExif {
+                app1_offset,
+                header_offset,
+                ifd_offset,
+                tag,
+                byte_order,
+            } => Self {
+                kind: "jpeg_exif",
+                tiff_header_offset: Some(*header_offset),
+                tiff_ifd_offset: Some(*ifd_offset),
+                tiff_tag: Some(*tag),
+                tiff_byte_order: Some(byte_order.as_storage_str()),
+                jpeg_app1_offset: Some(*app1_offset),
+                bmff_box_offset: None,
+                bmff_box_path: None,
+            },
+            MetadataContainerLocator::IsoBmff {
+                box_offset,
+                box_path,
+            } => Self {
+                kind: "iso_bmff",
+                tiff_header_offset: None,
+                tiff_ifd_offset: None,
+                tiff_tag: None,
+                tiff_byte_order: None,
+                jpeg_app1_offset: None,
+                bmff_box_offset: Some(*box_offset),
+                bmff_box_path: Some(box_path),
+            },
+        }
+    }
+}
+
+fn validate_time_batch(field: &'static str, count: usize) -> Result<()> {
+    if !(1..=MAX_TIME_EVIDENCE_BATCH).contains(&count) {
+        return Err(StoreError::invalid_input(
+            field,
+            format!("batch must contain between 1 and {MAX_TIME_EVIDENCE_BATCH} records"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_metadata_report_input(input: &BeginMetadataReportInput) -> Result<()> {
+    let limits = input.limits;
+    let usage = input.usage;
+    if usage.bytes_read > limits.total_bytes_read
+        || usage.read_operations > limits.read_operations
+        || usage.retained_field_bytes > limits.retained_field_bytes
+        || usage.fields_emitted > limits.fields
+        || usage.jpeg_segments_visited > limits.jpeg_segments
+        || usage.ifd_entries_visited > limits.ifd_entries
+        || usage.bmff_boxes_visited > limits.bmff_boxes
+        || usage.max_depth_observed > limits.ifd_depth.max(limits.bmff_depth)
+        || input.expected_field_count != usage.fields_emitted
+        || input.expected_retained_field_bytes != usage.retained_field_bytes
+    {
+        return Err(StoreError::invalid_input(
+            "metadata_report_usage",
+            "usage or expected counts contradict the effective extraction limits",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_metadata_field_input(input: &MetadataFieldInput) -> Result<()> {
+    if input.raw_bytes.len() > MAX_OPAQUE_BLOB_BYTES
+        || input.locator.byte_len != input.raw_bytes.len() as i64
+        || blake3::hash(&input.raw_bytes).as_bytes() != input.raw_digest.as_bytes()
+    {
+        return Err(StoreError::invalid_input(
+            "metadata_field",
+            "retained bytes, byte length, or raw digest are inconsistent",
+        ));
+    }
+    input
+        .locator
+        .absolute_offset
+        .checked_add(input.locator.byte_len)
+        .ok_or_else(|| StoreError::invalid_input("metadata_locator", "locator range overflow"))?;
+    Ok(())
+}
+
+fn require_draft_report_for_guard(
+    connection: &Connection,
+    guard: &TimeEvidenceGuard,
+    report_id: i64,
+) -> Result<()> {
+    require_positive("report_id", report_id)?;
+    let matches = connection.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM metadata_extraction_reports \
+             WHERE id = ?1 AND scan_run_id = ?2 AND core_session_id = ?3 AND state = 'draft' \
+         )",
+        params![
+            report_id,
+            guard.run().scan_run_id,
+            guard.core_session_id().as_bytes().as_slice(),
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !matches {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "draft_metadata_report_guard",
+            id: report_id,
+        });
+    }
+    Ok(())
+}
+
+fn require_draft_analysis_for_guard(
+    connection: &Connection,
+    guard: &TimeEvidenceGuard,
+    analysis_build_id: i64,
+) -> Result<()> {
+    require_positive("analysis_build_id", analysis_build_id)?;
+    let matches = connection.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM capture_time_analysis_builds AS build \
+             JOIN scan_time_sessions AS time_session ON time_session.id = build.time_session_id \
+             WHERE build.id = ?1 AND build.scan_run_id = ?2 AND build.state = 'draft' \
+               AND time_session.core_session_id = ?3 AND time_session.state = 'draft' \
+         )",
+        params![
+            analysis_build_id,
+            guard.run().scan_run_id,
+            guard.core_session_id().as_bytes().as_slice(),
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !matches {
+        return Err(StoreError::ConcurrencyConflict {
+            entity: "draft_capture_time_analysis_guard",
+            id: analysis_build_id,
+        });
+    }
+    Ok(())
+}
+
+fn latest_metadata_report_extraction_ms(connection: &Connection, report_id: i64) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT max(value) FROM ( \
+                 SELECT created_at_ms AS value FROM metadata_extraction_reports WHERE id = ?1 \
+                 UNION ALL SELECT created_at_ms FROM metadata_extraction_fields \
+                     WHERE report_id = ?1 \
+                 UNION ALL SELECT created_at_ms FROM metadata_extraction_issues \
+                     WHERE report_id = ?1 \
+             )",
+            [report_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn latest_capture_time_analysis_child_ms(
+    connection: &Connection,
+    analysis_build_id: i64,
+) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT max(value) FROM ( \
+                 SELECT created_at_ms AS value FROM capture_time_analysis_builds WHERE id = ?1 \
+                 UNION ALL SELECT created_at_ms FROM capture_time_analysis_sources \
+                     WHERE analysis_build_id = ?1 \
+                 UNION ALL SELECT created_at_ms FROM capture_time_observations \
+                     WHERE analysis_build_id = ?1 \
+                 UNION ALL SELECT created_at_ms FROM capture_time_candidates \
+                     WHERE analysis_build_id = ?1 \
+                 UNION ALL SELECT created_at_ms FROM capture_time_policy_issues \
+                     WHERE analysis_build_id = ?1 \
+                 UNION ALL SELECT created_at_ms FROM capture_time_member_assessments \
+                     WHERE analysis_build_id = ?1 \
+                 UNION ALL SELECT created_at_ms FROM capture_time_recommendations \
+                     WHERE analysis_build_id = ?1 \
+             )",
+            [analysis_build_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn latest_time_group_terminal_evidence_ms(
+    connection: &Connection,
+    time_session_id: i64,
+    exact_group_build_id: i64,
+) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT max(value) FROM ( \
+                 SELECT created_at_ms AS value FROM scan_time_sessions WHERE id = ?1 \
+                 UNION ALL SELECT finalized_at_ms FROM metadata_extraction_reports \
+                     WHERE time_session_id = ?1 AND exact_group_build_id = ?2 \
+                       AND finalized_at_ms IS NOT NULL \
+                 UNION ALL SELECT finalized_at_ms FROM capture_time_analysis_builds \
+                     WHERE time_session_id = ?1 AND exact_group_build_id = ?2 \
+                       AND finalized_at_ms IS NOT NULL \
+             )",
+            params![time_session_id, exact_group_build_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn validate_candidate_references(
+    connection: &Connection,
+    analysis_build_id: i64,
+    input: &CaptureTimeCandidateInput,
+) -> Result<()> {
+    for source_key in &input.source_keys {
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_time_analysis_sources \
+                           WHERE analysis_build_id = ?1 AND source_key = ?2)",
+            params![analysis_build_id, source_key.as_bytes().as_slice()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(StoreError::invalid_input(
+                "candidate_source_keys",
+                "candidate references a source outside its analysis",
+            ));
+        }
+    }
+    for lineage_key in &input.lineage_keys {
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_time_analysis_sources \
+                           WHERE analysis_build_id = ?1 AND lineage_key = ?2)",
+            params![analysis_build_id, lineage_key.as_bytes().as_slice()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(StoreError::invalid_input(
+                "candidate_lineage_keys",
+                "candidate references a lineage outside its analysis",
+            ));
+        }
+    }
+    for ordinal in &input.observation_ordinals {
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_time_observations \
+                           WHERE analysis_build_id = ?1 AND ordinal = ?2)",
+            params![analysis_build_id, ordinal],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(StoreError::invalid_input(
+                "candidate_observation_ordinals",
+                "candidate references an observation outside its analysis",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct CandidateSupportClaim {
+    analysis_build_id: i64,
+    wall_year: i64,
+    wall_month: i64,
+    wall_day: i64,
+    wall_hour: i64,
+    wall_minute: i64,
+    wall_second: i64,
+    wall_nanosecond: i64,
+    semantic_kind: String,
+    offset_kind: String,
+    utc_offset_minutes: Option<i64>,
+    utc_seconds_decimal: Option<String>,
+    utc_nanoseconds: Option<i64>,
+    precision_ns: i64,
+    evidence_kinds: Vec<String>,
+    source_keys: Vec<[u8; 32]>,
+    lineage_keys: Vec<[u8; 32]>,
+    observation_ordinals: Vec<i64>,
+}
+
+impl CandidateSupportClaim {
+    fn from_input(analysis_build_id: i64, input: &CaptureTimeCandidateInput) -> Self {
+        let wall = input.timestamp.wall_time();
+        Self {
+            analysis_build_id,
+            wall_year: i64::from(wall.year()),
+            wall_month: i64::from(wall.month()),
+            wall_day: i64::from(wall.day()),
+            wall_hour: i64::from(wall.hour()),
+            wall_minute: i64::from(wall.minute()),
+            wall_second: i64::from(wall.second()),
+            wall_nanosecond: i64::from(wall.nanosecond()),
+            semantic_kind: input.timestamp.semantic_kind().as_storage_str().to_owned(),
+            offset_kind: input.timestamp.offset_kind().as_storage_str().to_owned(),
+            utc_offset_minutes: input.timestamp.utc_offset_minutes().map(i64::from),
+            utc_seconds_decimal: input.timestamp.utc_seconds_decimal().map(str::to_owned),
+            utc_nanoseconds: input.timestamp.utc_nanoseconds().map(i64::from),
+            precision_ns: i64::from(input.timestamp.precision_ns()),
+            evidence_kinds: input
+                .evidence_kinds
+                .iter()
+                .map(|value| value.as_storage_str().to_owned())
+                .collect(),
+            source_keys: input
+                .source_keys
+                .iter()
+                .map(|value| *value.as_bytes())
+                .collect(),
+            lineage_keys: input
+                .lineage_keys
+                .iter()
+                .map(|value| *value.as_bytes())
+                .collect(),
+            observation_ordinals: input.observation_ordinals.clone(),
+        }
+    }
+}
+
+struct StoredCandidateSupportObservation {
+    source_ordinal: i64,
+    report_id: i64,
+    interpretation_kind: String,
+    wall_year: Option<i64>,
+    wall_month: Option<i64>,
+    wall_day: Option<i64>,
+    wall_hour: Option<i64>,
+    wall_minute: Option<i64>,
+    wall_second: Option<i64>,
+    wall_nanosecond: Option<i64>,
+    semantic_kind: Option<String>,
+    offset_kind: Option<String>,
+    utc_offset_minutes: Option<i64>,
+    utc_seconds_decimal: Option<String>,
+    utc_nanoseconds: Option<i64>,
+    normalized_precision_ns: Option<i64>,
+    parsed_offset_minutes: Option<i64>,
+    subsecond_nanosecond: Option<i64>,
+    subsecond_digits: Option<i64>,
+    subsecond_precision_ns: Option<i64>,
+    source_key: Vec<u8>,
+    lineage_key: Vec<u8>,
+    field_kind: String,
+    container_kind: String,
+    tiff_header_offset: Option<i64>,
+    tiff_ifd_offset: Option<i64>,
+    jpeg_app1_offset: Option<i64>,
+}
+
+struct CandidateSourceComposition {
+    exif_original_atoms: BTreeMap<StoredExifScope, CandidateExifOriginalAtom>,
+    independent_timestamps: Vec<StoredCandidateTimestamp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum StoredExifScope {
+    Tiff {
+        header_offset: i64,
+        ifd_offset: i64,
+    },
+    JpegExif {
+        app1_offset: i64,
+        header_offset: i64,
+        ifd_offset: i64,
+    },
+}
+
+struct CandidateExifOriginalAtom {
+    timestamp: Option<StoredCandidateTimestamp>,
+    offset_minutes: Option<i64>,
+    subsecond: Option<(i64, i64, i64)>,
+}
+
+struct StoredCandidateTimestamp {
+    wall_year: i64,
+    wall_month: i64,
+    wall_day: i64,
+    wall_hour: i64,
+    wall_minute: i64,
+    wall_second: i64,
+    wall_nanosecond: i64,
+    semantic_kind: String,
+    offset_kind: String,
+    utc_offset_minutes: Option<i64>,
+    utc_seconds_decimal: Option<String>,
+    utc_nanoseconds: Option<i64>,
+    precision_ns: i64,
+}
+
+fn validate_eligible_candidate_support(
+    connection: &Connection,
+    claim: &CandidateSupportClaim,
+) -> Result<()> {
+    if claim.observation_ordinals.is_empty()
+        || claim.source_keys.is_empty()
+        || claim.lineage_keys.is_empty()
+        || claim.evidence_kinds.is_empty()
+    {
+        return Err(StoreError::invalid_input(
+            "capture_time_candidate_support",
+            "eligible candidate support must not be empty",
+        ));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT observation.source_ordinal, observation.report_id, \
+                observation.interpretation_kind, observation.wall_year, \
+                observation.wall_month, observation.wall_day, observation.wall_hour, \
+                observation.wall_minute, observation.wall_second, \
+                observation.wall_nanosecond, observation.semantic_kind, \
+                observation.offset_kind, observation.utc_offset_minutes, \
+                observation.utc_seconds_decimal, observation.utc_nanoseconds, \
+                observation.normalized_precision_ns, observation.parsed_offset_minutes, \
+                observation.subsecond_nanosecond, observation.subsecond_digits, \
+                observation.subsecond_precision_ns, source.source_key, source.lineage_key, \
+                field.field_kind, field.container_kind, field.tiff_header_offset, \
+                field.tiff_ifd_offset, field.jpeg_app1_offset \
+         FROM capture_time_observations AS observation \
+         JOIN capture_time_analysis_builds AS build \
+           ON build.id = observation.analysis_build_id \
+         JOIN capture_time_analysis_sources AS source \
+           ON source.analysis_build_id = observation.analysis_build_id \
+          AND source.ordinal = observation.source_ordinal \
+          AND source.report_id = observation.report_id \
+         JOIN metadata_extraction_reports AS report \
+           ON report.id = source.report_id \
+          AND report.time_session_id = build.time_session_id \
+          AND report.exact_group_build_id = build.exact_group_build_id \
+          AND report.volume_id = build.volume_id \
+          AND report.scan_run_id = build.scan_run_id \
+          AND report.state = 'sealed' \
+          AND report.extraction_status = 'extracted_unvalidated' \
+          AND report.expected_issue_count = 0 \
+          AND NOT EXISTS ( \
+              SELECT 1 FROM metadata_extraction_issues AS issue \
+              WHERE issue.report_id = report.id \
+          ) \
+         JOIN metadata_source_revalidations AS revalidation \
+           ON revalidation.report_id = report.id \
+          AND revalidation.time_session_id = report.time_session_id \
+          AND revalidation.exact_group_build_id = report.exact_group_build_id \
+          AND revalidation.metadata_probe_observation_id = \
+              report.metadata_probe_observation_id \
+          AND revalidation.source_key = source.source_key \
+          AND revalidation.lineage_key = source.lineage_key \
+          AND revalidation.outcome = 'reextracted_pinned_exact' \
+          AND revalidation.descriptor_revalidated = 1 \
+          AND revalidation.path_revalidated = 1 \
+          AND revalidation.session_revalidated = 1 \
+         JOIN metadata_extraction_fields AS field \
+           ON field.id = observation.metadata_field_id \
+          AND field.report_id = observation.report_id \
+         WHERE observation.analysis_build_id = ?1 AND observation.ordinal = ?2",
+    )?;
+
+    let mut derived_source_keys = Vec::with_capacity(claim.observation_ordinals.len());
+    let mut derived_lineage_keys = Vec::with_capacity(claim.observation_ordinals.len());
+    let mut derived_evidence_kinds = Vec::new();
+    let mut source_compositions: BTreeMap<(i64, i64, [u8; 32]), CandidateSourceComposition> =
+        BTreeMap::new();
+    for ordinal in &claim.observation_ordinals {
+        let observation = statement
+            .query_row(params![claim.analysis_build_id, ordinal], |row| {
+                Ok(StoredCandidateSupportObservation {
+                    source_ordinal: row.get(0)?,
+                    report_id: row.get(1)?,
+                    interpretation_kind: row.get(2)?,
+                    wall_year: row.get(3)?,
+                    wall_month: row.get(4)?,
+                    wall_day: row.get(5)?,
+                    wall_hour: row.get(6)?,
+                    wall_minute: row.get(7)?,
+                    wall_second: row.get(8)?,
+                    wall_nanosecond: row.get(9)?,
+                    semantic_kind: row.get(10)?,
+                    offset_kind: row.get(11)?,
+                    utc_offset_minutes: row.get(12)?,
+                    utc_seconds_decimal: row.get(13)?,
+                    utc_nanoseconds: row.get(14)?,
+                    normalized_precision_ns: row.get(15)?,
+                    parsed_offset_minutes: row.get(16)?,
+                    subsecond_nanosecond: row.get(17)?,
+                    subsecond_digits: row.get(18)?,
+                    subsecond_precision_ns: row.get(19)?,
+                    source_key: row.get(20)?,
+                    lineage_key: row.get(21)?,
+                    field_kind: row.get(22)?,
+                    container_kind: row.get(23)?,
+                    tiff_header_offset: row.get(24)?,
+                    tiff_ifd_offset: row.get(25)?,
+                    jpeg_app1_offset: row.get(26)?,
+                })
+            })
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::invalid_input(
+                    "capture_time_candidate_support",
+                    "eligible candidate references evidence without a complete sealed double-extraction proof",
+                )
+            })?;
+        let exif_scope = matches!(
+            observation.field_kind.as_str(),
+            "exif_date_time_original" | "exif_offset_time_original" | "exif_subsec_time_original"
+        )
+        .then(|| required_candidate_exif_scope(&observation))
+        .transpose()?;
+        let source_key = fixed_32_from_sql(observation.source_key, 20)?;
+        let lineage_key = fixed_32_from_sql(observation.lineage_key, 21)?;
+        derived_source_keys.push(source_key);
+        derived_lineage_keys.push(lineage_key);
+        let composition = source_compositions
+            .entry((
+                observation.source_ordinal,
+                observation.report_id,
+                source_key,
+            ))
+            .or_insert_with(|| CandidateSourceComposition {
+                exif_original_atoms: BTreeMap::new(),
+                independent_timestamps: Vec::new(),
+            });
+
+        match observation.interpretation_kind.as_str() {
+            "timestamp" => {
+                let evidence_kind = timestamp_field_evidence_kind(&observation.field_kind)
+                    .ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_candidate_support",
+                            "timestamp observation uses a non-timestamp metadata field",
+                        )
+                    })?;
+                derived_evidence_kinds.push(evidence_kind.to_owned());
+                let timestamp = StoredCandidateTimestamp {
+                    wall_year: required_candidate_timestamp_value(
+                        "wall_year",
+                        observation.wall_year,
+                    )?,
+                    wall_month: required_candidate_timestamp_value(
+                        "wall_month",
+                        observation.wall_month,
+                    )?,
+                    wall_day: required_candidate_timestamp_value("wall_day", observation.wall_day)?,
+                    wall_hour: required_candidate_timestamp_value(
+                        "wall_hour",
+                        observation.wall_hour,
+                    )?,
+                    wall_minute: required_candidate_timestamp_value(
+                        "wall_minute",
+                        observation.wall_minute,
+                    )?,
+                    wall_second: required_candidate_timestamp_value(
+                        "wall_second",
+                        observation.wall_second,
+                    )?,
+                    wall_nanosecond: required_candidate_timestamp_value(
+                        "wall_nanosecond",
+                        observation.wall_nanosecond,
+                    )?,
+                    semantic_kind: observation.semantic_kind.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_candidate_support",
+                            "timestamp observation has no semantic kind",
+                        )
+                    })?,
+                    offset_kind: observation.offset_kind.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_candidate_support",
+                            "timestamp observation has no offset kind",
+                        )
+                    })?,
+                    utc_offset_minutes: observation.utc_offset_minutes,
+                    utc_seconds_decimal: observation.utc_seconds_decimal,
+                    utc_nanoseconds: observation.utc_nanoseconds,
+                    precision_ns: required_candidate_timestamp_value(
+                        "normalized_precision_ns",
+                        observation.normalized_precision_ns,
+                    )?,
+                };
+                if observation.field_kind == "exif_date_time_original" {
+                    let scope = exif_scope.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_candidate_support",
+                            "DateTimeOriginal is missing an exact Exif scope",
+                        )
+                    })?;
+                    let atom = composition
+                        .exif_original_atoms
+                        .entry(scope)
+                        .or_insert_with(empty_candidate_exif_original_atom);
+                    if atom.timestamp.replace(timestamp).is_some() {
+                        return Err(StoreError::invalid_input(
+                            "capture_time_candidate_support",
+                            "eligible candidate contains duplicate DateTimeOriginal observations in one Exif scope",
+                        ));
+                    }
+                } else {
+                    composition.independent_timestamps.push(timestamp);
+                }
+            }
+            "offset" if observation.field_kind == "exif_offset_time_original" => {
+                let scope = exif_scope.ok_or_else(|| {
+                    StoreError::invalid_input(
+                        "capture_time_candidate_support",
+                        "OffsetTimeOriginal is missing an exact Exif scope",
+                    )
+                })?;
+                let minutes = observation.parsed_offset_minutes.ok_or_else(|| {
+                    StoreError::invalid_input(
+                        "capture_time_candidate_support",
+                        "offset companion has no parsed offset",
+                    )
+                })?;
+                let atom = composition
+                    .exif_original_atoms
+                    .entry(scope)
+                    .or_insert_with(empty_candidate_exif_original_atom);
+                if atom.offset_minutes.replace(minutes).is_some() {
+                    return Err(StoreError::invalid_input(
+                        "capture_time_candidate_support",
+                        "eligible candidate contains duplicate offset companions in one Exif scope",
+                    ));
+                }
+            }
+            "subsecond" if observation.field_kind == "exif_subsec_time_original" => {
+                let scope = exif_scope.ok_or_else(|| {
+                    StoreError::invalid_input(
+                        "capture_time_candidate_support",
+                        "SubSecTimeOriginal is missing an exact Exif scope",
+                    )
+                })?;
+                let subsecond = (
+                    observation.subsecond_nanosecond.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_candidate_support",
+                            "subsecond companion has no normalized nanosecond",
+                        )
+                    })?,
+                    observation.subsecond_digits.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_candidate_support",
+                            "subsecond companion has no digit count",
+                        )
+                    })?,
+                    observation.subsecond_precision_ns.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_candidate_support",
+                            "subsecond companion has no precision",
+                        )
+                    })?,
+                );
+                let atom = composition
+                    .exif_original_atoms
+                    .entry(scope)
+                    .or_insert_with(empty_candidate_exif_original_atom);
+                if atom.subsecond.replace(subsecond).is_some() {
+                    return Err(StoreError::invalid_input(
+                        "capture_time_candidate_support",
+                        "eligible candidate contains duplicate subsecond companions in one Exif scope",
+                    ));
+                }
+            }
+            _ => {
+                return Err(StoreError::invalid_input(
+                    "capture_time_candidate_support",
+                    "eligible candidate contains a rejected or unrelated observation",
+                ));
+            }
+        }
+    }
+
+    sort_dedup(&mut derived_source_keys);
+    sort_dedup(&mut derived_lineage_keys);
+    sort_dedup(&mut derived_evidence_kinds);
+    let mut declared_source_keys = claim.source_keys.clone();
+    let mut declared_lineage_keys = claim.lineage_keys.clone();
+    let mut declared_evidence_kinds = claim.evidence_kinds.clone();
+    sort_dedup(&mut declared_source_keys);
+    sort_dedup(&mut declared_lineage_keys);
+    sort_dedup(&mut declared_evidence_kinds);
+    let has_eligible_exif_original_atom = source_compositions.values().any(|composition| {
+        composition
+            .exif_original_atoms
+            .values()
+            .any(|atom| exif_original_atom_matches_candidate(atom, claim))
+    });
+    if claim.semantic_kind != "utc"
+        || claim.offset_kind != "explicit"
+        || derived_source_keys != declared_source_keys
+        || derived_lineage_keys != declared_lineage_keys
+        || derived_evidence_kinds != declared_evidence_kinds
+        || source_compositions.is_empty()
+        || !has_eligible_exif_original_atom
+        || !source_compositions
+            .values()
+            .all(|composition| source_composition_matches_candidate(composition, claim))
+    {
+        return Err(StoreError::invalid_input(
+            "capture_time_candidate_support",
+            "eligible candidate declarations do not exactly match their timestamp evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn empty_candidate_exif_original_atom() -> CandidateExifOriginalAtom {
+    CandidateExifOriginalAtom {
+        timestamp: None,
+        offset_minutes: None,
+        subsecond: None,
+    }
+}
+
+fn required_candidate_exif_scope(
+    observation: &StoredCandidateSupportObservation,
+) -> Result<StoredExifScope> {
+    let invalid = || {
+        StoreError::invalid_input(
+            "capture_time_candidate_support",
+            "Exif DateTimeOriginal and its companions require a TIFF or JPEG Exif locator",
+        )
+    };
+    match observation.container_kind.as_str() {
+        "tiff" if observation.jpeg_app1_offset.is_none() => Ok(StoredExifScope::Tiff {
+            header_offset: observation.tiff_header_offset.ok_or_else(invalid)?,
+            ifd_offset: observation.tiff_ifd_offset.ok_or_else(invalid)?,
+        }),
+        "jpeg_exif" => Ok(StoredExifScope::JpegExif {
+            app1_offset: observation.jpeg_app1_offset.ok_or_else(invalid)?,
+            header_offset: observation.tiff_header_offset.ok_or_else(invalid)?,
+            ifd_offset: observation.tiff_ifd_offset.ok_or_else(invalid)?,
+        }),
+        _ => Err(invalid()),
+    }
+}
+
+fn required_candidate_timestamp_value(field: &'static str, value: Option<i64>) -> Result<i64> {
+    value.ok_or_else(|| {
+        StoreError::invalid_input(
+            "capture_time_candidate_support",
+            format!("timestamp observation has no {field}"),
+        )
+    })
+}
+
+fn source_composition_matches_candidate(
+    composition: &CandidateSourceComposition,
+    claim: &CandidateSupportClaim,
+) -> bool {
+    composition
+        .exif_original_atoms
+        .values()
+        .all(|atom| exif_original_atom_matches_candidate(atom, claim))
+        && composition
+            .independent_timestamps
+            .iter()
+            .all(|timestamp| timestamp_exactly_matches_candidate(timestamp, claim))
+}
+
+fn timestamp_exactly_matches_candidate(
+    timestamp: &StoredCandidateTimestamp,
+    claim: &CandidateSupportClaim,
+) -> bool {
+    timestamp.wall_year == claim.wall_year
+        && timestamp.wall_month == claim.wall_month
+        && timestamp.wall_day == claim.wall_day
+        && timestamp.wall_hour == claim.wall_hour
+        && timestamp.wall_minute == claim.wall_minute
+        && timestamp.wall_second == claim.wall_second
+        && timestamp.wall_nanosecond == claim.wall_nanosecond
+        && timestamp.semantic_kind == claim.semantic_kind
+        && timestamp.offset_kind == claim.offset_kind
+        && timestamp.utc_offset_minutes == claim.utc_offset_minutes
+        && timestamp.utc_seconds_decimal == claim.utc_seconds_decimal
+        && timestamp.utc_nanoseconds == claim.utc_nanoseconds
+        && timestamp.precision_ns == claim.precision_ns
+}
+
+fn exif_original_atom_matches_candidate(
+    atom: &CandidateExifOriginalAtom,
+    claim: &CandidateSupportClaim,
+) -> bool {
+    let Some(timestamp) = atom.timestamp.as_ref() else {
+        return false;
+    };
+    if claim.semantic_kind != "utc"
+        || claim.offset_kind != "explicit"
+        || timestamp.semantic_kind != "floating"
+        || timestamp.offset_kind != "missing"
+        || timestamp.utc_offset_minutes.is_some()
+        || timestamp.utc_seconds_decimal.is_some()
+        || timestamp.utc_nanoseconds.is_some()
+        || atom.offset_minutes != claim.utc_offset_minutes
+        || timestamp.wall_year != claim.wall_year
+        || timestamp.wall_month != claim.wall_month
+        || timestamp.wall_day != claim.wall_day
+        || timestamp.wall_hour != claim.wall_hour
+        || timestamp.wall_minute != claim.wall_minute
+        || timestamp.wall_second != claim.wall_second
+    {
+        return false;
+    }
+    match atom.subsecond {
+        Some((nanosecond, _digits, precision)) => {
+            (timestamp.wall_nanosecond == 0 || timestamp.wall_nanosecond == nanosecond)
+                && nanosecond == claim.wall_nanosecond
+                && precision == claim.precision_ns
+        }
+        None => {
+            timestamp.wall_nanosecond == claim.wall_nanosecond
+                && timestamp.precision_ns == claim.precision_ns
+        }
+    }
+}
+
+fn timestamp_field_evidence_kind(field_kind: &str) -> Option<&'static str> {
+    match field_kind {
+        "exif_date_time_original" => Some("exif_date_time_original"),
+        "exif_create_date" => Some("exif_create_date"),
+        "exif_modify_date" => Some("exif_modify_date"),
+        "quicktime_metadata_creation_date" => Some("quicktime_metadata_creation_date"),
+        "quicktime_movie_header_creation_time" => Some("quicktime_movie_header_creation_time"),
+        _ => None,
+    }
+}
+
+fn sort_dedup<T: Ord>(values: &mut Vec<T>) {
+    values.sort_unstable();
+    values.dedup();
+}
+
+pub(crate) fn validate_capture_time_candidate_supports(connection: &Connection) -> Result<()> {
+    validate_capture_time_candidate_supports_for_analysis(connection, None)
+}
+
+fn validate_capture_time_candidate_supports_for_analysis(
+    connection: &Connection,
+    analysis_build_id: Option<i64>,
+) -> Result<()> {
+    let mut last_id = 0_i64;
+    loop {
+        let stored = connection
+            .query_row(
+                "SELECT id, analysis_build_id, wall_year, wall_month, wall_day, wall_hour, \
+                        wall_minute, wall_second, wall_nanosecond, semantic_kind, offset_kind, \
+                        utc_offset_minutes, utc_seconds_decimal, utc_nanoseconds, precision_ns, \
+                        evidence_kinds_json, source_keys_json, lineage_keys_json, \
+                        observation_ordinals_json \
+                 FROM capture_time_candidates \
+                 WHERE evidence_gate = 'eligible' AND id > ?1 \
+                   AND (?2 IS NULL OR analysis_build_id = ?2) \
+                 ORDER BY id LIMIT 1",
+                params![last_id, analysis_build_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
+                        row.get::<_, i64>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, String>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, String>(18)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        last_id = stored.0;
+        let evidence_kinds: Vec<String> = serde_json::from_str(&stored.15).map_err(|error| {
+            StoreError::MigrationHistoryMismatch(format!(
+                "eligible candidate id {} has invalid evidence-kind JSON: {error}",
+                stored.0
+            ))
+        })?;
+        let source_key_hex: Vec<String> = serde_json::from_str(&stored.16).map_err(|error| {
+            StoreError::MigrationHistoryMismatch(format!(
+                "eligible candidate id {} has invalid source-key JSON: {error}",
+                stored.0
+            ))
+        })?;
+        let lineage_key_hex: Vec<String> = serde_json::from_str(&stored.17).map_err(|error| {
+            StoreError::MigrationHistoryMismatch(format!(
+                "eligible candidate id {} has invalid lineage-key JSON: {error}",
+                stored.0
+            ))
+        })?;
+        let observation_ordinals: Vec<i64> = serde_json::from_str(&stored.18).map_err(|error| {
+            StoreError::MigrationHistoryMismatch(format!(
+                "eligible candidate id {} has invalid observation JSON: {error}",
+                stored.0
+            ))
+        })?;
+        let source_keys = source_key_hex
+            .iter()
+            .map(|value| parse_lower_hex_32("candidate_source_keys", value))
+            .collect::<Result<Vec<_>>>()?;
+        let lineage_keys = lineage_key_hex
+            .iter()
+            .map(|value| parse_lower_hex_32("candidate_lineage_keys", value))
+            .collect::<Result<Vec<_>>>()?;
+        let claim = CandidateSupportClaim {
+            analysis_build_id: stored.1,
+            wall_year: stored.2,
+            wall_month: stored.3,
+            wall_day: stored.4,
+            wall_hour: stored.5,
+            wall_minute: stored.6,
+            wall_second: stored.7,
+            wall_nanosecond: stored.8,
+            semantic_kind: stored.9,
+            offset_kind: stored.10,
+            utc_offset_minutes: stored.11,
+            utc_seconds_decimal: stored.12,
+            utc_nanoseconds: stored.13,
+            precision_ns: stored.14,
+            evidence_kinds,
+            source_keys,
+            lineage_keys,
+            observation_ordinals,
+        };
+        validate_eligible_candidate_support(connection, &claim).map_err(|error| {
+            StoreError::MigrationHistoryMismatch(format!(
+                "eligible candidate id {} has invalid evidence support: {error}",
+                stored.0
+            ))
+        })?;
+    }
+}
+
+fn validate_policy_issue_references(
+    connection: &Connection,
+    analysis_build_id: i64,
+    input: &CaptureTimePolicyIssueInput,
+) -> Result<()> {
+    for source_key in &input.source_keys {
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_time_analysis_sources \
+                           WHERE analysis_build_id = ?1 AND source_key = ?2)",
+            params![analysis_build_id, source_key.as_bytes().as_slice()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(StoreError::invalid_input(
+                "policy_issue_source_keys",
+                "policy issue references a source outside its analysis",
+            ));
+        }
+    }
+    for lineage_key in &input.lineage_keys {
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_time_analysis_sources \
+                           WHERE analysis_build_id = ?1 AND lineage_key = ?2)",
+            params![analysis_build_id, lineage_key.as_bytes().as_slice()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(StoreError::invalid_input(
+                "policy_issue_lineage_keys",
+                "policy issue references a lineage outside its analysis",
+            ));
+        }
+    }
+    for ordinal in &input.observation_ordinals {
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_time_observations \
+                           WHERE analysis_build_id = ?1 AND ordinal = ?2)",
+            params![analysis_build_id, ordinal],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(StoreError::invalid_input(
+                "policy_issue_observation_ordinals",
+                "policy issue references an observation outside its analysis",
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct StoredMemberCandidate {
+    id: i64,
+    utc_seconds_decimal: String,
+    utc_nanoseconds: i64,
+    precision_ns: i64,
+}
+
+struct StoredMemberObservation {
+    birth_time_seconds: Option<i64>,
+    birth_time_nanoseconds: Option<i64>,
+    modified_time_seconds: i64,
+    modified_time_nanoseconds: i64,
+    timestamp_granularity_ns: Option<i64>,
+}
+
+fn validate_member_assessment_policy(
+    input: &CaptureTimeMemberAssessmentInput,
+    candidate: Option<&StoredMemberCandidate>,
+    observation: &StoredMemberObservation,
+) -> Result<()> {
+    let expected = expected_member_assessment(candidate, observation)?;
+    if input.birth_time_relation != expected.0
+        || input.modified_time_relation != expected.1
+        || input.donor_eligibility != crate::model::TimeDonorEligibility::Ineligible
+        || input.reason_code != expected.2
+    {
+        return Err(StoreError::invalid_input(
+            "capture_time_member",
+            "member filesystem-time relations or reason do not match persisted UTC evidence and precision",
+        ));
+    }
+    Ok(())
+}
+
+fn expected_member_assessment(
+    candidate: Option<&StoredMemberCandidate>,
+    observation: &StoredMemberObservation,
+) -> Result<(
+    crate::model::FileTimeRelation,
+    crate::model::FileTimeRelation,
+    &'static str,
+)> {
+    let birth_time = match (
+        observation.birth_time_seconds,
+        observation.birth_time_nanoseconds,
+    ) {
+        (Some(seconds), Some(nanoseconds)) if (0..1_000_000_000).contains(&nanoseconds) => {
+            Some((seconds, nanoseconds))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(StoreError::invalid_input(
+                "capture_time_member",
+                "stored birth timestamp components are inconsistent",
+            ));
+        }
+    };
+    if !(0..1_000_000_000).contains(&observation.modified_time_nanoseconds) {
+        return Err(StoreError::invalid_input(
+            "capture_time_member",
+            "stored modified timestamp nanoseconds are invalid",
+        ));
+    }
+    let Some(candidate) = candidate else {
+        return Ok((
+            if birth_time.is_some() {
+                crate::model::FileTimeRelation::NotCompared
+            } else {
+                crate::model::FileTimeRelation::Unavailable
+            },
+            crate::model::FileTimeRelation::NotCompared,
+            "no_strong_embedded_candidate",
+        ));
+    };
+    let Some(granularity_ns) = observation.timestamp_granularity_ns else {
+        return Ok((
+            if birth_time.is_some() {
+                crate::model::FileTimeRelation::ReviewFsPrecisionUnknown
+            } else {
+                crate::model::FileTimeRelation::Unavailable
+            },
+            crate::model::FileTimeRelation::ReviewFsPrecisionUnknown,
+            "fs_precision_unknown",
+        ));
+    };
+    if granularity_ns <= 0 || !(1..=1_000_000_000).contains(&candidate.precision_ns) {
+        return Err(StoreError::invalid_input(
+            "capture_time_member",
+            "stored filesystem or candidate precision is invalid",
+        ));
+    }
+    let candidate_seconds = parse_stored_utc_seconds(&candidate.utc_seconds_decimal)?;
+    let tolerance_ns = granularity_ns.max(candidate.precision_ns);
+    let birth_relation = match birth_time {
+        Some((seconds, nanoseconds)) => relation_for_timestamp(
+            candidate_seconds,
+            candidate.utc_nanoseconds,
+            seconds,
+            nanoseconds,
+            tolerance_ns,
+        )?,
+        None => crate::model::FileTimeRelation::Unavailable,
+    };
+    let modified_relation = relation_for_timestamp(
+        candidate_seconds,
+        candidate.utc_nanoseconds,
+        observation.modified_time_seconds,
+        observation.modified_time_nanoseconds,
+        tolerance_ns,
+    )?;
+    let reason = if birth_relation == crate::model::FileTimeRelation::Matches
+        || modified_relation == crate::model::FileTimeRelation::Matches
+    {
+        "embedded_time_matches_fs"
+    } else {
+        "embedded_time_differs_fs"
+    };
+    Ok((birth_relation, modified_relation, reason))
+}
+
+fn relation_for_timestamp(
+    candidate_seconds: i128,
+    candidate_nanoseconds: i64,
+    filesystem_seconds: i64,
+    filesystem_nanoseconds: i64,
+    tolerance_ns: i64,
+) -> Result<crate::model::FileTimeRelation> {
+    if !(0..1_000_000_000).contains(&candidate_nanoseconds)
+        || !(0..1_000_000_000).contains(&filesystem_nanoseconds)
+        || tolerance_ns <= 0
+    {
+        return Err(StoreError::invalid_input(
+            "capture_time_member",
+            "timestamp components or comparison tolerance are invalid",
+        ));
+    }
+    let candidate_total = candidate_seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(candidate_nanoseconds)))
+        .ok_or_else(|| {
+            StoreError::invalid_input("capture_time_member", "candidate timestamp overflow")
+        })?;
+    let filesystem_total =
+        i128::from(filesystem_seconds) * 1_000_000_000 + i128::from(filesystem_nanoseconds);
+    let difference = candidate_total
+        .checked_sub(filesystem_total)
+        .and_then(i128::checked_abs)
+        .ok_or_else(|| {
+            StoreError::invalid_input("capture_time_member", "timestamp difference overflow")
+        })?;
+    Ok(if difference <= i128::from(tolerance_ns) {
+        crate::model::FileTimeRelation::Matches
+    } else {
+        crate::model::FileTimeRelation::Differs
+    })
+}
+
+fn parse_stored_utc_seconds(value: &str) -> Result<i128> {
+    if value.is_empty() || value.len() > 40 || value.trim() != value || value.starts_with('+') {
+        return Err(StoreError::invalid_input(
+            "capture_time_member",
+            "stored UTC seconds are not bounded canonical decimal",
+        ));
+    }
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+        || value == "-0"
+    {
+        return Err(StoreError::invalid_input(
+            "capture_time_member",
+            "stored UTC seconds are not canonical decimal",
+        ));
+    }
+    value.parse::<i128>().map_err(|_| {
+        StoreError::invalid_input("capture_time_member", "stored UTC seconds exceed i128")
+    })
+}
+
+pub(crate) fn validate_capture_time_member_relations(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT member.analysis_build_id, member.member_ordinal, \
+                member.birth_time_relation, member.modified_time_relation, \
+                member.donor_eligibility, member.reason_code, member.candidate_id, \
+                candidate.id, candidate.utc_seconds_decimal, candidate.utc_nanoseconds, \
+                candidate.precision_ns, candidate.evidence_gate, candidate.semantic_kind, \
+                observation.id, observation.birth_time_seconds, \
+                observation.birth_time_nanoseconds, observation.modified_time_seconds, \
+                observation.modified_time_nanoseconds, observation.timestamp_granularity_ns \
+         FROM capture_time_member_assessments AS member \
+         LEFT JOIN capture_time_candidates AS candidate \
+           ON candidate.analysis_build_id = member.analysis_build_id \
+          AND candidate.id = member.candidate_id \
+         LEFT JOIN media_observation_snapshots AS observation \
+           ON observation.id = member.media_observation_snapshot_id \
+          AND observation.scan_run_id = member.scan_run_id \
+          AND observation.volume_id = member.volume_id \
+         ORDER BY member.analysis_build_id, member.member_ordinal",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let analysis_build_id = row.get::<_, i64>(0)?;
+        let member_ordinal = row.get::<_, i64>(1)?;
+        let birth_relation = row.get::<_, String>(2)?;
+        let modified_relation = row.get::<_, String>(3)?;
+        let donor_eligibility = row.get::<_, String>(4)?;
+        let reason_code = row.get::<_, String>(5)?;
+        let candidate_id = row.get::<_, Option<i64>>(6)?;
+        let joined_candidate_id = row.get::<_, Option<i64>>(7)?;
+        let candidate_seconds = row.get::<_, Option<String>>(8)?;
+        let candidate_nanoseconds = row.get::<_, Option<i64>>(9)?;
+        let candidate_precision = row.get::<_, Option<i64>>(10)?;
+        let candidate_gate = row.get::<_, Option<String>>(11)?;
+        let candidate_semantic = row.get::<_, Option<String>>(12)?;
+        let observation_id = row.get::<_, Option<i64>>(13)?;
+        let observation = StoredMemberObservation {
+            birth_time_seconds: row.get(14)?,
+            birth_time_nanoseconds: row.get(15)?,
+            modified_time_seconds: row.get::<_, Option<i64>>(16)?.ok_or_else(|| {
+                StoreError::invalid_input(
+                    "capture_time_member",
+                    "member observation has no modified timestamp",
+                )
+            })?,
+            modified_time_nanoseconds: row.get::<_, Option<i64>>(17)?.ok_or_else(|| {
+                StoreError::invalid_input(
+                    "capture_time_member",
+                    "member observation has no modified timestamp",
+                )
+            })?,
+            timestamp_granularity_ns: row.get(18)?,
+        };
+        if observation_id.is_none() || donor_eligibility != "ineligible" {
+            return Err(StoreError::invalid_input(
+                "capture_time_member",
+                format!(
+                    "analysis {analysis_build_id} member {member_ordinal} has detached observation or forbidden donor status"
+                ),
+            ));
+        }
+        let candidate = match candidate_id {
+            Some(id)
+                if joined_candidate_id == Some(id)
+                    && candidate_gate.as_deref() == Some("eligible")
+                    && candidate_semantic.as_deref() == Some("utc") =>
+            {
+                Some(StoredMemberCandidate {
+                    id,
+                    utc_seconds_decimal: candidate_seconds.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_member",
+                            "eligible member candidate has no UTC seconds",
+                        )
+                    })?,
+                    utc_nanoseconds: candidate_nanoseconds.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_member",
+                            "eligible member candidate has no UTC nanoseconds",
+                        )
+                    })?,
+                    precision_ns: candidate_precision.ok_or_else(|| {
+                        StoreError::invalid_input(
+                            "capture_time_member",
+                            "eligible member candidate has no precision",
+                        )
+                    })?,
+                })
+            }
+            Some(_) => {
+                return Err(StoreError::invalid_input(
+                    "capture_time_member",
+                    "member candidate is detached or not eligible UTC evidence",
+                ));
+            }
+            None => None,
+        };
+        let expected = expected_member_assessment(candidate.as_ref(), &observation)?;
+        if birth_relation != expected.0.as_storage_str()
+            || modified_relation != expected.1.as_storage_str()
+            || reason_code != expected.2
+        {
+            return Err(StoreError::invalid_input(
+                "capture_time_member",
+                format!(
+                    "analysis {analysis_build_id} member {member_ordinal} stores a false filesystem-time relation"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod capture_time_relation_tests {
+    use super::{
+        lower_hex, relation_for_timestamp, validate_capture_time_candidate_supports,
+        validate_capture_time_member_relations, validate_eligible_candidate_support,
+        CandidateSupportClaim,
+    };
+    use crate::model::FileTimeRelation;
+    use rusqlite::Connection;
+
+    #[test]
+    fn v7_member_relation_uses_an_inclusive_nanosecond_tolerance() -> crate::Result<()> {
+        assert_eq!(
+            relation_for_timestamp(10, 0, 9, 999_999_500, 500)?,
+            FileTimeRelation::Matches
+        );
+        assert_eq!(
+            relation_for_timestamp(10, 0, 9, 999_999_499, 500)?,
+            FileTimeRelation::Differs
+        );
+        assert_eq!(
+            relation_for_timestamp(10, 0, 9, 0, 1_000_000_000)?,
+            FileTimeRelation::Matches
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v7_reopen_relation_validator_rejects_a_forged_match() -> crate::Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE capture_time_member_assessments ( \
+                 analysis_build_id INTEGER NOT NULL, member_ordinal INTEGER NOT NULL, \
+                 birth_time_relation TEXT NOT NULL, modified_time_relation TEXT NOT NULL, \
+                 donor_eligibility TEXT NOT NULL, reason_code TEXT NOT NULL, \
+                 candidate_id INTEGER, media_observation_snapshot_id INTEGER NOT NULL, \
+                 scan_run_id INTEGER NOT NULL, volume_id INTEGER NOT NULL \
+             ); \
+             CREATE TABLE capture_time_candidates ( \
+                 id INTEGER NOT NULL, analysis_build_id INTEGER NOT NULL, \
+                 utc_seconds_decimal TEXT, utc_nanoseconds INTEGER, precision_ns INTEGER, \
+                 evidence_gate TEXT NOT NULL, semantic_kind TEXT NOT NULL \
+             ); \
+             CREATE TABLE media_observation_snapshots ( \
+                 id INTEGER NOT NULL, scan_run_id INTEGER NOT NULL, volume_id INTEGER NOT NULL, \
+                 birth_time_seconds INTEGER, birth_time_nanoseconds INTEGER, \
+                 modified_time_seconds INTEGER, modified_time_nanoseconds INTEGER, \
+                 timestamp_granularity_ns INTEGER \
+             ); \
+             INSERT INTO capture_time_candidates VALUES ( \
+                 1, 1, '1577934245', 0, 1000000000, 'eligible', 'utc' \
+             ); \
+             INSERT INTO media_observation_snapshots VALUES ( \
+                 1, 1, 1, NULL, NULL, 2000, 0, 1 \
+             ); \
+             INSERT INTO capture_time_member_assessments VALUES ( \
+                 1, 0, 'unavailable', 'matches', 'ineligible', \
+                 'embedded_time_matches_fs', 1, 1, 1, 1 \
+             );",
+        )?;
+        assert!(validate_capture_time_member_relations(&connection).is_err());
+        connection.execute(
+            "UPDATE capture_time_member_assessments \
+             SET modified_time_relation = 'differs', \
+                 reason_code = 'embedded_time_differs_fs'",
+            [],
+        )?;
+        validate_capture_time_member_relations(&connection)
+    }
+
+    #[test]
+    fn v7_eligible_candidate_requires_same_source_exact_exif_companions() -> crate::Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE capture_time_analysis_builds ( \
+                 id INTEGER PRIMARY KEY, time_session_id INTEGER NOT NULL, \
+                 exact_group_build_id INTEGER NOT NULL, volume_id INTEGER NOT NULL, \
+                 scan_run_id INTEGER NOT NULL \
+             ); \
+             CREATE TABLE capture_time_analysis_sources ( \
+                 analysis_build_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, \
+                 report_id INTEGER NOT NULL, source_key BLOB NOT NULL, lineage_key BLOB NOT NULL \
+             ); \
+             CREATE TABLE metadata_extraction_reports ( \
+                 id INTEGER PRIMARY KEY, time_session_id INTEGER NOT NULL, \
+                 exact_group_build_id INTEGER NOT NULL, volume_id INTEGER NOT NULL, \
+                 scan_run_id INTEGER NOT NULL, metadata_probe_observation_id INTEGER NOT NULL, \
+                 state TEXT NOT NULL, extraction_status TEXT NOT NULL, \
+                 expected_issue_count INTEGER NOT NULL \
+             ); \
+             CREATE TABLE metadata_extraction_issues (report_id INTEGER NOT NULL); \
+             CREATE TABLE metadata_source_revalidations ( \
+                 report_id INTEGER NOT NULL, time_session_id INTEGER NOT NULL, \
+                 exact_group_build_id INTEGER NOT NULL, \
+                 metadata_probe_observation_id INTEGER NOT NULL, source_key BLOB NOT NULL, \
+                 lineage_key BLOB NOT NULL, outcome TEXT NOT NULL, \
+                 descriptor_revalidated INTEGER NOT NULL, path_revalidated INTEGER NOT NULL, \
+                 session_revalidated INTEGER NOT NULL \
+             ); \
+             CREATE TABLE metadata_extraction_fields ( \
+                 id INTEGER PRIMARY KEY, report_id INTEGER NOT NULL, field_kind TEXT NOT NULL, \
+                 container_kind TEXT NOT NULL, tiff_header_offset INTEGER, \
+                 tiff_ifd_offset INTEGER, jpeg_app1_offset INTEGER \
+             ); \
+             CREATE TABLE capture_time_observations ( \
+                 analysis_build_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, \
+                 source_ordinal INTEGER NOT NULL, report_id INTEGER NOT NULL, \
+                 metadata_field_id INTEGER NOT NULL, interpretation_kind TEXT NOT NULL, \
+                 wall_year INTEGER, wall_month INTEGER, wall_day INTEGER, wall_hour INTEGER, \
+                 wall_minute INTEGER, wall_second INTEGER, wall_nanosecond INTEGER, \
+                 semantic_kind TEXT, offset_kind TEXT, utc_offset_minutes INTEGER, \
+                 utc_seconds_decimal TEXT, utc_nanoseconds INTEGER, \
+                 normalized_precision_ns INTEGER, parsed_offset_minutes INTEGER, \
+                 subsecond_nanosecond INTEGER, subsecond_digits INTEGER, \
+                 subsecond_precision_ns INTEGER \
+             ); \
+             CREATE TABLE capture_time_candidates ( \
+                 id INTEGER PRIMARY KEY, analysis_build_id INTEGER NOT NULL, \
+                 wall_year INTEGER NOT NULL, wall_month INTEGER NOT NULL, \
+                 wall_day INTEGER NOT NULL, wall_hour INTEGER NOT NULL, \
+                 wall_minute INTEGER NOT NULL, wall_second INTEGER NOT NULL, \
+                 wall_nanosecond INTEGER NOT NULL, semantic_kind TEXT NOT NULL, \
+                 offset_kind TEXT NOT NULL, utc_offset_minutes INTEGER, \
+                 utc_seconds_decimal TEXT, utc_nanoseconds INTEGER, precision_ns INTEGER NOT NULL, \
+                 evidence_gate TEXT NOT NULL, evidence_kinds_json TEXT NOT NULL, \
+                 source_keys_json TEXT NOT NULL, lineage_keys_json TEXT NOT NULL, \
+                 observation_ordinals_json TEXT NOT NULL \
+             ); \
+             INSERT INTO capture_time_analysis_builds VALUES (1, 10, 20, 1, 1); \
+             INSERT INTO metadata_extraction_reports VALUES ( \
+                 1, 10, 20, 1, 1, 101, 'sealed', 'extracted_unvalidated', 0 \
+             ); \
+             INSERT INTO metadata_extraction_reports VALUES ( \
+                 2, 10, 20, 1, 1, 102, 'sealed', 'extracted_unvalidated', 0 \
+             ); \
+             INSERT INTO metadata_extraction_fields VALUES ( \
+                 1, 1, 'exif_date_time_original', 'tiff', 20, 30, NULL \
+             ); \
+             INSERT INTO metadata_extraction_fields VALUES ( \
+                 2, 1, 'exif_offset_time_original', 'tiff', 20, 30, NULL \
+             ); \
+             INSERT INTO metadata_extraction_fields VALUES ( \
+                 3, 1, 'exif_subsec_time_original', 'tiff', 20, 30, NULL \
+             ); \
+             INSERT INTO metadata_extraction_fields VALUES ( \
+                 4, 2, 'exif_offset_time_original', 'tiff', 20, 30, NULL \
+             ); \
+             INSERT INTO metadata_extraction_fields VALUES ( \
+                 5, 1, 'exif_offset_time_original', 'tiff', 20, 31, NULL \
+             ); \
+             INSERT INTO metadata_extraction_fields VALUES ( \
+                 6, 1, 'exif_create_date', 'tiff', 20, 30, NULL \
+             ); \
+             INSERT INTO metadata_extraction_fields VALUES ( \
+                 7, 1, 'quicktime_metadata_creation_date', 'iso_bmff', NULL, NULL, NULL \
+             ); \
+             INSERT INTO capture_time_observations VALUES ( \
+                 1, 0, 0, 1, 1, 'timestamp', 2020, 1, 2, 3, 4, 5, 0, \
+                 'floating', 'missing', NULL, NULL, NULL, 1000000000, \
+                 NULL, NULL, NULL, NULL \
+             ); \
+             INSERT INTO capture_time_observations VALUES ( \
+                 1, 1, 0, 1, 2, 'offset', NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                 NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL \
+             ); \
+             INSERT INTO capture_time_observations VALUES ( \
+                 1, 2, 0, 1, 3, 'subsecond', NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                 NULL, NULL, NULL, NULL, NULL, NULL, NULL, 123000000, 3, 1000000 \
+             ); \
+             INSERT INTO capture_time_observations VALUES ( \
+                 1, 3, 1, 2, 4, 'offset', NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                 NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL \
+             ); \
+             INSERT INTO capture_time_observations VALUES ( \
+                 1, 4, 0, 1, 5, 'offset', NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                 NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL \
+             ); \
+             INSERT INTO capture_time_observations VALUES ( \
+                 1, 5, 0, 1, 6, 'timestamp', 2020, 1, 2, 3, 4, 5, 0, \
+                 'floating', 'missing', NULL, NULL, NULL, 1000000000, \
+                 NULL, NULL, NULL, NULL \
+             ); \
+             INSERT INTO capture_time_observations VALUES ( \
+                 1, 6, 0, 1, 7, 'timestamp', 2020, 1, 2, 3, 4, 5, 0, \
+                 'floating', 'missing', NULL, NULL, NULL, 1000000000, \
+                 NULL, NULL, NULL, NULL \
+             );",
+        )?;
+        for (ordinal, report_id, source, lineage, probe) in [
+            (0_i64, 1_i64, [1_u8; 32], [3_u8; 32], 101_i64),
+            (1_i64, 2_i64, [2_u8; 32], [4_u8; 32], 102_i64),
+        ] {
+            connection.execute(
+                "INSERT INTO capture_time_analysis_sources VALUES (1, ?1, ?2, ?3, ?4)",
+                rusqlite::params![ordinal, report_id, source.as_slice(), lineage.as_slice()],
+            )?;
+            connection.execute(
+                "INSERT INTO metadata_source_revalidations VALUES ( \
+                     ?1, 10, 20, ?2, ?3, ?4, 'reextracted_pinned_exact', 1, 1, 1 \
+                 )",
+                rusqlite::params![report_id, probe, source.as_slice(), lineage.as_slice()],
+            )?;
+        }
+        let claim = CandidateSupportClaim {
+            analysis_build_id: 1,
+            wall_year: 2020,
+            wall_month: 1,
+            wall_day: 2,
+            wall_hour: 3,
+            wall_minute: 4,
+            wall_second: 5,
+            wall_nanosecond: 123_000_000,
+            semantic_kind: "utc".to_owned(),
+            offset_kind: "explicit".to_owned(),
+            utc_offset_minutes: Some(0),
+            utc_seconds_decimal: Some("1577934245".to_owned()),
+            utc_nanoseconds: Some(123_000_000),
+            precision_ns: 1_000_000,
+            evidence_kinds: vec!["exif_date_time_original".to_owned()],
+            source_keys: vec![[1; 32]],
+            lineage_keys: vec![[3; 32]],
+            observation_ordinals: vec![0, 1, 2],
+        };
+        validate_eligible_candidate_support(&connection, &claim)?;
+
+        let mut wrong_offset = claim.clone();
+        wrong_offset.utc_offset_minutes = Some(60);
+        wrong_offset.utc_seconds_decimal = Some("1577930645".to_owned());
+        assert!(validate_eligible_candidate_support(&connection, &wrong_offset).is_err());
+
+        let mut cross_source = claim;
+        cross_source.source_keys.push([2; 32]);
+        cross_source.lineage_keys.push([4; 32]);
+        cross_source.observation_ordinals = vec![0, 2, 3];
+        assert!(validate_eligible_candidate_support(&connection, &cross_source).is_err());
+
+        let mut cross_ifd = complete_candidate_claim();
+        cross_ifd.observation_ordinals = vec![0, 2, 4];
+        assert!(validate_eligible_candidate_support(&connection, &cross_ifd).is_err());
+
+        let mut borrowed_create_date = complete_candidate_claim();
+        borrowed_create_date
+            .evidence_kinds
+            .push("exif_create_date".to_owned());
+        borrowed_create_date.observation_ordinals = vec![0, 1, 2, 5];
+        assert!(validate_eligible_candidate_support(&connection, &borrowed_create_date).is_err());
+
+        let mut borrowed_quicktime = complete_candidate_claim();
+        borrowed_quicktime
+            .evidence_kinds
+            .push("quicktime_metadata_creation_date".to_owned());
+        borrowed_quicktime.observation_ordinals = vec![0, 1, 2, 6];
+        assert!(validate_eligible_candidate_support(&connection, &borrowed_quicktime).is_err());
+
+        let source_keys_json = serde_json::to_string(&[lower_hex(&[1; 32])])?;
+        let lineage_keys_json = serde_json::to_string(&[lower_hex(&[3; 32])])?;
+        connection.execute(
+            "INSERT INTO capture_time_candidates VALUES ( \
+                 1, 1, 2020, 1, 2, 3, 4, 5, 123000000, 'utc', 'explicit', 0, \
+                 '1577934245', 123000000, 1000000, 'eligible', \
+                 '[\"exif_date_time_original\"]', ?1, ?2, '[0,1,2]' \
+             )",
+            rusqlite::params![source_keys_json, lineage_keys_json],
+        )?;
+        validate_capture_time_candidate_supports(&connection)?;
+        connection.execute(
+            "UPDATE capture_time_candidates SET observation_ordinals_json = '[0,2,4]'",
+            [],
+        )?;
+        assert!(validate_capture_time_candidate_supports(&connection).is_err());
+        connection.execute(
+            "UPDATE capture_time_candidates SET observation_ordinals_json = '[0,1,2]'",
+            [],
+        )?;
+
+        connection.execute(
+            "UPDATE metadata_extraction_reports SET extraction_status = 'partial' WHERE id = 1",
+            [],
+        )?;
+        let mut complete_source = cross_source;
+        complete_source.source_keys = vec![[1; 32]];
+        complete_source.lineage_keys = vec![[3; 32]];
+        complete_source.observation_ordinals = vec![0, 1, 2];
+        assert!(validate_eligible_candidate_support(&connection, &complete_source).is_err());
+        Ok(())
+    }
+
+    fn complete_candidate_claim() -> CandidateSupportClaim {
+        CandidateSupportClaim {
+            analysis_build_id: 1,
+            wall_year: 2020,
+            wall_month: 1,
+            wall_day: 2,
+            wall_hour: 3,
+            wall_minute: 4,
+            wall_second: 5,
+            wall_nanosecond: 123_000_000,
+            semantic_kind: "utc".to_owned(),
+            offset_kind: "explicit".to_owned(),
+            utc_offset_minutes: Some(0),
+            utc_seconds_decimal: Some("1577934245".to_owned()),
+            utc_nanoseconds: Some(123_000_000),
+            precision_ns: 1_000_000,
+            evidence_kinds: vec!["exif_date_time_original".to_owned()],
+            source_keys: vec![[1; 32]],
+            lineage_keys: vec![[3; 32]],
+            observation_ordinals: vec![0, 1, 2],
+        }
+    }
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn validate_v5_batch(field: &'static str, count: usize) -> Result<()> {
@@ -6906,10 +11997,769 @@ pub fn compute_capability_profile_hash(input: &CapabilityProfileInput) -> Result
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
+/// Computes the feature-independent digest used by v7 policy-context rows.
+pub fn compute_time_policy_context_digest(
+    value: &serde_json::Value,
+) -> Result<crate::model::TimePolicyContextDigest> {
+    let bytes = canonical_json_bytes(value)?;
+    if bytes.len() > MAX_JSON_BYTES {
+        return Err(StoreError::invalid_input(
+            "policy_context_json",
+            "canonical policy context exceeds 1 MiB",
+        ));
+    }
+    Ok(
+        crate::model::TimePolicyContextDigest::from_runtime_evidence(
+            *blake3::hash(&bytes).as_bytes(),
+        ),
+    )
+}
+
+/// Computes the copy-family key from exact content identity only.
+///
+/// Run, mount, path, observation, and exact-group identity are deliberately
+/// excluded so independently copied bytes share one lineage key.
+pub fn compute_time_lineage_key(material: &TimeExactFingerprintMaterial) -> TimeLineageKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.runtime.timestamp-lineage.v1\0");
+    hash_unchecked_length_prefixed(&mut hasher, material.algorithm.as_bytes());
+    hasher.update(&material.algorithm_version.to_le_bytes());
+    hasher.update(material.parameters_hash.as_bytes());
+    hasher.update(&material.observed_size_bytes.to_le_bytes());
+    hash_unchecked_length_prefixed(&mut hasher, &material.digest);
+    TimeLineageKey::from_runtime_evidence(*hasher.finalize().as_bytes())
+}
+
+/// Computes a descriptor/session/path/stat/group-bound v2 source identity.
+pub fn compute_time_source_key(material: &TimeSourceKeyMaterial) -> TimeSourceKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.runtime.timestamp-source.v2\0");
+    hasher.update(&material.runtime_contract_version.to_le_bytes());
+    hasher.update(&material.scan_run_id.to_le_bytes());
+    hasher.update(material.core_session_id.as_bytes());
+    hasher.update(material.mount_session_key.as_bytes());
+    hasher.update(material.root_scope_key.as_bytes());
+    hasher.update(material.stable_root_path_key.as_bytes());
+    hasher.update(material.root_object_signature.as_bytes());
+    hasher.update(material.stable_path_key.as_bytes());
+    hasher.update(material.source_signature.as_bytes());
+    hasher.update(&material.observation_id.to_le_bytes());
+    hasher.update(&material.fingerprint_id.to_le_bytes());
+    hasher.update(material.group_key.as_bytes());
+    hasher.update(material.group_manifest.as_bytes());
+    hash_unchecked_length_prefixed(&mut hasher, material.exact_fingerprint.algorithm.as_bytes());
+    hasher.update(&material.exact_fingerprint.algorithm_version.to_le_bytes());
+    hasher.update(material.exact_fingerprint.parameters_hash.as_bytes());
+    hasher.update(&material.exact_fingerprint.observed_size_bytes.to_le_bytes());
+    hash_unchecked_length_prefixed(&mut hasher, &material.exact_fingerprint.digest);
+    TimeSourceKey::from_runtime_evidence(*hasher.finalize().as_bytes())
+}
+
+enum ManifestValue<'a> {
+    Null,
+    Integer(i64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+fn begin_manifest_section(hasher: &mut blake3::Hasher, label: &[u8]) -> Result<()> {
+    hash_length_prefixed(hasher, label)
+}
+
+fn hash_manifest_row(hasher: &mut blake3::Hasher, values: &[ManifestValue<'_>]) -> Result<()> {
+    hasher.update(&[0xa5]);
+    for value in values {
+        match value {
+            ManifestValue::Null => {
+                hasher.update(&[0]);
+            }
+            ManifestValue::Integer(value) => {
+                hasher.update(&[1]);
+                hasher.update(&value.to_le_bytes());
+            }
+            ManifestValue::Text(value) => {
+                hasher.update(&[3]);
+                hash_length_prefixed(hasher, value.as_bytes())?;
+            }
+            ManifestValue::Blob(value) => {
+                hasher.update(&[4]);
+                hash_length_prefixed(hasher, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn end_manifest_section(hasher: &mut blake3::Hasher, count: i64) {
+    hasher.update(&[0x5a]);
+    hasher.update(&count.to_le_bytes());
+}
+
+fn optional_text(value: Option<&str>) -> ManifestValue<'_> {
+    value.map_or(ManifestValue::Null, ManifestValue::Text)
+}
+
+fn optional_integer(value: Option<i64>) -> ManifestValue<'static> {
+    value.map_or(ManifestValue::Null, ManifestValue::Integer)
+}
+
+fn optional_blob(value: Option<&[u8]>) -> ManifestValue<'_> {
+    value.map_or(ManifestValue::Null, ManifestValue::Blob)
+}
+
+/// Computes the exact expected digest for a complete typed metadata report.
+/// The same row/column stream is recomputed from SQLite at seal and reopen.
+pub fn compute_metadata_report_manifest(
+    plan: &MetadataReportManifestPlan,
+    fields: &[MetadataFieldInput],
+    issues: &[MetadataExtractionIssueInput],
+    revalidation: &MetadataSourceRevalidationInput,
+) -> Result<TimeEvidenceManifestDigest> {
+    let input = &plan.begin;
+    validate_metadata_report_input(input)?;
+    if fields.len() as i64 != input.expected_field_count
+        || issues.len() as i64 != input.expected_issue_count
+    {
+        return Err(StoreError::invalid_input(
+            "metadata_report_manifest",
+            "typed field or issue count differs from the frozen report header",
+        ));
+    }
+    let mut sorted_fields = fields.iter().collect::<Vec<_>>();
+    sorted_fields.sort_unstable_by_key(|field| field.ordinal);
+    if sorted_fields
+        .windows(2)
+        .any(|pair| pair[0].ordinal == pair[1].ordinal)
+    {
+        return Err(StoreError::invalid_input(
+            "metadata_field_ordinal",
+            "field ordinals must be unique",
+        ));
+    }
+    let mut retained_bytes = 0_i64;
+    for field in &sorted_fields {
+        validate_metadata_field_input(field)?;
+        retained_bytes = retained_bytes
+            .checked_add(field.locator.byte_len)
+            .ok_or_else(|| {
+                StoreError::invalid_input("expected_retained_field_bytes", "byte sum overflow")
+            })?;
+    }
+    if retained_bytes != input.expected_retained_field_bytes {
+        return Err(StoreError::invalid_input(
+            "expected_retained_field_bytes",
+            "retained field byte sum differs from the frozen report header",
+        ));
+    }
+    let mut sorted_issues = issues.iter().collect::<Vec<_>>();
+    sorted_issues.sort_unstable_by_key(|issue| issue.ordinal);
+    if sorted_issues
+        .windows(2)
+        .any(|pair| pair[0].ordinal == pair[1].ordinal)
+    {
+        return Err(StoreError::invalid_input(
+            "metadata_issue_ordinal",
+            "issue ordinals must be unique",
+        ));
+    }
+    if revalidation.source_signature_before != revalidation.source_signature_after
+        || revalidation.first_report_digest != revalidation.second_report_digest
+        || revalidation.first_report_digest != input.retained_report_digest
+    {
+        return Err(StoreError::invalid_input(
+            "metadata_revalidation",
+            "typed revalidation does not reproduce the pinned report",
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.metadata-report-manifest.v1\0");
+    begin_manifest_section(&mut hasher, b"header")?;
+    let detected_format = input.detected_format.map(|value| value.as_storage_str());
+    hash_manifest_row(
+        &mut hasher,
+        &[
+            ManifestValue::Integer(input.time_session_id),
+            ManifestValue::Integer(plan.scan_run_id),
+            ManifestValue::Blob(plan.core_session_id.as_bytes()),
+            ManifestValue::Integer(input.exact_group_build_id),
+            ManifestValue::Integer(input.metadata_probe_observation_id),
+            ManifestValue::Integer(input.metadata_probe_fingerprint_id),
+            ManifestValue::Integer(input.probe_ordinal),
+            ManifestValue::Integer(input.source_size_bytes),
+            ManifestValue::Text(&input.parser.name),
+            ManifestValue::Text(&input.parser.version),
+            optional_text(detected_format),
+            ManifestValue::Text(input.extraction_status.as_storage_str()),
+            ManifestValue::Integer(input.limits.total_bytes_read),
+            ManifestValue::Integer(input.limits.read_operations),
+            ManifestValue::Integer(input.limits.retained_field_bytes),
+            ManifestValue::Integer(input.limits.field_bytes),
+            ManifestValue::Integer(input.limits.fields),
+            ManifestValue::Integer(input.limits.jpeg_segments),
+            ManifestValue::Integer(input.limits.ifd_entries),
+            ManifestValue::Integer(input.limits.ifd_depth),
+            ManifestValue::Integer(input.limits.bmff_boxes),
+            ManifestValue::Integer(input.limits.bmff_depth),
+            ManifestValue::Integer(input.usage.bytes_read),
+            ManifestValue::Integer(input.usage.read_operations),
+            ManifestValue::Integer(input.usage.retained_field_bytes),
+            ManifestValue::Integer(input.usage.fields_emitted),
+            ManifestValue::Integer(input.usage.jpeg_segments_visited),
+            ManifestValue::Integer(input.usage.ifd_entries_visited),
+            ManifestValue::Integer(input.usage.bmff_boxes_visited),
+            ManifestValue::Integer(input.usage.max_depth_observed),
+            ManifestValue::Integer(input.expected_field_count),
+            ManifestValue::Integer(input.expected_issue_count),
+            ManifestValue::Integer(input.expected_retained_field_bytes),
+            ManifestValue::Blob(input.retained_report_digest.as_bytes()),
+            ManifestValue::Integer(input.created_at_ms),
+        ],
+    )?;
+    end_manifest_section(&mut hasher, 1);
+    begin_manifest_section(&mut hasher, b"fields")?;
+    for field in sorted_fields {
+        let locator = StoredLocatorColumns::from(&field.locator.container);
+        hash_manifest_row(
+            &mut hasher,
+            &[
+                ManifestValue::Integer(field.ordinal),
+                ManifestValue::Text(&field.parser.name),
+                ManifestValue::Text(&field.parser.version),
+                ManifestValue::Text(field.field_kind.as_storage_str()),
+                ManifestValue::Text(field.encoding.as_storage_str()),
+                ManifestValue::Integer(field.locator.absolute_offset),
+                ManifestValue::Integer(field.locator.byte_len),
+                ManifestValue::Blob(&field.raw_bytes),
+                ManifestValue::Blob(field.raw_digest.as_bytes()),
+                ManifestValue::Text(locator.kind),
+                optional_integer(locator.tiff_header_offset),
+                optional_integer(locator.tiff_ifd_offset),
+                optional_integer(locator.tiff_tag),
+                optional_text(locator.tiff_byte_order),
+                optional_integer(locator.jpeg_app1_offset),
+                optional_integer(locator.bmff_box_offset),
+                optional_blob(locator.bmff_box_path),
+                ManifestValue::Integer(field.created_at_ms),
+            ],
+        )?;
+    }
+    end_manifest_section(&mut hasher, input.expected_field_count);
+    begin_manifest_section(&mut hasher, b"issues")?;
+    for issue in sorted_issues {
+        hash_manifest_row(
+            &mut hasher,
+            &[
+                ManifestValue::Integer(issue.ordinal),
+                ManifestValue::Text(&issue.parser.name),
+                ManifestValue::Text(&issue.parser.version),
+                ManifestValue::Text(issue.issue_code.as_storage_str()),
+                optional_integer(issue.source_offset),
+                ManifestValue::Text(&issue.context),
+                ManifestValue::Integer(issue.created_at_ms),
+            ],
+        )?;
+    }
+    end_manifest_section(&mut hasher, input.expected_issue_count);
+    begin_manifest_section(&mut hasher, b"revalidation")?;
+    hash_manifest_row(
+        &mut hasher,
+        &[
+            ManifestValue::Integer(input.time_session_id),
+            ManifestValue::Integer(plan.scan_run_id),
+            ManifestValue::Blob(plan.core_session_id.as_bytes()),
+            ManifestValue::Integer(input.exact_group_build_id),
+            ManifestValue::Integer(input.metadata_probe_observation_id),
+            ManifestValue::Blob(revalidation.source_key.as_bytes()),
+            ManifestValue::Integer(2),
+            ManifestValue::Blob(revalidation.lineage_key.as_bytes()),
+            ManifestValue::Integer(1),
+            ManifestValue::Blob(revalidation.source_signature_before.as_bytes()),
+            ManifestValue::Blob(revalidation.source_signature_after.as_bytes()),
+            ManifestValue::Blob(revalidation.first_report_digest.as_bytes()),
+            ManifestValue::Blob(revalidation.second_report_digest.as_bytes()),
+            ManifestValue::Text("reextracted_pinned_exact"),
+            ManifestValue::Integer(1),
+            ManifestValue::Integer(1),
+            ManifestValue::Integer(1),
+            ManifestValue::Text("historical_proof_only"),
+            ManifestValue::Integer(revalidation.revalidated_at_ms),
+        ],
+    )?;
+    end_manifest_section(&mut hasher, 1);
+    Ok(TimeEvidenceManifestDigest::from_runtime_evidence(
+        *hasher.finalize().as_bytes(),
+    ))
+}
+
+/// Computes the complete expected analysis digest from typed, bounded rows.
+/// Candidate/member references use stable ordinals rather than SQLite ids.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_capture_time_analysis_manifest(
+    plan: &CaptureTimeAnalysisManifestPlan,
+    sources: &[CaptureTimeAnalysisSourceInput],
+    observations: &[CaptureTimeObservationInput],
+    candidates: &[CaptureTimeCandidateInput],
+    issues: &[CaptureTimePolicyIssueInput],
+    members: &[CaptureTimeMemberAssessmentInput],
+    recommendation: &CaptureTimeRecommendationInput,
+) -> Result<TimeEvidenceManifestDigest> {
+    let input = &plan.begin;
+    if sources.len() as i64 != input.expected_source_count
+        || observations.len() as i64 != input.expected_observation_count
+        || candidates.len() as i64 != input.expected_candidate_count
+        || issues.len() as i64 != input.expected_issue_count
+        || members.len() as i64 != input.expected_member_count
+        || input.expected_recommendation_count != 1
+    {
+        return Err(StoreError::invalid_input(
+            "capture_time_analysis_manifest",
+            "typed evidence counts differ from the frozen analysis header",
+        ));
+    }
+    if recommendation.keeper_observation_id.is_some()
+        || recommendation.time_donor_observation_id.is_some()
+        || recommendation.candidate_id.is_some()
+        || recommendation.keeper_policy_name.is_some()
+        || recommendation.keeper_policy_version.is_some()
+        || recommendation.time_donor_policy_name.is_some()
+        || recommendation.time_donor_policy_version.is_some()
+    {
+        return Err(StoreError::invalid_input(
+            "capture_time_recommendation",
+            "manifest builder cannot encode an unimplemented keeper policy",
+        ));
+    }
+    let mut sorted_sources = sources.iter().collect::<Vec<_>>();
+    sorted_sources.sort_unstable_by_key(|source| source.ordinal);
+    let mut sorted_observations = observations.iter().collect::<Vec<_>>();
+    sorted_observations.sort_unstable_by_key(|observation| observation.ordinal);
+    let mut sorted_candidates = candidates.iter().collect::<Vec<_>>();
+    sorted_candidates.sort_unstable_by_key(|candidate| candidate.ordinal);
+    let mut sorted_issues = issues.iter().collect::<Vec<_>>();
+    sorted_issues.sort_unstable_by_key(|issue| issue.ordinal);
+    let mut sorted_members = members.iter().collect::<Vec<_>>();
+    sorted_members.sort_unstable_by_key(|member| member.member_ordinal);
+    for (field, has_duplicate) in [
+        (
+            "capture_time_source_ordinal",
+            sorted_sources
+                .windows(2)
+                .any(|pair| pair[0].ordinal == pair[1].ordinal),
+        ),
+        (
+            "capture_time_observation_ordinal",
+            sorted_observations
+                .windows(2)
+                .any(|pair| pair[0].ordinal == pair[1].ordinal),
+        ),
+        (
+            "capture_time_candidate_ordinal",
+            sorted_candidates
+                .windows(2)
+                .any(|pair| pair[0].ordinal == pair[1].ordinal),
+        ),
+        (
+            "capture_time_issue_ordinal",
+            sorted_issues
+                .windows(2)
+                .any(|pair| pair[0].ordinal == pair[1].ordinal),
+        ),
+        (
+            "capture_time_member_ordinal",
+            sorted_members
+                .windows(2)
+                .any(|pair| pair[0].member_ordinal == pair[1].member_ordinal),
+        ),
+    ] {
+        if has_duplicate {
+            return Err(StoreError::invalid_input(field, "ordinals must be unique"));
+        }
+    }
+    let policy_context_json = serialize_canonical_json(&input.policy_context_json)?;
+    let mut retained_json_bytes = i64::try_from(policy_context_json.len()).map_err(|_| {
+        StoreError::invalid_input(
+            "capture_time_analysis_budget",
+            "policy JSON length does not fit the evidence counter",
+        )
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.capture-time-analysis-manifest.v1\0");
+    begin_manifest_section(&mut hasher, b"header")?;
+    hash_manifest_row(
+        &mut hasher,
+        &[
+            ManifestValue::Integer(input.time_session_id),
+            ManifestValue::Integer(plan.scan_run_id),
+            ManifestValue::Integer(input.exact_group_build_id),
+            ManifestValue::Text(&input.policy_name),
+            ManifestValue::Text(&input.policy_version),
+            ManifestValue::Text(&policy_context_json),
+            ManifestValue::Blob(input.policy_context_digest.as_bytes()),
+            ManifestValue::Integer(input.expected_source_count),
+            ManifestValue::Integer(input.expected_observation_count),
+            ManifestValue::Integer(input.expected_candidate_count),
+            ManifestValue::Integer(input.expected_issue_count),
+            ManifestValue::Integer(input.expected_member_count),
+            ManifestValue::Integer(input.expected_recommendation_count),
+            ManifestValue::Integer(input.created_at_ms),
+        ],
+    )?;
+    end_manifest_section(&mut hasher, 1);
+
+    begin_manifest_section(&mut hasher, b"sources")?;
+    for source in sorted_sources {
+        hash_manifest_row(
+            &mut hasher,
+            &[
+                ManifestValue::Integer(source.ordinal),
+                ManifestValue::Integer(source.report_id),
+                ManifestValue::Blob(source.source_key.as_bytes()),
+                ManifestValue::Blob(source.lineage_key.as_bytes()),
+                ManifestValue::Text("reextracted_pinned_source"),
+                ManifestValue::Integer(source.created_at_ms),
+            ],
+        )?;
+    }
+    end_manifest_section(&mut hasher, input.expected_source_count);
+
+    begin_manifest_section(&mut hasher, b"observations")?;
+    for observation in sorted_observations {
+        let columns = StoredInterpretationColumns::from(&observation.interpretation);
+        let report_id = sources
+            .iter()
+            .find(|source| source.ordinal == observation.source_ordinal)
+            .map(|source| source.report_id)
+            .ok_or_else(|| {
+                StoreError::invalid_input(
+                    "capture_time_observation_source",
+                    "observation references a missing source ordinal",
+                )
+            })?;
+        hash_manifest_row(
+            &mut hasher,
+            &[
+                ManifestValue::Integer(observation.ordinal),
+                ManifestValue::Integer(observation.source_ordinal),
+                ManifestValue::Integer(report_id),
+                ManifestValue::Integer(observation.metadata_field_id),
+                ManifestValue::Text(columns.kind),
+                optional_integer(columns.wall_year),
+                optional_integer(columns.wall_month),
+                optional_integer(columns.wall_day),
+                optional_integer(columns.wall_hour),
+                optional_integer(columns.wall_minute),
+                optional_integer(columns.wall_second),
+                optional_integer(columns.wall_nanosecond),
+                optional_text(columns.semantic_kind),
+                optional_text(columns.offset_kind),
+                optional_integer(columns.utc_offset_minutes),
+                optional_text(columns.utc_seconds_decimal),
+                optional_integer(columns.utc_nanoseconds),
+                optional_integer(columns.normalized_precision_ns),
+                optional_integer(columns.parsed_offset_minutes),
+                optional_integer(columns.subsecond_nanosecond),
+                optional_integer(columns.subsecond_digits),
+                optional_integer(columns.subsecond_precision_ns),
+                optional_text(columns.rejection_code),
+                ManifestValue::Integer(observation.created_at_ms),
+            ],
+        )?;
+    }
+    end_manifest_section(&mut hasher, input.expected_observation_count);
+
+    begin_manifest_section(&mut hasher, b"candidates")?;
+    for candidate in sorted_candidates {
+        validate_candidate_references_in_memory(sources, observations, candidate)?;
+        let evidence_kinds_json = serde_json::to_string(
+            &candidate
+                .evidence_kinds
+                .iter()
+                .map(|value| value.as_storage_str())
+                .collect::<Vec<_>>(),
+        )?;
+        let source_keys_json = serde_json::to_string(
+            &candidate
+                .source_keys
+                .iter()
+                .map(|value| lower_hex(value.as_bytes()))
+                .collect::<Vec<_>>(),
+        )?;
+        let lineage_keys_json = serde_json::to_string(
+            &candidate
+                .lineage_keys
+                .iter()
+                .map(|value| lower_hex(value.as_bytes()))
+                .collect::<Vec<_>>(),
+        )?;
+        let observation_ordinals_json = serde_json::to_string(&candidate.observation_ordinals)?;
+        let anomalies_json = serde_json::to_string(
+            &candidate
+                .anomalies
+                .iter()
+                .map(|value| value.as_storage_str())
+                .collect::<Vec<_>>(),
+        )?;
+        let blockers_json = serde_json::to_string(
+            &candidate
+                .evidence_gate
+                .blockers()
+                .iter()
+                .map(|value| value.as_storage_str())
+                .collect::<Vec<_>>(),
+        )?;
+        for value in [
+            evidence_kinds_json.as_str(),
+            source_keys_json.as_str(),
+            lineage_keys_json.as_str(),
+            observation_ordinals_json.as_str(),
+            anomalies_json.as_str(),
+            blockers_json.as_str(),
+        ] {
+            retained_json_bytes = retained_json_bytes
+                .checked_add(i64::try_from(value.len()).map_err(|_| {
+                    StoreError::invalid_input(
+                        "capture_time_analysis_budget",
+                        "candidate JSON length does not fit the evidence counter",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    StoreError::invalid_input(
+                        "capture_time_analysis_budget",
+                        "retained JSON byte sum overflow",
+                    )
+                })?;
+        }
+        let wall = candidate.timestamp.wall_time();
+        hash_manifest_row(
+            &mut hasher,
+            &[
+                ManifestValue::Integer(candidate.ordinal),
+                ManifestValue::Integer(i64::from(wall.year())),
+                ManifestValue::Integer(i64::from(wall.month())),
+                ManifestValue::Integer(i64::from(wall.day())),
+                ManifestValue::Integer(i64::from(wall.hour())),
+                ManifestValue::Integer(i64::from(wall.minute())),
+                ManifestValue::Integer(i64::from(wall.second())),
+                ManifestValue::Integer(i64::from(wall.nanosecond())),
+                ManifestValue::Text(candidate.timestamp.semantic_kind().as_storage_str()),
+                ManifestValue::Text(candidate.timestamp.offset_kind().as_storage_str()),
+                optional_integer(candidate.timestamp.utc_offset_minutes().map(i64::from)),
+                optional_text(candidate.timestamp.utc_seconds_decimal()),
+                optional_integer(candidate.timestamp.utc_nanoseconds().map(i64::from)),
+                ManifestValue::Integer(i64::from(candidate.timestamp.precision_ns())),
+                ManifestValue::Text(candidate.confidence.as_storage_str()),
+                ManifestValue::Text(candidate.evidence_gate.as_storage_str()),
+                ManifestValue::Text(&evidence_kinds_json),
+                ManifestValue::Text(&source_keys_json),
+                ManifestValue::Text(&lineage_keys_json),
+                ManifestValue::Text(&observation_ordinals_json),
+                ManifestValue::Text(&anomalies_json),
+                ManifestValue::Text(&blockers_json),
+                ManifestValue::Integer(candidate.created_at_ms),
+            ],
+        )?;
+    }
+    end_manifest_section(&mut hasher, input.expected_candidate_count);
+
+    begin_manifest_section(&mut hasher, b"policy-issues")?;
+    for issue in sorted_issues {
+        validate_policy_issue_references_in_memory(sources, observations, issue)?;
+        let observation_ordinals_json = serde_json::to_string(&issue.observation_ordinals)?;
+        let source_keys_json = serde_json::to_string(
+            &issue
+                .source_keys
+                .iter()
+                .map(|value| lower_hex(value.as_bytes()))
+                .collect::<Vec<_>>(),
+        )?;
+        let lineage_keys_json = serde_json::to_string(
+            &issue
+                .lineage_keys
+                .iter()
+                .map(|value| lower_hex(value.as_bytes()))
+                .collect::<Vec<_>>(),
+        )?;
+        for value in [
+            observation_ordinals_json.as_str(),
+            source_keys_json.as_str(),
+            lineage_keys_json.as_str(),
+            issue.context.as_str(),
+        ] {
+            retained_json_bytes = retained_json_bytes
+                .checked_add(i64::try_from(value.len()).map_err(|_| {
+                    StoreError::invalid_input(
+                        "capture_time_analysis_budget",
+                        "policy issue text length does not fit the evidence counter",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    StoreError::invalid_input(
+                        "capture_time_analysis_budget",
+                        "retained JSON/text byte sum overflow",
+                    )
+                })?;
+        }
+        hash_manifest_row(
+            &mut hasher,
+            &[
+                ManifestValue::Integer(issue.ordinal),
+                ManifestValue::Text(&issue.code),
+                optional_text(issue.field_kind.map(|value| value.as_storage_str())),
+                ManifestValue::Text(&observation_ordinals_json),
+                ManifestValue::Text(&source_keys_json),
+                ManifestValue::Text(&lineage_keys_json),
+                ManifestValue::Text(&issue.context),
+                ManifestValue::Integer(issue.created_at_ms),
+            ],
+        )?;
+    }
+    end_manifest_section(&mut hasher, input.expected_issue_count);
+    if retained_json_bytes > MAX_TIME_EVIDENCE_PAGE_BYTES {
+        return Err(StoreError::invalid_input(
+            "capture_time_analysis_budget",
+            "retained policy/candidate/issue JSON and text exceed 16 MiB",
+        ));
+    }
+
+    begin_manifest_section(&mut hasher, b"members")?;
+    for member in sorted_members {
+        if member.candidate_ordinal.is_some_and(|ordinal| {
+            !candidates
+                .iter()
+                .any(|candidate| candidate.ordinal == ordinal)
+        }) {
+            return Err(StoreError::invalid_input(
+                "member_candidate_ordinal",
+                "member references a candidate outside its analysis",
+            ));
+        }
+        hash_manifest_row(
+            &mut hasher,
+            &[
+                ManifestValue::Integer(member.member_ordinal),
+                ManifestValue::Integer(member.media_observation_snapshot_id),
+                optional_integer(member.candidate_ordinal),
+                ManifestValue::Text(member.birth_time_relation.as_storage_str()),
+                ManifestValue::Text(member.modified_time_relation.as_storage_str()),
+                ManifestValue::Text(member.donor_eligibility.as_storage_str()),
+                ManifestValue::Text(&member.reason_code),
+                ManifestValue::Integer(member.created_at_ms),
+            ],
+        )?;
+    }
+    end_manifest_section(&mut hasher, input.expected_member_count);
+
+    begin_manifest_section(&mut hasher, b"recommendation")?;
+    hash_manifest_row(
+        &mut hasher,
+        &[
+            ManifestValue::Null,
+            ManifestValue::Null,
+            ManifestValue::Null,
+            ManifestValue::Null,
+            ManifestValue::Null,
+            ManifestValue::Null,
+            ManifestValue::Null,
+            ManifestValue::Integer(1),
+            ManifestValue::Integer(0),
+            ManifestValue::Text(&recommendation.reason_code),
+            ManifestValue::Integer(recommendation.created_at_ms),
+        ],
+    )?;
+    end_manifest_section(&mut hasher, 1);
+    Ok(TimeEvidenceManifestDigest::from_runtime_evidence(
+        *hasher.finalize().as_bytes(),
+    ))
+}
+
+fn validate_candidate_references_in_memory(
+    sources: &[CaptureTimeAnalysisSourceInput],
+    observations: &[CaptureTimeObservationInput],
+    candidate: &CaptureTimeCandidateInput,
+) -> Result<()> {
+    let mut derived_sources = Vec::with_capacity(candidate.observation_ordinals.len());
+    let mut derived_lineages = Vec::with_capacity(candidate.observation_ordinals.len());
+    for ordinal in &candidate.observation_ordinals {
+        let observation = observations
+            .iter()
+            .find(|observation| observation.ordinal == *ordinal)
+            .ok_or_else(|| {
+                StoreError::invalid_input(
+                    "capture_time_candidate_support",
+                    "candidate references an observation outside its analysis manifest",
+                )
+            })?;
+        let source = sources
+            .iter()
+            .find(|source| source.ordinal == observation.source_ordinal)
+            .ok_or_else(|| {
+                StoreError::invalid_input(
+                    "capture_time_candidate_support",
+                    "candidate observation references a missing analysis source",
+                )
+            })?;
+        derived_sources.push(*source.source_key.as_bytes());
+        derived_lineages.push(*source.lineage_key.as_bytes());
+    }
+    sort_dedup(&mut derived_sources);
+    sort_dedup(&mut derived_lineages);
+    let mut declared_sources = candidate
+        .source_keys
+        .iter()
+        .map(|key| *key.as_bytes())
+        .collect::<Vec<_>>();
+    let mut declared_lineages = candidate
+        .lineage_keys
+        .iter()
+        .map(|key| *key.as_bytes())
+        .collect::<Vec<_>>();
+    sort_dedup(&mut declared_sources);
+    sort_dedup(&mut declared_lineages);
+    if derived_sources != declared_sources || derived_lineages != declared_lineages {
+        return Err(StoreError::invalid_input(
+            "capture_time_candidate_support",
+            "candidate source and lineage declarations do not exactly match its observations",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_policy_issue_references_in_memory(
+    sources: &[CaptureTimeAnalysisSourceInput],
+    observations: &[CaptureTimeObservationInput],
+    issue: &CaptureTimePolicyIssueInput,
+) -> Result<()> {
+    if issue
+        .source_keys
+        .iter()
+        .any(|key| !sources.iter().any(|source| source.source_key == *key))
+        || issue
+            .lineage_keys
+            .iter()
+            .any(|key| !sources.iter().any(|source| source.lineage_key == *key))
+        || issue.observation_ordinals.iter().any(|ordinal| {
+            !observations
+                .iter()
+                .any(|observation| observation.ordinal == *ordinal)
+        })
+    {
+        return Err(StoreError::invalid_input(
+            "capture_time_policy_issue",
+            "policy issue references evidence outside its analysis manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn hash_unchecked_length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 /// Encodes JSON without relying on `serde_json::Map`'s feature-selected
 /// iteration order. Type tags and fixed-width length domains keep adjacent
 /// values unambiguous; object keys are ordered by their UTF-8 bytes.
-fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
+pub(crate) fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     encode_canonical_json(value, &mut output)?;
     Ok(output)

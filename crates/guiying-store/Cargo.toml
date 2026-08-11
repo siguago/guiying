@@ -17,5 +17,8 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 tempfile = "=3.15.0"
 thiserror = "2.0.20"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=0.38.44", features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
