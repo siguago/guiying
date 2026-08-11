@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::error::{Result, StoreError};
 
 pub(crate) const APPLICATION_ID: i32 = 0x4755_5949; // ASCII "GUYI"
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 7;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 8;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_init.sql");
 
@@ -18,6 +18,7 @@ const RUNTIME_STREAM_EVIDENCE_MIGRATION: &str =
     include_str!("migrations/0006_runtime_stream_evidence.sql");
 const CAPTURE_TIME_EVIDENCE_MIGRATION: &str =
     include_str!("migrations/0007_capture_time_evidence.sql");
+const RUNTIME_CONTROL_MIGRATION: &str = include_str!("migrations/0008_runtime_control.sql");
 
 const REGISTRY_SQL: &str = r#"
 CREATE TABLE guiying_schema_migrations (
@@ -40,7 +41,7 @@ struct Migration {
     strips_embedded_transaction: bool,
 }
 
-const MIGRATIONS: [Migration; 7] = [
+const MIGRATIONS: [Migration; 8] = [
     Migration {
         version: 1,
         name: "initial_data_model",
@@ -81,6 +82,12 @@ const MIGRATIONS: [Migration; 7] = [
         version: 7,
         name: "capture_time_evidence",
         sql: CAPTURE_TIME_EVIDENCE_MIGRATION,
+        strips_embedded_transaction: false,
+    },
+    Migration {
+        version: 8,
+        name: "runtime_control",
+        sql: RUNTIME_CONTROL_MIGRATION,
         strips_embedded_transaction: false,
     },
 ];
@@ -159,7 +166,13 @@ pub(crate) fn reconcile_stale_scan_sessions(
     }
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let interrupted = transaction.execute(
+    let schema_version = read_user_version(&transaction)?;
+    let runtime_control_interrupted = if schema_version >= 8 {
+        reconcile_runtime_control_sessions(&transaction, now_ms)?
+    } else {
+        0
+    };
+    let legacy_reconcile_sql = if schema_version >= 8 {
         "UPDATE scan_runs \
          SET state = 'interrupted', \
              state_version = state_version + 1, \
@@ -174,9 +187,29 @@ pub(crate) fn reconcile_stale_scan_sessions(
                SELECT 1 FROM scan_run_sessions AS session \
                WHERE session.scan_run_id = scan_runs.id \
                  AND session.volume_id = scan_runs.volume_id \
-           )",
-        [now_ms],
-    )?;
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM scan_runtime_leases AS lease \
+               WHERE lease.scan_run_id = scan_runs.id \
+           )"
+    } else {
+        "UPDATE scan_runs \
+         SET state = 'interrupted', \
+             state_version = state_version + 1, \
+             started_at_ms = COALESCE(started_at_ms, created_at_ms), \
+             finished_at_ms = MAX(created_at_ms, updated_at_ms, ?1), \
+             updated_at_ms = MAX(updated_at_ms, ?1), \
+             last_error_code = 'PROCESS_RESTARTED_WITH_STALE_SESSION', \
+             last_error_message = \
+                 'The process-local volume binding ended; start a fresh bound attempt.' \
+         WHERE state IN ('queued', 'running', 'paused') \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_run_sessions AS session \
+               WHERE session.scan_run_id = scan_runs.id \
+                 AND session.volume_id = scan_runs.volume_id \
+           )"
+    };
+    let legacy_interrupted = transaction.execute(legacy_reconcile_sql, [now_ms])?;
     transaction.execute(
         "UPDATE exact_group_builds \
          SET state = 'abandoned', \
@@ -193,7 +226,10 @@ pub(crate) fn reconcile_stale_scan_sessions(
                WHERE run.id = exact_group_builds.scan_run_id \
                  AND run.volume_id = exact_group_builds.volume_id \
                  AND run.state = 'interrupted' \
-                 AND run.last_error_code = 'PROCESS_RESTARTED_WITH_STALE_SESSION' \
+                 AND run.last_error_code IN ( \
+                     'PROCESS_RESTARTED_WITH_STALE_SESSION', \
+                     'PROCESS_RESTARTED_WITH_RUNTIME_LEASE' \
+                 ) \
            )",
         [now_ms],
     )?;
@@ -325,6 +361,174 @@ pub(crate) fn reconcile_stale_scan_sessions(
         [],
     )?;
     transaction.commit()?;
+    let interrupted = runtime_control_interrupted
+        .checked_add(u64::try_from(legacy_interrupted).map_err(|_| {
+            StoreError::invalid_input("interrupted_scan_count", "row count overflow")
+        })?)
+        .ok_or_else(|| StoreError::invalid_input("interrupted_scan_count", "row count overflow"))?;
+    Ok(interrupted)
+}
+
+/// Reconciles v8 process-local leases before the legacy stale-session pass.
+/// Every unfinished lease first enters restart release, then pending
+/// pause/resume intent is made terminal before the run/job state gates fire.
+/// A durable pending cancel is the sole intent honoured across reopen.
+/// Repository terminal transitions are one SQLite transaction, so a persisted
+/// one-sided terminal pair is impossible and preflight rejects it as tampering.
+fn reconcile_runtime_control_sessions(
+    transaction: &rusqlite::Transaction<'_>,
+    now_ms: i64,
+) -> Result<u64> {
+    transaction.execute(
+        "UPDATE scan_runtime_leases \
+         SET state = 'releasing', release_reason = 'process_restart', \
+             release_started_at_ms = MAX(last_heartbeat_at_ms, ?1) \
+         WHERE state = 'active' \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runs AS run \
+               JOIN scan_jobs AS job ON job.id = scan_runtime_leases.scan_job_id \
+               WHERE run.id = scan_runtime_leases.scan_run_id \
+                 AND run.state IN ('running', 'paused') \
+                 AND job.state IN ('running', 'paused') \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE scan_control_requests \
+         SET disposition = 'interrupted', \
+             acknowledged_at_ms = MAX(requested_at_ms, ?1), \
+             ack_reason_code = 'PROCESS_RESTART' \
+         WHERE disposition = 'pending' AND kind IN ('pause', 'resume') \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runtime_leases AS lease \
+               WHERE lease.scan_run_id = scan_control_requests.scan_run_id \
+                 AND lease.runtime_lease_key = scan_control_requests.runtime_lease_key \
+                 AND lease.state = 'releasing' \
+                 AND lease.release_reason = 'process_restart' \
+           )",
+        [now_ms],
+    )?;
+
+    transaction.execute(
+        "UPDATE scan_runs \
+         SET state = 'cancelled', state_version = state_version + 1, \
+             started_at_ms = COALESCE(started_at_ms, created_at_ms), \
+             finished_at_ms = MAX(created_at_ms, updated_at_ms, ?1), \
+             updated_at_ms = MAX(updated_at_ms, ?1), \
+             last_error_code = NULL, last_error_message = NULL \
+         WHERE state IN ('running', 'paused') \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runtime_leases AS lease \
+               JOIN scan_control_requests AS request \
+                 ON request.scan_run_id = lease.scan_run_id \
+                AND request.runtime_lease_key = lease.runtime_lease_key \
+               WHERE lease.scan_run_id = scan_runs.id \
+                 AND lease.state = 'releasing' \
+                 AND lease.release_reason = 'process_restart' \
+                 AND request.kind = 'cancel' \
+                 AND request.disposition = 'pending' \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE scan_jobs \
+         SET state = 'cancelled', state_version = state_version + 1, \
+             updated_at_ms = MAX(updated_at_ms, ?1) \
+         WHERE state IN ('running', 'paused') \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runtime_leases AS lease \
+               JOIN scan_runs AS run ON run.id = lease.scan_run_id \
+               JOIN scan_control_requests AS request \
+                 ON request.scan_run_id = lease.scan_run_id \
+                AND request.runtime_lease_key = lease.runtime_lease_key \
+               WHERE lease.scan_job_id = scan_jobs.id \
+                 AND lease.state = 'releasing' \
+                 AND lease.release_reason = 'process_restart' \
+                 AND run.state = 'cancelled' \
+                 AND request.kind = 'cancel' \
+                 AND request.disposition = 'pending' \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE scan_control_requests \
+         SET disposition = 'acknowledged', \
+             acknowledged_at_ms = MAX(requested_at_ms, ?1), \
+             ack_job_state_version = ( \
+                 SELECT job.state_version FROM scan_runtime_leases AS lease \
+                 JOIN scan_jobs AS job ON job.id = lease.scan_job_id \
+                 WHERE lease.scan_run_id = scan_control_requests.scan_run_id \
+             ), \
+             ack_run_state_version = ( \
+                 SELECT run.state_version FROM scan_runs AS run \
+                 WHERE run.id = scan_control_requests.scan_run_id \
+             ), \
+             ack_checkpoint_generation = ( \
+                 SELECT max(checkpoint.generation) FROM scan_pause_checkpoints AS checkpoint \
+                 WHERE checkpoint.scan_run_id = scan_control_requests.scan_run_id \
+             ), \
+             ack_reason_code = 'PROCESS_RESTART_CANCEL_ACK' \
+         WHERE disposition = 'pending' AND kind = 'cancel' \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runtime_leases AS lease \
+               JOIN scan_runs AS run ON run.id = lease.scan_run_id \
+               JOIN scan_jobs AS job ON job.id = lease.scan_job_id \
+               WHERE lease.scan_run_id = scan_control_requests.scan_run_id \
+                 AND lease.runtime_lease_key = scan_control_requests.runtime_lease_key \
+                 AND lease.state = 'releasing' \
+                 AND lease.release_reason = 'process_restart' \
+                 AND run.state = 'cancelled' AND job.state = 'cancelled' \
+           )",
+        [now_ms],
+    )?;
+
+    let interrupted = transaction.execute(
+        "UPDATE scan_runs \
+         SET state = 'interrupted', state_version = state_version + 1, \
+             started_at_ms = COALESCE(started_at_ms, created_at_ms), \
+             finished_at_ms = MAX(created_at_ms, updated_at_ms, ?1), \
+             updated_at_ms = MAX(updated_at_ms, ?1), \
+             last_error_code = 'PROCESS_RESTARTED_WITH_RUNTIME_LEASE', \
+             last_error_message = \
+                 'The process-local runtime lease ended; start a fresh bound attempt.' \
+         WHERE state IN ('running', 'paused') \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runtime_leases AS lease \
+               WHERE lease.scan_run_id = scan_runs.id \
+                 AND lease.state = 'releasing' \
+                 AND lease.release_reason = 'process_restart' \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE scan_jobs \
+         SET state = 'failed', state_version = state_version + 1, \
+             updated_at_ms = MAX(updated_at_ms, ?1) \
+         WHERE state IN ('running', 'paused') \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runtime_leases AS lease \
+               JOIN scan_runs AS run ON run.id = lease.scan_run_id \
+               WHERE lease.scan_job_id = scan_jobs.id \
+                 AND lease.state = 'releasing' \
+                 AND lease.release_reason = 'process_restart' \
+                 AND run.state = 'interrupted' \
+           )",
+        [now_ms],
+    )?;
+    transaction.execute(
+        "UPDATE scan_runtime_leases \
+         SET state = 'released', \
+             released_at_ms = MAX(release_started_at_ms, ?1) \
+         WHERE state = 'releasing' AND release_reason = 'process_restart' \
+           AND EXISTS ( \
+               SELECT 1 FROM scan_runs AS run \
+               JOIN scan_jobs AS job ON job.id = scan_runtime_leases.scan_job_id \
+               WHERE run.id = scan_runtime_leases.scan_run_id \
+                 AND ((run.state = 'interrupted' AND job.state = 'failed') \
+                   OR (run.state = 'cancelled' AND job.state = 'cancelled')) \
+           )",
+        [now_ms],
+    )?;
     u64::try_from(interrupted)
         .map_err(|_| StoreError::invalid_input("interrupted_scan_count", "row count overflow"))
 }
@@ -611,7 +815,393 @@ fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<
     if version >= 7 {
         validate_capture_time_evidence(connection)?;
     }
+    if version >= 8 {
+        validate_runtime_control_evidence(connection)?;
+    }
     validate_stored_path_evidence(connection, version)?;
+    Ok(())
+}
+
+fn validate_runtime_control_evidence(connection: &Connection) -> Result<()> {
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_runtime_leases AS lease \
+             LEFT JOIN scan_runs AS run \
+               ON run.id = lease.scan_run_id AND run.volume_id = lease.volume_id \
+             LEFT JOIN scan_jobs AS job \
+               ON job.id = lease.scan_job_id AND job.volume_id = lease.volume_id \
+             LEFT JOIN scan_job_runs AS binding \
+               ON binding.scan_job_id = lease.scan_job_id \
+              AND binding.scan_run_id = lease.scan_run_id \
+              AND binding.volume_id = lease.volume_id \
+             LEFT JOIN scan_run_sessions AS session \
+               ON session.scan_run_id = lease.scan_run_id \
+              AND session.volume_id = lease.volume_id \
+              AND session.capability_profile_id = lease.capability_profile_id \
+              AND session.namespace_profile_id = lease.namespace_profile_id \
+              AND session.mount_session_key = lease.mount_session_key \
+             LEFT JOIN scan_core_sessions AS core \
+               ON core.scan_run_id = lease.scan_run_id \
+              AND core.volume_id = lease.volume_id \
+              AND core.capability_profile_id = lease.capability_profile_id \
+              AND core.namespace_profile_id = lease.namespace_profile_id \
+              AND core.core_session_id = lease.core_session_id \
+             WHERE run.id IS NULL OR job.id IS NULL OR binding.scan_run_id IS NULL \
+                OR session.scan_run_id IS NULL OR core.scan_run_id IS NULL \
+                OR session.scan_job_id <> lease.scan_job_id \
+                OR run.capability_profile_id <> lease.capability_profile_id \
+                OR lease.acquired_at_ms < core.bound_at_ms \
+                OR lease.last_heartbeat_at_ms < lease.acquired_at_ms \
+                OR NOT ( \
+                    (lease.state = 'active' \
+                     AND lease.release_reason IS NULL \
+                     AND lease.release_started_at_ms IS NULL \
+                     AND lease.released_at_ms IS NULL \
+                     AND job.active_scan_run_id = lease.scan_run_id \
+                     AND ((run.state = 'running' AND job.state = 'running') \
+                       OR (run.state = 'paused' AND job.state = 'paused'))) \
+                 OR (lease.state = 'released' \
+                     AND lease.release_reason IS NOT NULL \
+                     AND lease.release_started_at_ms >= lease.last_heartbeat_at_ms \
+                     AND lease.released_at_ms >= lease.release_started_at_ms \
+                     AND ( \
+                         (lease.release_reason = 'completed' \
+                          AND run.state = 'completed') \
+                      OR (lease.release_reason = 'failed' \
+                          AND run.state = 'failed') \
+                      OR (lease.release_reason = 'cancelled' \
+                          AND run.state = 'cancelled') \
+                      OR (lease.release_reason IN ('interrupted', 'process_restart') \
+                          AND run.state IN ('interrupted', 'cancelled')) \
+                     )) \
+                ) \
+         )",
+        "runtime lease is not fully bound or has an invalid lifecycle/state relation",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_control_requests AS request \
+             LEFT JOIN scan_runtime_leases AS lease \
+               ON lease.scan_run_id = request.scan_run_id \
+              AND lease.volume_id = request.volume_id \
+              AND lease.runtime_lease_key = request.runtime_lease_key \
+             LEFT JOIN scan_runs AS run ON run.id = request.scan_run_id \
+             LEFT JOIN scan_jobs AS job ON job.id = lease.scan_job_id \
+             WHERE lease.scan_run_id IS NULL \
+                OR request.requested_at_ms < lease.acquired_at_ms \
+                OR length(request.request_key) <> 32 \
+                OR length(request.runtime_lease_key) <> 32 \
+                OR (request.kind = 'resume') \
+                   <> (request.expected_checkpoint_generation IS NOT NULL) \
+                OR (request.disposition = 'pending' AND ( \
+                       request.acknowledged_at_ms IS NOT NULL \
+                       OR request.ack_job_state_version IS NOT NULL \
+                       OR request.ack_run_state_version IS NOT NULL \
+                       OR request.ack_checkpoint_generation IS NOT NULL \
+                       OR request.ack_reason_code IS NOT NULL \
+                       OR request.pause_checkpoint_write_key IS NOT NULL \
+                       OR request.pause_checkpoint_payload_digest IS NOT NULL \
+                       OR request.superseded_by_request_id IS NOT NULL \
+                   )) \
+                OR (request.disposition = 'acknowledged' AND ( \
+                       request.acknowledged_at_ms < request.requested_at_ms \
+                       OR request.ack_job_state_version <> \
+                          request.expected_job_state_version + 1 \
+                       OR request.ack_run_state_version <> \
+                          request.expected_run_state_version + 1 \
+                       OR request.ack_reason_code IS NULL \
+                       OR length(CAST(request.ack_reason_code AS BLOB)) NOT BETWEEN 1 AND 256 \
+                       OR request.superseded_by_request_id IS NOT NULL \
+                       OR (request.kind IN ('pause', 'resume') \
+                           AND request.ack_checkpoint_generation IS NULL) \
+                       OR (request.kind = 'pause' AND ( \
+                           length(request.pause_checkpoint_write_key) <> 32 \
+                           OR length(request.pause_checkpoint_payload_digest) <> 32 \
+                       )) \
+                       OR (request.kind IN ('resume', 'cancel') AND ( \
+                           request.pause_checkpoint_write_key IS NOT NULL \
+                           OR request.pause_checkpoint_payload_digest IS NOT NULL \
+                       )) \
+                       OR (request.kind = 'resume' \
+                           AND request.ack_checkpoint_generation \
+                               <> request.expected_checkpoint_generation) \
+                       OR (request.kind = 'pause' AND NOT EXISTS ( \
+                           SELECT 1 FROM scan_pause_checkpoints AS checkpoint \
+                           WHERE checkpoint.pause_request_id = request.id \
+                             AND checkpoint.scan_run_id = request.scan_run_id \
+                             AND checkpoint.pause_request_key = request.request_key \
+                             AND checkpoint.generation = \
+                                 request.ack_checkpoint_generation \
+                             AND checkpoint.write_key = \
+                                 request.pause_checkpoint_write_key \
+                             AND checkpoint.payload_digest = \
+                                 request.pause_checkpoint_payload_digest \
+                             AND checkpoint.job_state_version = \
+                                 request.ack_job_state_version \
+                             AND checkpoint.run_state_version = \
+                                 request.ack_run_state_version \
+                       )) \
+                   )) \
+                OR (request.kind <> 'pause' AND EXISTS ( \
+                       SELECT 1 FROM scan_pause_checkpoints AS checkpoint \
+                       WHERE checkpoint.pause_request_id = request.id \
+                   )) \
+                OR (request.disposition <> 'acknowledged' AND EXISTS ( \
+                       SELECT 1 FROM scan_pause_checkpoints AS checkpoint \
+                       WHERE checkpoint.pause_request_id = request.id \
+                   )) \
+                OR (request.disposition = 'superseded' AND ( \
+                       request.acknowledged_at_ms < request.requested_at_ms \
+                       OR request.ack_job_state_version IS NOT NULL \
+                       OR request.ack_run_state_version IS NOT NULL \
+                       OR request.ack_checkpoint_generation IS NOT NULL \
+                       OR request.pause_checkpoint_write_key IS NOT NULL \
+                       OR request.pause_checkpoint_payload_digest IS NOT NULL \
+                       OR request.ack_reason_code <> 'CANCEL_DOMINATED' \
+                       OR NOT EXISTS ( \
+                           SELECT 1 FROM scan_control_requests AS superseder \
+                           WHERE superseder.id = request.superseded_by_request_id \
+                             AND superseder.scan_run_id = request.scan_run_id \
+                             AND superseder.kind = 'cancel' \
+                             AND superseder.sequence > request.sequence \
+                       ) \
+                   )) \
+                OR (request.disposition = 'interrupted' AND ( \
+                       request.kind NOT IN ('pause', 'resume') \
+                       OR request.ack_reason_code <> 'PROCESS_RESTART' \
+                       OR lease.state NOT IN ('releasing', 'released') \
+                       OR lease.release_reason <> 'process_restart' \
+                       OR \
+                       request.acknowledged_at_ms < request.requested_at_ms \
+                       OR request.ack_job_state_version IS NOT NULL \
+                       OR request.ack_run_state_version IS NOT NULL \
+                       OR request.ack_checkpoint_generation IS NOT NULL \
+                       OR request.pause_checkpoint_write_key IS NOT NULL \
+                       OR request.pause_checkpoint_payload_digest IS NOT NULL \
+                       OR request.ack_reason_code IS NULL \
+                       OR length(CAST(request.ack_reason_code AS BLOB)) NOT BETWEEN 1 AND 256 \
+                       OR request.superseded_by_request_id IS NOT NULL \
+                   )) \
+                OR (request.disposition = 'pending' AND lease.state = 'active' AND ( \
+                       request.expected_job_state_version <> job.state_version \
+                       OR request.expected_run_state_version <> run.state_version \
+                       OR (request.kind = 'pause' \
+                           AND (job.state <> 'running' OR run.state <> 'running')) \
+                       OR (request.kind = 'resume' \
+                           AND (job.state <> 'paused' OR run.state <> 'paused' \
+                                OR NOT EXISTS ( \
+                                    SELECT 1 FROM scan_pause_checkpoints AS checkpoint \
+                                    WHERE checkpoint.scan_run_id = request.scan_run_id \
+                                      AND checkpoint.generation = \
+                                          request.expected_checkpoint_generation \
+                                      AND checkpoint.runtime_lease_key = \
+                                          request.runtime_lease_key \
+                                ))) \
+                       OR (request.kind = 'cancel' \
+                           AND (job.state NOT IN ('running', 'paused') \
+                                OR run.state NOT IN ('running', 'paused'))) \
+                   )) \
+         )",
+        "runtime control request is not lease-bound or has invalid terminal evidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_control_requests \
+             GROUP BY scan_run_id \
+             HAVING min(sequence) <> 1 OR max(sequence) <> count(*) \
+                 OR sum(disposition = 'pending') > 1 \
+         )",
+        "runtime control sequence is non-contiguous or has multiple pending requests",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_control_requests \
+             GROUP BY scan_run_id \
+             HAVING (min(CASE WHEN kind = 'cancel' THEN sequence END) IS NOT NULL \
+                     AND max(sequence) > \
+                         min(CASE WHEN kind = 'cancel' THEN sequence END)) \
+                 OR (sum(disposition = 'pending' AND kind <> 'cancel') > 0 \
+                     AND sum(kind = 'cancel') > 0) \
+         )",
+        "runtime control request violates durable cancel dominance",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_pause_checkpoints AS checkpoint \
+             LEFT JOIN scan_runtime_leases AS lease \
+               ON lease.scan_run_id = checkpoint.scan_run_id \
+              AND lease.volume_id = checkpoint.volume_id \
+              AND lease.runtime_lease_key = checkpoint.runtime_lease_key \
+              AND lease.core_session_id = checkpoint.core_session_id \
+              AND lease.mount_session_key = checkpoint.mount_session_key \
+             LEFT JOIN scan_control_requests AS request \
+               ON request.id = checkpoint.pause_request_id \
+              AND request.request_key = checkpoint.pause_request_key \
+              AND request.scan_run_id = checkpoint.scan_run_id \
+              AND request.volume_id = checkpoint.volume_id \
+              AND request.runtime_lease_key = checkpoint.runtime_lease_key \
+             LEFT JOIN scan_runs AS run ON run.id = checkpoint.scan_run_id \
+             WHERE lease.scan_run_id IS NULL OR request.id IS NULL OR run.id IS NULL \
+                OR request.kind <> 'pause' OR request.disposition <> 'acknowledged' \
+                OR request.pause_checkpoint_write_key <> checkpoint.write_key \
+                OR request.pause_checkpoint_payload_digest <> checkpoint.payload_digest \
+                OR request.ack_checkpoint_generation <> checkpoint.generation \
+                OR request.ack_job_state_version <> checkpoint.job_state_version \
+                OR request.ack_run_state_version <> checkpoint.run_state_version \
+                OR request.expected_job_state_version + 1 \
+                   <> checkpoint.job_state_version \
+                OR request.expected_run_state_version + 1 \
+                   <> checkpoint.run_state_version \
+                OR checkpoint.job_state_version > ( \
+                    SELECT job.state_version FROM scan_jobs AS job \
+                    WHERE job.id = lease.scan_job_id \
+                ) \
+                OR checkpoint.run_state_version > run.state_version \
+                OR checkpoint.discovered_count > run.discovered_count \
+                OR checkpoint.fingerprinted_count > run.fingerprinted_count \
+                OR checkpoint.error_count > run.error_count \
+                OR checkpoint.logical_bytes_seen > run.logical_bytes_seen \
+                OR checkpoint.saved_at_ms < request.requested_at_ms \
+                OR length(checkpoint.write_key) <> 32 \
+                OR length(checkpoint.payload_digest) <> 32 \
+                OR length(checkpoint.work_plan_digest) <> 32 \
+                OR length(checkpoint.evidence_manifest_digest) <> 32 \
+                OR length(CAST(checkpoint.cursor_json AS BLOB)) NOT BETWEEN 2 AND 16384 \
+                OR CASE WHEN json_valid(checkpoint.cursor_json) THEN ( \
+                       json_type(checkpoint.cursor_json) <> 'object' \
+                       OR checkpoint.cursor_json <> json(checkpoint.cursor_json) \
+                       OR (SELECT count(*) FROM json_each(checkpoint.cursor_json)) <> 3 \
+                       OR (SELECT count(*) FROM json_each(checkpoint.cursor_json) \
+                           WHERE key = 'stage' AND type = 'text' \
+                             AND value = 'enumeration') <> 1 \
+                       OR (SELECT count(*) FROM json_each(checkpoint.cursor_json) \
+                           WHERE key = 'next_directory_ordinal' AND type = 'integer' \
+                             AND atom BETWEEN 0 AND 9223372036854775807) <> 1 \
+                       OR (SELECT count(*) FROM json_each(checkpoint.cursor_json) \
+                           WHERE key = 'next_file_ordinal' AND type = 'integer' \
+                             AND atom BETWEEN 0 AND 9223372036854775807) <> 1 \
+                       OR json_extract(checkpoint.cursor_json, \
+                                       '$.next_directory_ordinal') > ( \
+                           lease.directory_evidence_count \
+                       ) \
+                       OR json_extract(checkpoint.cursor_json, \
+                                       '$.next_file_ordinal') > ( \
+                           lease.file_evidence_count \
+                       ) \
+                   ) ELSE 1 END \
+         )",
+        "pause checkpoint is not a closed typed projection of lease-bound evidence",
+    )?;
+    reject_if_exists(
+        connection,
+        "SELECT EXISTS( \
+             SELECT 1 FROM scan_runtime_leases AS lease \
+             JOIN scan_runs AS run ON run.id = lease.scan_run_id \
+             JOIN scan_jobs AS job ON job.id = lease.scan_job_id \
+             WHERE (lease.state IN ('releasing', 'released') AND EXISTS ( \
+                       SELECT 1 FROM scan_control_requests AS request \
+                       WHERE request.scan_run_id = lease.scan_run_id \
+                         AND request.disposition = 'pending' \
+                   )) \
+                OR (lease.state = 'active' AND run.state = 'paused' AND ( \
+                       NOT EXISTS ( \
+                           SELECT 1 FROM scan_pause_checkpoints AS checkpoint \
+                           WHERE checkpoint.scan_run_id = lease.scan_run_id \
+                             AND checkpoint.generation = ( \
+                                 SELECT max(latest.generation) \
+                                 FROM scan_pause_checkpoints AS latest \
+                                 WHERE latest.scan_run_id = lease.scan_run_id \
+                             ) \
+                             AND checkpoint.pause_request_id = ( \
+                                 SELECT latest_request.id \
+                                 FROM scan_control_requests AS latest_request \
+                                 WHERE latest_request.scan_run_id = lease.scan_run_id \
+                                   AND latest_request.disposition = 'acknowledged' \
+                                 ORDER BY latest_request.sequence DESC LIMIT 1 \
+                             ) \
+                             AND checkpoint.work_plan_digest = lease.work_plan_digest \
+                             AND checkpoint.evidence_manifest_digest = \
+                                 lease.evidence_chain_digest \
+                             AND json_extract(checkpoint.cursor_json, \
+                                              '$.next_directory_ordinal') = \
+                                 lease.directory_evidence_count \
+                             AND json_extract(checkpoint.cursor_json, \
+                                              '$.next_file_ordinal') = \
+                                 lease.file_evidence_count \
+                       ) \
+                       OR COALESCE(( \
+                           SELECT request.kind FROM scan_control_requests AS request \
+                           WHERE request.scan_run_id = lease.scan_run_id \
+                             AND request.disposition = 'acknowledged' \
+                           ORDER BY request.sequence DESC LIMIT 1 \
+                       ), '') <> 'pause' \
+                   )) \
+                OR (lease.state = 'active' AND run.state = 'running' \
+                    AND EXISTS ( \
+                        SELECT 1 FROM scan_control_requests AS acknowledged \
+                        WHERE acknowledged.scan_run_id = lease.scan_run_id \
+                          AND acknowledged.disposition = 'acknowledged' \
+                    ) \
+                    AND COALESCE(( \
+                        SELECT request.kind FROM scan_control_requests AS request \
+                        WHERE request.scan_run_id = lease.scan_run_id \
+                          AND request.disposition = 'acknowledged' \
+                        ORDER BY request.sequence DESC LIMIT 1 \
+                    ), '') <> 'resume') \
+         )",
+        "runtime lease current state is inconsistent with control/checkpoint evidence",
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT scan_run_id, runtime_lease_key, core_session_id, work_plan_digest, \
+                directory_evidence_count, file_evidence_count \
+         FROM scan_runtime_leases ORDER BY scan_run_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut leases = Vec::new();
+    while let Some(row) = rows.next()? {
+        leases.push((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+        ));
+    }
+    drop(rows);
+    drop(statement);
+    for lease in leases {
+        let lease_key: [u8; 32] = lease.1.try_into().map_err(|_| {
+            StoreError::MigrationHistoryMismatch("runtime lease key length is invalid".into())
+        })?;
+        let core_session_id: [u8; 32] = lease.2.try_into().map_err(|_| {
+            StoreError::MigrationHistoryMismatch("runtime core session id length is invalid".into())
+        })?;
+        let work_plan_digest = crate::repository::compute_runtime_work_plan_digest(
+            connection,
+            lease.0,
+            &lease_key,
+            &core_session_id,
+        )?;
+        crate::repository::validate_runtime_checkpoint_payload_history(
+            connection,
+            lease.0,
+            &work_plan_digest,
+            lease.4,
+            lease.5,
+        )?;
+        if lease.3.as_slice() != work_plan_digest {
+            return Err(StoreError::MigrationHistoryMismatch(
+                "runtime lease work plan does not match its immutable session binding".into(),
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -3895,6 +4485,7 @@ mod tests {
         apply_migration(&mut connection, &MIGRATIONS[4], 1_004, false)?;
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[7], 1_007, false)?;
         validate_current_schema(&connection)?;
         let (encoding, raw): (String, Vec<u8>) = connection.query_row(
             "SELECT path_encoding, relative_path_raw FROM media_file_paths WHERE media_file_id = 1",
@@ -4264,6 +4855,7 @@ mod tests {
         }
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[7], 1_007, false)?;
         validate_current_schema(&connection)?;
         Ok(())
     }
@@ -4301,6 +4893,7 @@ mod tests {
         assert_eq!((scope.0.as_str(), scope.1), ("legacy_session_v4", 0));
         apply_migration(&mut connection, &MIGRATIONS[5], 1_005, false)?;
         apply_migration(&mut connection, &MIGRATIONS[6], 1_006, false)?;
+        apply_migration(&mut connection, &MIGRATIONS[7], 1_007, false)?;
         validate_current_schema(&connection)?;
         Ok(())
     }

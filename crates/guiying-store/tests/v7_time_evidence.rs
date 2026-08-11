@@ -1,10 +1,10 @@
 use guiying_store::{
     compute_capture_time_analysis_manifest, compute_exact_group_manifest,
     compute_exact_group_member_leaf, compute_metadata_report_manifest, compute_time_lineage_key,
-    compute_time_policy_context_digest, compute_time_source_key, BeginExactGroupInput,
-    BeginTimeSessionInput, BuildKey, CapabilityProfileInput, CaptureTimeAnalysisManifestPlan,
-    CaptureTimeAnalysisSourceInput, CaptureTimeCandidateInput, CaptureTimeConfidence,
-    CaptureTimeDecision, CaptureTimeEvidenceGate, CaptureTimeEvidenceKind,
+    compute_time_policy_context_digest, compute_time_source_key, AcquireRuntimeLeaseInput,
+    BeginExactGroupInput, BeginTimeSessionInput, BuildKey, CapabilityProfileInput,
+    CaptureTimeAnalysisManifestPlan, CaptureTimeAnalysisSourceInput, CaptureTimeCandidateInput,
+    CaptureTimeConfidence, CaptureTimeDecision, CaptureTimeEvidenceGate, CaptureTimeEvidenceKind,
     CaptureTimeMemberAssessmentInput, CaptureTimeObservationInput,
     CaptureTimeObservationInterpretationInput, CaptureTimeRecommendationInput, CaptureWallTime,
     CoreCoverageSealDigest, CoreDirectoryManifest, CoreDirectoryObservationInput,
@@ -12,16 +12,16 @@ use guiying_store::{
     CoverageStatus, DirectoryObjectSignature, EvidenceParserIdentity, EvidenceReader,
     ExactGroupManifestMember, ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey,
     FileTimeRelation, FileTimestampParts, FingerprintReadOrigin, FreshFingerprintInput,
-    FreshFingerprintKind, ManifestDigest, MetadataDetectedFormat, MetadataExtractionLimitsInput,
-    MetadataExtractionStatus, MetadataExtractionUsageInput, MetadataFieldInput,
-    MetadataLocatorInput, MetadataReportDigest, MetadataReportManifestPlan,
+    FreshFingerprintKind, LeasedScanTerminalOutcome, ManifestDigest, MetadataDetectedFormat,
+    MetadataExtractionLimitsInput, MetadataExtractionStatus, MetadataExtractionUsageInput,
+    MetadataFieldInput, MetadataLocatorInput, MetadataReportDigest, MetadataReportManifestPlan,
     MetadataSourceRevalidationInput, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey,
     NewBoundScanRun, NewScopedScanJob, NormalizedCaptureTime, ObservationInput, ParametersHash,
-    RootObjectSignature, RootScopeKey, RunEvidenceGuard, ScanStage, SourceSignature, StablePathKey,
-    Store, StoreError, StoredMetadataEncoding, StoredMetadataFieldKind, StoredTiffByteOrder,
-    TicketSortKey, TimeDonorEligibility, TimeEvidenceManifestDigest, TimeExactFingerprintMaterial,
-    TimeSessionBudget, TimeSessionKey, TimeSessionOutcome, TimeSourceKeyMaterial,
-    VolumeCoverageManifest, VolumeInput,
+    RootObjectSignature, RootScopeKey, RunEvidenceGuard, RuntimeLeaseGuard, RuntimeLeaseKey,
+    ScanStage, SourceSignature, StablePathKey, Store, StoreError, StoredMetadataEncoding,
+    StoredMetadataFieldKind, StoredTiffByteOrder, TicketSortKey, TimeDonorEligibility,
+    TimeEvidenceManifestDigest, TimeExactFingerprintMaterial, TimeSessionBudget, TimeSessionKey,
+    TimeSessionOutcome, TimeSourceKeyMaterial, VolumeCoverageManifest, VolumeInput,
 };
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags};
@@ -30,9 +30,15 @@ use tempfile::TempDir;
 
 const ALGORITHM: &str = "blake3";
 
+fn core_ticket_sort_key(ticket_blob: &[u8]) -> TicketSortKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.core-ticket-id.v1\0");
+    hasher.update(ticket_blob);
+    TicketSortKey::from_core_evidence(*hasher.finalize().as_bytes())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RunningRun {
-    job_id: i64,
     run_id: i64,
     guard: RunEvidenceGuard,
 }
@@ -59,25 +65,27 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         .map(|(index, observation)| {
             let index_u8 = u8::try_from(index).expect("fixture index fits in u8");
             let index_i64 = i64::try_from(index).expect("fixture index fits in i64");
+            let ticket_blob = vec![80 + index_u8; 48];
             CoreFileObservationInput {
                 observation: observation.clone(),
-                ticket_blob: vec![80 + index_u8; 48],
-                ticket_sort_key: TicketSortKey::from_core_evidence([90 + index_u8; 32]),
+                ticket_sort_key: core_ticket_sort_key(&ticket_blob),
+                ticket_blob,
                 ticket_created_at_ms: 180 + index_i64,
             }
         })
         .collect::<Vec<_>>();
+    let directory_ticket_blob = vec![75; 48];
     let directory = CoreDirectoryObservationInput {
         root_relative_path_raw: Vec::new(),
         path_encoding: "utf8".into(),
         display_path: String::new(),
         source_signature: SourceSignature::from_runtime_evidence([73; 32]),
         directory_object_signature: DirectoryObjectSignature::from_runtime_evidence([74; 32]),
-        ticket_blob: vec![75; 48],
-        ticket_sort_key: TicketSortKey::from_core_evidence([76; 32]),
+        ticket_sort_key: core_ticket_sort_key(&directory_ticket_blob),
+        ticket_blob: directory_ticket_blob,
         observed_at_ms: 182,
     };
-    let observation_ids = store.write_transaction(|repository| {
+    let (runtime_lease, observation_ids) = store.write_transaction(|repository| {
         repository.bind_core_session(
             &run.guard,
             &CoreSessionInput {
@@ -87,11 +95,19 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
                 bound_at_ms: 151,
             },
         )?;
+        let runtime_lease = repository.acquire_runtime_lease(
+            &run.guard,
+            &AcquireRuntimeLeaseInput::new(
+                RuntimeLeaseKey::from_runtime_evidence([71; 32]),
+                core_session_id,
+                160,
+            )?,
+        )?;
         let ids = repository.record_core_observation_batch(&run.guard, &core_session_id, &files)?;
         repository.record_core_directory_batch(&run.guard, &core_session_id, &[directory])?;
         repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 3, 384, 200)?;
         repository.seal_scan_stage(&run.guard, ScanStage::Sampling, 0, 0, 210)?;
-        Ok(ids)
+        Ok((runtime_lease, ids))
     })?;
     let parameters_hash = ParametersHash::from_runtime_evidence([41; 32]);
     let fingerprints = observation_ids
@@ -244,15 +260,13 @@ fn v7_full_time_evidence_pipeline_is_guarded_sealed_and_historical_only(
         Err(StoreError::ConcurrencyConflict { .. })
     ));
     store.write_transaction(|repository| {
-        repository.transition_bound_scan_job_and_run(
-            &run.guard,
-            run.job_id,
+        repository.transition_leased_scan_job_and_run(
+            &runtime_lease,
             "running",
             1,
             "running",
             1,
-            "completed",
-            "completed",
+            LeasedScanTerminalOutcome::Completed,
             800,
             None,
         )?;
@@ -1511,12 +1525,12 @@ fn long_lived_evidence_reader_observes_later_writer_commit_and_wal_rotation(
     let temporary = TempDir::new()?;
     let database_path = temporary.path().join("v7-live-history-reader.sqlite3");
     let mut writer = Store::open_or_create(&database_path)?;
-    let run = prepare_empty_exact_sealed_run(&mut writer, "live-reader", 9, 91)?;
+    let (run, runtime_lease) = prepare_empty_exact_sealed_run(&mut writer, "live-reader", 9, 91)?;
 
     let reader = EvidenceReader::open_existing_read_only(&database_path)?;
     assert!(reader.list_scan_history_page(None, 64)?.items.is_empty());
 
-    finish_empty_history_run(&mut writer, &run, 1_060)?;
+    finish_empty_history_run(&mut writer, &runtime_lease, 1_060)?;
     reader.revalidate_source_identity()?;
     let committed_page = reader.list_scan_history_page(None, 64)?;
     assert_eq!(committed_page.items.len(), 1);
@@ -1610,11 +1624,7 @@ fn create_running_run(
         repository.transition_bound_scan_job_and_run(
             &guard, job_id, "queued", 0, "queued", 0, "running", "running", 150, None,
         )?;
-        Ok(RunningRun {
-            job_id,
-            run_id,
-            guard,
-        })
+        Ok(RunningRun { run_id, guard })
     })
 }
 
@@ -1624,8 +1634,9 @@ fn complete_empty_history_run(
     session_byte: u8,
     core_byte: u8,
 ) -> Result<RunningRun, StoreError> {
-    let run = prepare_empty_exact_sealed_run(store, prefix, session_byte, core_byte)?;
-    finish_empty_history_run(store, &run, 1_060)?;
+    let (run, runtime_lease) =
+        prepare_empty_exact_sealed_run(store, prefix, session_byte, core_byte)?;
+    finish_empty_history_run(store, &runtime_lease, 1_060)?;
     Ok(run)
 }
 
@@ -1634,10 +1645,10 @@ fn prepare_empty_exact_sealed_run(
     prefix: &str,
     session_byte: u8,
     core_byte: u8,
-) -> Result<RunningRun, StoreError> {
+) -> Result<(RunningRun, RuntimeLeaseGuard), StoreError> {
     let run = create_running_run(store, prefix, session_byte)?;
     let core_session_id = CoreSessionId::from_runtime_evidence([core_byte; 32]);
-    store.write_transaction(|repository| {
+    let runtime_lease = store.write_transaction(|repository| {
         repository.bind_core_session(
             &run.guard,
             &CoreSessionInput {
@@ -1646,6 +1657,14 @@ fn prepare_empty_exact_sealed_run(
                 root_source_signature: SourceSignature::from_runtime_evidence([core_byte + 1; 32]),
                 bound_at_ms: 1_000,
             },
+        )?;
+        let runtime_lease = repository.acquire_runtime_lease(
+            &run.guard,
+            &AcquireRuntimeLeaseInput::new(
+                RuntimeLeaseKey::from_runtime_evidence([core_byte + 5; 32]),
+                core_session_id,
+                1_005,
+            )?,
         )?;
         repository.seal_scan_stage(&run.guard, ScanStage::Enumeration, 0, 0, 1_010)?;
         repository.seal_scan_stage(&run.guard, ScanStage::Sampling, 0, 0, 1_020)?;
@@ -1672,26 +1691,24 @@ fn prepare_empty_exact_sealed_run(
             },
         )?;
         repository.seal_scan_stage(&run.guard, ScanStage::ExactVerification, 0, 0, 1_050)?;
-        Ok(())
+        Ok(runtime_lease)
     })?;
-    Ok(run)
+    Ok((run, runtime_lease))
 }
 
 fn finish_empty_history_run(
     store: &mut Store,
-    run: &RunningRun,
+    runtime_lease: &RuntimeLeaseGuard,
     finished_at_ms: i64,
 ) -> Result<(), StoreError> {
     store.write_transaction(|repository| {
-        repository.transition_bound_scan_job_and_run(
-            &run.guard,
-            run.job_id,
+        repository.transition_leased_scan_job_and_run(
+            runtime_lease,
             "running",
             1,
             "running",
             1,
-            "completed",
-            "completed",
+            LeasedScanTerminalOutcome::Completed,
             finished_at_ms,
             None,
         )?;

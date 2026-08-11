@@ -11,10 +11,10 @@ use tempfile::TempDir;
 #[cfg(unix)]
 const APPLICATION_ID: i32 = 0x4755_5949;
 #[cfg(unix)]
-const PRE_V7_PREFIX: &str = ".guiying-pre-v7-v6-";
+const PRE_MIGRATION_V6_TO_V8_PREFIX: &str = ".guiying-pre-migration-from-v6-to-v8-";
 
 #[cfg(unix)]
-const MIGRATIONS: [(&str, &str); 6] = [
+const MIGRATIONS: [(&str, &str); 7] = [
     (
         "initial_data_model",
         include_str!("../src/migrations/0001_init.sql"),
@@ -39,27 +39,31 @@ const MIGRATIONS: [(&str, &str); 6] = [
         "runtime_stream_evidence",
         include_str!("../src/migrations/0006_runtime_stream_evidence.sql"),
     ),
+    (
+        "capture_time_evidence",
+        include_str!("../src/migrations/0007_capture_time_evidence.sql"),
+    ),
 ];
 
 #[cfg(unix)]
 #[test]
-fn v6_open_publishes_one_verified_pre_v7_snapshot_before_upgrade(
+fn v6_open_publishes_one_verified_pre_migration_snapshot_before_upgrade(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let private_parent = fs::canonicalize(temporary.path())?;
     let database = private_parent.join("managed-v6.sqlite3");
     create_empty_managed_v6(&database)?;
 
-    let existing = private_parent.join(format!("{PRE_V7_PREFIX}existing.sqlite3"));
+    let existing = private_parent.join(format!("{PRE_MIGRATION_V6_TO_V8_PREFIX}existing.sqlite3"));
     let sentinel = b"existing snapshot name must never be overwritten";
     fs::write(&existing, sentinel)?;
     make_private(&existing)?;
 
     let store = Store::open_existing(&database)?;
-    assert_eq!(store.schema_version()?, 7);
+    assert_eq!(store.schema_version()?, 8);
     store.close()?;
 
-    let candidates = pre_v7_candidates(&private_parent)?;
+    let candidates = pre_migration_candidates(&private_parent, 6, 8)?;
     assert_eq!(
         candidates.len(),
         2,
@@ -69,8 +73,8 @@ fn v6_open_publishes_one_verified_pre_v7_snapshot_before_upgrade(
     let snapshot = candidates
         .iter()
         .find(|path| path.as_path() != existing)
-        .ok_or("pre-v7 snapshot missing")?;
-    assert_pre_v7_snapshot(snapshot, 6)?;
+        .ok_or("pre-migration snapshot missing")?;
+    assert_pre_migration_snapshot(snapshot, 6)?;
 
     #[cfg(unix)]
     {
@@ -80,16 +84,16 @@ fn v6_open_publishes_one_verified_pre_v7_snapshot_before_upgrade(
 
     Store::open_existing(&database)?.close()?;
     assert_eq!(
-        pre_v7_candidates(&private_parent)?,
+        pre_migration_candidates(&private_parent, 6, 8)?,
         candidates,
-        "opening an already-v7 database must not create another snapshot"
+        "opening an already-v8 database must not create another snapshot"
     );
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn every_supported_pre_v7_version_gets_an_exact_self_contained_snapshot(
+fn every_supported_pre_migration_version_gets_an_exact_self_contained_snapshot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for expected_version in 1_i64..=6 {
         let temporary = TempDir::new()?;
@@ -97,13 +101,43 @@ fn every_supported_pre_v7_version_gets_an_exact_self_contained_snapshot(
         let database = parent.join(format!("managed-v{expected_version}.sqlite3"));
         create_empty_managed_version(&database, expected_version)?;
 
-        Store::open_existing(&database)?.close()?;
+        let store = Store::open_existing(&database)?;
+        assert_eq!(store.schema_version()?, 8);
+        store.close()?;
 
-        let prefix = format!(".guiying-pre-v7-v{expected_version}-");
+        let prefix = pre_migration_prefix(expected_version, 8);
         let snapshots = candidates_with_prefix(&parent, &prefix)?;
         assert_eq!(snapshots.len(), 1, "version {expected_version}");
-        assert_pre_v7_snapshot(&snapshots[0], expected_version)?;
+        assert_pre_migration_snapshot(&snapshots[0], expected_version)?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn v7_to_v8_open_snapshots_exact_v7_then_migrates_once() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let parent = fs::canonicalize(temporary.path())?;
+    let database = parent.join("managed-v7.sqlite3");
+    create_empty_managed_version(&database, 7)?;
+
+    let store = Store::open_existing(&database)?;
+    assert_eq!(store.schema_version()?, 8);
+    store.close()?;
+
+    let snapshots = pre_migration_candidates(&parent, 7, 8)?;
+    assert_eq!(snapshots.len(), 1);
+    assert_pre_migration_snapshot(&snapshots[0], 7)?;
+    assert_latest_source_after_migration(&database)?;
+
+    let reopened = Store::open_existing(&database)?;
+    assert_eq!(reopened.schema_version()?, 8);
+    reopened.close()?;
+    assert_eq!(
+        pre_migration_candidates(&parent, 7, 8)?,
+        snapshots,
+        "reopening an already-v8 source must not publish another snapshot"
+    );
     Ok(())
 }
 
@@ -175,7 +209,7 @@ fn unknown_source_sidecar_fails_closed_before_sqlite_open() -> Result<(), Box<dy
     assert!(matches!(error, StoreError::PreV7SourceFamilyUnsafe { .. }));
     assert_eq!(fs::read(&database)?, before);
     assert_eq!(fs::read(&unknown)?, sentinel);
-    assert!(pre_v7_candidates(&parent)?.is_empty());
+    assert!(pre_migration_candidates(&parent, 6, 8)?.is_empty());
     Ok(())
 }
 
@@ -203,7 +237,7 @@ fn simultaneous_wal_and_journal_fail_closed_before_sqlite_open(
     assert_eq!(fs::read(&database)?, before);
     assert_eq!(fs::read(&wal)?, b"WAL sentinel");
     assert_eq!(fs::read(&journal)?, b"journal sentinel");
-    assert!(pre_v7_candidates(&parent)?.is_empty());
+    assert!(pre_migration_candidates(&parent, 6, 8)?.is_empty());
     Ok(())
 }
 
@@ -233,9 +267,9 @@ fn crash_wal_without_shm_is_recovered_into_the_snapshot() -> Result<(), Box<dyn 
 
     Store::open_existing(&database)?.close()?;
 
-    let snapshots = candidates_with_prefix(&parent, PRE_V7_PREFIX)?;
+    let snapshots = candidates_with_prefix(&parent, PRE_MIGRATION_V6_TO_V8_PREFIX)?;
     assert_eq!(snapshots.len(), 1);
-    assert_pre_v7_snapshot(&snapshots[0], 6)?;
+    assert_pre_migration_snapshot(&snapshots[0], 6)?;
     assert_eq!(migration_applied_at(&snapshots[0], 1)?, 424_242);
     assert_eq!(migration_applied_at(&database, 1)?, 424_242);
     Ok(())
@@ -259,9 +293,9 @@ fn hot_rollback_journal_is_recovered_only_on_the_isolated_clone(
 
     Store::open_existing(&database)?.close()?;
 
-    let snapshots = candidates_with_prefix(&parent, PRE_V7_PREFIX)?;
+    let snapshots = candidates_with_prefix(&parent, PRE_MIGRATION_V6_TO_V8_PREFIX)?;
     assert_eq!(snapshots.len(), 1);
-    assert_pre_v7_snapshot(&snapshots[0], 6)?;
+    assert_pre_migration_snapshot(&snapshots[0], 6)?;
     assert_eq!(migration_checksum(&snapshots[0], 1)?, checksum_before);
     assert_eq!(migration_checksum(&database, 1)?, checksum_before);
     Ok(())
@@ -269,12 +303,12 @@ fn hot_rollback_journal_is_recovered_only_on_the_isolated_clone(
 
 #[cfg(unix)]
 #[test]
-fn pre_v7_crash_fixture_child() {
-    let Ok(mode) = std::env::var("GUIYING_PRE_V7_CRASH_MODE") else {
+fn pre_migration_crash_fixture_child() {
+    let Ok(mode) = std::env::var("GUIYING_PRE_MIGRATION_CRASH_MODE") else {
         return;
     };
     let path = PathBuf::from(
-        std::env::var_os("GUIYING_PRE_V7_CRASH_PATH")
+        std::env::var_os("GUIYING_PRE_MIGRATION_CRASH_PATH")
             .expect("crash fixture database path must be provided"),
     );
     let connection = Connection::open(&path).expect("crash fixture must open");
@@ -340,7 +374,7 @@ fn pre_v7_crash_fixture_child() {
 }
 
 #[cfg(unix)]
-fn assert_pre_v7_snapshot(
+fn assert_pre_migration_snapshot(
     path: &Path,
     expected_version: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -366,6 +400,15 @@ fn assert_pre_v7_snapshot(
         [],
         |row| row.get(0),
     )?;
+    let v8_object_count: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_schema \
+         WHERE name IN ( \
+             'scan_runtime_leases', 'scan_control_requests', 'scan_pause_checkpoints', \
+             'ux_scan_run_sessions_mount_binding_v8' \
+         ) OR name GLOB '*_v8'",
+        [],
+        |row| row.get(0),
+    )?;
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_key_violations: i64 =
         connection.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
@@ -374,15 +417,59 @@ fn assert_pre_v7_snapshot(
     assert_eq!(version, expected_version);
     assert_eq!(application_id, i64::from(APPLICATION_ID));
     assert_eq!(migration_count, expected_version);
-    assert_eq!(v7_table_count, 0);
+    assert_eq!(v7_table_count, if expected_version >= 7 { 1 } else { 0 });
+    assert_eq!(v8_object_count, 0);
     assert_eq!(integrity, "ok");
     assert_eq!(foreign_key_violations, 0);
     Ok(())
 }
 
 #[cfg(unix)]
-fn pre_v7_candidates(parent: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    candidates_with_prefix(parent, PRE_V7_PREFIX)
+fn assert_latest_source_after_migration(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let connection = Connection::open_with_flags(path, flags)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let migration_count: i64 = connection.query_row(
+        "SELECT count(*) FROM guiying_schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    let v8_tables: i64 = connection.query_row(
+        "SELECT count(*) FROM pragma_table_list \
+         WHERE name IN ( \
+             'scan_runtime_leases', 'scan_control_requests', 'scan_pause_checkpoints' \
+         ) AND strict = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    let foreign_key_violations: i64 =
+        connection.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(version, 8);
+    assert_eq!(migration_count, 8);
+    assert_eq!(v8_tables, 3);
+    assert_eq!(integrity, "ok");
+    assert_eq!(foreign_key_violations, 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pre_migration_prefix(source_version: i64, target_version: i64) -> String {
+    format!(".guiying-pre-migration-from-v{source_version}-to-v{target_version}-")
+}
+
+#[cfg(unix)]
+fn pre_migration_candidates(
+    parent: &Path,
+    source_version: i64,
+    target_version: i64,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    candidates_with_prefix(
+        parent,
+        &pre_migration_prefix(source_version, target_version),
+    )
 }
 
 #[cfg(unix)]
@@ -413,10 +500,10 @@ fn family_path(database: &Path, suffix: &str) -> PathBuf {
 fn run_crash_fixture(mode: &str, database: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let status = Command::new(std::env::current_exe()?)
         .arg("--exact")
-        .arg("pre_v7_crash_fixture_child")
+        .arg("pre_migration_crash_fixture_child")
         .arg("--nocapture")
-        .env("GUIYING_PRE_V7_CRASH_MODE", mode)
-        .env("GUIYING_PRE_V7_CRASH_PATH", database)
+        .env("GUIYING_PRE_MIGRATION_CRASH_MODE", mode)
+        .env("GUIYING_PRE_MIGRATION_CRASH_PATH", database)
         .status()?;
     assert!(!status.success(), "crash fixture exited cleanly");
     Ok(())

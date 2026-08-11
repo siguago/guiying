@@ -29,7 +29,11 @@ fn sealed_metadata_review_is_scoped_bounded_and_lossless() -> Result<(), Box<dyn
     let store = Store::open_or_create(&database_path)?;
     seed_read_fixture(&database_path)?;
 
-    assert_eq!(store.schema_version()?, 7, "read APIs must not require v8");
+    assert_eq!(
+        store.schema_version()?,
+        8,
+        "capture-time read APIs must remain available on the latest schema"
+    );
 
     let reports = store.list_capture_time_metadata_reports_page(
         SCAN_RUN_ID,

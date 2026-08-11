@@ -188,8 +188,10 @@ pub enum StoreError {
     #[error("backup parent directory is not private or does not share the database owner: {0:?}")]
     UnsafeBackupParent(PathBuf),
 
+    // The `PreV7*` variant names are retained for source compatibility. Their
+    // contract applies to every managed source older than the current schema.
     #[error(
-        "pre-v7 backup {role} schema version mismatch: expected {expected}, observed {observed}"
+        "pre-migration snapshot {role} schema version mismatch: expected {expected}, observed {observed}"
     )]
     PreV7BackupVersionMismatch {
         role: &'static str,
@@ -197,25 +199,29 @@ pub enum StoreError {
         observed: i64,
     },
 
-    #[error("could not allocate a unique no-clobber pre-v7 backup name in {0:?}")]
+    #[error("could not allocate a unique no-clobber pre-migration snapshot name in {0:?}")]
     PreV7BackupNameExhausted(PathBuf),
 
-    #[error("unsafe pre-v7 source file family member at {path:?}: {reason}")]
+    #[error("unsafe pre-migration source file family member at {path:?}: {reason}")]
     PreV7SourceFamilyUnsafe { path: PathBuf, reason: String },
 
-    #[error("pre-v7 source file family changed while it was being staged: {0:?}")]
+    #[error("pre-migration source file family changed while it was being staged: {0:?}")]
     PreV7SourceFamilyChanged(PathBuf),
 
-    #[error("pre-v7 source file family requires {bytes} bytes, above the staging limit {limit}")]
+    #[error(
+        "pre-migration source file family requires {bytes} bytes, above the staging limit {limit}"
+    )]
     PreV7StagingLimit { bytes: u64, limit: u64 },
 
-    #[error("pre-v7 staging copy digest mismatch between {source_path:?} and {staged_path:?}")]
+    #[error(
+        "pre-migration staging copy digest mismatch between {source_path:?} and {staged_path:?}"
+    )]
     PreV7StagingDigestMismatch {
         source_path: PathBuf,
         staged_path: PathBuf,
     },
 
-    #[error("pre-v7 staging directory could not be removed: {0:?}")]
+    #[error("pre-migration staging directory could not be removed: {0:?}")]
     PreV7StagingCleanupFailed(PathBuf),
 
     #[error("backup destination family member already exists: {0:?}")]
@@ -224,7 +230,9 @@ pub enum StoreError {
     #[error("backup destination collides with the source database family: {0:?}")]
     BackupDestinationIsSourceFamily(PathBuf),
 
-    #[error("v7 migration/open failed after durable pre-v7 backup {backup_path:?}: {source}")]
+    #[error(
+        "migration/open failed after durable pre-migration snapshot {backup_path:?}: {source}"
+    )]
     PreV7MigrationFailed {
         backup_path: PathBuf,
         #[source]

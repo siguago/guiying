@@ -1,21 +1,28 @@
 use guiying_store::{
-    compute_exact_group_manifest, compute_exact_group_member_leaf, BeginExactGroupInput, BuildKey,
-    CapabilityProfileInput, CoreCoverageSealDigest, CoreDirectoryManifest,
-    CoreDirectoryObservationInput, CoreFileObservationInput, CoreSessionId, CoreSessionInput,
-    CoverageOutcomeInput, CoverageStatus, DirectoryObjectSignature, ExactGroupManifestMember,
-    ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey, FileTimestampParts,
-    FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind, ManifestDigest,
-    MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue,
-    NewScanJob, NewScanReport, NewScopedScanJob, ObservationInput, ParametersHash, PathKey,
-    RepositoryTx, RootObjectSignature, RootScopeKey, RunEvidenceGuard, ScanCheckpointInput,
-    ScanStage, SourceSignature, StablePathKey, Store, StoreError, TicketSortKey,
-    VolumeCoverageManifest, VolumeInput,
+    compute_exact_group_manifest, compute_exact_group_member_leaf, AcquireRuntimeLeaseInput,
+    BeginExactGroupInput, BuildKey, CapabilityProfileInput, CoreCoverageSealDigest,
+    CoreDirectoryManifest, CoreDirectoryObservationInput, CoreFileObservationInput, CoreSessionId,
+    CoreSessionInput, CoverageOutcomeInput, CoverageStatus, DirectoryObjectSignature,
+    ExactGroupManifestMember, ExactGroupMemberInput, ExactVerificationEdgeInput, FileObjectKey,
+    FileTimestampParts, FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind,
+    ManifestDigest, MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun,
+    NewScanIssue, NewScanJob, NewScanReport, NewScopedScanJob, ObservationInput, ParametersHash,
+    PathKey, RepositoryTx, RootObjectSignature, RootScopeKey, RunEvidenceGuard, RuntimeLeaseKey,
+    ScanCheckpointInput, ScanStage, SourceSignature, StablePathKey, Store, StoreError,
+    TicketSortKey, VolumeCoverageManifest, VolumeInput,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
 use tempfile::TempDir;
 
 const ALGORITHM: &str = "blake3";
+
+fn core_ticket_sort_key(ticket_blob: &[u8]) -> TicketSortKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.core-ticket-id.v1\0");
+    hasher.update(ticket_blob);
+    TicketSortKey::from_core_evidence(*hasher.finalize().as_bytes())
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RunningRun {
@@ -101,13 +108,13 @@ fn v6_core_ticket_coverage_is_required_before_exact_seal() -> Result<(), Box<dyn
         CoreFileObservationInput {
             observation: first.clone(),
             ticket_blob: vec![76; 48],
-            ticket_sort_key: TicketSortKey::from_core_evidence([77; 32]),
+            ticket_sort_key: core_ticket_sort_key(&[76; 48]),
             ticket_created_at_ms: 170,
         },
         CoreFileObservationInput {
             observation: second.clone(),
             ticket_blob: vec![78; 48],
-            ticket_sort_key: TicketSortKey::from_core_evidence([79; 32]),
+            ticket_sort_key: core_ticket_sort_key(&[78; 48]),
             ticket_created_at_ms: 171,
         },
     ];
@@ -119,7 +126,7 @@ fn v6_core_ticket_coverage_is_required_before_exact_seal() -> Result<(), Box<dyn
             source_signature: SourceSignature::from_runtime_evidence([80; 32]),
             directory_object_signature: DirectoryObjectSignature::from_runtime_evidence([81; 32]),
             ticket_blob: vec![82; 48],
-            ticket_sort_key: TicketSortKey::from_core_evidence([83; 32]),
+            ticket_sort_key: core_ticket_sort_key(&[82; 48]),
             observed_at_ms: 172,
         },
         CoreDirectoryObservationInput {
@@ -129,13 +136,21 @@ fn v6_core_ticket_coverage_is_required_before_exact_seal() -> Result<(), Box<dyn
             source_signature: SourceSignature::from_runtime_evidence([84; 32]),
             directory_object_signature: DirectoryObjectSignature::from_runtime_evidence([85; 32]),
             ticket_blob: vec![86; 48],
-            ticket_sort_key: TicketSortKey::from_core_evidence([87; 32]),
+            ticket_sort_key: core_ticket_sort_key(&[86; 48]),
             observed_at_ms: 173,
         },
     ];
     let observation_ids = store.write_transaction(|repository| {
         repository.bind_core_session(&run.guard, &session)?;
         repository.bind_core_session(&run.guard, &session)?;
+        repository.acquire_runtime_lease(
+            &run.guard,
+            &AcquireRuntimeLeaseInput::new(
+                RuntimeLeaseKey::from_runtime_evidence([72; 32]),
+                core_session_id,
+                160,
+            )?,
+        )?;
         let first_ids =
             repository.record_core_observation_batch(&run.guard, &core_session_id, &files)?;
         let repeated_ids =
@@ -150,6 +165,7 @@ fn v6_core_ticket_coverage_is_required_before_exact_seal() -> Result<(), Box<dyn
     })?;
     let mut conflicting_files = files.clone();
     conflicting_files[0].ticket_blob[0] ^= 1;
+    conflicting_files[0].ticket_sort_key = core_ticket_sort_key(&conflicting_files[0].ticket_blob);
     let conflict = store
         .write_transaction(|repository| {
             repository.record_core_observation_batch(

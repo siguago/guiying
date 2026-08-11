@@ -76,6 +76,7 @@ pub struct Store {
     settings: StoreSettings,
     store_instance_key: [u8; 32],
     live_core_sessions: HashSet<(i64, [u8; 32])>,
+    live_runtime_leases: HashSet<(i64, [u8; 32], [u8; 32])>,
 }
 
 impl Store {
@@ -209,15 +210,36 @@ impl Store {
         callback: impl FnOnce(&mut RepositoryTx<'_>) -> Result<T>,
     ) -> Result<T> {
         self.verify_bound_database()?;
+        let live_core_sessions = self.live_core_sessions.clone();
+        let live_runtime_leases = self.live_runtime_leases.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (callback_result, poisoned, bound_core_sessions) = {
-            let mut repository = RepositoryTx::new_bound(&transaction, self.store_instance_key);
+        let (
+            callback_result,
+            poisoned,
+            bound_core_sessions,
+            acquired_runtime_leases,
+            released_runtime_leases,
+        ) = {
+            let mut repository = RepositoryTx::new_bound(
+                &transaction,
+                self.store_instance_key,
+                live_core_sessions,
+                live_runtime_leases,
+            );
             let result = callback(&mut repository);
             let poisoned = repository.is_poisoned();
             let bound_core_sessions = repository.take_bound_core_sessions();
-            (result, poisoned, bound_core_sessions)
+            let acquired_runtime_leases = repository.take_acquired_runtime_leases();
+            let released_runtime_leases = repository.take_released_runtime_leases();
+            (
+                result,
+                poisoned,
+                bound_core_sessions,
+                acquired_runtime_leases,
+                released_runtime_leases,
+            )
         };
         let value = callback_result?;
         if poisoned {
@@ -225,6 +247,10 @@ impl Store {
         }
         transaction.commit()?;
         self.live_core_sessions.extend(bound_core_sessions);
+        self.live_runtime_leases.extend(acquired_runtime_leases);
+        for released in released_runtime_leases {
+            self.live_runtime_leases.remove(&released);
+        }
         self.verify_bound_database()?;
         Ok(value)
     }
@@ -3395,6 +3421,7 @@ impl Store {
             settings,
             store_instance_key: fresh_store_instance_key(),
             live_core_sessions: HashSet::new(),
+            live_runtime_leases: HashSet::new(),
         })
     }
 
@@ -3529,6 +3556,7 @@ impl Store {
                 settings,
                 store_instance_key: fresh_store_instance_key(),
                 live_core_sessions: HashSet::new(),
+                live_runtime_leases: HashSet::new(),
             })
         })();
 
@@ -6643,7 +6671,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    const PRE_V7_TEST_TABLES_REVERSE: [&str; 13] = [
+    const V7_TEST_TABLES_REVERSE: [&str; 13] = [
         "capture_time_recommendations",
         "capture_time_member_assessments",
         "capture_time_policy_issues",
@@ -6730,12 +6758,13 @@ mod tests {
     }
 
     #[test]
-    fn pre_v7_backup_failure_prevents_read_write_open_and_migration() -> crate::Result<()> {
+    fn pre_migration_snapshot_failure_prevents_read_write_open_and_migration() -> crate::Result<()>
+    {
         let temporary = TempDir::new()
             .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
         let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
             StoreError::io(
-                "canonicalizing pre-v7 test directory",
+                "canonicalizing pre-migration test directory",
                 temporary.path(),
                 error,
             )
@@ -6778,19 +6807,19 @@ mod tests {
             ))?,
             before_bytes
         );
-        assert!(pre_v7_test_backups(&parent)?.is_empty());
+        assert!(pre_migration_test_snapshots(&parent)?.is_empty());
         assert_database_sidecars_absent_for_test(&database)?;
         Ok(())
     }
 
     #[test]
-    fn pre_v7_source_path_replacement_after_backup_never_reaches_read_write_open(
+    fn pre_migration_source_path_replacement_after_snapshot_never_reaches_read_write_open(
     ) -> crate::Result<()> {
         let temporary = TempDir::new()
             .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
         let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
             StoreError::io(
-                "canonicalizing pre-v7 identity test directory",
+                "canonicalizing pre-migration identity test directory",
                 temporary.path(),
                 error,
             )
@@ -6808,17 +6837,25 @@ mod tests {
                 let prepared =
                     crate::backup::prepare_existing_database_before_sqlite_open(source_path)?;
                 std::fs::rename(source_path, &moved).map_err(|error| {
-                    StoreError::io("moving pre-v7 identity fixture", source_path, error)
+                    StoreError::io("moving pre-migration identity fixture", source_path, error)
                 })?;
                 std::fs::File::create(source_path).map_err(|error| {
-                    StoreError::io("replacing pre-v7 identity fixture", source_path, error)
+                    StoreError::io(
+                        "replacing pre-migration identity fixture",
+                        source_path,
+                        error,
+                    )
                 })?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(source_path, std::fs::Permissions::from_mode(0o600))
                         .map_err(|error| {
-                        StoreError::io("setting pre-v7 replacement permissions", source_path, error)
+                        StoreError::io(
+                            "setting pre-migration replacement permissions",
+                            source_path,
+                            error,
+                        )
                     })?;
                 }
                 Ok(prepared)
@@ -6840,13 +6877,13 @@ mod tests {
     }
 
     #[test]
-    fn migration_fault_rolls_back_source_and_preserves_verified_pre_v7_backup() -> crate::Result<()>
-    {
+    fn migration_fault_rolls_back_source_and_preserves_verified_pre_migration_snapshot(
+    ) -> crate::Result<()> {
         let temporary = TempDir::new()
             .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
         let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
             StoreError::io(
-                "canonicalizing pre-v7 test directory",
+                "canonicalizing pre-migration test directory",
                 temporary.path(),
                 error,
             )
@@ -6893,7 +6930,7 @@ mod tests {
             .close()
             .map_err(|(_, error)| StoreError::from(error))?;
 
-        let backups = pre_v7_test_backups(&parent)?;
+        let backups = pre_migration_test_snapshots(&parent)?;
         assert_eq!(backups.len(), 1);
         assert_eq!(retained_backup, backups[0]);
         assert!(retained_backup.is_file());
@@ -6937,9 +6974,9 @@ mod tests {
 
         assert_eq!(prepared.expected_version(), 6);
         assert_eq!(read_database_family_bytes_for_test(&database)?, before);
-        let backup_path = prepared
-            .backup_path()
-            .ok_or_else(|| StoreError::invalid_input("pre_v7_backup", "WAL snapshot missing"))?;
+        let backup_path = prepared.backup_path().ok_or_else(|| {
+            StoreError::invalid_input("pre_migration_snapshot", "WAL snapshot missing")
+        })?;
         assert_eq!(read_v6_health(backup_path)?, (6, 6, "ok".into(), 0));
         let applied_at: i64 = Connection::open(backup_path)?.query_row(
             "SELECT applied_at_ms FROM guiying_schema_migrations WHERE version = 1",
@@ -6997,7 +7034,7 @@ mod tests {
         assert_eq!(prepared.expected_version(), 6);
         assert_eq!(read_database_family_bytes_for_test(&database)?, before);
         let backup_path = prepared.backup_path().ok_or_else(|| {
-            StoreError::invalid_input("pre_v7_backup", "journal snapshot missing")
+            StoreError::invalid_input("pre_migration_snapshot", "journal snapshot missing")
         })?;
         assert_eq!(read_v6_health(backup_path)?, (6, 6, "ok".into(), 0));
         drop(prepared);
@@ -7010,7 +7047,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pre_v7_staging_backup_sync_and_publish_faults_leave_source_untouched() -> crate::Result<()> {
+    fn pre_migration_staging_snapshot_sync_and_publish_faults_leave_source_untouched(
+    ) -> crate::Result<()> {
         use crate::backup::BackupFaultPoint;
 
         let fault_points = [
@@ -7025,7 +7063,7 @@ mod tests {
                 .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
             let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
                 StoreError::io(
-                    "canonicalizing pre-v7 fault test directory",
+                    "canonicalizing pre-migration fault test directory",
                     temporary.path(),
                     error,
                 )
@@ -7043,14 +7081,16 @@ mod tests {
                 result.err()
             );
             assert_eq!(read_database_family_bytes_for_test(&database)?, before);
-            assert!(pre_v7_test_backups(&parent)?.is_empty());
+            assert!(pre_migration_test_snapshots(&parent)?.is_empty());
             let leaked_private_temporary = std::fs::read_dir(&parent)
                 .map_err(|error| {
-                    StoreError::io("reading pre-v7 fault test directory", &parent, error)
+                    StoreError::io("reading pre-migration fault test directory", &parent, error)
                 })?
                 .filter_map(|entry| entry.ok())
                 .filter_map(|entry| entry.file_name().into_string().ok())
-                .any(|name| name.starts_with(".guiying-pre-v7-stage-") || name.starts_with(".tmp"));
+                .any(|name| {
+                    name.starts_with(".guiying-pre-migration-stage-") || name.starts_with(".tmp")
+                });
             assert!(
                 !leaked_private_temporary,
                 "{fault_point:?} left a staging or backup temporary behind"
@@ -7061,17 +7101,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clean_current_v7_uses_raw_header_fast_path_without_staging() -> crate::Result<()> {
+    fn clean_latest_schema_uses_raw_header_fast_path_without_staging() -> crate::Result<()> {
         let temporary = TempDir::new()
             .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
         let parent = std::fs::canonicalize(temporary.path()).map_err(|error| {
             StoreError::io(
-                "canonicalizing current-v7 fast-path test directory",
+                "canonicalizing latest-schema fast-path test directory",
                 temporary.path(),
                 error,
             )
         })?;
-        let database = parent.join("current-v7.sqlite3");
+        let database = parent.join("latest-schema.sqlite3");
         Store::open_or_create(&database)?.close()?;
         assert_database_sidecars_absent_for_test(&database)?;
         crate::backup::set_test_backup_fault(crate::backup::BackupFaultPoint::StagingWrite);
@@ -7086,7 +7126,7 @@ mod tests {
         );
         assert!(prepared.backup_path().is_none());
         prepared.verify_before_read_write()?;
-        assert!(pre_v7_test_backups(&parent)?.is_empty());
+        assert!(pre_migration_test_snapshots(&parent)?.is_empty());
         Ok(())
     }
 
@@ -7189,21 +7229,57 @@ mod tests {
 
     fn create_managed_v6_fixture(path: &Path) -> crate::Result<()> {
         Store::open_or_create(path)?.close()?;
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", false)?;
-        connection.execute_batch(
-            "DROP INDEX ux_exact_group_build_members_probe_binding_v7; \
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "DROP TRIGGER trg_scan_runs_runtime_control_gate_v8; \
+             DROP TRIGGER trg_scan_jobs_runtime_control_gate_v8; \
+             DROP TABLE scan_pause_checkpoints; \
+             DROP TABLE scan_control_requests; \
+             DROP TABLE scan_runtime_leases; \
+             DROP INDEX ux_scan_run_sessions_mount_binding_v8; \
+             DROP INDEX ux_exact_group_build_members_probe_binding_v7; \
              DROP INDEX ux_exact_group_build_members_assessment_binding_v7;",
         )?;
-        for table in PRE_V7_TEST_TABLES_REVERSE {
-            connection.execute_batch(&format!("DROP TABLE {table};"))?;
+        for table in V7_TEST_TABLES_REVERSE {
+            transaction.execute_batch(&format!("DROP TABLE {table};"))?;
         }
-        let deleted = connection.execute(
-            "DELETE FROM guiying_schema_migrations WHERE version = 7",
+        let deleted = transaction.execute(
+            "DELETE FROM guiying_schema_migrations WHERE version IN (7, 8)",
             [],
         )?;
-        assert_eq!(deleted, 1);
-        connection.pragma_update(None, "user_version", 6)?;
+        assert_eq!(
+            deleted, 2,
+            "v6 fixture must remove both v7 and v8 registry rows"
+        );
+        transaction.pragma_update(None, "user_version", 6)?;
+        let residual_v8_objects: i64 = transaction.query_row(
+            "SELECT count(*) FROM sqlite_schema \
+             WHERE name IN ( \
+                 'ux_scan_run_sessions_mount_binding_v8', \
+                 'scan_runtime_leases', 'scan_control_requests', \
+                 'scan_pause_checkpoints', \
+                 'trg_scan_runs_runtime_control_gate_v8', \
+                 'trg_scan_jobs_runtime_control_gate_v8' \
+             ) OR name GLOB '*_v8'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            residual_v8_objects, 0,
+            "v6 fixture retained a v8 schema object"
+        );
+        let residual_new_registry_rows: i64 = transaction.query_row(
+            "SELECT count(*) FROM guiying_schema_migrations WHERE version > 6",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            residual_new_registry_rows, 0,
+            "v6 fixture retained a post-v6 migration record"
+        );
+        transaction.commit()?;
         connection
             .close()
             .map_err(|(_, error)| StoreError::from(error))?;
@@ -7239,19 +7315,24 @@ mod tests {
         Ok((version, migration_count, integrity, foreign_key_violations))
     }
 
-    fn pre_v7_test_backups(parent: &Path) -> crate::Result<Vec<PathBuf>> {
-        let entries = std::fs::read_dir(parent)
-            .map_err(|error| StoreError::io("reading pre-v7 backup directory", parent, error))?;
+    fn pre_migration_test_snapshots(parent: &Path) -> crate::Result<Vec<PathBuf>> {
+        let entries = std::fs::read_dir(parent).map_err(|error| {
+            StoreError::io("reading pre-migration snapshot directory", parent, error)
+        })?;
         let mut backups = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| {
-                StoreError::io("reading pre-v7 backup directory entry", parent, error)
+                StoreError::io(
+                    "reading pre-migration snapshot directory entry",
+                    parent,
+                    error,
+                )
             })?;
             let path = entry.path();
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".guiying-pre-v7-v6-"))
+                .is_some_and(|name| name.starts_with(".guiying-pre-migration-from-v6-to-v8-"))
             {
                 backups.push(path);
             }
@@ -7303,7 +7384,7 @@ mod tests {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(StoreError::io(
-                        "checking pre-v7 test source sidecar",
+                        "checking pre-migration test source sidecar",
                         sidecar,
                         error,
                     ))

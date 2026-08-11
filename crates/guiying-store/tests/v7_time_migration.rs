@@ -32,14 +32,14 @@ const MIGRATIONS: [(&str, &str); 6] = [
 ];
 
 #[test]
-fn empty_v6_database_upgrades_transactionally_to_v7_without_legacy_copy(
+fn empty_v6_database_upgrades_transactionally_to_latest_without_legacy_copy(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
-    let database = temporary.path().join("v6-to-v7.sqlite3");
+    let database = temporary.path().join("v6-to-latest.sqlite3");
     create_empty_managed_v6(&database)?;
 
     let store = Store::open_existing(&database)?;
-    assert_eq!(store.schema_version()?, 7);
+    assert_eq!(store.schema_version()?, 8);
     store.close()?;
 
     let connection = Connection::open(&database)?;
@@ -48,7 +48,7 @@ fn empty_v6_database_upgrades_transactionally_to_v7_without_legacy_copy(
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(registered, 7);
+    assert_eq!(registered, 8);
     let v7_tables: i64 = connection.query_row(
         "SELECT count(*) FROM pragma_table_list \
          WHERE name IN ( \
@@ -110,8 +110,8 @@ fn empty_v6_database_upgrades_transactionally_to_v7_without_legacy_copy(
 }
 
 #[test]
-fn fresh_v7_manifest_detects_a_removed_evidence_only_gate() -> Result<(), Box<dyn std::error::Error>>
-{
+fn fresh_latest_manifest_detects_a_removed_v7_evidence_only_gate(
+) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let database = temporary.path().join("manifest.sqlite3");
     Store::open_or_create(&database)?.close()?;
@@ -122,7 +122,7 @@ fn fresh_v7_manifest_detects_a_removed_evidence_only_gate() -> Result<(), Box<dy
 
     let error = Store::open_existing(&database)
         .err()
-        .ok_or("store accepted a v7 schema with an evidence trigger removed")?;
+        .ok_or("store accepted the latest schema with a v7 evidence trigger removed")?;
     assert!(matches!(error, StoreError::SchemaManifestMismatch { .. }));
     Ok(())
 }

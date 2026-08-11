@@ -1,27 +1,29 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::error::{Result, StoreError};
 use crate::model::{
-    BeginCaptureTimeAnalysisInput, BeginExactGroupInput, BeginMetadataReportInput,
-    BeginTimeSessionInput, CapabilityProfileInput, CaptureTimeAnalysisManifestPlan,
-    CaptureTimeAnalysisSourceInput, CaptureTimeCandidateInput, CaptureTimeDecision,
-    CaptureTimeMemberAssessmentInput, CaptureTimeObservationInput,
+    AcquireRuntimeLeaseInput, BeginCaptureTimeAnalysisInput, BeginExactGroupInput,
+    BeginMetadataReportInput, BeginTimeSessionInput, CapabilityProfileInput,
+    CaptureTimeAnalysisManifestPlan, CaptureTimeAnalysisSourceInput, CaptureTimeCandidateInput,
+    CaptureTimeDecision, CaptureTimeMemberAssessmentInput, CaptureTimeObservationInput,
     CaptureTimeObservationInterpretationInput, CaptureTimePolicyIssueInput,
     CaptureTimeRecommendationInput, CoreDirectoryObservationInput, CoreFileObservationInput,
     CoreSessionId, CoreSessionInput, CoverageOutcomeInput, CoverageStatus, ExactGroupKey,
     ExactGroupManifestMember, ExactGroupMemberInput, ExactVerificationEdgeInput,
-    FileTimestampParts, FreshFingerprintInput, FreshFingerprintKind, ManifestDigest,
-    MediaFileInput, MetadataContainerLocator, MetadataExtractionIssueInput, MetadataFieldInput,
-    MetadataReportManifestPlan, MetadataSourceRevalidationInput, MountSessionKey,
-    NamespaceProfileInput, NewBoundScanRun, NewScanIssue, NewScanJob, NewScanReport, NewScanRun,
-    NewScopedScanJob, ObservationInput, RecordTimeGroupOutcomeInput, RunEvidenceGuard,
-    ScanCheckpointInput, ScanStage, SourceSignature, TimeEvidenceGuard, TimeEvidenceManifestDigest,
-    TimeExactFingerprintMaterial, TimeLineageKey, TimeSessionOutcome, TimeSourceKey,
-    TimeSourceKeyMaterial, VerifiedExactGroup, VolumeInput, MAX_IDENTIFIER_BYTES, MAX_JSON_BYTES,
-    MAX_OPAQUE_BLOB_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES, MAX_TIME_EVIDENCE_BATCH,
-    MAX_TIME_EVIDENCE_PAGE_BYTES,
+    FileTimestampParts, FreshFingerprintInput, FreshFingerprintKind, LeasedScanTerminalOutcome,
+    ManifestDigest, MediaFileInput, MetadataContainerLocator, MetadataExtractionIssueInput,
+    MetadataFieldInput, MetadataReportManifestPlan, MetadataSourceRevalidationInput,
+    MountSessionKey, NamespaceProfileInput, NewBoundScanRun, NewScanIssue, NewScanJob,
+    NewScanReport, NewScanRun, NewScopedScanJob, ObservationInput, PauseCheckpointCursor,
+    PauseCheckpointInput, PauseCheckpointWriteKey, RecordTimeGroupOutcomeInput, RunEvidenceGuard,
+    RuntimeLeaseGuard, ScanCheckpointInput, ScanControlDisposition, ScanControlKind,
+    ScanControlRequestInput, ScanControlRequestKey, ScanControlRequestRecord, ScanStage,
+    SourceSignature, TimeEvidenceGuard, TimeEvidenceManifestDigest, TimeExactFingerprintMaterial,
+    TimeLineageKey, TimeSessionOutcome, TimeSourceKey, TimeSourceKeyMaterial, VerifiedExactGroup,
+    VolumeInput, MAX_IDENTIFIER_BYTES, MAX_JSON_BYTES, MAX_OPAQUE_BLOB_BYTES, MAX_PATH_BYTES,
+    MAX_TEXT_BYTES, MAX_TIME_EVIDENCE_BATCH, MAX_TIME_EVIDENCE_PAGE_BYTES,
 };
 
 const MAX_V5_WRITE_BATCH: usize = 128;
@@ -31,7 +33,11 @@ pub struct RepositoryTx<'transaction> {
     transaction: &'transaction Transaction<'transaction>,
     store_instance_key: [u8; 32],
     poisoned: bool,
+    live_core_sessions: HashSet<(i64, [u8; 32])>,
+    live_runtime_leases: HashSet<(i64, [u8; 32], [u8; 32])>,
     bound_core_sessions: Vec<(i64, [u8; 32])>,
+    acquired_runtime_leases: Vec<(i64, [u8; 32], [u8; 32])>,
+    released_runtime_leases: Vec<(i64, [u8; 32], [u8; 32])>,
 }
 
 impl<'transaction> RepositoryTx<'transaction> {
@@ -41,19 +47,29 @@ impl<'transaction> RepositoryTx<'transaction> {
             transaction,
             store_instance_key: [0; 32],
             poisoned: false,
+            live_core_sessions: HashSet::new(),
+            live_runtime_leases: HashSet::new(),
             bound_core_sessions: Vec::new(),
+            acquired_runtime_leases: Vec::new(),
+            released_runtime_leases: Vec::new(),
         }
     }
 
     pub(crate) fn new_bound(
         transaction: &'transaction Transaction<'transaction>,
         store_instance_key: [u8; 32],
+        live_core_sessions: HashSet<(i64, [u8; 32])>,
+        live_runtime_leases: HashSet<(i64, [u8; 32], [u8; 32])>,
     ) -> Self {
         Self {
             transaction,
             store_instance_key,
             poisoned: false,
+            live_core_sessions,
+            live_runtime_leases,
             bound_core_sessions: Vec::new(),
+            acquired_runtime_leases: Vec::new(),
+            released_runtime_leases: Vec::new(),
         }
     }
 
@@ -63,6 +79,14 @@ impl<'transaction> RepositoryTx<'transaction> {
 
     pub(crate) fn take_bound_core_sessions(&mut self) -> Vec<(i64, [u8; 32])> {
         std::mem::take(&mut self.bound_core_sessions)
+    }
+
+    pub(crate) fn take_acquired_runtime_leases(&mut self) -> Vec<(i64, [u8; 32], [u8; 32])> {
+        std::mem::take(&mut self.acquired_runtime_leases)
+    }
+
+    pub(crate) fn take_released_runtime_leases(&mut self) -> Vec<(i64, [u8; 32], [u8; 32])> {
+        std::mem::take(&mut self.released_runtime_leases)
     }
 
     fn run_mutator<T>(
@@ -220,6 +244,93 @@ impl<'transaction> RepositoryTx<'transaction> {
         input: &CoreSessionInput,
     ) -> Result<()> {
         self.run_mutator(|repository| repository.bind_core_session_impl(guard, input))
+    }
+
+    pub fn acquire_runtime_lease(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        input: &AcquireRuntimeLeaseInput,
+    ) -> Result<RuntimeLeaseGuard> {
+        self.run_mutator(|repository| repository.acquire_runtime_lease_impl(guard, input))
+    }
+
+    pub fn heartbeat_runtime_lease(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        heartbeat_at_ms: i64,
+    ) -> Result<()> {
+        self.run_mutator(|repository| {
+            repository.heartbeat_runtime_lease_impl(guard, heartbeat_at_ms)
+        })
+    }
+
+    pub fn request_scan_control(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        input: &ScanControlRequestInput,
+    ) -> Result<ScanControlRequestRecord> {
+        self.run_mutator(|repository| repository.request_scan_control_impl(guard, input))
+    }
+
+    pub fn acknowledge_pause(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        input: &PauseCheckpointInput,
+        acknowledged_at_ms: i64,
+    ) -> Result<(i64, i64, i64)> {
+        self.run_mutator(|repository| {
+            repository.acknowledge_pause_impl(guard, input, acknowledged_at_ms)
+        })
+    }
+
+    pub fn acknowledge_resume(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        request_id: i64,
+        request_key: &ScanControlRequestKey,
+        acknowledged_at_ms: i64,
+    ) -> Result<(i64, i64)> {
+        self.run_mutator(|repository| {
+            repository.acknowledge_resume_impl(guard, request_id, request_key, acknowledged_at_ms)
+        })
+    }
+
+    pub fn acknowledge_cancel(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        request_id: i64,
+        request_key: &ScanControlRequestKey,
+        acknowledged_at_ms: i64,
+    ) -> Result<(i64, i64)> {
+        self.run_mutator(|repository| {
+            repository.acknowledge_cancel_impl(guard, request_id, request_key, acknowledged_at_ms)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn transition_leased_scan_job_and_run(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        expected_job_state: &str,
+        expected_job_version: i64,
+        expected_run_state: &str,
+        expected_run_version: i64,
+        outcome: LeasedScanTerminalOutcome,
+        now_ms: i64,
+        last_error: Option<(&str, &str)>,
+    ) -> Result<(i64, i64)> {
+        self.run_mutator(|repository| {
+            repository.transition_leased_scan_job_and_run_impl(
+                guard,
+                expected_job_state,
+                expected_job_version,
+                expected_run_state,
+                expected_run_version,
+                outcome,
+                now_ms,
+                last_error,
+            )
+        })
     }
 
     /// Atomically records immutable media observations and their opaque core
@@ -3628,8 +3739,15 @@ impl<'transaction> RepositoryTx<'transaction> {
                 && existing.9.as_slice() == input.root_source_signature.as_bytes()
                 && existing.10 == input.bound_at_ms;
             if matches {
-                self.bound_core_sessions
-                    .push((guard.scan_run_id, input.core_session_id.into_bytes()));
+                let membership = (guard.scan_run_id, input.core_session_id.into_bytes());
+                if !self.live_core_sessions.contains(&membership)
+                    && !self.bound_core_sessions.contains(&membership)
+                {
+                    return Err(StoreError::ConcurrencyConflict {
+                        entity: "live_core_session_store_instance",
+                        id: guard.scan_run_id,
+                    });
+                }
                 return Ok(());
             }
             return Err(StoreError::IdempotencyConflict {
@@ -3661,6 +3779,678 @@ impl<'transaction> RepositoryTx<'transaction> {
         Ok(())
     }
 
+    fn acquire_runtime_lease_impl(
+        &mut self,
+        guard: &RunEvidenceGuard,
+        input: &AcquireRuntimeLeaseInput,
+    ) -> Result<RuntimeLeaseGuard> {
+        if self.store_instance_key == [0; 32] {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_lease_store_instance",
+                id: guard.scan_run_id,
+            });
+        }
+        let core_membership = (guard.scan_run_id, input.core_session_id.into_bytes());
+        if !self.live_core_sessions.contains(&core_membership)
+            && !self.bound_core_sessions.contains(&core_membership)
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "live_runtime_core_session",
+                id: guard.scan_run_id,
+            });
+        }
+        let context = self.validate_core_session_guard(guard, &input.core_session_id)?;
+        require_nonnegative("acquired_at_ms", input.acquired_at_ms)?;
+        let mount_session_key = guard.mount_session_key.to_storage_hex();
+        let work_plan_digest = compute_runtime_work_plan_digest(
+            self.transaction,
+            guard.scan_run_id,
+            input.lease_key.as_bytes(),
+            input.core_session_id.as_bytes(),
+        )?;
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT runtime_lease_key, core_session_id, mount_session_key, state, \
+                        acquired_at_ms, volume_id, scan_job_id, capability_profile_id, \
+                        namespace_profile_id, work_plan_digest \
+                 FROM scan_runtime_leases WHERE scan_run_id = ?1",
+                [guard.scan_run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let lease_membership = (
+                guard.scan_run_id,
+                input.lease_key.into_bytes(),
+                input.core_session_id.into_bytes(),
+            );
+            if existing.0.as_slice() == input.lease_key.as_bytes()
+                && existing.1.as_slice() == input.core_session_id.as_bytes()
+                && existing.2 == mount_session_key
+                && existing.3 == "active"
+                && existing.4 == input.acquired_at_ms
+                && existing.5 == context.volume_id
+                && existing.6 == context.scan_job_id
+                && existing.7 == context.capability_profile_id
+                && existing.8 == context.namespace_profile_id
+                && existing.9.as_slice() == work_plan_digest
+                && (self.live_runtime_leases.contains(&lease_membership)
+                    || self.acquired_runtime_leases.contains(&lease_membership))
+            {
+                return Ok(RuntimeLeaseGuard::new(
+                    *guard,
+                    input.lease_key,
+                    input.core_session_id,
+                    self.store_instance_key,
+                ));
+            }
+            return Err(StoreError::IdempotencyConflict {
+                entity: "runtime_lease",
+                key: guard.scan_run_id.to_string(),
+            });
+        }
+        let has_preexisting_evidence = self.transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scan_directory_observations WHERE scan_run_id = ?1) \
+                 OR EXISTS(SELECT 1 FROM scan_file_tickets WHERE scan_run_id = ?1)",
+            [guard.scan_run_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_preexisting_evidence {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_lease_preexisting_core_evidence",
+                id: guard.scan_run_id,
+            });
+        }
+        let evidence = empty_runtime_evidence_accumulator(&work_plan_digest);
+        self.transaction.execute(
+            "INSERT INTO scan_runtime_leases ( \
+                 scan_run_id, volume_id, scan_job_id, capability_profile_id, \
+                 namespace_profile_id, runtime_lease_key, core_session_id, mount_session_key, \
+                 work_plan_digest, directory_evidence_count, file_evidence_count, \
+                 directory_evidence_digest, file_evidence_digest, evidence_chain_digest, \
+                 lease_contract_version, state, acquired_at_ms, last_heartbeat_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                       1, 'active', ?15, ?15)",
+            params![
+                guard.scan_run_id,
+                context.volume_id,
+                context.scan_job_id,
+                context.capability_profile_id,
+                context.namespace_profile_id,
+                input.lease_key.as_bytes().as_slice(),
+                input.core_session_id.as_bytes().as_slice(),
+                mount_session_key,
+                work_plan_digest.as_slice(),
+                evidence.directory_count,
+                evidence.file_count,
+                evidence.directory_digest.as_slice(),
+                evidence.file_digest.as_slice(),
+                evidence.combined_digest.as_slice(),
+                input.acquired_at_ms,
+            ],
+        )?;
+        self.acquired_runtime_leases.push((
+            guard.scan_run_id,
+            input.lease_key.into_bytes(),
+            input.core_session_id.into_bytes(),
+        ));
+        Ok(RuntimeLeaseGuard::new(
+            *guard,
+            input.lease_key,
+            input.core_session_id,
+            self.store_instance_key,
+        ))
+    }
+
+    fn heartbeat_runtime_lease_impl(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        heartbeat_at_ms: i64,
+    ) -> Result<()> {
+        self.validate_runtime_lease_guard(guard)?;
+        require_nonnegative("heartbeat_at_ms", heartbeat_at_ms)?;
+        let changed = self.transaction.execute(
+            "UPDATE scan_runtime_leases SET last_heartbeat_at_ms = ?2 \
+             WHERE scan_run_id = ?1 AND state = 'active' \
+               AND last_heartbeat_at_ms <= ?2",
+            params![guard.scan_run_id(), heartbeat_at_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_lease_heartbeat",
+                id: guard.scan_run_id(),
+            });
+        }
+        Ok(())
+    }
+
+    fn request_scan_control_impl(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        input: &ScanControlRequestInput,
+    ) -> Result<ScanControlRequestRecord> {
+        self.validate_runtime_guard_instance(guard)?;
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT id, sequence, kind, disposition, expected_job_state_version, \
+                        expected_run_state_version, expected_checkpoint_generation, \
+                        requested_at_ms, acknowledged_at_ms, ack_job_state_version, \
+                        ack_run_state_version, ack_checkpoint_generation, ack_reason_code, \
+                        runtime_lease_key, scan_run_id \
+                 FROM scan_control_requests WHERE request_key = ?1",
+                [input.request_key.as_bytes().as_slice()],
+                control_request_from_row_with_lease,
+            )
+            .optional()?;
+        if let Some((record, lease_key, scan_run_id)) = existing {
+            if lease_key.as_slice() == guard.lease_key().as_bytes()
+                && scan_run_id == guard.scan_run_id()
+                && record.kind == input.kind
+                && record.expected_job_state_version == input.expected_job_state_version
+                && record.expected_run_state_version == input.expected_run_state_version
+                && record.expected_checkpoint_generation == input.expected_checkpoint_generation
+                && record.requested_at_ms == input.requested_at_ms
+            {
+                return Ok(record);
+            }
+            return Err(StoreError::IdempotencyConflict {
+                entity: "scan_control_request",
+                key: lower_hex(input.request_key.as_bytes()),
+            });
+        }
+        let context = self.validate_runtime_lease_guard(guard)?;
+        let (job_version, run_version) = self.transaction.query_row(
+            "SELECT job.state_version, run.state_version \
+             FROM scan_runtime_leases AS lease \
+             JOIN scan_jobs AS job ON job.id = lease.scan_job_id \
+             JOIN scan_runs AS run ON run.id = lease.scan_run_id \
+             WHERE lease.scan_run_id = ?1 AND lease.state = 'active'",
+            [guard.scan_run_id()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if job_version != input.expected_job_state_version
+            || run_version != input.expected_run_state_version
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "scan_control_state_version",
+                id: guard.scan_run_id(),
+            });
+        }
+        let next_id = self.transaction.query_row(
+            "SELECT COALESCE(max(id), 0) + 1 FROM scan_control_requests",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let sequence = self.transaction.query_row(
+            "SELECT COALESCE(max(sequence), 0) + 1 FROM scan_control_requests \
+             WHERE scan_run_id = ?1",
+            [guard.scan_run_id()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if input.kind == ScanControlKind::Cancel {
+            self.transaction.execute(
+                "UPDATE scan_control_requests \
+                 SET disposition = 'superseded', acknowledged_at_ms = MAX(requested_at_ms, ?2), \
+                     ack_reason_code = 'CANCEL_DOMINATED', superseded_by_request_id = ?3 \
+                 WHERE scan_run_id = ?1 AND disposition = 'pending' \
+                   AND kind IN ('pause', 'resume')",
+                params![guard.scan_run_id(), input.requested_at_ms, next_id],
+            )?;
+        }
+        self.transaction.execute(
+            "INSERT INTO scan_control_requests ( \
+                 id, request_key, scan_run_id, volume_id, runtime_lease_key, sequence, kind, \
+                 expected_job_state_version, expected_run_state_version, \
+                 expected_checkpoint_generation, disposition, requested_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
+            params![
+                next_id,
+                input.request_key.as_bytes().as_slice(),
+                guard.scan_run_id(),
+                context.volume_id,
+                guard.lease_key().as_bytes().as_slice(),
+                sequence,
+                input.kind.as_storage_str(),
+                input.expected_job_state_version,
+                input.expected_run_state_version,
+                input.expected_checkpoint_generation,
+                input.requested_at_ms,
+            ],
+        )?;
+        Ok(ScanControlRequestRecord {
+            id: next_id,
+            sequence,
+            kind: input.kind,
+            disposition: ScanControlDisposition::Pending,
+            expected_job_state_version: input.expected_job_state_version,
+            expected_run_state_version: input.expected_run_state_version,
+            expected_checkpoint_generation: input.expected_checkpoint_generation,
+            requested_at_ms: input.requested_at_ms,
+            acknowledged_at_ms: None,
+            ack_job_state_version: None,
+            ack_run_state_version: None,
+            ack_checkpoint_generation: None,
+            ack_reason_code: None,
+        })
+    }
+
+    fn acknowledge_pause_impl(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        input: &PauseCheckpointInput,
+        acknowledged_at_ms: i64,
+    ) -> Result<(i64, i64, i64)> {
+        self.validate_runtime_guard_instance(guard)?;
+        require_nonnegative("acknowledged_at_ms", acknowledged_at_ms)?;
+        let cursor_json = serialize_canonical_json(&serde_json::to_value(&input.cursor)?)?;
+        if cursor_json.len() > 16 * 1024 {
+            return Err(StoreError::invalid_input(
+                "pause_checkpoint_cursor",
+                "typed pause cursor exceeds 16 KiB",
+            ));
+        }
+        let (next_directory_ordinal, next_file_ordinal) = pause_cursor_ordinals(&input.cursor)?;
+        let expected_job_version =
+            input
+                .expected_job_state_version
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StoreError::invalid_input("job_state_version", "state version overflow")
+                })?;
+        let expected_run_version =
+            input
+                .expected_run_state_version
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StoreError::invalid_input("run_state_version", "state version overflow")
+                })?;
+        let expected_generation = match input.expected_generation {
+            Some(generation) => generation.checked_add(1).ok_or_else(|| {
+                StoreError::invalid_input("pause_checkpoint_generation", "generation overflow")
+            })?,
+            None => 1,
+        };
+        let payload_digest = pause_checkpoint_payload_digest(
+            input,
+            acknowledged_at_ms,
+            &cursor_json,
+            expected_job_version,
+            expected_run_version,
+            expected_generation,
+        )?;
+        let exact_retry = self
+            .transaction
+            .query_row(
+                "SELECT checkpoint.scan_run_id, checkpoint.pause_request_id, \
+                        checkpoint.pause_request_key, request.disposition, \
+                        request.acknowledged_at_ms, request.ack_job_state_version, \
+                        request.ack_run_state_version, request.ack_checkpoint_generation, \
+                        checkpoint.payload_digest \
+                 FROM scan_pause_checkpoints AS checkpoint \
+                 JOIN scan_control_requests AS request \
+                   ON request.id = checkpoint.pause_request_id \
+                 WHERE checkpoint.write_key = ?1",
+                [input.write_key.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(retry) = exact_retry {
+            if retry.0 == guard.scan_run_id()
+                && retry.1 == input.pause_request_id
+                && retry.2.as_slice() == input.pause_request_key.as_bytes()
+                && retry.3 == "acknowledged"
+                && retry.4 == Some(acknowledged_at_ms)
+                && retry.5 == Some(expected_job_version)
+                && retry.6 == Some(expected_run_version)
+                && retry.7 == Some(expected_generation)
+                && retry.8.as_slice() == payload_digest
+            {
+                return Ok((
+                    expected_job_version,
+                    expected_run_version,
+                    expected_generation,
+                ));
+            }
+            return Err(StoreError::IdempotencyConflict {
+                entity: "pause_checkpoint_write",
+                key: lower_hex(input.write_key.as_bytes()),
+            });
+        }
+        let context = self.validate_runtime_lease_guard(guard)?;
+        let (
+            work_plan_digest,
+            directory_evidence_count,
+            file_evidence_count,
+            evidence_manifest_digest,
+        ) = self.transaction.query_row(
+            "SELECT work_plan_digest, directory_evidence_count, file_evidence_count, \
+                    evidence_chain_digest \
+             FROM scan_runtime_leases WHERE scan_run_id = ?1 AND state = 'active'",
+            [guard.scan_run_id()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )?;
+        if context.run_state != "running" || context.job_state != "running" {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "pause_runtime_state",
+                id: guard.scan_run_id(),
+            });
+        }
+        let request = self.require_pending_control_request(
+            guard,
+            input.pause_request_id,
+            &input.pause_request_key,
+            ScanControlKind::Pause,
+        )?;
+        if request.expected_job_state_version != input.expected_job_state_version
+            || request.expected_run_state_version != input.expected_run_state_version
+            || acknowledged_at_ms < input.saved_at_ms
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "pause_request_checkpoint_binding",
+                id: input.pause_request_id,
+            });
+        }
+        if next_directory_ordinal != directory_evidence_count
+            || next_file_ordinal != file_evidence_count
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "pause_checkpoint_evidence_cursor",
+                id: guard.scan_run_id(),
+            });
+        }
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT generation, write_key, cursor_json, work_plan_digest \
+                 FROM scan_pause_checkpoints \
+                 WHERE scan_run_id = ?1 \
+                 ORDER BY generation DESC LIMIT 1",
+                [guard.scan_run_id()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let generation = match (existing, input.expected_generation) {
+            (None, None) => 1,
+            (
+                Some((generation, write_key, previous_cursor_json, stored_work_plan_digest)),
+                Some(expected),
+            ) if generation == expected
+                && write_key.as_slice() != input.write_key.as_bytes()
+                && stored_work_plan_digest == work_plan_digest
+                && pause_cursor_does_not_rewind(
+                    &previous_cursor_json,
+                    next_directory_ordinal,
+                    next_file_ordinal,
+                )? =>
+            {
+                expected.checked_add(1).ok_or_else(|| {
+                    StoreError::invalid_input("pause_checkpoint_generation", "generation overflow")
+                })?
+            }
+            (Some((generation, write_key, _, _)), _)
+                if write_key.as_slice() == input.write_key.as_bytes() =>
+            {
+                return Err(StoreError::IdempotencyConflict {
+                    entity: "pause_checkpoint_write",
+                    key: generation.to_string(),
+                });
+            }
+            _ => {
+                return Err(StoreError::ConcurrencyConflict {
+                    entity: "pause_checkpoint_generation",
+                    id: guard.scan_run_id(),
+                })
+            }
+        };
+        let job_version = expected_job_version;
+        let run_version = expected_run_version;
+        self.transaction.execute(
+            "INSERT INTO scan_pause_checkpoints ( \
+                 scan_run_id, volume_id, runtime_lease_key, core_session_id, mount_session_key, \
+                 pause_request_id, pause_request_key, generation, write_key, payload_digest, \
+                 cursor_contract_version, stage, cursor_json, work_plan_digest, \
+                 evidence_manifest_digest, job_state_version, run_state_version, \
+                 discovered_count, fingerprinted_count, error_count, logical_bytes_seen, saved_at_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, \
+                       ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            params![
+                guard.scan_run_id(),
+                context.volume_id,
+                guard.lease_key().as_bytes().as_slice(),
+                guard.core_session_id().as_bytes().as_slice(),
+                guard.run().mount_session_key.to_storage_hex(),
+                input.pause_request_id,
+                input.pause_request_key.as_bytes().as_slice(),
+                generation,
+                input.write_key.as_bytes().as_slice(),
+                payload_digest.as_slice(),
+                input.cursor.stage().as_storage_str(),
+                cursor_json,
+                work_plan_digest,
+                evidence_manifest_digest,
+                job_version,
+                run_version,
+                input.discovered_count,
+                input.fingerprinted_count,
+                input.error_count,
+                input.logical_bytes_seen,
+                input.saved_at_ms,
+            ],
+        )?;
+        let observed_run = self.transition_scan_run(
+            guard.scan_run_id(),
+            "running",
+            input.expected_run_state_version,
+            "paused",
+            acknowledged_at_ms,
+            None,
+        )?;
+        let observed_job = self.transition_scan_job(
+            context.scan_job_id,
+            "running",
+            input.expected_job_state_version,
+            "paused",
+            acknowledged_at_ms,
+        )?;
+        self.acknowledge_control_request(
+            input.pause_request_id,
+            observed_job,
+            observed_run,
+            Some(generation),
+            "PAUSE_SAFE_POINT_ACKNOWLEDGED",
+            acknowledged_at_ms,
+            Some((&input.write_key, &payload_digest)),
+        )?;
+        Ok((observed_job, observed_run, generation))
+    }
+
+    fn acknowledge_resume_impl(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        request_id: i64,
+        request_key: &ScanControlRequestKey,
+        acknowledged_at_ms: i64,
+    ) -> Result<(i64, i64)> {
+        let context = self.validate_runtime_lease_guard(guard)?;
+        let request = self.require_pending_control_request(
+            guard,
+            request_id,
+            request_key,
+            ScanControlKind::Resume,
+        )?;
+        let generation =
+            request
+                .expected_checkpoint_generation
+                .ok_or(StoreError::ConcurrencyConflict {
+                    entity: "resume_checkpoint_generation",
+                    id: guard.scan_run_id(),
+                })?;
+        let observed_job = self.transition_scan_job(
+            context.scan_job_id,
+            "paused",
+            request.expected_job_state_version,
+            "running",
+            acknowledged_at_ms,
+        )?;
+        let observed_run = self.transition_scan_run(
+            guard.scan_run_id(),
+            "paused",
+            request.expected_run_state_version,
+            "running",
+            acknowledged_at_ms,
+            None,
+        )?;
+        self.acknowledge_control_request(
+            request_id,
+            observed_job,
+            observed_run,
+            Some(generation),
+            "RESUME_ACKNOWLEDGED",
+            acknowledged_at_ms,
+            None,
+        )?;
+        Ok((observed_job, observed_run))
+    }
+
+    fn acknowledge_cancel_impl(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        request_id: i64,
+        request_key: &ScanControlRequestKey,
+        acknowledged_at_ms: i64,
+    ) -> Result<(i64, i64)> {
+        let context = self.validate_runtime_lease_guard(guard)?;
+        let request = self.require_pending_control_request(
+            guard,
+            request_id,
+            request_key,
+            ScanControlKind::Cancel,
+        )?;
+        self.begin_runtime_lease_release(guard, "cancelled", acknowledged_at_ms)?;
+        let observed_run = self.transition_scan_run(
+            guard.scan_run_id(),
+            context.run_state.as_str(),
+            request.expected_run_state_version,
+            "cancelled",
+            acknowledged_at_ms,
+            None,
+        )?;
+        let observed_job = self.transition_scan_job(
+            context.scan_job_id,
+            context.job_state.as_str(),
+            request.expected_job_state_version,
+            "cancelled",
+            acknowledged_at_ms,
+        )?;
+        let generation = self.current_pause_checkpoint_generation(guard.scan_run_id())?;
+        self.acknowledge_control_request(
+            request_id,
+            observed_job,
+            observed_run,
+            generation,
+            "CANCEL_ACKNOWLEDGED",
+            acknowledged_at_ms,
+            None,
+        )?;
+        self.finish_runtime_lease_release(guard, acknowledged_at_ms)?;
+        Ok((observed_job, observed_run))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transition_leased_scan_job_and_run_impl(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        expected_job_state: &str,
+        expected_job_version: i64,
+        expected_run_state: &str,
+        expected_run_version: i64,
+        outcome: LeasedScanTerminalOutcome,
+        now_ms: i64,
+        last_error: Option<(&str, &str)>,
+    ) -> Result<(i64, i64)> {
+        let context = self.validate_runtime_lease_guard(guard)?;
+        if context.job_state != expected_job_state || context.run_state != expected_run_state {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "leased_terminal_state",
+                id: guard.scan_run_id(),
+            });
+        }
+        let pending = self.transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scan_control_requests \
+             WHERE scan_run_id = ?1 AND disposition = 'pending')",
+            [guard.scan_run_id()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if pending {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "leased_terminal_pending_control",
+                id: guard.scan_run_id(),
+            });
+        }
+        if outcome == LeasedScanTerminalOutcome::Completed {
+            self.require_stage_sealed(guard.scan_run_id(), ScanStage::ExactVerification)?;
+        }
+        self.begin_runtime_lease_release(guard, outcome.release_reason(), now_ms)?;
+        let observed_run = self.transition_scan_run(
+            guard.scan_run_id(),
+            expected_run_state,
+            expected_run_version,
+            outcome.run_state(),
+            now_ms,
+            last_error,
+        )?;
+        let observed_job = self.transition_scan_job(
+            context.scan_job_id,
+            expected_job_state,
+            expected_job_version,
+            outcome.job_state(),
+            now_ms,
+        )?;
+        self.finish_runtime_lease_release(guard, now_ms)?;
+        Ok((observed_job, observed_run))
+    }
+
     fn record_core_observation_batch_impl(
         &mut self,
         guard: &RunEvidenceGuard,
@@ -3669,6 +4459,7 @@ impl<'transaction> RepositoryTx<'transaction> {
     ) -> Result<Vec<i64>> {
         validate_v5_batch("core_file_observations", inputs.len())?;
         let context = self.validate_core_session_guard(guard, core_session_id)?;
+        self.require_active_runtime_lease_for_core(guard, core_session_id)?;
         let mut ids = Vec::with_capacity(inputs.len());
         for input in inputs {
             validate_observation(&input.observation, context.path_encoding.as_str())?;
@@ -3738,6 +4529,13 @@ impl<'transaction> RepositoryTx<'transaction> {
                     input.ticket_created_at_ms,
                 ],
             )?;
+            self.append_runtime_file_evidence_if_leased(
+                guard.scan_run_id,
+                observation_id,
+                input.observation.source_signature.as_bytes(),
+                input.ticket_sort_key.as_bytes(),
+                &input.ticket_blob,
+            )?;
             ids.push(observation_id);
         }
         Ok(ids)
@@ -3751,6 +4549,7 @@ impl<'transaction> RepositoryTx<'transaction> {
     ) -> Result<Vec<i64>> {
         validate_v5_batch("core_directory_observations", inputs.len())?;
         let context = self.validate_core_session_guard(guard, core_session_id)?;
+        self.require_active_runtime_lease_for_core(guard, core_session_id)?;
         let mut ids = Vec::with_capacity(inputs.len());
         for input in inputs {
             validate_directory_observation(input, context.path_encoding.as_str())?;
@@ -3825,9 +4624,165 @@ impl<'transaction> RepositoryTx<'transaction> {
                     input.observed_at_ms,
                 ],
             )?;
-            ids.push(self.transaction.last_insert_rowid());
+            let directory_id = self.transaction.last_insert_rowid();
+            self.append_runtime_directory_evidence_if_leased(
+                guard.scan_run_id,
+                directory_id,
+                input.source_signature.as_bytes(),
+                input.ticket_sort_key.as_bytes(),
+                input.directory_object_signature.as_bytes(),
+                &input.ticket_blob,
+            )?;
+            ids.push(directory_id);
         }
         Ok(ids)
+    }
+
+    fn append_runtime_file_evidence_if_leased(
+        &self,
+        scan_run_id: i64,
+        observation_id: i64,
+        source_signature: &[u8; 32],
+        ticket_sort_key: &[u8; 32],
+        ticket_blob: &[u8],
+    ) -> Result<()> {
+        let Some(mut evidence) = self.runtime_evidence_accumulator(scan_run_id)? else {
+            return Ok(());
+        };
+        validate_runtime_ticket_sort_key(ticket_blob, ticket_sort_key)?;
+        let previous_file_count = evidence.file_count;
+        let previous_file_digest = evidence.file_digest;
+        let previous_combined_digest = evidence.combined_digest;
+        evidence.file_digest = advance_runtime_evidence_digest(
+            &evidence.file_digest,
+            b"file\0",
+            observation_id,
+            source_signature,
+            ticket_sort_key,
+            None,
+        )?;
+        evidence.file_count = evidence.file_count.checked_add(1).ok_or_else(|| {
+            StoreError::invalid_input("runtime_file_evidence_count", "count overflow")
+        })?;
+        evidence.combined_digest = combine_runtime_evidence_digests(
+            &self.runtime_work_plan_digest(scan_run_id)?,
+            evidence.directory_count,
+            &evidence.directory_digest,
+            evidence.file_count,
+            &evidence.file_digest,
+        );
+        let changed = self.transaction.execute(
+            "UPDATE scan_runtime_leases \
+             SET file_evidence_count = ?2, file_evidence_digest = ?3, \
+                 evidence_chain_digest = ?4 \
+             WHERE scan_run_id = ?1 AND state = 'active' \
+               AND file_evidence_count = ?5 AND file_evidence_digest = ?6 \
+               AND evidence_chain_digest = ?7",
+            params![
+                scan_run_id,
+                evidence.file_count,
+                evidence.file_digest.as_slice(),
+                evidence.combined_digest.as_slice(),
+                previous_file_count,
+                previous_file_digest.as_slice(),
+                previous_combined_digest.as_slice(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_file_evidence_accumulator",
+                id: scan_run_id,
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_runtime_directory_evidence_if_leased(
+        &self,
+        scan_run_id: i64,
+        directory_id: i64,
+        source_signature: &[u8; 32],
+        ticket_sort_key: &[u8; 32],
+        directory_object_signature: &[u8; 32],
+        ticket_blob: &[u8],
+    ) -> Result<()> {
+        let Some(mut evidence) = self.runtime_evidence_accumulator(scan_run_id)? else {
+            return Ok(());
+        };
+        validate_runtime_ticket_sort_key(ticket_blob, ticket_sort_key)?;
+        let previous_directory_count = evidence.directory_count;
+        let previous_directory_digest = evidence.directory_digest;
+        let previous_combined_digest = evidence.combined_digest;
+        evidence.directory_digest = advance_runtime_evidence_digest(
+            &evidence.directory_digest,
+            b"directory\0",
+            directory_id,
+            source_signature,
+            ticket_sort_key,
+            Some(directory_object_signature),
+        )?;
+        evidence.directory_count = evidence.directory_count.checked_add(1).ok_or_else(|| {
+            StoreError::invalid_input("runtime_directory_evidence_count", "count overflow")
+        })?;
+        evidence.combined_digest = combine_runtime_evidence_digests(
+            &self.runtime_work_plan_digest(scan_run_id)?,
+            evidence.directory_count,
+            &evidence.directory_digest,
+            evidence.file_count,
+            &evidence.file_digest,
+        );
+        let changed = self.transaction.execute(
+            "UPDATE scan_runtime_leases \
+             SET directory_evidence_count = ?2, directory_evidence_digest = ?3, \
+                 evidence_chain_digest = ?4 \
+             WHERE scan_run_id = ?1 AND state = 'active' \
+               AND directory_evidence_count = ?5 AND directory_evidence_digest = ?6 \
+               AND evidence_chain_digest = ?7",
+            params![
+                scan_run_id,
+                evidence.directory_count,
+                evidence.directory_digest.as_slice(),
+                evidence.combined_digest.as_slice(),
+                previous_directory_count,
+                previous_directory_digest.as_slice(),
+                previous_combined_digest.as_slice(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_directory_evidence_accumulator",
+                id: scan_run_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn runtime_evidence_accumulator(
+        &self,
+        scan_run_id: i64,
+    ) -> Result<Option<RuntimeEvidenceAccumulator>> {
+        self.transaction
+            .query_row(
+                "SELECT directory_evidence_count, file_evidence_count, \
+                        directory_evidence_digest, file_evidence_digest, evidence_chain_digest \
+                 FROM scan_runtime_leases WHERE scan_run_id = ?1 AND state = 'active'",
+                [scan_run_id],
+                runtime_evidence_accumulator_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn runtime_work_plan_digest(&self, scan_run_id: i64) -> Result<[u8; 32]> {
+        self.transaction
+            .query_row(
+                "SELECT work_plan_digest FROM scan_runtime_leases \
+                 WHERE scan_run_id = ?1 AND state = 'active'",
+                [scan_run_id],
+                |row| fixed_digest_from_row(row, 0),
+            )
+            .map_err(StoreError::from)
     }
 
     fn record_core_coverage_impl(
@@ -4491,6 +5446,15 @@ impl<'transaction> RepositoryTx<'transaction> {
         guard: &RunEvidenceGuard,
         core_session_id: &CoreSessionId,
     ) -> Result<BoundRunContext> {
+        let membership = (guard.scan_run_id, core_session_id.into_bytes());
+        if !self.live_core_sessions.contains(&membership)
+            && !self.bound_core_sessions.contains(&membership)
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "live_core_session_store_instance",
+                id: guard.scan_run_id,
+            });
+        }
         let context = self.validate_v5_run_guard(guard)?;
         let matches = self.transaction.query_row(
             "SELECT EXISTS( \
@@ -4517,6 +5481,240 @@ impl<'transaction> RepositoryTx<'transaction> {
             });
         }
         Ok(context)
+    }
+
+    fn validate_runtime_guard_instance(&self, guard: &RuntimeLeaseGuard) -> Result<()> {
+        if self.store_instance_key == [0; 32]
+            || guard.store_instance_key() != &self.store_instance_key
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_lease_store_instance",
+                id: guard.scan_run_id(),
+            });
+        }
+        Ok(())
+    }
+
+    fn require_active_runtime_lease_for_core(
+        &self,
+        guard: &RunEvidenceGuard,
+        core_session_id: &CoreSessionId,
+    ) -> Result<()> {
+        let live = self.live_runtime_leases.iter().any(|membership| {
+            membership.0 == guard.scan_run_id
+                && membership.2.as_slice() == core_session_id.as_bytes()
+        }) || self.acquired_runtime_leases.iter().any(|membership| {
+            membership.0 == guard.scan_run_id
+                && membership.2.as_slice() == core_session_id.as_bytes()
+        });
+        let persisted = self.transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM scan_runtime_leases \
+                 WHERE scan_run_id = ?1 AND core_session_id = ?2 AND state = 'active' \
+             )",
+            params![guard.scan_run_id, core_session_id.as_bytes().as_slice(),],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !live || !persisted {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "core_evidence_requires_live_runtime_lease",
+                id: guard.scan_run_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_lease_membership(&self, guard: &RuntimeLeaseGuard) -> Result<()> {
+        self.validate_runtime_guard_instance(guard)?;
+        let lease_membership = (
+            guard.scan_run_id(),
+            guard.lease_key().into_bytes(),
+            guard.core_session_id().into_bytes(),
+        );
+        if !self.live_runtime_leases.contains(&lease_membership)
+            && !self.acquired_runtime_leases.contains(&lease_membership)
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "live_runtime_lease_store_instance",
+                id: guard.scan_run_id(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_lease_guard(&self, guard: &RuntimeLeaseGuard) -> Result<BoundRunContext> {
+        self.validate_runtime_lease_membership(guard)?;
+        let context = self.validate_v5_bound_run_guard(guard.run())?;
+        let matches = self.transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM scan_runtime_leases \
+                 WHERE scan_run_id = ?1 AND volume_id = ?2 AND scan_job_id = ?3 \
+                   AND capability_profile_id = ?4 AND namespace_profile_id = ?5 \
+                   AND runtime_lease_key = ?6 AND core_session_id = ?7 \
+                   AND mount_session_key = ?8 AND state = 'active' \
+             )",
+            params![
+                guard.scan_run_id(),
+                context.volume_id,
+                context.scan_job_id,
+                context.capability_profile_id,
+                context.namespace_profile_id,
+                guard.lease_key().as_bytes().as_slice(),
+                guard.core_session_id().as_bytes().as_slice(),
+                guard.run().mount_session_key.to_storage_hex(),
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !matches {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "active_runtime_lease_guard",
+                id: guard.scan_run_id(),
+            });
+        }
+        Ok(context)
+    }
+
+    fn require_pending_control_request(
+        &self,
+        guard: &RuntimeLeaseGuard,
+        request_id: i64,
+        request_key: &ScanControlRequestKey,
+        kind: ScanControlKind,
+    ) -> Result<ScanControlRequestRecord> {
+        require_positive("control_request_id", request_id)?;
+        self.transaction
+            .query_row(
+                "SELECT id, sequence, kind, disposition, expected_job_state_version, \
+                        expected_run_state_version, expected_checkpoint_generation, \
+                        requested_at_ms, acknowledged_at_ms, ack_job_state_version, \
+                        ack_run_state_version, ack_checkpoint_generation, ack_reason_code \
+                 FROM scan_control_requests \
+                 WHERE id = ?1 AND request_key = ?2 AND scan_run_id = ?3 \
+                   AND runtime_lease_key = ?4 AND kind = ?5 AND disposition = 'pending'",
+                params![
+                    request_id,
+                    request_key.as_bytes().as_slice(),
+                    guard.scan_run_id(),
+                    guard.lease_key().as_bytes().as_slice(),
+                    kind.as_storage_str(),
+                ],
+                control_request_from_row,
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::ConcurrencyConflict {
+                    entity: "pending_scan_control_request",
+                    id: request_id,
+                },
+                other => StoreError::from(other),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acknowledge_control_request(
+        &self,
+        request_id: i64,
+        job_version: i64,
+        run_version: i64,
+        checkpoint_generation: Option<i64>,
+        reason_code: &str,
+        acknowledged_at_ms: i64,
+        pause_checkpoint: Option<(&PauseCheckpointWriteKey, &[u8; 32])>,
+    ) -> Result<()> {
+        require_bounded_nonempty("control_ack_reason", reason_code, 256)?;
+        let (pause_checkpoint_write_key, pause_checkpoint_payload_digest) = pause_checkpoint
+            .map(|(write_key, payload_digest)| {
+                (
+                    Some(write_key.as_bytes().as_slice()),
+                    Some(payload_digest.as_slice()),
+                )
+            })
+            .unwrap_or((None, None));
+        let changed = self.transaction.execute(
+            "UPDATE scan_control_requests \
+             SET disposition = 'acknowledged', acknowledged_at_ms = ?2, \
+                 ack_job_state_version = ?3, ack_run_state_version = ?4, \
+                 ack_checkpoint_generation = ?5, ack_reason_code = ?6, \
+                 pause_checkpoint_write_key = ?7, \
+                 pause_checkpoint_payload_digest = ?8 \
+             WHERE id = ?1 AND disposition = 'pending'",
+            params![
+                request_id,
+                acknowledged_at_ms,
+                job_version,
+                run_version,
+                checkpoint_generation,
+                reason_code,
+                pause_checkpoint_write_key,
+                pause_checkpoint_payload_digest,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "scan_control_acknowledgement",
+                id: request_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn begin_runtime_lease_release(
+        &self,
+        guard: &RuntimeLeaseGuard,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        require_nonnegative("release_started_at_ms", now_ms)?;
+        let changed = self.transaction.execute(
+            "UPDATE scan_runtime_leases \
+             SET state = 'releasing', release_reason = ?2, release_started_at_ms = ?3 \
+             WHERE scan_run_id = ?1 AND state = 'active' \
+               AND last_heartbeat_at_ms <= ?3",
+            params![guard.scan_run_id(), reason, now_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_lease_release_intent",
+                id: guard.scan_run_id(),
+            });
+        }
+        Ok(())
+    }
+
+    fn finish_runtime_lease_release(
+        &mut self,
+        guard: &RuntimeLeaseGuard,
+        now_ms: i64,
+    ) -> Result<()> {
+        let changed = self.transaction.execute(
+            "UPDATE scan_runtime_leases SET state = 'released', released_at_ms = ?2 \
+             WHERE scan_run_id = ?1 AND state = 'releasing' \
+               AND release_started_at_ms <= ?2",
+            params![guard.scan_run_id(), now_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_lease_release",
+                id: guard.scan_run_id(),
+            });
+        }
+        self.released_runtime_leases.push((
+            guard.scan_run_id(),
+            guard.lease_key().into_bytes(),
+            guard.core_session_id().into_bytes(),
+        ));
+        Ok(())
+    }
+
+    fn current_pause_checkpoint_generation(&self, scan_run_id: i64) -> Result<Option<i64>> {
+        self.transaction
+            .query_row(
+                "SELECT generation FROM scan_pause_checkpoints WHERE scan_run_id = ?1 \
+                 ORDER BY generation DESC LIMIT 1",
+                [scan_run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     fn validate_time_evidence_guard(&self, guard: &TimeEvidenceGuard) -> Result<BoundRunContext> {
@@ -6422,6 +7620,25 @@ impl<'transaction> RepositoryTx<'transaction> {
         last_error: Option<(&str, &str)>,
     ) -> Result<(i64, i64)> {
         let context = self.validate_v5_bound_run_guard(guard)?;
+        let has_runtime_control = self.transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'scan_runtime_leases')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_runtime_control
+            && self.transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM scan_runtime_leases WHERE scan_run_id = ?1) \
+                     OR EXISTS(SELECT 1 FROM scan_core_sessions WHERE scan_run_id = ?1)",
+                [guard.scan_run_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(StoreError::ConcurrencyConflict {
+                entity: "runtime_core_scan_requires_lease_control",
+                id: guard.scan_run_id,
+            });
+        }
         if context.scan_job_id != scan_job_id {
             return Err(StoreError::ConcurrencyConflict {
                 entity: "scan_job_run_evidence_guard",
@@ -10512,6 +11729,535 @@ fn lower_hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+fn pause_cursor_ordinals(cursor: &PauseCheckpointCursor) -> Result<(i64, i64)> {
+    let PauseCheckpointCursor::Enumeration {
+        next_directory_ordinal,
+        next_file_ordinal,
+    } = cursor;
+    let next_directory_ordinal = i64::try_from(*next_directory_ordinal).map_err(|_| {
+        StoreError::invalid_input(
+            "next_directory_ordinal",
+            "pause cursor ordinal exceeds SQLite's signed 64-bit domain",
+        )
+    })?;
+    let next_file_ordinal = i64::try_from(*next_file_ordinal).map_err(|_| {
+        StoreError::invalid_input(
+            "next_file_ordinal",
+            "pause cursor ordinal exceeds SQLite's signed 64-bit domain",
+        )
+    })?;
+    Ok((next_directory_ordinal, next_file_ordinal))
+}
+
+fn pause_cursor_does_not_rewind(
+    previous_cursor_json: &str,
+    next_directory_ordinal: i64,
+    next_file_ordinal: i64,
+) -> Result<bool> {
+    let previous: PauseCheckpointCursor = serde_json::from_str(previous_cursor_json)?;
+    let (previous_directory_ordinal, previous_file_ordinal) = pause_cursor_ordinals(&previous)?;
+    Ok(next_directory_ordinal >= previous_directory_ordinal
+        && next_file_ordinal >= previous_file_ordinal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pause_checkpoint_payload_digest(
+    input: &PauseCheckpointInput,
+    acknowledged_at_ms: i64,
+    cursor_json: &str,
+    job_state_version: i64,
+    run_state_version: i64,
+    generation: i64,
+) -> Result<[u8; 32]> {
+    compute_pause_checkpoint_payload_digest(
+        input.pause_request_id,
+        input.expected_generation,
+        input.expected_job_state_version,
+        input.expected_run_state_version,
+        job_state_version,
+        run_state_version,
+        generation,
+        input.discovered_count,
+        input.fingerprinted_count,
+        input.error_count,
+        input.logical_bytes_seen,
+        input.saved_at_ms,
+        acknowledged_at_ms,
+        input.pause_request_key.as_bytes(),
+        input.write_key.as_bytes(),
+        cursor_json,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_pause_checkpoint_payload_digest(
+    pause_request_id: i64,
+    expected_generation: Option<i64>,
+    expected_job_state_version: i64,
+    expected_run_state_version: i64,
+    job_state_version: i64,
+    run_state_version: i64,
+    generation: i64,
+    discovered_count: i64,
+    fingerprinted_count: i64,
+    error_count: i64,
+    logical_bytes_seen: i64,
+    saved_at_ms: i64,
+    acknowledged_at_ms: i64,
+    pause_request_key: &[u8],
+    write_key: &[u8],
+    cursor_json: &str,
+) -> Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.pause-checkpoint-payload.v1\0");
+    for value in [
+        pause_request_id,
+        expected_generation.unwrap_or(0),
+        expected_job_state_version,
+        expected_run_state_version,
+        job_state_version,
+        run_state_version,
+        generation,
+        discovered_count,
+        fingerprinted_count,
+        error_count,
+        logical_bytes_seen,
+        saved_at_ms,
+        acknowledged_at_ms,
+    ] {
+        hasher.update(&value.to_le_bytes());
+    }
+    hasher.update(pause_request_key);
+    hasher.update(write_key);
+    hash_length_prefixed(&mut hasher, cursor_json.as_bytes())?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeEvidenceAccumulator {
+    pub(crate) directory_count: i64,
+    pub(crate) file_count: i64,
+    pub(crate) directory_digest: [u8; 32],
+    pub(crate) file_digest: [u8; 32],
+    pub(crate) combined_digest: [u8; 32],
+}
+
+pub(crate) fn compute_runtime_work_plan_digest(
+    connection: &Connection,
+    scan_run_id: i64,
+    runtime_lease_key: &[u8; 32],
+    core_session_id: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let binding = connection.query_row(
+        "SELECT session.volume_id, session.scan_run_id, session.scan_job_id, \
+                session.capability_profile_id, session.namespace_profile_id, \
+                session.mount_session_key, \
+                session.mount_relative_root_raw, session.path_encoding, \
+                session.stable_root_path_key, session.root_scope_key, \
+                session.root_object_signature, core.root_source_signature \
+         FROM scan_run_sessions AS session \
+         JOIN scan_core_sessions AS core \
+           ON core.scan_run_id = session.scan_run_id \
+          AND core.volume_id = session.volume_id \
+          AND core.core_session_id = ?2 \
+         WHERE session.scan_run_id = ?1",
+        params![scan_run_id, core_session_id.as_slice()],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+                row.get::<_, Vec<u8>>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
+                row.get::<_, Vec<u8>>(11)?,
+            ))
+        },
+    )?;
+    let mut work_plan_hasher = blake3::Hasher::new();
+    work_plan_hasher.update(b"guiying.runtime-work-plan.v1\0");
+    for value in [binding.0, binding.1, binding.2, binding.3, binding.4] {
+        work_plan_hasher.update(&value.to_le_bytes());
+    }
+    for bytes in [
+        runtime_lease_key.as_slice(),
+        core_session_id.as_slice(),
+        binding.5.as_bytes(),
+        binding.6.as_slice(),
+        binding.7.as_bytes(),
+        binding.8.as_slice(),
+        binding.9.as_slice(),
+        binding.10.as_slice(),
+        binding.11.as_slice(),
+    ] {
+        hash_length_prefixed(&mut work_plan_hasher, bytes)?;
+    }
+    Ok(*work_plan_hasher.finalize().as_bytes())
+}
+
+fn empty_runtime_evidence_digest(kind: &[u8], work_plan_digest: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.runtime-evidence-empty.v1\0");
+    hasher.update(kind);
+    hasher.update(work_plan_digest);
+    *hasher.finalize().as_bytes()
+}
+
+fn empty_runtime_evidence_accumulator(work_plan_digest: &[u8; 32]) -> RuntimeEvidenceAccumulator {
+    let directory_digest = empty_runtime_evidence_digest(b"directory\0", work_plan_digest);
+    let file_digest = empty_runtime_evidence_digest(b"file\0", work_plan_digest);
+    RuntimeEvidenceAccumulator {
+        directory_count: 0,
+        file_count: 0,
+        directory_digest,
+        file_digest,
+        combined_digest: combine_runtime_evidence_digests(
+            work_plan_digest,
+            0,
+            &directory_digest,
+            0,
+            &file_digest,
+        ),
+    }
+}
+
+fn validate_runtime_ticket_sort_key(ticket_blob: &[u8], ticket_sort_key: &[u8; 32]) -> Result<()> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.core-ticket-id.v1\0");
+    hasher.update(ticket_blob);
+    if hasher.finalize().as_bytes() != ticket_sort_key {
+        return Err(StoreError::invalid_input(
+            "ticket_sort_key",
+            "leased runtime ticket key is not the core-domain digest of its opaque ticket",
+        ));
+    }
+    Ok(())
+}
+
+fn advance_runtime_evidence_digest(
+    previous: &[u8; 32],
+    kind: &[u8],
+    evidence_id: i64,
+    source_signature: &[u8],
+    ticket_sort_key: &[u8],
+    object_signature: Option<&[u8]>,
+) -> Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.runtime-evidence-step.v1\0");
+    hasher.update(previous);
+    hasher.update(kind);
+    hasher.update(&1_i64.to_le_bytes());
+    hasher.update(&evidence_id.to_le_bytes());
+    hash_length_prefixed(&mut hasher, source_signature)?;
+    hash_length_prefixed(&mut hasher, ticket_sort_key)?;
+    match object_signature {
+        Some(signature) => {
+            hasher.update(&[1]);
+            hash_length_prefixed(&mut hasher, signature)?;
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn combine_runtime_evidence_digests(
+    work_plan_digest: &[u8; 32],
+    directory_count: i64,
+    directory_digest: &[u8; 32],
+    file_count: i64,
+    file_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.runtime-evidence-combined.v1\0");
+    hasher.update(work_plan_digest);
+    hasher.update(&directory_count.to_le_bytes());
+    hasher.update(directory_digest);
+    hasher.update(&file_count.to_le_bytes());
+    hasher.update(file_digest);
+    *hasher.finalize().as_bytes()
+}
+
+/// Validates append-only checkpoint payloads without replaying core evidence.
+/// V8 checkpoints are same-process pause audit commitments and are never
+/// resume authority after `Store` reopen; reopen reconciliation terminates the
+/// old lease before callers can obtain a new process-local guard.
+pub(crate) fn validate_runtime_checkpoint_payload_history(
+    connection: &Connection,
+    scan_run_id: i64,
+    work_plan_digest: &[u8; 32],
+    final_directory_count: i64,
+    final_file_count: i64,
+) -> Result<()> {
+    let mut checkpoint_statement = connection.prepare(
+        "SELECT checkpoint.generation, checkpoint.cursor_json, \
+                checkpoint.work_plan_digest, checkpoint.payload_digest, \
+                checkpoint.pause_request_id, checkpoint.pause_request_key, \
+                checkpoint.write_key, checkpoint.job_state_version, \
+                checkpoint.run_state_version, checkpoint.discovered_count, \
+                checkpoint.fingerprinted_count, checkpoint.error_count, \
+                checkpoint.logical_bytes_seen, checkpoint.saved_at_ms, \
+                request.expected_job_state_version, request.expected_run_state_version, \
+                request.acknowledged_at_ms, request.pause_checkpoint_payload_digest, \
+                request.sequence \
+         FROM scan_pause_checkpoints AS checkpoint \
+         JOIN scan_control_requests AS request ON request.id = checkpoint.pause_request_id \
+         WHERE checkpoint.scan_run_id = ?1 \
+         ORDER BY checkpoint.generation",
+    )?;
+    let mut checkpoint_rows = checkpoint_statement.query([scan_run_id])?;
+    let mut previous_generation = 0_i64;
+    let mut previous_request_sequence = 0_i64;
+    let mut previous_directory_count = 0_i64;
+    let mut previous_file_count = 0_i64;
+    let mut previous_discovered_count = 0_i64;
+    let mut previous_fingerprinted_count = 0_i64;
+    let mut previous_error_count = 0_i64;
+    let mut previous_logical_bytes_seen = 0_i64;
+    let mut previous_saved_at_ms = 0_i64;
+    while let Some(row) = checkpoint_rows.next()? {
+        let generation = row.get::<_, i64>(0)?;
+        let cursor_json = row.get::<_, String>(1)?;
+        let checkpoint_work_plan = row.get::<_, Vec<u8>>(2)?;
+        let payload_digest = row.get::<_, Vec<u8>>(3)?;
+        let pause_request_id = row.get::<_, i64>(4)?;
+        let pause_request_key = row.get::<_, Vec<u8>>(5)?;
+        let write_key = row.get::<_, Vec<u8>>(6)?;
+        let job_state_version = row.get::<_, i64>(7)?;
+        let run_state_version = row.get::<_, i64>(8)?;
+        let discovered_count = row.get::<_, i64>(9)?;
+        let fingerprinted_count = row.get::<_, i64>(10)?;
+        let error_count = row.get::<_, i64>(11)?;
+        let logical_bytes_seen = row.get::<_, i64>(12)?;
+        let saved_at_ms = row.get::<_, i64>(13)?;
+        let expected_job_state_version = row.get::<_, i64>(14)?;
+        let expected_run_state_version = row.get::<_, i64>(15)?;
+        let acknowledged_at_ms = row.get::<_, i64>(16)?;
+        let request_payload_digest = row.get::<_, Vec<u8>>(17)?;
+        let request_sequence = row.get::<_, i64>(18)?;
+        let expected_generation = (generation > 1).then_some(generation - 1);
+        let computed_payload = compute_pause_checkpoint_payload_digest(
+            pause_request_id,
+            expected_generation,
+            expected_job_state_version,
+            expected_run_state_version,
+            job_state_version,
+            run_state_version,
+            generation,
+            discovered_count,
+            fingerprinted_count,
+            error_count,
+            logical_bytes_seen,
+            saved_at_ms,
+            acknowledged_at_ms,
+            &pause_request_key,
+            &write_key,
+            &cursor_json,
+        )?;
+        let cursor: PauseCheckpointCursor = serde_json::from_str(&cursor_json).map_err(|_| {
+            StoreError::MigrationHistoryMismatch(
+                "pause checkpoint cursor is not the closed typed projection".into(),
+            )
+        })?;
+        let (directory_count, file_count) = pause_cursor_ordinals(&cursor)?;
+        if generation != previous_generation + 1
+            || request_sequence <= previous_request_sequence
+            || checkpoint_work_plan.as_slice() != work_plan_digest
+            || payload_digest.as_slice() != computed_payload
+            || request_payload_digest.as_slice() != computed_payload
+            || directory_count < previous_directory_count
+            || file_count < previous_file_count
+            || directory_count > final_directory_count
+            || file_count > final_file_count
+            || discovered_count < previous_discovered_count
+            || fingerprinted_count < previous_fingerprinted_count
+            || error_count < previous_error_count
+            || logical_bytes_seen < previous_logical_bytes_seen
+            || saved_at_ms < previous_saved_at_ms
+        {
+            return Err(StoreError::MigrationHistoryMismatch(
+                "pause checkpoint history payload or generation is invalid".into(),
+            ));
+        }
+        previous_generation = generation;
+        previous_request_sequence = request_sequence;
+        previous_directory_count = directory_count;
+        previous_file_count = file_count;
+        previous_discovered_count = discovered_count;
+        previous_fingerprinted_count = fingerprinted_count;
+        previous_error_count = error_count;
+        previous_logical_bytes_seen = logical_bytes_seen;
+        previous_saved_at_ms = saved_at_ms;
+    }
+    drop(checkpoint_rows);
+    drop(checkpoint_statement);
+
+    let mut request_statement = connection.prepare(
+        "SELECT sequence, kind, disposition, expected_checkpoint_generation, \
+                ack_checkpoint_generation \
+         FROM scan_control_requests WHERE scan_run_id = ?1 ORDER BY sequence",
+    )?;
+    let mut request_rows = request_statement.query([scan_run_id])?;
+    let mut previous_sequence = 0_i64;
+    let mut latest_pause_generation = 0_i64;
+    let mut last_acknowledged_kind: Option<String> = None;
+    while let Some(row) = request_rows.next()? {
+        let sequence = row.get::<_, i64>(0)?;
+        let kind = row.get::<_, String>(1)?;
+        let disposition = row.get::<_, String>(2)?;
+        let expected_checkpoint_generation = row.get::<_, Option<i64>>(3)?;
+        let ack_checkpoint_generation = row.get::<_, Option<i64>>(4)?;
+        if sequence != previous_sequence + 1
+            || (kind == "resume"
+                && (expected_checkpoint_generation != Some(latest_pause_generation)
+                    || latest_pause_generation == 0
+                    || last_acknowledged_kind.as_deref() != Some("pause")))
+            || (kind != "resume" && expected_checkpoint_generation.is_some())
+        {
+            return Err(StoreError::MigrationHistoryMismatch(
+                "runtime control sequence or checkpoint expectation is invalid".into(),
+            ));
+        }
+        if disposition == "acknowledged" {
+            match kind.as_str() {
+                "pause" => {
+                    if last_acknowledged_kind.as_deref() == Some("pause") {
+                        return Err(StoreError::MigrationHistoryMismatch(
+                            "acknowledged pause controls do not alternate with resume".into(),
+                        ));
+                    }
+                    latest_pause_generation =
+                        latest_pause_generation.checked_add(1).ok_or_else(|| {
+                            StoreError::MigrationHistoryMismatch(
+                                "pause checkpoint generation overflow".into(),
+                            )
+                        })?;
+                    if ack_checkpoint_generation != Some(latest_pause_generation) {
+                        return Err(StoreError::MigrationHistoryMismatch(
+                            "acknowledged pause generation is not contiguous".into(),
+                        ));
+                    }
+                }
+                "resume" => {
+                    if ack_checkpoint_generation != expected_checkpoint_generation {
+                        return Err(StoreError::MigrationHistoryMismatch(
+                            "acknowledged resume does not reference its latest pause".into(),
+                        ));
+                    }
+                }
+                "cancel" => {
+                    let expected = (latest_pause_generation > 0).then_some(latest_pause_generation);
+                    if ack_checkpoint_generation != expected {
+                        return Err(StoreError::MigrationHistoryMismatch(
+                            "acknowledged cancel does not reference the latest pause".into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(StoreError::MigrationHistoryMismatch(
+                        "runtime control kind is invalid".into(),
+                    ));
+                }
+            }
+            last_acknowledged_kind = Some(kind);
+        }
+        previous_sequence = sequence;
+    }
+    if latest_pause_generation != previous_generation {
+        return Err(StoreError::MigrationHistoryMismatch(
+            "pause requests and append-only checkpoint history are not one-to-one".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn fixed_digest_from_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<[u8; 32]> {
+    let bytes = row.get::<_, Vec<u8>>(index)?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Blob,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("expected 32-byte digest, got {} bytes", bytes.len()),
+            )
+            .into(),
+        )
+    })
+}
+
+fn runtime_evidence_accumulator_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RuntimeEvidenceAccumulator> {
+    Ok(RuntimeEvidenceAccumulator {
+        directory_count: row.get(0)?,
+        file_count: row.get(1)?,
+        directory_digest: fixed_digest_from_row(row, 2)?,
+        file_digest: fixed_digest_from_row(row, 3)?,
+        combined_digest: fixed_digest_from_row(row, 4)?,
+    })
+}
+
+fn control_request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanControlRequestRecord> {
+    Ok(ScanControlRequestRecord {
+        id: row.get(0)?,
+        sequence: row.get(1)?,
+        kind: control_kind_from_sql(row.get::<_, String>(2)?, 2)?,
+        disposition: control_disposition_from_sql(row.get::<_, String>(3)?, 3)?,
+        expected_job_state_version: row.get(4)?,
+        expected_run_state_version: row.get(5)?,
+        expected_checkpoint_generation: row.get(6)?,
+        requested_at_ms: row.get(7)?,
+        acknowledged_at_ms: row.get(8)?,
+        ack_job_state_version: row.get(9)?,
+        ack_run_state_version: row.get(10)?,
+        ack_checkpoint_generation: row.get(11)?,
+        ack_reason_code: row.get(12)?,
+    })
+}
+
+fn control_request_from_row_with_lease(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(ScanControlRequestRecord, Vec<u8>, i64)> {
+    Ok((control_request_from_row(row)?, row.get(13)?, row.get(14)?))
+}
+
+fn control_kind_from_sql(value: String, index: usize) -> rusqlite::Result<ScanControlKind> {
+    match value.as_str() {
+        "pause" => Ok(ScanControlKind::Pause),
+        "resume" => Ok(ScanControlKind::Resume),
+        "cancel" => Ok(ScanControlKind::Cancel),
+        _ => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            value,
+            rusqlite::types::Type::Text,
+        )),
+    }
+}
+
+fn control_disposition_from_sql(
+    value: String,
+    index: usize,
+) -> rusqlite::Result<ScanControlDisposition> {
+    match value.as_str() {
+        "pending" => Ok(ScanControlDisposition::Pending),
+        "acknowledged" => Ok(ScanControlDisposition::Acknowledged),
+        "superseded" => Ok(ScanControlDisposition::Superseded),
+        "interrupted" => Ok(ScanControlDisposition::Interrupted),
+        _ => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            value,
+            rusqlite::types::Type::Text,
+        )),
+    }
 }
 
 fn validate_v5_batch(field: &'static str, count: usize) -> Result<()> {

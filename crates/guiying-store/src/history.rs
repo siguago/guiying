@@ -8,10 +8,17 @@ use crate::model::{
     CaptureTimeIssueCursor, CaptureTimeIssueRecord, CaptureTimeMemberCursor,
     CaptureTimeMemberRecord, CaptureTimeMetadataFieldRawDetail, CaptureTimeMetadataFieldRecord,
     CaptureTimeMetadataReportRecord, CaptureTimeSummaryCursor, DuplicateGroupCursor,
-    DuplicateGroupMemberCursor, DuplicateGroupMemberRecord, EvidenceDatabaseScope, KeysetPage,
+    DuplicateGroupMemberCursor, DuplicateGroupMemberRecord, EvidenceDatabaseScope,
+    HistoryExportBatch, HistoryExportCoverageStatus, HistoryExportDecimal,
+    HistoryExportDuplicateGroupRecord, HistoryExportDuplicateMemberRecord,
+    HistoryExportFileTimestamp, HistoryExportIssueSeverity, HistoryExportProjectedText,
+    HistoryExportProjection, HistoryExportRecord, HistoryExportRequest,
+    HistoryExportScanIssueRecord, HistoryExportScanMode, HistoryExportScope,
+    HistoryExportSummaryRecord, HistoryExportTimeOutcome, HistoryExportTimeState, KeysetPage,
     MetadataFieldCursor, MetadataReportCursor, ScanHistoryContext, ScanHistoryCursor,
     ScanHistoryGroupContext, ScanHistoryRecord, ScanHistoryTimeOutcomeRecord, ScanIssueCursor,
-    ScanIssueRecord, VerifiedExactGroup,
+    ScanIssueRecord, VerifiedExactGroup, MAX_HISTORY_EXPORT_LOGICAL_BYTES,
+    MAX_HISTORY_EXPORT_RECORDS,
 };
 use crate::store::{
     enforce_read_budget, keyset_page_from_items, validate_positive_read_id, Store,
@@ -358,6 +365,60 @@ impl EvidenceReader {
                     time_session_id: row.2,
                 }))
             })
+        })
+    }
+
+    /// Runs a bounded v1 export against one `BEGIN DEFERRED` read snapshot.
+    ///
+    /// The callback receives an iterator-like facade, never the SQLite
+    /// connection or arbitrary SQL access. It must call `next_batch` until it
+    /// returns `None`; each call supplies the caller-owned deadline check.
+    /// Returning successfully without consuming the snapshot is rejected so a
+    /// truncated file cannot be mistaken for a complete export.
+    pub fn with_scan_history_export_snapshot<T>(
+        &self,
+        context: &ScanHistoryContext,
+        request: HistoryExportRequest,
+        callback: impl FnOnce(&mut HistoryExportSnapshot<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.store.consistent_read(|connection| {
+            self.require_history_context(connection, context)?;
+            let summary = connection
+                .query_row(
+                    &history_record_select_sql(),
+                    rusqlite::params![
+                        Option::<i64>::None,
+                        Option::<i64>::None,
+                        1_i64,
+                        context.scan_run_id,
+                    ],
+                    scan_history_record_from_row,
+                )
+                .optional()?
+                .ok_or(StoreError::ConcurrencyConflict {
+                    entity: "scan_history_export_context",
+                    id: context.scan_run_id,
+                })?;
+            let expected_record_count =
+                history_export_record_count(connection, context, request.scope())?;
+            let logical_bytes_upper_bound =
+                history_export_preflight_bytes(connection, context, request)?;
+            let mut snapshot = HistoryExportSnapshot::new(
+                connection,
+                context.clone(),
+                request,
+                history_export_summary(summary, request.projection())?,
+                expected_record_count,
+                logical_bytes_upper_bound,
+            );
+            let value = callback(&mut snapshot)?;
+            if !snapshot.is_complete() {
+                return Err(StoreError::invalid_input(
+                    "history_export_callback",
+                    "callback returned before consuming the complete export snapshot",
+                ));
+            }
+            Ok(value)
         })
     }
 
@@ -710,6 +771,645 @@ impl EvidenceReader {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryExportStage {
+    Summary,
+    DuplicateGroups,
+    DuplicateMembers,
+    ScanIssues,
+    Done,
+}
+
+/// Iterator-like access to one bounded history export read snapshot.
+///
+/// This type can only be obtained inside
+/// [`EvidenceReader::with_scan_history_export_snapshot`]. It intentionally
+/// exposes neither its SQLite connection nor an arbitrary-query escape hatch.
+pub struct HistoryExportSnapshot<'connection> {
+    connection: &'connection rusqlite::Connection,
+    context: ScanHistoryContext,
+    request: HistoryExportRequest,
+    stage: HistoryExportStage,
+    summary: Option<HistoryExportSummaryRecord>,
+    group_after_id: i64,
+    member_after_group_id: i64,
+    member_after_sort_rank: i64,
+    member_after_ordinal: i64,
+    issue_after_id: i64,
+    emitted_record_count: u32,
+    emitted_logical_bytes_upper_bound: u64,
+    expected_record_count: u32,
+    logical_bytes_upper_bound: u64,
+}
+
+impl<'connection> HistoryExportSnapshot<'connection> {
+    fn new(
+        connection: &'connection rusqlite::Connection,
+        context: ScanHistoryContext,
+        request: HistoryExportRequest,
+        summary: HistoryExportSummaryRecord,
+        expected_record_count: u32,
+        logical_bytes_upper_bound: u64,
+    ) -> Self {
+        Self {
+            connection,
+            context,
+            request,
+            stage: HistoryExportStage::Summary,
+            summary: Some(summary),
+            group_after_id: 0,
+            member_after_group_id: 0,
+            member_after_sort_rank: -1,
+            member_after_ordinal: -1,
+            issue_after_id: 0,
+            emitted_record_count: 0,
+            // JSON array brackets are included in the logical encoding bound.
+            emitted_logical_bytes_upper_bound: 2,
+            expected_record_count,
+            logical_bytes_upper_bound,
+        }
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> HistoryExportRequest {
+        self.request
+    }
+
+    #[must_use]
+    pub const fn expected_record_count(&self) -> u32 {
+        self.expected_record_count
+    }
+
+    #[must_use]
+    pub const fn logical_bytes_upper_bound(&self) -> u64 {
+        self.logical_bytes_upper_bound
+    }
+
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.stage, HistoryExportStage::Done)
+            && self.emitted_record_count == self.expected_record_count
+    }
+
+    /// Returns the next ordered batch after running the caller-owned deadline
+    /// check. The check is repeated before each bounded SQL page and callers
+    /// should propagate any returned error, treating the snapshot as terminal.
+    pub fn next_batch(
+        &mut self,
+        mut check_deadline: impl FnMut() -> Result<()>,
+    ) -> Result<Option<HistoryExportBatch>> {
+        loop {
+            check_deadline()?;
+            let records = match self.stage {
+                HistoryExportStage::Summary => {
+                    let summary = self.summary.take().ok_or(StoreError::ConcurrencyConflict {
+                        entity: "scan_history_export_summary",
+                        id: self.context.scan_run_id,
+                    })?;
+                    self.stage = match self.request.scope() {
+                        HistoryExportScope::Summary => HistoryExportStage::Done,
+                        HistoryExportScope::CompleteEvidence => HistoryExportStage::DuplicateGroups,
+                    };
+                    vec![HistoryExportRecord::Summary(Box::new(summary))]
+                }
+                HistoryExportStage::DuplicateGroups => {
+                    let records = self.read_duplicate_groups_batch()?;
+                    if records.is_empty() {
+                        self.stage = HistoryExportStage::DuplicateMembers;
+                        continue;
+                    }
+                    records
+                }
+                HistoryExportStage::DuplicateMembers => {
+                    let records = self.read_duplicate_members_batch()?;
+                    if records.is_empty() {
+                        self.stage = HistoryExportStage::ScanIssues;
+                        continue;
+                    }
+                    records
+                }
+                HistoryExportStage::ScanIssues => {
+                    let records = self.read_scan_issues_batch()?;
+                    if records.is_empty() {
+                        self.stage = HistoryExportStage::Done;
+                        continue;
+                    }
+                    records
+                }
+                HistoryExportStage::Done => {
+                    if self.emitted_record_count != self.expected_record_count {
+                        return Err(StoreError::ConcurrencyConflict {
+                            entity: "scan_history_export_record_count",
+                            id: self.context.scan_run_id,
+                        });
+                    }
+                    return Ok(None);
+                }
+            };
+            check_deadline()?;
+            return self.finish_batch(records).map(Some);
+        }
+    }
+
+    fn read_duplicate_groups_batch(&mut self) -> Result<Vec<HistoryExportRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, expected_member_count, expected_edge_count, \
+                    independent_file_count, logical_reclaimable_bytes, finalized_at_ms \
+             FROM exact_group_builds \
+             WHERE scan_run_id = ?1 AND volume_id = ?2 AND state = 'verified' AND id > ?3 \
+             ORDER BY id LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                self.context.scan_run_id,
+                self.context.volume_id,
+                self.group_after_id,
+                i64::from(self.request.batch_size()),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        let mut records = Vec::with_capacity(self.request.batch_size() as usize);
+        for row in rows {
+            let (group_build_id, member_count, edge_count, independent_count, bytes, finalized) =
+                row?;
+            self.group_after_id = group_build_id;
+            records.push(HistoryExportRecord::DuplicateGroup(
+                HistoryExportDuplicateGroupRecord {
+                    scan_run_id: decimal(self.context.scan_run_id),
+                    group_build_id: decimal(group_build_id),
+                    member_count: decimal(member_count),
+                    edge_count: decimal(edge_count),
+                    independent_file_count: decimal(independent_count),
+                    logical_reclaimable_bytes: decimal(bytes),
+                    finalized_at_ms: decimal(finalized),
+                },
+            ));
+        }
+        Ok(records)
+    }
+
+    fn read_duplicate_members_batch(&mut self) -> Result<Vec<HistoryExportRecord>> {
+        let include_display = projection_flag(self.request.projection());
+        let mut statement = self.connection.prepare(
+            "SELECT member.exact_group_build_id, member.ordinal, member.sort_rank, \
+                    CASE WHEN ?6 = 1 THEN observation.display_path END, \
+                    observation.size_bytes, observation.birth_time_seconds, \
+                    observation.birth_time_nanoseconds, observation.modified_time_seconds, \
+                    observation.modified_time_nanoseconds, observation.timestamp_granularity_ns \
+             FROM exact_group_build_members AS member \
+             JOIN exact_group_builds AS build \
+               ON build.volume_id = member.volume_id \
+              AND build.scan_run_id = member.scan_run_id \
+              AND build.id = member.exact_group_build_id \
+             JOIN media_observation_snapshots AS observation \
+               ON observation.volume_id = member.volume_id \
+              AND observation.scan_run_id = member.scan_run_id \
+              AND observation.id = member.media_observation_snapshot_id \
+             WHERE member.scan_run_id = ?1 AND member.volume_id = ?2 \
+               AND build.state = 'verified' \
+               AND (member.exact_group_build_id > ?3 \
+                    OR (member.exact_group_build_id = ?3 \
+                        AND (member.sort_rank > ?4 \
+                             OR (member.sort_rank = ?4 AND member.ordinal > ?5)))) \
+             ORDER BY member.exact_group_build_id, member.sort_rank, member.ordinal \
+             LIMIT ?7",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                self.context.scan_run_id,
+                self.context.volume_id,
+                self.member_after_group_id,
+                self.member_after_sort_rank,
+                self.member_after_ordinal,
+                include_display,
+                i64::from(self.request.batch_size()),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    history_export_optional_timestamp(row, 5, 6)?,
+                    history_export_required_timestamp(row, 7, 8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                ))
+            },
+        )?;
+        let mut records = Vec::with_capacity(self.request.batch_size() as usize);
+        for row in rows {
+            let (group_id, ordinal, sort_rank, path, size, birth, modified, granularity) = row?;
+            self.member_after_group_id = group_id;
+            self.member_after_sort_rank = sort_rank;
+            self.member_after_ordinal = ordinal;
+            records.push(HistoryExportRecord::DuplicateMember(
+                HistoryExportDuplicateMemberRecord {
+                    scan_run_id: decimal(self.context.scan_run_id),
+                    group_build_id: decimal(group_id),
+                    ordinal: decimal(ordinal),
+                    sort_rank: decimal(sort_rank),
+                    display_path: projected_optional_text(self.request.projection(), path)?,
+                    size_bytes: decimal(size),
+                    birth_time: birth,
+                    modified_time: modified,
+                    timestamp_granularity_ns: granularity.map(decimal),
+                },
+            ));
+        }
+        Ok(records)
+    }
+
+    fn read_scan_issues_batch(&mut self) -> Result<Vec<HistoryExportRecord>> {
+        let include_display = projection_flag(self.request.projection());
+        let mut statement = self.connection.prepare(
+            "SELECT id, severity, CASE WHEN ?4 = 1 THEN stage END, \
+                    CASE WHEN ?4 = 1 THEN code END, CASE WHEN ?4 = 1 THEN message END, \
+                    occurred_at_ms, resolved_at_ms \
+             FROM scan_issues \
+             WHERE scan_run_id = ?1 AND volume_id = ?2 AND id > ?3 \
+             ORDER BY id LIMIT ?5",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                self.context.scan_run_id,
+                self.context.volume_id,
+                self.issue_after_id,
+                include_display,
+                i64::from(self.request.batch_size()),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            },
+        )?;
+        let mut records = Vec::with_capacity(self.request.batch_size() as usize);
+        for row in rows {
+            let (id, severity, stage, code, message, occurred, resolved) = row?;
+            self.issue_after_id = id;
+            records.push(HistoryExportRecord::ScanIssue(
+                HistoryExportScanIssueRecord {
+                    scan_run_id: decimal(self.context.scan_run_id),
+                    issue_id: decimal(id),
+                    severity: history_export_severity(&severity)?,
+                    stage: projected_optional_text(self.request.projection(), stage)?,
+                    code: projected_optional_text(self.request.projection(), code)?,
+                    message: projected_optional_text(self.request.projection(), message)?,
+                    occurred_at_ms: decimal(occurred),
+                    resolved_at_ms: resolved.map(decimal),
+                },
+            ));
+        }
+        Ok(records)
+    }
+
+    fn finish_batch(&mut self, records: Vec<HistoryExportRecord>) -> Result<HistoryExportBatch> {
+        let batch_count = u32::try_from(records.len()).map_err(|_| {
+            StoreError::invalid_input("history_export_batch", "batch record count overflow")
+        })?;
+        if batch_count == 0 || batch_count > self.request.batch_size() {
+            return Err(StoreError::invalid_input(
+                "history_export_batch",
+                "batch is empty or exceeds the validated request size",
+            ));
+        }
+        let next_count = self
+            .emitted_record_count
+            .checked_add(batch_count)
+            .ok_or_else(|| StoreError::invalid_input("history_export", "record count overflow"))?;
+        if next_count > MAX_HISTORY_EXPORT_RECORDS || next_count > self.expected_record_count {
+            return Err(StoreError::invalid_input(
+                "history_export",
+                format!("history export exceeds {MAX_HISTORY_EXPORT_RECORDS} records"),
+            ));
+        }
+        let batch_bytes = records.iter().try_fold(0_u64, |total, record| {
+            let encoded = serde_json::to_vec(record)?;
+            total
+                .checked_add(encoded.len() as u64)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| {
+                    StoreError::invalid_input("history_export", "encoded byte count overflow")
+                })
+        })?;
+        let next_bytes = self
+            .emitted_logical_bytes_upper_bound
+            .checked_add(batch_bytes)
+            .ok_or_else(|| {
+                StoreError::invalid_input("history_export", "encoded byte count overflow")
+            })?;
+        if next_bytes > MAX_HISTORY_EXPORT_LOGICAL_BYTES
+            || next_bytes > self.logical_bytes_upper_bound
+        {
+            return Err(StoreError::ReadResultLimit {
+                kind: "history export logical records",
+                bytes: i64::try_from(next_bytes).unwrap_or(i64::MAX),
+                limit: MAX_HISTORY_EXPORT_LOGICAL_BYTES as i64,
+            });
+        }
+        self.emitted_record_count = next_count;
+        self.emitted_logical_bytes_upper_bound = next_bytes;
+        Ok(HistoryExportBatch {
+            records,
+            cumulative_record_count: next_count,
+            cumulative_logical_bytes_upper_bound: next_bytes,
+        })
+    }
+}
+
+fn history_export_record_count(
+    connection: &rusqlite::Connection,
+    context: &ScanHistoryContext,
+    scope: HistoryExportScope,
+) -> Result<u32> {
+    let count = match scope {
+        HistoryExportScope::Summary => 1_i64,
+        HistoryExportScope::CompleteEvidence => connection.query_row(
+            "SELECT 1 \
+                 + (SELECT count(*) FROM exact_group_builds AS build \
+                    WHERE build.scan_run_id = ?1 AND build.volume_id = ?2 \
+                      AND build.state = 'verified') \
+                 + (SELECT count(*) \
+                    FROM exact_group_build_members AS member \
+                    JOIN exact_group_builds AS build \
+                      ON build.volume_id = member.volume_id \
+                     AND build.scan_run_id = member.scan_run_id \
+                     AND build.id = member.exact_group_build_id \
+                    WHERE member.scan_run_id = ?1 AND member.volume_id = ?2 \
+                      AND build.state = 'verified') \
+                 + (SELECT count(*) FROM scan_issues AS issue \
+                    WHERE issue.scan_run_id = ?1 AND issue.volume_id = ?2)",
+            rusqlite::params![context.scan_run_id, context.volume_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+    };
+    if count <= 0 || count > i64::from(MAX_HISTORY_EXPORT_RECORDS) {
+        return Err(StoreError::invalid_input(
+            "history_export",
+            format!("history export exceeds {MAX_HISTORY_EXPORT_RECORDS} records"),
+        ));
+    }
+    u32::try_from(count)
+        .map_err(|_| StoreError::invalid_input("history_export", "record count overflow"))
+}
+
+fn history_export_preflight_bytes(
+    connection: &rusqlite::Connection,
+    context: &ScanHistoryContext,
+    request: HistoryExportRequest,
+) -> Result<u64> {
+    let include_display = projection_flag(request.projection());
+    let bytes = match request.scope() {
+        HistoryExportScope::Summary => connection.query_row(
+            "SELECT 2050 + CASE WHEN ?3 = 1 \
+                         THEN 6 * length(CAST(root_relative_path AS BLOB)) ELSE 0 END \
+             FROM scan_runs WHERE id = ?1 AND volume_id = ?2",
+            rusqlite::params![context.scan_run_id, context.volume_id, include_display],
+            |row| row.get::<_, i64>(0),
+        )?,
+        HistoryExportScope::CompleteEvidence => connection.query_row(
+            "SELECT 2050 \
+                 + CASE WHEN ?3 = 1 \
+                        THEN 6 * length(CAST(run.root_relative_path AS BLOB)) ELSE 0 END \
+                 + COALESCE(( \
+                     SELECT sum(512) FROM exact_group_builds AS build \
+                     WHERE build.scan_run_id = ?1 AND build.volume_id = ?2 \
+                       AND build.state = 'verified' \
+                   ), 0) \
+                 + COALESCE(( \
+                     SELECT sum(512 + CASE WHEN ?3 = 1 \
+                                      THEN 6 * length(CAST(observation.display_path AS BLOB)) \
+                                      ELSE 0 END) \
+                     FROM exact_group_build_members AS member \
+                     JOIN exact_group_builds AS build \
+                       ON build.volume_id = member.volume_id \
+                      AND build.scan_run_id = member.scan_run_id \
+                      AND build.id = member.exact_group_build_id \
+                     JOIN media_observation_snapshots AS observation \
+                       ON observation.volume_id = member.volume_id \
+                      AND observation.scan_run_id = member.scan_run_id \
+                      AND observation.id = member.media_observation_snapshot_id \
+                     WHERE member.scan_run_id = ?1 AND member.volume_id = ?2 \
+                       AND build.state = 'verified' \
+                   ), 0) \
+                 + COALESCE(( \
+                     SELECT sum(512 + CASE WHEN ?3 = 1 THEN \
+                                  6 * length(CAST(issue.stage AS BLOB)) \
+                                + 6 * length(CAST(issue.code AS BLOB)) \
+                                + 6 * length(CAST(issue.message AS BLOB)) ELSE 0 END) \
+                     FROM scan_issues AS issue \
+                     WHERE issue.scan_run_id = ?1 AND issue.volume_id = ?2 \
+                   ), 0) \
+             FROM scan_runs AS run WHERE run.id = ?1 AND run.volume_id = ?2",
+            rusqlite::params![context.scan_run_id, context.volume_id, include_display],
+            |row| row.get::<_, i64>(0),
+        )?,
+    };
+    if bytes < 0 || bytes > MAX_HISTORY_EXPORT_LOGICAL_BYTES as i64 {
+        return Err(StoreError::ReadResultLimit {
+            kind: "history export logical records",
+            bytes,
+            limit: MAX_HISTORY_EXPORT_LOGICAL_BYTES as i64,
+        });
+    }
+    u64::try_from(bytes)
+        .map_err(|_| StoreError::invalid_input("history_export", "encoded byte count overflow"))
+}
+
+fn history_export_summary(
+    record: ScanHistoryRecord,
+    projection: HistoryExportProjection,
+) -> Result<HistoryExportSummaryRecord> {
+    Ok(HistoryExportSummaryRecord {
+        scan_run_id: decimal(record.scan_run_id),
+        root_display_path: projected_text(projection, record.root_display_path),
+        scan_mode: history_export_scan_mode(&record.scan_mode)?,
+        started_at_ms: decimal(record.started_at_ms),
+        finished_at_ms: decimal(record.finished_at_ms),
+        duration_ms: decimal(record.duration_ms),
+        coverage_status: history_export_coverage_status(&record.coverage_status)?,
+        discovered_count: decimal(record.discovered_count),
+        fingerprinted_count: decimal(record.fingerprinted_count),
+        error_count: decimal(record.error_count),
+        logical_bytes_seen: decimal(record.logical_bytes_seen),
+        observed_file_count: decimal(record.observed_file_count),
+        verified_group_count: decimal(record.verified_group_count),
+        verified_member_count: decimal(record.verified_member_count),
+        redundant_copy_count: decimal(record.redundant_copy_count),
+        logical_reclaimable_bytes: decimal(record.logical_reclaimable_bytes),
+        issue_count: decimal(record.issue_count),
+        unresolved_issue_count: decimal(record.unresolved_issue_count),
+        time_outcome: history_export_time_outcome(record.time_outcome)?,
+    })
+}
+
+fn history_export_time_outcome(
+    record: ScanHistoryTimeOutcomeRecord,
+) -> Result<HistoryExportTimeOutcome> {
+    Ok(HistoryExportTimeOutcome {
+        state: match record.state.as_str() {
+            "complete" => HistoryExportTimeState::Complete,
+            "partial" => HistoryExportTimeState::Partial,
+            "not_run" => HistoryExportTimeState::NotRun,
+            "unavailable" => HistoryExportTimeState::Unavailable,
+            "failed" => HistoryExportTimeState::Failed,
+            _ => {
+                return Err(StoreError::invalid_input(
+                    "history_export_time_state",
+                    "database returned an unsupported time state",
+                ))
+            }
+        },
+        expected_group_count: record.expected_group_count.map(decimal),
+        evidence_group_count: record.evidence_group_count.map(decimal),
+        unavailable_group_count: record.unavailable_group_count.map(decimal),
+        failed_group_count: record.failed_group_count.map(decimal),
+        max_total_read_bytes: record.max_total_read_bytes.map(decimal),
+        max_probe_count_per_group: record.max_probe_count_per_group.map(decimal),
+        max_report_total_bytes_read: record.max_report_total_bytes_read.map(decimal),
+        max_report_read_operations: record.max_report_read_operations.map(decimal),
+        max_report_retained_field_bytes: record.max_report_retained_field_bytes.map(decimal),
+        max_report_fields: record.max_report_fields.map(decimal),
+        max_report_issues: record.max_report_issues.map(decimal),
+        sealed_report_read_bytes: record.sealed_report_read_bytes.map(decimal),
+        sealed_report_read_operations: record.sealed_report_read_operations.map(decimal),
+        finalized_at_ms: record.finalized_at_ms.map(decimal),
+    })
+}
+
+fn history_export_scan_mode(value: &str) -> Result<HistoryExportScanMode> {
+    match value {
+        "full" => Ok(HistoryExportScanMode::Full),
+        "incremental" => Ok(HistoryExportScanMode::Incremental),
+        "resume" => Ok(HistoryExportScanMode::Resume),
+        "verify" => Ok(HistoryExportScanMode::Verify),
+        _ => Err(StoreError::invalid_input(
+            "history_export_scan_mode",
+            "database returned an unsupported scan mode",
+        )),
+    }
+}
+
+fn history_export_coverage_status(value: &str) -> Result<HistoryExportCoverageStatus> {
+    match value {
+        "complete" => Ok(HistoryExportCoverageStatus::Complete),
+        "partial" => Ok(HistoryExportCoverageStatus::Partial),
+        _ => Err(StoreError::invalid_input(
+            "history_export_coverage_status",
+            "database returned an ineligible coverage status",
+        )),
+    }
+}
+
+fn history_export_severity(value: &str) -> Result<HistoryExportIssueSeverity> {
+    match value {
+        "info" => Ok(HistoryExportIssueSeverity::Info),
+        "warning" => Ok(HistoryExportIssueSeverity::Warning),
+        "error" => Ok(HistoryExportIssueSeverity::Error),
+        "fatal" => Ok(HistoryExportIssueSeverity::Fatal),
+        _ => Err(StoreError::invalid_input(
+            "history_export_issue_severity",
+            "database returned an unsupported issue severity",
+        )),
+    }
+}
+
+fn decimal(value: i64) -> HistoryExportDecimal {
+    HistoryExportDecimal::from_i64(value)
+}
+
+const fn projection_flag(projection: HistoryExportProjection) -> i64 {
+    match projection {
+        HistoryExportProjection::Redacted => 0,
+        HistoryExportProjection::Display => 1,
+    }
+}
+
+fn projected_text(
+    projection: HistoryExportProjection,
+    value: String,
+) -> HistoryExportProjectedText {
+    match projection {
+        HistoryExportProjection::Redacted => HistoryExportProjectedText::Redacted,
+        HistoryExportProjection::Display => HistoryExportProjectedText::Display(value),
+    }
+}
+
+fn projected_optional_text(
+    projection: HistoryExportProjection,
+    value: Option<String>,
+) -> Result<HistoryExportProjectedText> {
+    match (projection, value) {
+        (HistoryExportProjection::Redacted, _) => Ok(HistoryExportProjectedText::Redacted),
+        (HistoryExportProjection::Display, Some(value)) => {
+            Ok(HistoryExportProjectedText::Display(value))
+        }
+        (HistoryExportProjection::Display, None) => Err(StoreError::invalid_input(
+            "history_export_projection",
+            "display projection unexpectedly omitted display text",
+        )),
+    }
+}
+
+fn history_export_optional_timestamp(
+    row: &rusqlite::Row<'_>,
+    seconds_index: usize,
+    nanoseconds_index: usize,
+) -> rusqlite::Result<Option<HistoryExportFileTimestamp>> {
+    let seconds = row.get::<_, Option<i64>>(seconds_index)?;
+    let nanoseconds = row.get::<_, Option<i64>>(nanoseconds_index)?;
+    match (seconds, nanoseconds) {
+        (None, None) => Ok(None),
+        (Some(seconds), Some(nanoseconds)) => {
+            if !(0..1_000_000_000).contains(&nanoseconds) {
+                return Err(rusqlite::Error::IntegralValueOutOfRange(
+                    nanoseconds_index,
+                    nanoseconds,
+                ));
+            }
+            Ok(Some(HistoryExportFileTimestamp {
+                seconds: decimal(seconds),
+                nanoseconds: decimal(nanoseconds),
+            }))
+        }
+        _ => Err(rusqlite::Error::InvalidColumnType(
+            nanoseconds_index,
+            "history_export_timestamp_parts".to_owned(),
+            rusqlite::types::Type::Null,
+        )),
+    }
+}
+
+fn history_export_required_timestamp(
+    row: &rusqlite::Row<'_>,
+    seconds_index: usize,
+    nanoseconds_index: usize,
+) -> rusqlite::Result<HistoryExportFileTimestamp> {
+    history_export_optional_timestamp(row, seconds_index, nanoseconds_index)?.ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
+            seconds_index,
+            "history_export_timestamp_parts".to_owned(),
+            rusqlite::types::Type::Null,
+        )
+    })
 }
 
 fn validate_history_limit(limit: u32) -> Result<i64> {

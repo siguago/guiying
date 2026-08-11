@@ -37,7 +37,7 @@ const BUSY_RETRY_PAUSE: Duration = Duration::from_millis(10);
 const MAX_BACKUP_STEPS: u64 = 1_000_000;
 const BACKUP_DEADLINE: Duration = Duration::from_secs(120);
 #[cfg(unix)]
-const MAX_PRE_V7_NAME_ATTEMPTS: u64 = 32;
+const MAX_PRE_MIGRATION_NAME_ATTEMPTS: u64 = 32;
 #[cfg(unix)]
 const STAGING_COPY_BUFFER_BYTES: usize = 1024 * 1024;
 #[cfg(unix)]
@@ -45,7 +45,7 @@ const MAX_STAGING_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 #[cfg(unix)]
 const MAX_STAGING_FAMILY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 #[cfg(unix)]
-static PRE_V7_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
+static PRE_MIGRATION_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackupFaultPoint {
@@ -154,13 +154,13 @@ pub(crate) fn prepare_existing_database_before_sqlite_open(
 type PlatformSourceSeal = UnixSourceFamilySeal;
 
 #[cfg(windows)]
-type PlatformSourceSeal = WindowsCleanV7Seal;
+type PlatformSourceSeal = WindowsSourceSeal;
 
 #[cfg(windows)]
-struct WindowsCleanV7Seal;
+struct WindowsSourceSeal;
 
 #[cfg(windows)]
-impl WindowsCleanV7Seal {
+impl WindowsSourceSeal {
     fn verify(&self) -> Result<()> {
         unreachable!("Windows existing-database staging fails closed before constructing a seal")
     }
@@ -169,7 +169,7 @@ impl WindowsCleanV7Seal {
 #[cfg(windows)]
 fn prepare_existing_database_platform(source_path: &Path) -> Result<PreparedExistingDatabase> {
     Err(StoreError::UnsupportedPlatform {
-        operation: "pre-v7 stable file-family staging",
+        operation: "pre-migration stable file-family staging",
         platform: std::env::consts::OS,
         path: source_path.to_path_buf(),
     })
@@ -189,7 +189,7 @@ impl PlatformSourceSeal {
 #[cfg(not(any(unix, windows)))]
 fn prepare_existing_database_platform(source_path: &Path) -> Result<PreparedExistingDatabase> {
     Err(StoreError::UnsupportedPlatform {
-        operation: "pre-v7 stable file-family staging",
+        operation: "pre-migration stable file-family staging",
         platform: std::env::consts::OS,
         path: source_path.to_path_buf(),
     })
@@ -411,11 +411,15 @@ fn stage_unix_source_family(
         }
         fail_if_test_backup_fault(
             BackupFaultPoint::StagingDirectorySync,
-            "syncing pre-v7 staging directory",
+            "syncing pre-migration staging directory",
             &staging_path,
         )?;
         staged_parent.sync_all().map_err(|error| {
-            StoreError::io("syncing pre-v7 staging directory", &staging_path, error)
+            StoreError::io(
+                "syncing pre-migration staging directory",
+                &staging_path,
+                error,
+            )
         })?;
         parent_identity.verify_file_and_path(&parent, &parent_path)?;
         let second =
@@ -485,14 +489,14 @@ fn create_unix_staging_directory(
     parent_path: &Path,
     expected_owner: u32,
 ) -> Result<(std::ffi::OsString, PathBuf, File, ParentIdentity)> {
-    for _ in 0..MAX_PRE_V7_NAME_ATTEMPTS {
-        let counter = PRE_V7_BACKUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    for _ in 0..MAX_PRE_MIGRATION_NAME_ATTEMPTS {
+        let counter = PRE_MIGRATION_BACKUP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let name = std::ffi::OsString::from(format!(
-            ".guiying-pre-v7-stage-{:x}-{now_nanos:x}-{counter:x}",
+            ".guiying-pre-migration-stage-{:x}-{now_nanos:x}-{counter:x}",
             std::process::id()
         ));
         match mkdirat(parent, &name, Mode::from_bits_truncate(0o700)) {
@@ -507,7 +511,11 @@ fn create_unix_staging_directory(
                     Ok(descriptor) => descriptor,
                     Err(error) => {
                         cleanup_empty_unix_staging_directory(parent, &name, &path)?;
-                        return Err(rustix_io("opening pre-v7 staging directory", &path, error));
+                        return Err(rustix_io(
+                            "opening pre-migration staging directory",
+                            &path,
+                            error,
+                        ));
                     }
                 };
                 let directory = File::from(descriptor);
@@ -524,7 +532,7 @@ fn create_unix_staging_directory(
             Err(error) if error == rustix::io::Errno::EXIST => continue,
             Err(error) => {
                 return Err(rustix_io(
-                    "creating pre-v7 staging directory",
+                    "creating pre-migration staging directory",
                     parent_path,
                     error,
                 ))
@@ -544,14 +552,14 @@ fn cleanup_empty_unix_staging_directory(
 ) -> Result<()> {
     unlinkat(parent, staging_name, AtFlags::REMOVEDIR).map_err(|error| {
         rustix_io(
-            "removing empty pre-v7 staging directory",
+            "removing empty pre-migration staging directory",
             staging_path,
             error,
         )
     })?;
-    parent
-        .sync_all()
-        .map_err(|error| StoreError::io("syncing pre-v7 staging parent", staging_path, error))?;
+    parent.sync_all().map_err(|error| {
+        StoreError::io("syncing pre-migration staging parent", staging_path, error)
+    })?;
     Ok(())
 }
 
@@ -564,11 +572,20 @@ fn remove_unix_staging_directory(
     staging_identity: ParentIdentity,
 ) -> Result<()> {
     staging_identity.verify_file_and_path(staging, staging_path)?;
-    let mut entries = Dir::read_from(staging)
-        .map_err(|error| rustix_io("enumerating pre-v7 staging cleanup", staging_path, error))?;
+    let mut entries = Dir::read_from(staging).map_err(|error| {
+        rustix_io(
+            "enumerating pre-migration staging cleanup",
+            staging_path,
+            error,
+        )
+    })?;
     while let Some(entry) = entries.read() {
         let entry = entry.map_err(|error| {
-            rustix_io("reading pre-v7 staging cleanup entry", staging_path, error)
+            rustix_io(
+                "reading pre-migration staging cleanup entry",
+                staging_path,
+                error,
+            )
         })?;
         let name = entry.file_name().to_bytes();
         if matches!(name, b"." | b"..") {
@@ -576,7 +593,7 @@ fn remove_unix_staging_directory(
         }
         unlinkat(staging, entry.file_name(), AtFlags::empty()).map_err(|error| {
             rustix_io(
-                "removing pre-v7 staging file",
+                "removing pre-migration staging file",
                 &staging_path.join(OsStr::from_bytes(name)),
                 error,
             )
@@ -584,17 +601,22 @@ fn remove_unix_staging_directory(
     }
     staging.sync_all().map_err(|error| {
         StoreError::io(
-            "syncing cleaned pre-v7 staging directory",
+            "syncing cleaned pre-migration staging directory",
             staging_path,
             error,
         )
     })?;
     staging_identity.verify_file_and_path(staging, staging_path)?;
-    unlinkat(parent, staging_name, AtFlags::REMOVEDIR)
-        .map_err(|error| rustix_io("removing pre-v7 staging directory", staging_path, error))?;
-    parent
-        .sync_all()
-        .map_err(|error| StoreError::io("syncing pre-v7 staging parent", staging_path, error))?;
+    unlinkat(parent, staging_name, AtFlags::REMOVEDIR).map_err(|error| {
+        rustix_io(
+            "removing pre-migration staging directory",
+            staging_path,
+            error,
+        )
+    })?;
+    parent.sync_all().map_err(|error| {
+        StoreError::io("syncing pre-migration staging parent", staging_path, error)
+    })?;
     Ok(())
 }
 
@@ -620,13 +642,17 @@ fn recover_and_snapshot_staged_database(
         });
     }
     let backup_path = if source_version < migrations::LATEST_SCHEMA_VERSION {
-        let destination = unique_pre_v7_destination(original_source, source_version)?;
+        let destination = unique_pre_migration_destination(
+            original_source,
+            source_version,
+            migrations::LATEST_SCHEMA_VERSION,
+        )?;
         Some(create_verified_backup(
             &staged,
             staged_main,
             &destination,
             false,
-            BackupSchemaValidation::PreV7 {
+            BackupSchemaValidation::PreMigration {
                 expected_version: source_version,
             },
         )?)
@@ -1147,9 +1173,13 @@ fn validate_staging_directory(
     use std::os::unix::fs::MetadataExt;
     let identity = ParentIdentity::from_file(path, directory)?;
     identity.verify_file_and_path(directory, path)?;
-    let metadata = directory
-        .metadata()
-        .map_err(|error| StoreError::io("reading pre-v7 staging directory handle", path, error))?;
+    let metadata = directory.metadata().map_err(|error| {
+        StoreError::io(
+            "reading pre-migration staging directory handle",
+            path,
+            error,
+        )
+    })?;
     let mode = metadata.mode() & 0o777;
     if !metadata.file_type().is_dir() || metadata.uid() != expected_owner || mode != 0o700 {
         return Err(StoreError::PreV7SourceFamilyUnsafe {
@@ -1202,7 +1232,7 @@ impl Store {
 enum BackupSchemaValidation {
     Current,
     #[cfg(unix)]
-    PreV7 {
+    PreMigration {
         expected_version: i64,
     },
 }
@@ -1212,7 +1242,7 @@ impl BackupSchemaValidation {
         match self {
             Self::Current => migrations::validate_current_schema(connection),
             #[cfg(unix)]
-            Self::PreV7 { expected_version } => {
+            Self::PreMigration { expected_version } => {
                 let observed = migrations::preflight_existing(connection)?;
                 if observed != expected_version {
                     return Err(StoreError::PreV7BackupVersionMismatch {
@@ -1230,7 +1260,7 @@ impl BackupSchemaValidation {
         match self {
             Self::Current => migrations::validate_current_schema(connection),
             #[cfg(unix)]
-            Self::PreV7 { expected_version } => {
+            Self::PreMigration { expected_version } => {
                 let observed = migrations::preflight_existing(connection)?;
                 if observed != expected_version {
                     return Err(StoreError::PreV7BackupVersionMismatch {
@@ -1369,7 +1399,11 @@ fn ensure_backup_sidecars_absent(database: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn unique_pre_v7_destination(source: &Path, source_version: i64) -> Result<PathBuf> {
+fn unique_pre_migration_destination(
+    source: &Path,
+    source_version: i64,
+    target_version: i64,
+) -> Result<PathBuf> {
     let parent = source
         .parent()
         .ok_or_else(|| StoreError::InvalidDatabasePath {
@@ -1377,14 +1411,14 @@ fn unique_pre_v7_destination(source: &Path, source_version: i64) -> Result<PathB
             reason: "database path has no parent".into(),
         })?;
     let process_id = std::process::id();
-    for _ in 0..MAX_PRE_V7_NAME_ATTEMPTS {
-        let counter = PRE_V7_BACKUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    for _ in 0..MAX_PRE_MIGRATION_NAME_ATTEMPTS {
+        let counter = PRE_MIGRATION_BACKUP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let candidate = parent.join(format!(
-            ".guiying-pre-v7-v{source_version}-{process_id:x}-{now_nanos:x}-{counter:x}.sqlite3"
+            ".guiying-pre-migration-from-v{source_version}-to-v{target_version}-{process_id:x}-{now_nanos:x}-{counter:x}.sqlite3"
         ));
         match prepare_destination(&candidate, false, source) {
             Ok(destination) => return Ok(destination),
@@ -1856,25 +1890,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pre_v7_target_validation_requires_the_exact_source_version() -> crate::Result<()> {
+    fn pre_migration_target_validation_requires_the_exact_source_version() -> crate::Result<()> {
         let temporary = tempfile::TempDir::new()
             .map_err(|error| StoreError::io("creating test directory", "/tmp", error))?;
         let database = temporary.path().join("current.sqlite3");
         let store = crate::Store::open_or_create(database)?;
 
-        let error = super::BackupSchemaValidation::PreV7 {
+        let error = super::BackupSchemaValidation::PreMigration {
             expected_version: 6,
         }
         .validate_target(&store.connection)
-        .expect_err("a v7 target must not satisfy an expected-v6 backup contract");
+        .expect_err("a latest-schema target must not satisfy an expected-v6 snapshot contract");
 
         assert!(matches!(
             error,
             StoreError::PreV7BackupVersionMismatch {
                 role: "target",
                 expected: 6,
-                observed: 7,
+                observed,
             }
+            if observed == crate::migrations::LATEST_SCHEMA_VERSION
         ));
         store.close()
     }

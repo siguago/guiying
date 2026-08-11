@@ -178,6 +178,31 @@ fixed_evidence_type!(
     from_runtime_evidence,
     "Copy-family identity used to prevent duplicate-count confidence voting."
 );
+fixed_evidence_type!(
+    RuntimeLeaseKey,
+    from_runtime_evidence,
+    "Random idempotency key for one process-local scan runtime lease."
+);
+fixed_evidence_type!(
+    ScanControlRequestKey,
+    from_runtime_evidence,
+    "Random idempotency key for one durable runtime control request."
+);
+fixed_evidence_type!(
+    PauseCheckpointWriteKey,
+    from_runtime_evidence,
+    "Random idempotency key for one pause-checkpoint generation."
+);
+fixed_evidence_type!(
+    RuntimeWorkPlanDigest,
+    from_runtime_evidence,
+    "Digest of the immutable runtime lease, session, and root-scope binding. It is not a digest of walker stack state or every scan option."
+);
+fixed_evidence_type!(
+    RuntimeEvidenceManifestDigest,
+    from_runtime_evidence,
+    "Digest of accepted runtime evidence at one pause safe point."
+);
 
 /// Authenticated mount generation emitted by the volume runtime.
 ///
@@ -247,6 +272,58 @@ impl TimeEvidenceGuard {
 
     #[must_use]
     pub const fn core_session_id(&self) -> &CoreSessionId {
+        &self.core_session_id
+    }
+
+    pub(crate) const fn store_instance_key(&self) -> &[u8; 32] {
+        &self.store_instance_key
+    }
+}
+
+/// Process-local authority for control and terminal transitions of one live scan.
+///
+/// The private Store-instance binding deliberately prevents reconstruction
+/// from persisted lease columns after restart. Core evidence writes require
+/// the same Store instance's live `CoreSessionId` plus an active lease, but do
+/// not need to carry this guard independently because the mutable repository
+/// itself is process-private. This type has no serde traits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeLeaseGuard {
+    run: RunEvidenceGuard,
+    lease_key: RuntimeLeaseKey,
+    core_session_id: CoreSessionId,
+    store_instance_key: [u8; 32],
+}
+
+impl RuntimeLeaseGuard {
+    pub(crate) const fn new(
+        run: RunEvidenceGuard,
+        lease_key: RuntimeLeaseKey,
+        core_session_id: CoreSessionId,
+        store_instance_key: [u8; 32],
+    ) -> Self {
+        Self {
+            run,
+            lease_key,
+            core_session_id,
+            store_instance_key,
+        }
+    }
+
+    #[must_use]
+    pub const fn scan_run_id(&self) -> i64 {
+        self.run.scan_run_id
+    }
+
+    pub(crate) const fn run(&self) -> &RunEvidenceGuard {
+        &self.run
+    }
+
+    pub(crate) const fn lease_key(&self) -> &RuntimeLeaseKey {
+        &self.lease_key
+    }
+
+    pub(crate) const fn core_session_id(&self) -> &CoreSessionId {
         &self.core_session_id
     }
 
@@ -2917,6 +2994,250 @@ pub struct ScanHistoryRecord {
     pub time_outcome: ScanHistoryTimeOutcomeRecord,
 }
 
+/// Maximum number of records returned by one history-export batch.
+pub const MAX_HISTORY_EXPORT_BATCH_SIZE: u32 = 128;
+/// Maximum number of logical records in one history export.
+pub const MAX_HISTORY_EXPORT_RECORDS: u32 = 250_000;
+/// Maximum encoded logical-record bytes in one history export.
+pub const MAX_HISTORY_EXPORT_LOGICAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Frozen v1 data range for a history export.
+///
+/// `CompleteEvidence` means the complete sealed D1 duplicate-evidence range:
+/// the summary, verified groups, their members, and scan issues. Capture-time
+/// metadata and raw-detail endpoints are deliberately outside this v1 range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryExportScope {
+    Summary,
+    CompleteEvidence,
+}
+
+/// Privacy projection applied inside the Store snapshot, before any record
+/// crosses the desktop boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryExportProjection {
+    Redacted,
+    Display,
+}
+
+/// Validated request for one bounded history export snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryExportRequest {
+    scope: HistoryExportScope,
+    projection: HistoryExportProjection,
+    batch_size: u32,
+}
+
+impl HistoryExportRequest {
+    pub fn new(
+        scope: HistoryExportScope,
+        projection: HistoryExportProjection,
+        batch_size: u32,
+    ) -> crate::Result<Self> {
+        if batch_size == 0 || batch_size > MAX_HISTORY_EXPORT_BATCH_SIZE {
+            return Err(crate::StoreError::invalid_input(
+                "history_export_batch_size",
+                format!(
+                    "history export batch size must be between 1 and {MAX_HISTORY_EXPORT_BATCH_SIZE}"
+                ),
+            ));
+        }
+        Ok(Self {
+            scope,
+            projection,
+            batch_size,
+        })
+    }
+
+    #[must_use]
+    pub const fn scope(self) -> HistoryExportScope {
+        self.scope
+    }
+
+    #[must_use]
+    pub const fn projection(self) -> HistoryExportProjection {
+        self.projection
+    }
+
+    #[must_use]
+    pub const fn batch_size(self) -> u32 {
+        self.batch_size
+    }
+}
+
+/// Canonical base-10 representation of one SQLite `INTEGER` value.
+///
+/// Exported database integers use this type so JavaScript/JSON consumers never
+/// lose precision. Construction from `i64` cannot produce leading zeroes,
+/// positive signs, or a negative-zero spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct HistoryExportDecimal(String);
+
+impl HistoryExportDecimal {
+    #[must_use]
+    pub fn from_i64(value: i64) -> Self {
+        Self(value.to_string())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Text whose presence is fixed by the requested privacy projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "projection", content = "value", rename_all = "snake_case")]
+pub enum HistoryExportProjectedText {
+    Redacted,
+    Display(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryExportScanMode {
+    Full,
+    Incremental,
+    Resume,
+    Verify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryExportTimeState {
+    Complete,
+    Partial,
+    NotRun,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryExportCoverageStatus {
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryExportIssueSeverity {
+    Info,
+    Warning,
+    Error,
+    Fatal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryExportTimeOutcome {
+    pub state: HistoryExportTimeState,
+    pub expected_group_count: Option<HistoryExportDecimal>,
+    pub evidence_group_count: Option<HistoryExportDecimal>,
+    pub unavailable_group_count: Option<HistoryExportDecimal>,
+    pub failed_group_count: Option<HistoryExportDecimal>,
+    pub max_total_read_bytes: Option<HistoryExportDecimal>,
+    pub max_probe_count_per_group: Option<HistoryExportDecimal>,
+    pub max_report_total_bytes_read: Option<HistoryExportDecimal>,
+    pub max_report_read_operations: Option<HistoryExportDecimal>,
+    pub max_report_retained_field_bytes: Option<HistoryExportDecimal>,
+    pub max_report_fields: Option<HistoryExportDecimal>,
+    pub max_report_issues: Option<HistoryExportDecimal>,
+    pub sealed_report_read_bytes: Option<HistoryExportDecimal>,
+    pub sealed_report_read_operations: Option<HistoryExportDecimal>,
+    pub finalized_at_ms: Option<HistoryExportDecimal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryExportSummaryRecord {
+    pub scan_run_id: HistoryExportDecimal,
+    pub root_display_path: HistoryExportProjectedText,
+    pub scan_mode: HistoryExportScanMode,
+    pub started_at_ms: HistoryExportDecimal,
+    pub finished_at_ms: HistoryExportDecimal,
+    pub duration_ms: HistoryExportDecimal,
+    pub coverage_status: HistoryExportCoverageStatus,
+    pub discovered_count: HistoryExportDecimal,
+    pub fingerprinted_count: HistoryExportDecimal,
+    pub error_count: HistoryExportDecimal,
+    pub logical_bytes_seen: HistoryExportDecimal,
+    pub observed_file_count: HistoryExportDecimal,
+    pub verified_group_count: HistoryExportDecimal,
+    pub verified_member_count: HistoryExportDecimal,
+    pub redundant_copy_count: HistoryExportDecimal,
+    pub logical_reclaimable_bytes: HistoryExportDecimal,
+    pub issue_count: HistoryExportDecimal,
+    pub unresolved_issue_count: HistoryExportDecimal,
+    pub time_outcome: HistoryExportTimeOutcome,
+}
+
+/// Digest-free projection of one verified exact group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryExportDuplicateGroupRecord {
+    pub scan_run_id: HistoryExportDecimal,
+    pub group_build_id: HistoryExportDecimal,
+    pub member_count: HistoryExportDecimal,
+    pub edge_count: HistoryExportDecimal,
+    pub independent_file_count: HistoryExportDecimal,
+    pub logical_reclaimable_bytes: HistoryExportDecimal,
+    pub finalized_at_ms: HistoryExportDecimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryExportFileTimestamp {
+    pub seconds: HistoryExportDecimal,
+    pub nanoseconds: HistoryExportDecimal,
+}
+
+/// Display-safe projection of one verified group member. Native path bytes,
+/// path keys, signatures, fingerprints, and file-object identities are absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryExportDuplicateMemberRecord {
+    pub scan_run_id: HistoryExportDecimal,
+    pub group_build_id: HistoryExportDecimal,
+    pub ordinal: HistoryExportDecimal,
+    pub sort_rank: HistoryExportDecimal,
+    pub display_path: HistoryExportProjectedText,
+    pub size_bytes: HistoryExportDecimal,
+    pub birth_time: Option<HistoryExportFileTimestamp>,
+    pub modified_time: HistoryExportFileTimestamp,
+    pub timestamp_granularity_ns: Option<HistoryExportDecimal>,
+}
+
+/// Safe scan-issue projection. Redacted exports omit the free-form message;
+/// issue keys, details JSON, and media-file ids are never exported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryExportScanIssueRecord {
+    pub scan_run_id: HistoryExportDecimal,
+    pub issue_id: HistoryExportDecimal,
+    pub severity: HistoryExportIssueSeverity,
+    pub stage: HistoryExportProjectedText,
+    pub code: HistoryExportProjectedText,
+    pub message: HistoryExportProjectedText,
+    pub occurred_at_ms: HistoryExportDecimal,
+    pub resolved_at_ms: Option<HistoryExportDecimal>,
+}
+
+/// Fixed ordering is summary, duplicate groups by id, members by
+/// `(group id, sort rank, ordinal)`, then scan issues by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "record_type", content = "record", rename_all = "snake_case")]
+pub enum HistoryExportRecord {
+    Summary(Box<HistoryExportSummaryRecord>),
+    DuplicateGroup(HistoryExportDuplicateGroupRecord),
+    DuplicateMember(HistoryExportDuplicateMemberRecord),
+    ScanIssue(HistoryExportScanIssueRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryExportBatch {
+    pub records: Vec<HistoryExportRecord>,
+    pub cumulative_record_count: u32,
+    pub cumulative_logical_bytes_upper_bound: u64,
+}
+
 /// Process-local typed context resolved from a visible history entry.
 ///
 /// This intentionally has no serde implementation. A UI boundary should keep
@@ -3483,6 +3804,250 @@ pub struct NewScanReport {
     pub report_version: i64,
     pub report: Value,
     pub generated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcquireRuntimeLeaseInput {
+    pub(crate) lease_key: RuntimeLeaseKey,
+    pub(crate) core_session_id: CoreSessionId,
+    pub(crate) acquired_at_ms: i64,
+}
+
+impl AcquireRuntimeLeaseInput {
+    pub fn new(
+        lease_key: RuntimeLeaseKey,
+        core_session_id: CoreSessionId,
+        acquired_at_ms: i64,
+    ) -> crate::Result<Self> {
+        if acquired_at_ms < 0 {
+            return Err(crate::StoreError::invalid_input(
+                "acquired_at_ms",
+                "runtime lease timestamp must be non-negative",
+            ));
+        }
+        Ok(Self {
+            lease_key,
+            core_session_id,
+            acquired_at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanControlKind {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+impl ScanControlKind {
+    pub(crate) const fn as_storage_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanControlRequestInput {
+    pub(crate) request_key: ScanControlRequestKey,
+    pub(crate) kind: ScanControlKind,
+    pub(crate) expected_job_state_version: i64,
+    pub(crate) expected_run_state_version: i64,
+    pub(crate) expected_checkpoint_generation: Option<i64>,
+    pub(crate) requested_at_ms: i64,
+}
+
+impl ScanControlRequestInput {
+    pub fn new(
+        request_key: ScanControlRequestKey,
+        kind: ScanControlKind,
+        expected_job_state_version: i64,
+        expected_run_state_version: i64,
+        expected_checkpoint_generation: Option<i64>,
+        requested_at_ms: i64,
+    ) -> crate::Result<Self> {
+        if expected_job_state_version < 0
+            || expected_run_state_version < 0
+            || expected_checkpoint_generation.is_some_and(|value| value <= 0)
+            || requested_at_ms < 0
+            || (matches!(kind, ScanControlKind::Resume) != expected_checkpoint_generation.is_some())
+        {
+            return Err(crate::StoreError::invalid_input(
+                "scan_control_request",
+                "state versions and timestamp must be non-negative",
+            ));
+        }
+        Ok(Self {
+            request_key,
+            kind,
+            expected_job_state_version,
+            expected_run_state_version,
+            expected_checkpoint_generation,
+            requested_at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanControlDisposition {
+    Pending,
+    Acknowledged,
+    Superseded,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanControlRequestRecord {
+    pub id: i64,
+    pub sequence: i64,
+    pub kind: ScanControlKind,
+    pub disposition: ScanControlDisposition,
+    pub expected_job_state_version: i64,
+    pub expected_run_state_version: i64,
+    pub expected_checkpoint_generation: Option<i64>,
+    pub requested_at_ms: i64,
+    pub acknowledged_at_ms: Option<i64>,
+    pub ack_job_state_version: Option<i64>,
+    pub ack_run_state_version: Option<i64>,
+    pub ack_checkpoint_generation: Option<i64>,
+    pub ack_reason_code: Option<String>,
+}
+
+/// V8 intentionally supports only the enumeration safe point. Later stages
+/// require their own reviewed variants rather than an opaque JSON escape hatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PauseCheckpointCursor {
+    Enumeration {
+        next_directory_ordinal: u64,
+        next_file_ordinal: u64,
+    },
+}
+
+impl PauseCheckpointCursor {
+    pub(crate) const fn stage(&self) -> ScanStage {
+        match self {
+            Self::Enumeration { .. } => ScanStage::Enumeration,
+        }
+    }
+
+    const fn fits_sqlite_integer_domain(&self) -> bool {
+        match self {
+            Self::Enumeration {
+                next_directory_ordinal,
+                next_file_ordinal,
+            } => {
+                *next_directory_ordinal <= i64::MAX as u64 && *next_file_ordinal <= i64::MAX as u64
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PauseCheckpointInput {
+    pub(crate) pause_request_id: i64,
+    pub(crate) pause_request_key: ScanControlRequestKey,
+    pub(crate) expected_generation: Option<i64>,
+    pub(crate) write_key: PauseCheckpointWriteKey,
+    pub(crate) cursor: PauseCheckpointCursor,
+    pub(crate) expected_job_state_version: i64,
+    pub(crate) expected_run_state_version: i64,
+    pub(crate) discovered_count: i64,
+    pub(crate) fingerprinted_count: i64,
+    pub(crate) error_count: i64,
+    pub(crate) logical_bytes_seen: i64,
+    pub(crate) saved_at_ms: i64,
+}
+
+impl PauseCheckpointInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pause_request_id: i64,
+        pause_request_key: ScanControlRequestKey,
+        expected_generation: Option<i64>,
+        write_key: PauseCheckpointWriteKey,
+        cursor: PauseCheckpointCursor,
+        expected_job_state_version: i64,
+        expected_run_state_version: i64,
+        discovered_count: i64,
+        fingerprinted_count: i64,
+        error_count: i64,
+        logical_bytes_seen: i64,
+        saved_at_ms: i64,
+    ) -> crate::Result<Self> {
+        if pause_request_id <= 0
+            || expected_generation.is_some_and(|value| value <= 0)
+            || [
+                expected_job_state_version,
+                expected_run_state_version,
+                discovered_count,
+                fingerprinted_count,
+                error_count,
+                logical_bytes_seen,
+                saved_at_ms,
+            ]
+            .into_iter()
+            .any(|value| value < 0)
+            || fingerprinted_count > discovered_count
+            || !cursor.fits_sqlite_integer_domain()
+        {
+            return Err(crate::StoreError::invalid_input(
+                "pause_checkpoint",
+                "ids/generation must be positive and versions/progress/timestamp valid",
+            ));
+        }
+        Ok(Self {
+            pause_request_id,
+            pause_request_key,
+            expected_generation,
+            write_key,
+            cursor,
+            expected_job_state_version,
+            expected_run_state_version,
+            discovered_count,
+            fingerprinted_count,
+            error_count,
+            logical_bytes_seen,
+            saved_at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeasedScanTerminalOutcome {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl LeasedScanTerminalOutcome {
+    pub(crate) const fn run_state(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub(crate) const fn job_state(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed | Self::Interrupted => "failed",
+        }
+    }
+
+    pub(crate) const fn release_reason(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
