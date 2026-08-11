@@ -33,6 +33,37 @@ export interface CaptureTimeStageSummary {
   reservedReadOperations: number
   actualReadOperations: number
   budgetExhausted: boolean
+  usageScope?: 'runtime_actual' | 'sealed_reports'
+}
+
+export type ScanHistoryCaptureTimeStatus =
+  | 'complete'
+  | 'partial'
+  | 'not_run'
+  | 'unavailable'
+  | 'failed'
+
+export interface ScanHistoryItem {
+  historyEntryId: string
+  rootDisplay: string
+  scanMode: string
+  startedAtUnixMs: string
+  finishedAtUnixMs: string
+  durationMs: number
+  coverageStatus: 'complete' | 'partial'
+  observedFiles: number
+  logicalBytes: number
+  verifiedGroups: number
+  verifiedMembers: number
+  redundantCopies: number
+  logicalReclaimableBytes: number
+  issues: number
+  unresolvedIssues: number
+  captureTimeStatus: ScanHistoryCaptureTimeStatus
+  captureTimeExpectedGroups: number
+  captureTimeEvidenceGroups: number
+  captureTimeUnavailableGroups: number
+  captureTimeFailedGroups: number
 }
 
 export interface CaptureTimeGroupSummary {
@@ -268,7 +299,9 @@ export interface DuplicateGroup {
 export interface ScanReport {
   dataMode: 'live' | 'synthetic'
   status: 'complete' | 'partial' | 'cancelled' | 'interrupted'
-  resultJobId?: string
+  resultOrigin?: 'current' | 'history'
+  resultReadToken?: string
+  historyEntryId?: string
   acknowledgementPending?: boolean
   acknowledgementJobId?: string
   root: string

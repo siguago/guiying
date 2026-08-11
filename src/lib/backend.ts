@@ -17,10 +17,54 @@ import type {
   CaptureTimeStageSummary,
   DuplicateGroup,
   NativePathRef,
+  ScanHistoryItem,
   ScanReport,
 } from '../domain'
 
 const DEMO_ROOT = '/Volumes/影像归档/手机照片'
+const MAX_RESULT_READ_QUEUE_DEPTH = 8
+
+interface ResultReadQueue {
+  tail: Promise<void>
+  depth: number
+}
+
+const resultReadQueues = new Map<string, ResultReadQueue>()
+
+async function invokeResultRead<T>(
+  command: string,
+  resultReadToken: string,
+  payload: Record<string, unknown>,
+): Promise<T> {
+  const token = requireResultReadToken(resultReadToken)
+  let queue = resultReadQueues.get(token)
+  if (!queue) {
+    queue = { tail: Promise.resolve(), depth: 0 }
+    resultReadQueues.set(token, queue)
+  }
+  if (queue.depth >= MAX_RESULT_READ_QUEUE_DEPTH) {
+    throw new Error('封存结果等待中的读取请求过多；请等待当前页面完成后重试。')
+  }
+
+  queue.depth += 1
+  const previous = queue.tail
+  let releaseTurn: (() => void) | undefined
+  const turn = new Promise<void>((resolve) => {
+    releaseTurn = resolve
+  })
+  queue.tail = previous.then(() => turn)
+  await previous
+
+  try {
+    return await invoke<T>(command, { ...payload, resultReadToken: token })
+  } finally {
+    releaseTurn?.()
+    queue.depth -= 1
+    if (queue.depth === 0 && resultReadQueues.get(token) === queue) {
+      resultReadQueues.delete(token)
+    }
+  }
+}
 
 export interface ScanProgress {
   jobId?: string
@@ -42,6 +86,7 @@ interface CoreScanJobStatus {
   startedAtUnixMs: number
   finishedAtUnixMs: number | null
   scanRunId: string | null
+  historyEntryId?: string | null
   progress: ScanProgress | null
   result: CoreScanResultSummary | null
   error: CoreAppError | null
@@ -331,12 +376,56 @@ interface CoreResultPage<T> {
   nextCursor: string | null
 }
 
+interface CoreScanHistoryCaptureTimeItem {
+  status: 'complete' | 'partial' | 'not_run' | 'unavailable' | 'failed'
+  expectedGroups: string
+  evidenceGroups: string
+  unavailableGroups: string
+  failedGroups: string
+  sealedReportReadBytes: string
+  sealedReportReadOperations: string
+}
+
+interface CoreScanHistoryItem {
+  historyEntryId: string
+  rootDisplay: string
+  scanMode: string
+  startedAtUnixMs: string
+  finishedAtUnixMs: string
+  durationMs: string
+  coverageStatus: 'complete' | 'partial'
+  observedFiles: string
+  logicalBytes: string
+  verifiedGroups: string
+  verifiedMembers: string
+  redundantCopies: string
+  logicalReclaimableBytes: string
+  issues: string
+  unresolvedIssues: string
+  captureTime: CoreScanHistoryCaptureTimeItem
+}
+
+interface CoreScanHistoryPage {
+  schemaVersion: number
+  items: CoreScanHistoryItem[]
+  nextCursor: string | null
+}
+
+interface CoreOpenScanHistoryResult {
+  schemaVersion: number
+  historyEntryId: string
+  resultReadToken: string
+  expiresAtUnixMs: string
+  summary: CoreScanHistoryItem
+}
+
 const RESULT_PAGE_SIZE = 64
 const MEMBER_PAGE_SIZE = 256
 const ISSUE_PAGE_SIZE = 128
 const CAPTURE_TIME_PAGE_SIZE = 128
 const CAPTURE_TIME_METADATA_REPORT_PAGE_SIZE = 32
 const CAPTURE_TIME_METADATA_FIELD_PAGE_SIZE = 128
+const SCAN_HISTORY_PAGE_SIZE = 32
 
 function formatFromPath(path: string): string {
   const extension = fileNameFromPath(path).split('.').at(-1)
@@ -405,6 +494,7 @@ function adaptCaptureTimeStage(
       reservedReadOperations: 0,
       actualReadOperations: 0,
       budgetExhausted: false,
+      usageScope: 'runtime_actual',
     }
   }
   if (!['not_run', 'completed', 'partial', 'unavailable', 'failed'].includes(value.status)) {
@@ -429,6 +519,7 @@ function adaptCaptureTimeStage(
       '时间阶段实际读取操作数',
     ),
     budgetExhausted: value.budgetExhausted,
+    usageScope: 'runtime_actual',
   }
 }
 
@@ -498,8 +589,8 @@ function adaptGroup(group: CoreDuplicateGroupItem): DuplicateGroup {
     ],
     verification: [
       { label: '文件大小', detail: `${memberCount} 份一致`, status: 'passed' },
-      { label: '抽样指纹', detail: '当前会话有界读取一致', status: 'passed' },
-      { label: '完整 BLAKE3', detail: '当前会话完整读取并封印', status: 'passed' },
+      { label: '抽样指纹', detail: '封印扫描会话有界读取一致', status: 'passed' },
+      { label: '完整 BLAKE3', detail: '封印扫描会话完整读取并留档', status: 'passed' },
       { label: '逐字节校验', detail: `${memberCount} 份内容完全一致`, status: 'passed' },
       { label: '目录覆盖复核', detail: '所有读取后重新验证', status: 'passed' },
       { label: '执行前再次复核', detail: '隔离能力仍保持锁定', status: 'pending' },
@@ -650,42 +741,184 @@ function adaptNativePathRef(
   return { encoding, rawBase64 }
 }
 
-async function adaptPersistentReport(
-  jobId: string,
+async function adaptTransientTerminalReport(
   result: CoreScanResultSummary,
   durationMs: number,
-  includeEvidencePages: boolean,
 ): Promise<ScanReport> {
   if (result.schemaVersion !== 1) {
     throw new Error(`不支持持久化扫描结果版本 ${result.schemaVersion}；为避免误读证据，本次结果已拒绝显示。`)
   }
-  const groupPage = includeEvidencePages
-    ? await loadDuplicateGroupPage(jobId, null)
-    : { groups: [], nextCursor: null }
-  const verifiedGroups = includeEvidencePages
-    ? decimalToSafeNumber(result.verifiedGroups, '确定重复组数量')
-    : 0
   return {
     dataMode: 'live',
     status: result.status,
-    resultJobId: includeEvidencePages ? jobId : undefined,
     root: result.root,
     rootPath: adaptNativePathRef(result.rootPath, '扫描根目录'),
     scannedFiles: decimalToSafeNumber(result.mediaFiles, '媒体文件数量'),
     mediaFiles: decimalToSafeNumber(result.mediaFiles, '媒体文件数量'),
     candidateFiles: decimalToSafeNumber(result.sampledFiles, '候选文件数量'),
     scannedBytes: decimalToSafeNumber(result.logicalBytes, '媒体逻辑大小'),
-    duplicateFiles: includeEvidencePages
-      ? decimalToSafeNumber(result.redundantIndependentFiles, '冗余独立副本数量')
-      : 0,
-    reclaimableBytes: includeEvidencePages
-      ? decimalToSafeNumber(result.logicalReclaimableBytes, '逻辑重复上限')
-      : 0,
+    duplicateFiles: 0,
+    reclaimableBytes: 0,
     durationMs,
     skippedFiles: decimalToSafeNumber(result.issues, '问题数量'),
     captureTime: adaptCaptureTimeStage(result.captureTime),
     issues: [],
-    totalDuplicateGroups: verifiedGroups,
+    totalDuplicateGroups: 0,
+    nextDuplicateGroupCursor: null,
+    duplicateGroups: [],
+  }
+}
+
+function requireResultReadToken(value: string): string {
+  if (typeof value !== 'string' || !/^result-[0-9a-f]{64}$/.test(value)) {
+    throw new Error('结果读取 token 格式无效；请重新打开封存报告。')
+  }
+  return value
+}
+
+function adaptScanHistoryItem(item: CoreScanHistoryItem): ScanHistoryItem {
+  requirePositiveDecimal(item.historyEntryId, '历史报告选择编号')
+  const rootDisplay = item.rootDisplay === ''
+    ? '卷根目录'
+    : requireBoundedMetadataText(
+        item.rootDisplay,
+        '历史报告扫描范围显示文本',
+        65_536,
+      )
+  const startedAt = parseSignedDecimal(item.startedAtUnixMs, '历史报告开始时间')
+  const finishedAt = parseSignedDecimal(item.finishedAtUnixMs, '历史报告完成时间')
+  if (startedAt < 0n || finishedAt < startedAt) {
+    throw new Error('历史报告时间范围无效；该记录已拒绝展示。')
+  }
+  const durationMs = decimalToSafeNumber(item.durationMs, '历史报告耗时')
+  if (BigInt(item.durationMs) !== finishedAt - startedAt) {
+    throw new Error('历史报告耗时与开始/完成时间不一致；该记录已拒绝展示。')
+  }
+  if (item.coverageStatus !== 'complete' && item.coverageStatus !== 'partial') {
+    throw new Error('历史报告没有可复核的终态覆盖结论；该记录已拒绝展示。')
+  }
+  if (!['complete', 'partial', 'not_run', 'unavailable', 'failed'].includes(item.captureTime.status)) {
+    throw new Error('历史报告拍摄时间终态未知；该记录已拒绝展示。')
+  }
+  const expectedGroups = decimalToSafeNumber(
+    item.captureTime.expectedGroups,
+    '历史报告时间范围组数',
+  )
+  const evidenceGroups = decimalToSafeNumber(
+    item.captureTime.evidenceGroups,
+    '历史报告时间证据组数',
+  )
+  const unavailableGroups = decimalToSafeNumber(
+    item.captureTime.unavailableGroups,
+    '历史报告时间不可用组数',
+  )
+  const failedGroups = decimalToSafeNumber(
+    item.captureTime.failedGroups,
+    '历史报告时间失败组数',
+  )
+  const classifiedGroups = evidenceGroups + unavailableGroups + failedGroups
+  if (
+    (item.captureTime.status === 'complete' && classifiedGroups !== expectedGroups)
+    || (item.captureTime.status === 'partial' && classifiedGroups > expectedGroups)
+    || (['not_run', 'unavailable', 'failed'].includes(item.captureTime.status)
+      && (expectedGroups !== 0 || classifiedGroups !== 0))
+  ) {
+    throw new Error('历史报告拍摄时间覆盖计数矛盾；该记录已拒绝展示。')
+  }
+  decimalToSafeNumber(
+    item.captureTime.sealedReportReadBytes,
+    '历史报告封印双提取字节',
+  )
+  decimalToSafeNumber(
+    item.captureTime.sealedReportReadOperations,
+    '历史报告封印双提取操作数',
+  )
+  return {
+    historyEntryId: item.historyEntryId,
+    rootDisplay,
+    scanMode: requireBoundedMetadataText(item.scanMode, '历史报告扫描模式', 64, true),
+    startedAtUnixMs: item.startedAtUnixMs,
+    finishedAtUnixMs: item.finishedAtUnixMs,
+    durationMs,
+    coverageStatus: item.coverageStatus,
+    observedFiles: decimalToSafeNumber(item.observedFiles, '历史报告媒体观察数量'),
+    logicalBytes: decimalToSafeNumber(item.logicalBytes, '历史报告媒体逻辑大小'),
+    verifiedGroups: decimalToSafeNumber(item.verifiedGroups, '历史报告确定重复组数'),
+    verifiedMembers: decimalToSafeNumber(item.verifiedMembers, '历史报告重复成员数'),
+    redundantCopies: decimalToSafeNumber(item.redundantCopies, '历史报告冗余独立副本数'),
+    logicalReclaimableBytes: decimalToSafeNumber(
+      item.logicalReclaimableBytes,
+      '历史报告逻辑重复上限',
+    ),
+    issues: decimalToSafeNumber(item.issues, '历史报告问题数量'),
+    unresolvedIssues: decimalToSafeNumber(item.unresolvedIssues, '历史报告未解决问题数量'),
+    captureTimeStatus: item.captureTime.status,
+    captureTimeExpectedGroups: expectedGroups,
+    captureTimeEvidenceGroups: evidenceGroups,
+    captureTimeUnavailableGroups: unavailableGroups,
+    captureTimeFailedGroups: failedGroups,
+  }
+}
+
+async function adaptOpenedHistoryReport(
+  opened: CoreOpenScanHistoryResult,
+  resultOrigin: 'current' | 'history',
+): Promise<ScanReport> {
+  if (opened.schemaVersion !== 1 || opened.summary.historyEntryId !== opened.historyEntryId) {
+    throw new Error('打开的历史报告结构或范围不一致；结果已拒绝展示。')
+  }
+  requirePositiveDecimal(opened.historyEntryId, '历史报告选择编号')
+  const token = requireResultReadToken(opened.resultReadToken)
+  const expiresAt = parseSignedDecimal(opened.expiresAtUnixMs, '结果读取 token 到期时间')
+  if (expiresAt <= BigInt(Date.now())) {
+    throw new Error('结果读取 token 已经过期；请重新打开封存报告。')
+  }
+  const summary = adaptScanHistoryItem(opened.summary)
+  const groupPage = await loadDuplicateGroupPage(token, null)
+  const sealedReportReadBytes = decimalToSafeNumber(
+    opened.summary.captureTime.sealedReportReadBytes,
+    '历史报告封印双提取字节',
+  )
+  const sealedReportReadOperations = decimalToSafeNumber(
+    opened.summary.captureTime.sealedReportReadOperations,
+    '历史报告封印双提取操作数',
+  )
+  return {
+    dataMode: 'live',
+    status: summary.coverageStatus,
+    resultOrigin,
+    resultReadToken: token,
+    historyEntryId: summary.historyEntryId,
+    root: summary.rootDisplay,
+    scannedFiles: summary.observedFiles,
+    mediaFiles: summary.observedFiles,
+    candidateFiles: summary.verifiedMembers,
+    scannedBytes: summary.logicalBytes,
+    duplicateFiles: summary.redundantCopies,
+    reclaimableBytes: summary.logicalReclaimableBytes,
+    durationMs: summary.durationMs,
+    skippedFiles: summary.issues,
+    captureTime: {
+      status: summary.captureTimeStatus === 'complete'
+        ? 'completed'
+        : summary.captureTimeStatus,
+      groupsSeen: summary.captureTimeExpectedGroups,
+      groupsWritten:
+        summary.captureTimeEvidenceGroups
+        + summary.captureTimeUnavailableGroups
+        + summary.captureTimeFailedGroups,
+      evidenceGroups: summary.captureTimeEvidenceGroups,
+      unavailableGroups: summary.captureTimeUnavailableGroups,
+      failedGroups: summary.captureTimeFailedGroups,
+      reservedReadBytes: 0,
+      actualReadBytes: sealedReportReadBytes,
+      reservedReadOperations: 0,
+      actualReadOperations: sealedReportReadOperations,
+      budgetExhausted: false,
+      usageScope: 'sealed_reports',
+    },
+    issues: [],
+    totalDuplicateGroups: summary.verifiedGroups,
     nextDuplicateGroupCursor: groupPage.nextCursor,
     duplicateGroups: groupPage.groups,
   }
@@ -693,12 +926,17 @@ async function adaptPersistentReport(
 
 async function readPage<T>(
   command: string,
-  scope: Record<string, string>,
+  scope: Record<string, string> & { resultReadToken: string },
   cursor: string | null,
   limit: number,
   label: string,
 ): Promise<CoreResultPage<T>> {
-  const page = await invoke<CoreResultPage<T>>(command, { ...scope, cursor, limit })
+  const { resultReadToken, ...resultScope } = scope
+  const page = await invokeResultRead<CoreResultPage<T>>(
+    command,
+    resultReadToken,
+    { ...resultScope, cursor, limit },
+  )
   if (
     typeof page !== 'object'
     || page === null
@@ -707,7 +945,7 @@ async function readPage<T>(
   ) {
     throw new Error(`${label}分页结构无效；该页已拒绝接收。`)
   }
-  if (page.nextCursor !== null && page.nextCursor.length > 32 * 1024) {
+  if (page.nextCursor !== null && page.nextCursor.length > 16 * 1024) {
     throw new Error(`${label}分页游标超过界面硬上限；该页已拒绝接收。`)
   }
   if (page.items.length > limit) {
@@ -725,12 +963,13 @@ export interface DuplicateGroupPageResult {
 }
 
 export async function loadDuplicateGroupPage(
-  jobId: string,
+  resultReadToken: string,
   cursor: string | null,
 ): Promise<DuplicateGroupPageResult> {
+  requireResultReadToken(resultReadToken)
   const page = await readPage<CoreDuplicateGroupItem>(
     'list_duplicate_groups',
-    { jobId },
+    { resultReadToken },
     cursor,
     RESULT_PAGE_SIZE,
     '确定重复组',
@@ -747,13 +986,14 @@ export interface DuplicateMemberPageResult {
 }
 
 export async function loadDuplicateGroupMemberPage(
-  jobId: string,
+  resultReadToken: string,
   groupBuildId: string,
   cursor: string | null,
 ): Promise<DuplicateMemberPageResult> {
+  requireResultReadToken(resultReadToken)
   const page = await readPage<CoreDuplicateGroupMemberItem>(
     'list_duplicate_group_members',
-    { jobId, groupBuildId },
+    { resultReadToken, groupBuildId },
     cursor,
     MEMBER_PAGE_SIZE,
     '重复组成员',
@@ -793,12 +1033,13 @@ export interface ScanIssuePageResult {
 }
 
 export async function loadScanIssuePage(
-  jobId: string,
+  resultReadToken: string,
   cursor: string | null,
 ): Promise<ScanIssuePageResult> {
+  requireResultReadToken(resultReadToken)
   const page = await readPage<CoreScanIssueItem>(
     'list_scan_issues',
-    { jobId },
+    { resultReadToken },
     cursor,
     ISSUE_PAGE_SIZE,
     '扫描问题',
@@ -819,12 +1060,13 @@ export interface CaptureTimeGroupSummaryPageResult {
 }
 
 export async function loadCaptureTimeGroupSummaryPage(
-  jobId: string,
+  resultReadToken: string,
   cursor: string | null,
 ): Promise<CaptureTimeGroupSummaryPageResult> {
+  requireResultReadToken(resultReadToken)
   const page = await readPage<CoreCaptureTimeGroupSummaryItem>(
     'list_capture_time_group_summaries',
-    { jobId },
+    { resultReadToken },
     cursor,
     RESULT_PAGE_SIZE,
     '拍摄时间组摘要',
@@ -867,12 +1109,14 @@ function adaptCaptureTimeGroupSummary(
 }
 
 export async function loadCaptureTimeGroupSummary(
-  jobId: string,
+  resultReadToken: string,
   exactGroupBuildId: string,
 ): Promise<CaptureTimeGroupSummary | null> {
-  const summary = await invoke<CoreCaptureTimeGroupSummaryItem | null>(
+  requireResultReadToken(resultReadToken)
+  const summary = await invokeResultRead<CoreCaptureTimeGroupSummaryItem | null>(
     'get_capture_time_group_summary',
-    { jobId, exactGroupBuildId },
+    resultReadToken,
+    { exactGroupBuildId },
   )
   if (summary === null) return null
   if (summary.exactGroupBuildId !== exactGroupBuildId) {
@@ -887,14 +1131,15 @@ export interface CaptureTimeCandidatePageResult {
 }
 
 export async function loadCaptureTimeCandidatePage(
-  jobId: string,
+  resultReadToken: string,
   exactGroupBuildId: string,
   analysisBuildId: string,
   cursor: string | null,
 ): Promise<CaptureTimeCandidatePageResult> {
+  requireResultReadToken(resultReadToken)
   const page = await readPage<CoreCaptureTimeCandidateItem>(
     'list_capture_time_candidates',
-    { jobId, exactGroupBuildId, analysisBuildId },
+    { resultReadToken, exactGroupBuildId, analysisBuildId },
     cursor,
     CAPTURE_TIME_PAGE_SIZE,
     '拍摄时间候选',
@@ -968,14 +1213,15 @@ export interface CaptureTimeMemberPageResult {
 }
 
 export async function loadCaptureTimeMemberPage(
-  jobId: string,
+  resultReadToken: string,
   exactGroupBuildId: string,
   analysisBuildId: string,
   cursor: string | null,
 ): Promise<CaptureTimeMemberPageResult> {
+  requireResultReadToken(resultReadToken)
   const page = await readPage<CoreCaptureTimeMemberItem>(
     'list_capture_time_members',
-    { jobId, exactGroupBuildId, analysisBuildId },
+    { resultReadToken, exactGroupBuildId, analysisBuildId },
     cursor,
     CAPTURE_TIME_PAGE_SIZE,
     '文件时间关系',
@@ -1026,14 +1272,15 @@ export interface CaptureTimeIssuePageResult {
 }
 
 export async function loadCaptureTimeIssuePage(
-  jobId: string,
+  resultReadToken: string,
   exactGroupBuildId: string,
   analysisBuildId: string,
   cursor: string | null,
 ): Promise<CaptureTimeIssuePageResult> {
+  requireResultReadToken(resultReadToken)
   const page = await readPage<CoreCaptureTimeIssueItem>(
     'list_capture_time_issues',
-    { jobId, exactGroupBuildId, analysisBuildId },
+    { resultReadToken, exactGroupBuildId, analysisBuildId },
     cursor,
     CAPTURE_TIME_PAGE_SIZE,
     '拍摄时间问题',
@@ -1723,16 +1970,17 @@ export interface CaptureTimeMetadataReportPageResult {
 }
 
 export async function loadCaptureTimeMetadataReportPage(
-  jobId: string,
+  resultReadToken: string,
   exactGroupBuildId: string,
   analysisBuildId: string,
   cursor: string | null,
 ): Promise<CaptureTimeMetadataReportPageResult> {
+  requireResultReadToken(resultReadToken)
   requireUnsignedI64Decimal(exactGroupBuildId, '元数据报告重复组编号', true)
   requireUnsignedI64Decimal(analysisBuildId, '元数据报告分析编号', true)
   const page = await readPage<CoreCaptureTimeMetadataReportItem>(
     'list_capture_time_metadata_reports',
-    { jobId, exactGroupBuildId, analysisBuildId },
+    { resultReadToken, exactGroupBuildId, analysisBuildId },
     cursor,
     CAPTURE_TIME_METADATA_REPORT_PAGE_SIZE,
     '原始元数据报告',
@@ -1753,12 +2001,13 @@ export interface CaptureTimeMetadataFieldPageResult {
 }
 
 export async function loadCaptureTimeMetadataFieldPage(
-  jobId: string,
+  resultReadToken: string,
   exactGroupBuildId: string,
   analysisBuildId: string,
   report: CaptureTimeMetadataReport,
   cursor: string | null,
 ): Promise<CaptureTimeMetadataFieldPageResult> {
+  requireResultReadToken(resultReadToken)
   if (
     report.exactGroupBuildId !== exactGroupBuildId
     || report.analysisBuildId !== analysisBuildId
@@ -1768,7 +2017,7 @@ export async function loadCaptureTimeMetadataFieldPage(
   const page = await readPage<CoreCaptureTimeMetadataFieldItem>(
     'list_capture_time_metadata_fields',
     {
-      jobId,
+      resultReadToken,
       exactGroupBuildId,
       analysisBuildId,
       sourceOrdinal: report.sourceOrdinal,
@@ -1787,12 +2036,13 @@ export async function loadCaptureTimeMetadataFieldPage(
 }
 
 export async function loadCaptureTimeMetadataFieldRawDetail(
-  jobId: string,
+  resultReadToken: string,
   exactGroupBuildId: string,
   analysisBuildId: string,
   report: CaptureTimeMetadataReport,
   field: CaptureTimeMetadataField,
 ): Promise<CaptureTimeMetadataFieldRawDetail> {
+  requireResultReadToken(resultReadToken)
   if (
     report.exactGroupBuildId !== exactGroupBuildId
     || report.analysisBuildId !== analysisBuildId
@@ -1802,10 +2052,10 @@ export async function loadCaptureTimeMetadataFieldRawDetail(
   ) {
     throw new Error('原始字段详情请求与已封印报告范围不一致；请求已拒绝。')
   }
-  const detail = await invoke<CoreCaptureTimeMetadataFieldRawDetailItem>(
+  const detail = await invokeResultRead<CoreCaptureTimeMetadataFieldRawDetailItem>(
     'get_capture_time_metadata_field_raw_detail',
+    resultReadToken,
     {
-      jobId,
       exactGroupBuildId,
       analysisBuildId,
       sourceOrdinal: report.sourceOrdinal,
@@ -1836,6 +2086,71 @@ function decimalToSafeNumber(value: string, label: string): number {
     throw new Error(`${label}超过当前界面的安全整数范围；为避免错误展示，本次结果已保留但不渲染。`)
   }
   return Number(integer)
+}
+
+export interface ScanHistoryPageResult {
+  items: ScanHistoryItem[]
+  nextCursor: string | null
+}
+
+export async function loadScanHistoryPage(
+  cursor: string | null,
+): Promise<ScanHistoryPageResult> {
+  const page = await invoke<CoreScanHistoryPage>('list_scan_history', {
+    cursor,
+    limit: SCAN_HISTORY_PAGE_SIZE,
+  })
+  if (
+    typeof page !== 'object'
+    || page === null
+    || page.schemaVersion !== 1
+    || !Array.isArray(page.items)
+    || page.items.length > SCAN_HISTORY_PAGE_SIZE
+    || (page.nextCursor !== null && typeof page.nextCursor !== 'string')
+    || (page.nextCursor !== null && page.nextCursor.length > 16 * 1024)
+    || (page.nextCursor !== null && page.nextCursor === cursor)
+  ) {
+    throw new Error('历史报告分页结构无效；该页已拒绝接收。')
+  }
+  assertMetadataPageBudget(page, '历史报告目录')
+  assertMetadataListContainsNoRawPayload(page.items, '历史报告目录')
+  return {
+    items: page.items.map(adaptScanHistoryItem),
+    nextCursor: page.nextCursor,
+  }
+}
+
+export async function openScanHistoryResult(
+  historyEntryId: string,
+  resultOrigin: 'current' | 'history',
+): Promise<ScanReport> {
+  requirePositiveDecimal(historyEntryId, '历史报告选择编号')
+  const opened = await invoke<CoreOpenScanHistoryResult>('open_scan_history', {
+    historyEntryId,
+  })
+  let token: string | undefined
+  try {
+    if (typeof opened !== 'object' || opened === null) {
+      throw new Error('打开历史报告的响应结构无效。')
+    }
+    token = requireResultReadToken(opened.resultReadToken)
+    return await adaptOpenedHistoryReport(opened, resultOrigin)
+  } catch (error) {
+    if (token) {
+      try {
+        await invoke('close_result_read', { resultReadToken: token })
+      } catch {
+        // The original adaptation failure is more actionable. The backend
+        // registry also has an absolute TTL and per-window hard cap.
+      }
+    }
+    throw error
+  }
+}
+
+export async function closeResultRead(resultReadToken: string): Promise<void> {
+  requireResultReadToken(resultReadToken)
+  await invoke('close_result_read', { resultReadToken })
 }
 
 export function isDesktopRuntime(): boolean {
@@ -1941,21 +2256,23 @@ async function waitForScanResult(
       }
 
       if (status.phase === 'completed' || status.phase === 'cancelled') {
-        if (!status.result) {
-          throw new Error('扫描任务已结束，但没有返回持久化结果摘要。')
-        }
         const measuredDuration = status.finishedAtUnixMs === null
           ? Math.round(performance.now() - startedAt)
           : Math.max(0, status.finishedAtUnixMs - status.startedAtUnixMs)
         let report: ScanReport | undefined
         let adaptationError: unknown
         try {
-          report = await adaptPersistentReport(
-            jobId,
-            status.result,
-            measuredDuration,
-            status.phase === 'completed',
-          )
+          if (status.phase === 'completed') {
+            if (typeof status.historyEntryId !== 'string') {
+              throw new Error('扫描已完成，但没有返回封存历史选择编号。')
+            }
+            report = await openScanHistoryResult(status.historyEntryId, 'current')
+          } else {
+            if (!status.result) {
+              throw new Error('扫描已取消，但没有返回有界终态摘要。')
+            }
+            report = await adaptTransientTerminalReport(status.result, measuredDuration)
+          }
         } catch (error) {
           adaptationError = error
         }

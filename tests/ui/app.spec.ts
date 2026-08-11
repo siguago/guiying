@@ -121,6 +121,26 @@ test('a transient native status failure keeps cancellation control and recovers'
           if (command === 'start_scan') return { jobId: 'scan-fixture' }
           if (command === 'cancel_scan') return undefined
           if (command === 'acknowledge_scan') return { released: true }
+          if (command === 'open_scan_history') {
+            return {
+              schemaVersion: 1,
+              historyEntryId: '7',
+              resultReadToken: `result-${'1'.repeat(64)}`,
+              expiresAtUnixMs: '9999999999999',
+              summary: {
+                historyEntryId: '7', rootDisplay: '/Volumes/Test Photos', scanMode: 'full',
+                startedAtUnixMs: '1000', finishedAtUnixMs: '1400', durationMs: '400',
+                coverageStatus: 'complete', observedFiles: '0', logicalBytes: '0',
+                verifiedGroups: '0', verifiedMembers: '0', redundantCopies: '0',
+                logicalReclaimableBytes: '0', issues: '0', unresolvedIssues: '0',
+                captureTime: {
+                  status: 'complete', expectedGroups: '0', evidenceGroups: '0',
+                  unavailableGroups: '0', failedGroups: '0', sealedReportReadBytes: '0',
+                  sealedReportReadOperations: '0',
+                },
+              },
+            }
+          }
           if (command === 'list_duplicate_groups') return { items: [], nextCursor: null }
           if (command === 'list_scan_issues') return { items: [], nextCursor: null }
           if (command === 'get_scan_status') {
@@ -143,6 +163,7 @@ test('a transient native status failure keeps cancellation control and recovers'
             return {
               jobId: 'scan-fixture',
               phase: 'completed',
+              historyEntryId: '7',
               startedAtUnixMs: 1_000,
               finishedAtUnixMs: 1_400,
               scanRunId: '7',
@@ -193,10 +214,186 @@ test('webview rejects a path-shaped root authority instead of starting a scan', 
 
   await expect(page.getByRole('heading', { name: '没有执行主动修改操作' })).toBeVisible()
   await expect(page.getByText(/原生目录授权 token 格式无效/)).toBeVisible()
+  await expect(page.getByText('尚未选择目录。')).toBeVisible()
+  await expect(page.getByText('已授权')).toHaveCount(0)
   const startCalls = await page.evaluate(() => (
     window as Window & { __ROOT_TOKEN_FIXTURE__: { startCalls: number } }
   ).__ROOT_TOKEN_FIXTURE__.startCalls)
   expect(startCalls).toBe(0)
+})
+
+test('historical reports are paged, opened with a read token, and revoked on return', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fixture = {
+      calls: [] as Array<{ command: string; payload: Record<string, unknown> }>,
+      secondPageAttempts: 0,
+      closes: 0,
+    }
+    const historyItem = (id: string, rootDisplay: string) => ({
+      historyEntryId: id,
+      rootDisplay,
+      scanMode: 'full',
+      startedAtUnixMs: id === '7' ? '1704067200000' : '1735689600000',
+      finishedAtUnixMs: id === '7' ? '1704067201000' : '1735689602000',
+      durationMs: id === '7' ? '1000' : '2000',
+      coverageStatus: id === '7' ? 'complete' : 'partial',
+      observedFiles: id === '7' ? '3' : '4',
+      logicalBytes: id === '7' ? '12' : '16',
+      verifiedGroups: '0',
+      verifiedMembers: '0',
+      redundantCopies: '0',
+      logicalReclaimableBytes: '0',
+      issues: id === '7' ? '1' : '0',
+      unresolvedIssues: id === '7' ? '1' : '0',
+      captureTime: {
+        status: id === '7' ? 'not_run' : 'partial',
+        expectedGroups: id === '7' ? '0' : '1',
+        evidenceGroups: '0',
+        unavailableGroups: '0',
+        failedGroups: '0',
+        sealedReportReadBytes: '0',
+        sealedReportReadOperations: '0',
+      },
+    })
+    Object.assign(window, {
+      isTauri: true,
+      __HISTORY_FIXTURE__: fixture,
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
+          fixture.calls.push({ command, payload })
+          if (command === 'list_scan_history') {
+            if (payload.cursor === 'history-2') {
+              fixture.secondPageAttempts += 1
+              if (fixture.secondPageAttempts === 1) {
+                throw { code: 'PAGE_TEMPORARY', message: 'history page fixture failure' }
+              }
+              return { schemaVersion: 1, items: [historyItem('8', 'Archive/2025')], nextCursor: null }
+            }
+            return { schemaVersion: 1, items: [historyItem('7', '')], nextCursor: 'history-2' }
+          }
+          if (command === 'open_scan_history') {
+            const id = String(payload.historyEntryId)
+            return {
+              schemaVersion: 1,
+              historyEntryId: id,
+              resultReadToken: `result-${'6'.repeat(64)}`,
+              expiresAtUnixMs: '9999999999999',
+              summary: historyItem(id, id === '8' ? 'Archive/2025' : ''),
+            }
+          }
+          if (command === 'list_duplicate_groups') return { items: [], nextCursor: null }
+          if (command === 'close_result_read') {
+            fixture.closes += 1
+            return { revoked: true }
+          }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '查看历史报告' }).click()
+  await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
+  await expect(page.getByText('卷根目录 · 封存显示文本')).toBeVisible()
+  expect(await page.evaluate(() => (
+    window as Window & { __HISTORY_FIXTURE__: { calls: Array<{ command: string }> } }
+  ).__HISTORY_FIXTURE__.calls.filter((call) => call.command === 'open_scan_history'))).toHaveLength(0)
+
+  const accessibility = await new AxeBuilder({ page }).analyze()
+  expect(accessibility.violations).toEqual([])
+
+  await page.getByLabel('历史报告分页').getByRole('button', { name: '下一页' }).click()
+  await expect(page.getByText('history page fixture failure')).toBeVisible()
+  await expect(page.getByText('卷根目录 · 封存显示文本')).toBeVisible()
+  await page.getByRole('button', { name: '重试失败页' }).click()
+  await expect(page.getByText('Archive/2025 · 封存显示文本')).toBeVisible()
+  await page.screenshot({
+    animations: 'disabled',
+    path: `${evidenceDir}/history-1280x820.png`,
+    fullPage: true,
+  })
+
+  await page.getByRole('button', { name: '打开 Archive/2025 的封存报告' }).evaluate((button) => {
+    button.click()
+    button.click()
+  })
+  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  expect(await page.evaluate(() => (
+    window as Window & { __HISTORY_FIXTURE__: { calls: Array<{ command: string }> } }
+  ).__HISTORY_FIXTURE__.calls.filter((call) => call.command === 'open_scan_history'))).toHaveLength(1)
+  await expect(page.getByText('历史封印报告 · 只读复核')).toBeVisible()
+  await expect(page.getByText('扫描未覆盖全部条目。')).toBeVisible()
+  await expect(page.getByText('封存范围文本')).toBeVisible()
+  await expect(page.getByText('当前没有目录读取或写入权限')).toBeVisible()
+  await page.getByRole('button', { name: '返回历史报告' }).click()
+  await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & { __HISTORY_FIXTURE__: { closes: number } }
+  ).__HISTORY_FIXTURE__.closes)).toBe(1)
+})
+
+test('a late history-open response cannot restore an exited view or retain its token', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fixture = { openCalls: 0, closes: 0 }
+    const historyItem = {
+      historyEntryId: '9', rootDisplay: 'Archive/Late', scanMode: 'full',
+      startedAtUnixMs: '1000', finishedAtUnixMs: '2000', durationMs: '1000',
+      coverageStatus: 'complete', observedFiles: '1', logicalBytes: '4',
+      verifiedGroups: '0', verifiedMembers: '0', redundantCopies: '0',
+      logicalReclaimableBytes: '0', issues: '0', unresolvedIssues: '0',
+      captureTime: {
+        status: 'not_run', expectedGroups: '0', evidenceGroups: '0',
+        unavailableGroups: '0', failedGroups: '0', sealedReportReadBytes: '0',
+        sealedReportReadOperations: '0',
+      },
+    }
+    Object.assign(window, {
+      isTauri: true,
+      __LATE_HISTORY_FIXTURE__: fixture,
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string) => {
+          if (command === 'list_scan_history') {
+            return { schemaVersion: 1, items: [historyItem], nextCursor: null }
+          }
+          if (command === 'open_scan_history') {
+            fixture.openCalls += 1
+            await new Promise((resolve) => window.setTimeout(resolve, 120))
+            return {
+              schemaVersion: 1,
+              historyEntryId: '9',
+              resultReadToken: `result-${'9'.repeat(64)}`,
+              expiresAtUnixMs: '9999999999999',
+              summary: historyItem,
+            }
+          }
+          if (command === 'list_duplicate_groups') return { items: [], nextCursor: null }
+          if (command === 'close_result_read') {
+            fixture.closes += 1
+            return { revoked: true }
+          }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '查看历史报告' }).click()
+  await page.getByRole('button', { name: '打开 Archive/Late 的封存报告' }).click()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & { __LATE_HISTORY_FIXTURE__: { openCalls: number } }
+  ).__LATE_HISTORY_FIXTURE__.openCalls)).toBe(1)
+  await page.getByRole('button', { name: '返回扫描入口' }).click()
+  await expect(page.getByRole('heading', { name: /先看证据/ })).toBeVisible()
+  await expect.poll(async () => page.evaluate(() => (
+    window as Window & { __LATE_HISTORY_FIXTURE__: { closes: number } }
+  ).__LATE_HISTORY_FIXTURE__.closes)).toBe(1)
+  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toHaveCount(0)
 })
 
 test('persistent results page groups, members, and issues without unbounded accumulation', async ({ page }) => {
@@ -207,6 +404,19 @@ test('persistent results page groups, members, and issues without unbounded accu
     let issueSecondPageAttempts = 0
     const callbacks = new Map<number, (...args: unknown[]) => void>()
     const pagingCalls: Array<{ command: string; payload: Record<string, unknown> }> = []
+    const singleFlightState = { inFlight: 0, maxInFlight: 0, busyConflicts: 0 }
+    const resultReadCommands = new Set([
+      'list_duplicate_groups',
+      'list_duplicate_group_members',
+      'list_scan_issues',
+      'get_capture_time_group_summary',
+      'list_capture_time_candidates',
+      'list_capture_time_members',
+      'list_capture_time_issues',
+      'list_capture_time_metadata_reports',
+      'list_capture_time_metadata_fields',
+      'get_capture_time_metadata_field_raw_detail',
+    ])
     const result = {
       schemaVersion: 1,
       scanRunId: '77',
@@ -273,6 +483,7 @@ test('persistent results page groups, members, and issues without unbounded accu
     Object.assign(window, {
       isTauri: true,
       __PAGING_CALLS__: pagingCalls,
+      __RESULT_SINGLE_FLIGHT__: singleFlightState,
       __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
       __TAURI_INTERNALS__: {
         transformCallback: (callback: (...args: unknown[]) => void) => {
@@ -282,27 +493,62 @@ test('persistent results page groups, members, and issues without unbounded accu
         },
         unregisterCallback: (id: number) => callbacks.delete(id),
         invoke: async (command: string, payload: Record<string, unknown> = {}) => {
-          if (command === 'plugin:event|listen') return 1
-          if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'b'.repeat(64)}` }
-          if (command === 'start_scan') {
-            pagingCalls.push({ command, payload })
-            return { jobId: 'scan-paged' }
+          const isResultRead = resultReadCommands.has(command)
+          if (isResultRead) {
+            if (singleFlightState.inFlight !== 0) {
+              singleFlightState.busyConflicts += 1
+              throw { code: 'RESULT_READ_BUSY', message: 'fixture result token is already in use' }
+            }
+            singleFlightState.inFlight += 1
+            singleFlightState.maxInFlight = Math.max(
+              singleFlightState.maxInFlight,
+              singleFlightState.inFlight,
+            )
+            await new Promise((resolve) => window.setTimeout(resolve, 15))
           }
-          if (command === 'acknowledge_scan') return { released: true }
-          if (command === 'get_scan_status') {
-            return {
+          try {
+            if (command === 'plugin:event|listen') return 1
+            if (command === 'plugin:event|unlisten') return undefined
+            if (command === 'select_scan_root') return { rootToken: `root-${'b'.repeat(64)}` }
+            if (command === 'start_scan') {
+              pagingCalls.push({ command, payload })
+              return { jobId: 'scan-paged' }
+            }
+            if (command === 'acknowledge_scan') return { released: true }
+            if (command === 'open_scan_history') {
+              return {
+              schemaVersion: 1,
+              historyEntryId: '77',
+              resultReadToken: `result-${'2'.repeat(64)}`,
+              expiresAtUnixMs: '9999999999999',
+              summary: {
+                historyEntryId: '77', rootDisplay: '/Volumes/Test Photos', scanMode: 'full',
+                startedAtUnixMs: '1000', finishedAtUnixMs: '2000', durationMs: '1000',
+                coverageStatus: 'complete', observedFiles: '3', logicalBytes: '12',
+                verifiedGroups: '2', verifiedMembers: '5', redundantCopies: '3',
+                logicalReclaimableBytes: '12', issues: '2', unresolvedIssues: '2',
+                captureTime: {
+                  status: 'complete', expectedGroups: '2', evidenceGroups: '1',
+                  unavailableGroups: '1', failedGroups: '0', sealedReportReadBytes: '16',
+                  sealedReportReadOperations: '6',
+                },
+              },
+              }
+            }
+            if (command === 'get_scan_status') {
+              return {
               jobId: 'scan-paged',
               phase: 'completed',
+              historyEntryId: '77',
               startedAtUnixMs: 1_000,
               finishedAtUnixMs: 2_000,
               scanRunId: '77',
               progress: null,
               result,
               error: null,
+              }
             }
-          }
-          if (command === 'list_duplicate_groups') {
+            if (command === 'list_duplicate_groups') {
             pagingCalls.push({ command, payload })
             if (payload.cursor === 'groups-2') {
               groupSecondPageAttempts += 1
@@ -313,8 +559,8 @@ test('persistent results page groups, members, and issues without unbounded accu
               return { items: [group('102', 'B.JPG', '2')], nextCursor: null }
             }
             return { items: [group('101', 'A.JPG', '3')], nextCursor: 'groups-2' }
-          }
-          if (command === 'list_duplicate_group_members') {
+            }
+            if (command === 'list_duplicate_group_members') {
             pagingCalls.push({ command, payload })
             if (payload.groupBuildId === '102') {
               return {
@@ -333,8 +579,8 @@ test('persistent results page groups, members, and issues without unbounded accu
               items: [member('101', '0', 'A.JPG'), member('101', '1', 'A-copy.JPG')],
               nextCursor: 'members-a-2',
             }
-          }
-          if (command === 'list_scan_issues') {
+            }
+            if (command === 'list_scan_issues') {
             pagingCalls.push({ command, payload })
             if (payload.cursor === 'issues-2') {
               issueSecondPageAttempts += 1
@@ -356,8 +602,8 @@ test('persistent results page groups, members, and issues without unbounded accu
               }],
               nextCursor: 'issues-2',
             }
-          }
-          if (command === 'get_capture_time_group_summary') {
+            }
+            if (command === 'get_capture_time_group_summary') {
             const groupId = String(payload.exactGroupBuildId)
             return {
               analysisBuildId: groupId === '101' ? '501' : '502',
@@ -373,8 +619,8 @@ test('persistent results page groups, members, and issues without unbounded accu
               evidenceOnly: true,
               writeAuthorized: false,
             }
-          }
-          if (command === 'list_capture_time_candidates') {
+            }
+            if (command === 'list_capture_time_candidates') {
             if (payload.exactGroupBuildId !== '101') return { items: [], nextCursor: null }
             return {
               items: [{
@@ -388,8 +634,8 @@ test('persistent results page groups, members, and issues without unbounded accu
               }],
               nextCursor: null,
             }
-          }
-          if (command === 'list_capture_time_members') {
+            }
+            if (command === 'list_capture_time_members') {
             return {
               items: [{
                 analysisBuildId: '501', memberOrdinal: '0', observationId: '1010',
@@ -403,8 +649,8 @@ test('persistent results page groups, members, and issues without unbounded accu
               }],
               nextCursor: null,
             }
-          }
-          if (command === 'list_capture_time_issues') {
+            }
+            if (command === 'list_capture_time_issues') {
             return {
               items: [{
                 analysisBuildId: '501', ordinal: '0', code: 'FS_PRECISION_UNKNOWN',
@@ -413,8 +659,11 @@ test('persistent results page groups, members, and issues without unbounded accu
               }],
               nextCursor: null,
             }
+            }
+            throw new Error(`unexpected fixture command: ${command}`)
+          } finally {
+            if (isResultRead) singleFlightState.inFlight -= 1
           }
-          throw new Error(`unexpected fixture command: ${command}`)
         },
       },
     })
@@ -425,7 +674,8 @@ test('persistent results page groups, members, and issues without unbounded accu
   await page.getByRole('button', { name: '开始只读扫描' }).click()
 
   await expect(page.getByRole('heading', { name: '发现 2 组确定重复' })).toBeVisible()
-  await expect(page.getByText(/Unix 原生字节.*无损封存/)).toBeVisible()
+  await expect(page.getByText(/Unix 原生字节.*无损封存/)).toHaveCount(0)
+  await expect(page.getByText('当前没有目录读取或写入权限')).toBeVisible()
   await expect(page.getByRole('button', { name: /A\.JPG/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /B\.JPG/ })).toHaveCount(0)
   await expect(page.locator('code').filter({ hasText: '/Volumes/Test Photos/A-copy.JPG' })).toBeVisible()
@@ -496,6 +746,12 @@ test('persistent results page groups, members, and issues without unbounded accu
   expect(calls
     .filter((call) => call.command !== 'start_scan')
     .every((call) => typeof call.payload.limit === 'number')).toBe(true)
+  const singleFlight = await page.evaluate(() => (
+    window as Window & {
+      __RESULT_SINGLE_FLIGHT__: { inFlight: number; maxInFlight: number; busyConflicts: number }
+    }
+  ).__RESULT_SINGLE_FLIGHT__)
+  expect(singleFlight).toEqual({ inFlight: 0, maxInFlight: 1, busyConflicts: 0 })
 
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
@@ -698,9 +954,29 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
           if (command === 'select_scan_root') return { rootToken: `root-${'f'.repeat(64)}` }
           if (command === 'start_scan') return { jobId: 'scan-raw-metadata' }
           if (command === 'acknowledge_scan') return { released: true }
+          if (command === 'open_scan_history') {
+            return {
+              schemaVersion: 1,
+              historyEntryId: '77',
+              resultReadToken: `result-${'3'.repeat(64)}`,
+              expiresAtUnixMs: '9999999999999',
+              summary: {
+                historyEntryId: '77', rootDisplay: '/Volumes/Test Photos', scanMode: 'full',
+                startedAtUnixMs: '1000', finishedAtUnixMs: '2200', durationMs: '1200',
+                coverageStatus: 'complete', observedFiles: '4', logicalBytes: '16',
+                verifiedGroups: '2', verifiedMembers: '4', redundantCopies: '2',
+                logicalReclaimableBytes: '8', issues: '0', unresolvedIssues: '0',
+                captureTime: {
+                  status: 'complete', expectedGroups: '2', evidenceGroups: '2',
+                  unavailableGroups: '0', failedGroups: '0', sealedReportReadBytes: '8',
+                  sealedReportReadOperations: '4',
+                },
+              },
+            }
+          }
           if (command === 'get_scan_status') {
             return {
-              jobId: 'scan-raw-metadata', phase: 'completed', startedAtUnixMs: 1000,
+              jobId: 'scan-raw-metadata', phase: 'completed', historyEntryId: '77', startedAtUnixMs: 1000,
               finishedAtUnixMs: 2200, scanRunId: '77', progress: null, result, error: null,
             }
           }
@@ -965,9 +1241,30 @@ test('a malformed terminal summary is acknowledged before the adaptation error i
           if (command === 'plugin:event|unlisten') return undefined
           if (command === 'select_scan_root') return { rootToken: `root-${'c'.repeat(64)}` }
           if (command === 'start_scan') return { jobId: 'scan-malformed' }
+          if (command === 'open_scan_history') {
+            return {
+              schemaVersion: 1,
+              historyEntryId: '88',
+              resultReadToken: `result-${'4'.repeat(64)}`,
+              expiresAtUnixMs: '9999999999999',
+              summary: {
+                historyEntryId: '88', rootDisplay: '/Volumes/Test Photos', scanMode: 'full',
+                startedAtUnixMs: '1', finishedAtUnixMs: '2', durationMs: '1',
+                coverageStatus: 'complete', observedFiles: '1', logicalBytes: '4',
+                verifiedGroups: '0', verifiedMembers: '0', redundantCopies: 'invalid',
+                logicalReclaimableBytes: '0', issues: '0', unresolvedIssues: '0',
+                captureTime: {
+                  status: 'complete', expectedGroups: '0', evidenceGroups: '0',
+                  unavailableGroups: '0', failedGroups: '0', sealedReportReadBytes: '0',
+                  sealedReportReadOperations: '0',
+                },
+              },
+            }
+          }
+          if (command === 'close_result_read') return { revoked: true }
           if (command === 'get_scan_status') {
             return {
-              jobId: 'scan-malformed', phase: 'completed', startedAtUnixMs: 1,
+              jobId: 'scan-malformed', phase: 'completed', historyEntryId: '88', startedAtUnixMs: 1,
               finishedAtUnixMs: 2, scanRunId: '88', progress: null, result, error: null,
             }
           }
@@ -987,7 +1284,7 @@ test('a malformed terminal summary is acknowledged before the adaptation error i
   await page.getByRole('button', { name: '开始只读扫描' }).click()
 
   await expect(page.getByRole('heading', { name: '没有执行主动修改操作' })).toBeVisible()
-  await expect(page.getByText(/冗余独立副本数量不是有效的非负十进制数/)).toBeVisible()
+  await expect(page.getByText(/冗余独立副本数不是有效的非负十进制数/)).toBeVisible()
   const acknowledgements = await page.evaluate(() => (
     window as Window & { __TERMINAL_FIXTURE__: { acknowledgements: number } }
   ).__TERMINAL_FIXTURE__.acknowledgements)
@@ -1029,9 +1326,29 @@ test('a permanently failing acknowledgement still delivers the sealed report and
           if (command === 'plugin:event|unlisten') return undefined
           if (command === 'select_scan_root') return { rootToken: `root-${'e'.repeat(64)}` }
           if (command === 'start_scan') return { jobId: 'scan-ack-pending' }
+          if (command === 'open_scan_history') {
+            return {
+              schemaVersion: 1,
+              historyEntryId: '98',
+              resultReadToken: `result-${'5'.repeat(64)}`,
+              expiresAtUnixMs: '9999999999999',
+              summary: {
+                historyEntryId: '98', rootDisplay: '/Volumes/Test Photos', scanMode: 'full',
+                startedAtUnixMs: '1', finishedAtUnixMs: '2', durationMs: '1',
+                coverageStatus: 'complete', observedFiles: '0', logicalBytes: '0',
+                verifiedGroups: '0', verifiedMembers: '0', redundantCopies: '0',
+                logicalReclaimableBytes: '0', issues: '0', unresolvedIssues: '0',
+                captureTime: {
+                  status: 'complete', expectedGroups: '0', evidenceGroups: '0',
+                  unavailableGroups: '0', failedGroups: '0', sealedReportReadBytes: '0',
+                  sealedReportReadOperations: '0',
+                },
+              },
+            }
+          }
           if (command === 'get_scan_status') {
             return {
-              jobId: 'scan-ack-pending', phase: 'completed', startedAtUnixMs: 1,
+              jobId: 'scan-ack-pending', phase: 'completed', historyEntryId: '98', startedAtUnixMs: 1,
               finishedAtUnixMs: 2, scanRunId: '98', progress: null, result, error: null,
             }
           }

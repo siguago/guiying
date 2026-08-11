@@ -9,6 +9,7 @@ import {
   Fingerprint,
   FolderOpen,
   HardDrive,
+  History as HistoryIcon,
   Image as ImageIcon,
   Info,
   Layers3,
@@ -41,12 +42,14 @@ import type {
   DuplicateGroup,
   ScanErrorShape,
   ScanReport,
+  ScanHistoryItem,
 } from './domain'
 import { fileNameFromPath, formatBytes } from './domain'
 import {
   chooseScanDirectory,
   cancelDirectoryScanReadOnly,
   isDesktopRuntime,
+  closeResultRead,
   loadCaptureTimeCandidatePage,
   loadCaptureTimeGroupSummary,
   loadCaptureTimeIssuePage,
@@ -57,12 +60,14 @@ import {
   loadDuplicateGroupMemberPage,
   loadDuplicateGroupPage,
   loadScanIssuePage,
+  loadScanHistoryPage,
+  openScanHistoryResult,
   retryScanAcknowledgement,
   runSyntheticScan,
   startDirectoryScanReadOnly,
 } from './lib/backend'
 
-type AppPhase = 'idle' | 'ready-to-scan' | 'scanning' | 'results' | 'error'
+type AppPhase = 'idle' | 'ready-to-scan' | 'history' | 'scanning' | 'results' | 'error'
 type PageDirection = 'initial' | 'next' | 'previous'
 
 const scanStages = [
@@ -136,14 +141,28 @@ function EvidenceRail({ group }: { group: DuplicateGroup }) {
   )
 }
 
-function SourceOverview({ source }: { source: string | null }) {
+type SourceOverviewKind = 'none' | 'authorized' | 'active' | 'sealed'
+
+function SourceOverview({
+  kind,
+  source,
+}: {
+  kind: SourceOverviewKind
+  source: string | null
+}) {
+  const isSealed = kind === 'sealed'
+  const hasVisibleSource = kind !== 'none' && source !== null
   return (
     <section aria-labelledby="source-heading" className="rail-section source-overview">
       <div className="rail-section__heading">
-        <span id="source-heading">当前范围</span>
-        {source ? <span className="status-dot status-dot--ok">已选择</span> : null}
+        <span id="source-heading">{isSealed ? '封存范围文本' : '当前范围'}</span>
+        {hasVisibleSource ? (
+          <span className="status-dot status-dot--ok">
+            {kind === 'active' ? '扫描中' : isSealed ? '仅显示' : '已授权'}
+          </span>
+        ) : null}
       </div>
-      {source ? (
+      {hasVisibleSource ? (
         <>
           <div className="source-path" title={source}>
             <HardDrive aria-hidden="true" size={17} />
@@ -153,8 +172,17 @@ function SourceOverview({ source }: { source: string | null }) {
             </span>
           </div>
           <div className="source-facts">
-            <span><Check size={13} aria-hidden="true" /> 绑定根后不跟随树内符号链接</span>
-            <span><Check size={13} aria-hidden="true" /> 不主动修改内容或时间</span>
+            {isSealed ? (
+              <>
+                <span><LockKeyhole size={13} aria-hidden="true" /> 显示文本不用于重新寻址</span>
+                <span><Check size={13} aria-hidden="true" /> 当前没有目录读取或写入权限</span>
+              </>
+            ) : (
+              <>
+                <span><Check size={13} aria-hidden="true" /> 绑定根后不跟随树内符号链接</span>
+                <span><Check size={13} aria-hidden="true" /> 不主动修改内容或时间</span>
+              </>
+            )}
           </div>
         </>
       ) : (
@@ -168,6 +196,8 @@ function WorkflowRail({ phase }: { phase: AppPhase }) {
   const activeIndex =
     phase === 'idle' || phase === 'ready-to-scan'
       ? 0
+      : phase === 'history'
+        ? 2
       : phase === 'scanning'
         ? 1
         : phase === 'results'
@@ -211,6 +241,7 @@ function WorkflowRail({ phase }: { phase: AppPhase }) {
 function IdleWorkspace({
   source,
   onChoose,
+  onHistory,
   onScan,
   onDemo,
   isChoosing,
@@ -219,6 +250,7 @@ function IdleWorkspace({
 }: {
   source: string | null
   onChoose: () => Promise<void>
+  onHistory: () => void
   onScan: () => Promise<void>
   onDemo: () => Promise<void>
   isChoosing: boolean
@@ -247,6 +279,10 @@ function IdleWorkspace({
                 开始只读扫描
               </button>
             ) : null}
+            <button className="button button--quiet" disabled={!isDesktop} onClick={onHistory} type="button">
+              <HistoryIcon aria-hidden="true" size={17} />
+              查看历史报告
+            </button>
           </div>
 
           {import.meta.env.DEV ? (
@@ -286,6 +322,269 @@ function IdleWorkspace({
           </div>
         </aside>
       </div>
+    </main>
+  )
+}
+
+function historyInstantLabel(value: string): string {
+  if (!/^(0|[1-9]\d*)$/.test(value)) return '时间证据格式无效'
+  const milliseconds = BigInt(value)
+  if (milliseconds > 8_640_000_000_000_000n) return `Unix ${value} ms`
+  const instant = new Date(Number(milliseconds))
+  if (Number.isNaN(instant.getTime())) return `Unix ${value} ms`
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(instant)
+}
+
+function historyDurationLabel(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${milliseconds} ms`
+  const seconds = Math.floor(milliseconds / 1_000)
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const remainder = seconds % 60
+  return `${minutes} 分 ${remainder} 秒`
+}
+
+function historyCaptureTimeLabel(status: ScanHistoryItem['captureTimeStatus']): string {
+  return {
+    complete: '时间证据完整',
+    partial: '时间证据部分封印',
+    not_run: '时间阶段未运行',
+    unavailable: '时间阶段无可用终态',
+    failed: '时间阶段失败',
+  }[status]
+}
+
+function HistoryWorkspace({
+  onBack,
+  onOpen,
+}: {
+  onBack: () => void
+  onOpen: (report: ScanReport) => void
+}) {
+  const [items, setItems] = useState<ScanHistoryItem[]>([])
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [cursorHistory, setCursorHistory] = useState<Array<string | null>>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [failedCursor, setFailedCursor] = useState<string | null>(null)
+  const [failedDirection, setFailedDirection] = useState<PageDirection>('initial')
+  const [openingEntryId, setOpeningEntryId] = useState<string | null>(null)
+  const [openError, setOpenError] = useState<string | null>(null)
+  const requestGenerationRef = useRef(0)
+  const requestBusyRef = useRef(false)
+  const openGenerationRef = useRef(0)
+  const openBusyRef = useRef(false)
+
+  const fetchPage = useCallback(async (
+    targetCursor: string | null,
+  ): Promise<boolean> => {
+    if (requestBusyRef.current) return false
+    requestBusyRef.current = true
+    const generation = requestGenerationRef.current + 1
+    requestGenerationRef.current = generation
+    setIsLoading(true)
+    setLoadError(null)
+    try {
+      const page = await loadScanHistoryPage(targetCursor)
+      if (requestGenerationRef.current !== generation) return false
+      setItems(page.items)
+      setCursor(targetCursor)
+      setNextCursor(page.nextCursor)
+      setFailedCursor(null)
+      return true
+    } catch (historyError) {
+      if (requestGenerationRef.current === generation) {
+        setFailedCursor(targetCursor)
+        setLoadError(asScanError(historyError).message)
+      }
+      return false
+    } finally {
+      if (requestGenerationRef.current === generation) {
+        requestBusyRef.current = false
+        setIsLoading(false)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    void fetchPage(null)
+    return () => {
+      requestGenerationRef.current += 1
+      openGenerationRef.current += 1
+      requestBusyRef.current = false
+      openBusyRef.current = false
+    }
+  }, [fetchPage])
+
+  async function loadNext() {
+    if (nextCursor === null) return
+    const currentCursor = cursor
+    setFailedDirection('next')
+    if (await fetchPage(nextCursor)) {
+      setCursorHistory((current) => [...current, currentCursor])
+    }
+  }
+
+  async function loadPrevious() {
+    const previousCursor = cursorHistory.at(-1)
+    if (previousCursor === undefined) return
+    setFailedDirection('previous')
+    if (await fetchPage(previousCursor)) {
+      setCursorHistory((current) => current.slice(0, -1))
+    }
+  }
+
+  async function retryFailedPage() {
+    const previousCursor = cursor
+    if (!(await fetchPage(failedCursor))) return
+    if (failedDirection === 'next') {
+      setCursorHistory((current) => [...current, previousCursor])
+    } else if (failedDirection === 'previous') {
+      setCursorHistory((current) => current.slice(0, -1))
+    } else {
+      setCursorHistory([])
+    }
+  }
+
+  async function openEntry(entry: ScanHistoryItem) {
+    if (openBusyRef.current) return
+    openBusyRef.current = true
+    const generation = openGenerationRef.current + 1
+    openGenerationRef.current = generation
+    setOpeningEntryId(entry.historyEntryId)
+    setOpenError(null)
+    try {
+      const report = await openScanHistoryResult(entry.historyEntryId, 'history')
+      if (openGenerationRef.current !== generation) {
+        if (report.resultReadToken) {
+          void closeResultRead(report.resultReadToken).catch(() => undefined)
+        }
+        openBusyRef.current = false
+        return
+      }
+      onOpen(report)
+    } catch (historyError) {
+      if (openGenerationRef.current !== generation) return
+      openBusyRef.current = false
+      setOpenError(asScanError(historyError).message)
+      setOpeningEntryId(null)
+    }
+  }
+
+  return (
+    <main className="workspace workspace--history">
+      <header className="workspace-header history-header">
+        <div>
+          <span className="section-kicker"><HistoryIcon aria-hidden="true" size={15} /> 封存结果目录</span>
+          <h1>历史只读报告</h1>
+          <p>这里只列出覆盖阶段已终止且逐字节组已封印的扫描；部分覆盖与时间阶段失败都会明确标记。</p>
+        </div>
+        <button className="button button--quiet" onClick={onBack} type="button">
+          <ChevronLeft aria-hidden="true" size={16} /> 返回扫描入口
+        </button>
+      </header>
+
+      <div className="history-boundary" role="note">
+        <LockKeyhole aria-hidden="true" size={16} />
+        <div>
+          <strong>历史记录不是新的文件系统权限。</strong>
+          <span>范围名称只是封存显示文本；打开报告不会重新读取照片，也不会恢复旧描述符或挂载会话。</span>
+        </div>
+      </div>
+
+      <section aria-busy={isLoading} aria-labelledby="history-list-title" className="history-catalog">
+        <div className="history-catalog__heading">
+          <div>
+            <span>本地证据库</span>
+            <strong id="history-list-title">按完成时间倒序</strong>
+          </div>
+          <span className="read-only-badge"><LockKeyhole size={13} /> 仅查看封印证据</span>
+        </div>
+
+        {isLoading && items.length === 0 ? (
+          <div className="history-state" role="status">
+            <LoaderCircle aria-hidden="true" className="is-spinning" size={18} /> 正在验证并读取历史报告目录…
+          </div>
+        ) : null}
+        {loadError ? (
+          <div className="history-state history-state--error" role="alert">
+            <TriangleAlert aria-hidden="true" size={18} />
+            <div><strong>这一页历史报告没有通过读取。</strong><span>{loadError}</span></div>
+            <button onClick={() => void retryFailedPage()} type="button">重试失败页</button>
+          </div>
+        ) : null}
+        {openError ? (
+          <div className="history-state history-state--error" role="alert">
+            <TriangleAlert aria-hidden="true" size={18} />
+            <div><strong>封存报告未能打开。</strong><span>{openError}</span></div>
+          </div>
+        ) : null}
+        {!isLoading && !loadError && items.length === 0 ? (
+          <div className="history-empty">
+            <Database aria-hidden="true" size={26} />
+            <h2>还没有可复核的历史报告</h2>
+            <p>完成一次只读扫描后，封印结果会出现在这里；取消或尚未封印逐字节阶段的任务不会伪装成可复核报告。</p>
+          </div>
+        ) : null}
+
+        {items.length > 0 ? (
+          <ol className="history-list">
+            {items.map((entry) => (
+              <li key={entry.historyEntryId}>
+                <button
+                  aria-label={`打开 ${entry.rootDisplay} 的封存报告`}
+                  className="history-entry"
+                  disabled={openingEntryId !== null}
+                  onClick={() => void openEntry(entry)}
+                  type="button"
+                >
+                  <span className="history-entry__time">
+                    <HistoryIcon aria-hidden="true" size={16} />
+                    <span><strong>{historyInstantLabel(entry.finishedAtUnixMs)}</strong><small>{historyDurationLabel(entry.durationMs)}</small></span>
+                  </span>
+                  <span className="history-entry__scope" title={entry.rootDisplay}>
+                    <strong>{fileNameFromPath(entry.rootDisplay) || '卷内根目录'}</strong>
+                    <small>
+                      {entry.rootDisplay} · 封存显示文本 · {entry.coverageStatus === 'complete' ? '完整覆盖' : '部分覆盖'} · {historyCaptureTimeLabel(entry.captureTimeStatus)}
+                    </small>
+                  </span>
+                  <span className="history-entry__metrics">
+                    <span><strong>{entry.verifiedGroups.toLocaleString('zh-CN')}</strong><small>确定重复组</small></span>
+                    <span><strong>{formatBytes(entry.logicalReclaimableBytes)}</strong><small>逻辑重复上限</small></span>
+                    <span><strong>{entry.unresolvedIssues.toLocaleString('zh-CN')}</strong><small>未解决问题</small></span>
+                  </span>
+                  <span className="history-entry__action">
+                    {openingEntryId === entry.historyEntryId ? (
+                      <LoaderCircle aria-hidden="true" className="is-spinning" size={17} />
+                    ) : <ChevronRight aria-hidden="true" size={17} />}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ol>
+        ) : null}
+
+        {items.length > 0 && (cursorHistory.length > 0 || nextCursor !== null) ? (
+          <nav aria-busy={isLoading} aria-label="历史报告分页" className="pagination-bar history-pagination">
+            <button disabled={cursorHistory.length === 0 || isLoading} onClick={() => void loadPrevious()} type="button">
+              <ChevronLeft aria-hidden="true" size={14} /> 上一页
+            </button>
+            <span>{isLoading ? '正在读取…' : `第 ${cursorHistory.length + 1} 页 · 当前 ${items.length} 份`}</span>
+            <button disabled={nextCursor === null || isLoading} onClick={() => void loadNext()} type="button">
+              下一页 <ChevronRight aria-hidden="true" size={14} />
+            </button>
+          </nav>
+        ) : null}
+      </section>
     </main>
   )
 }
@@ -752,13 +1051,13 @@ function MetadataRawDetailPanel({
   analysisBuildId,
   exactGroupBuildId,
   field,
-  jobId,
+  resultReadToken,
   report,
 }: {
   analysisBuildId: string
   exactGroupBuildId: string
   field: CaptureTimeMetadataField
-  jobId: string
+  resultReadToken: string
   report: CaptureTimeMetadataReport
 }) {
   const [detail, setDetail] = useState<CaptureTimeMetadataFieldRawDetail | null>(null)
@@ -776,7 +1075,7 @@ function MetadataRawDetailPanel({
     setError(null)
     try {
       const nextDetail = await loadCaptureTimeMetadataFieldRawDetail(
-        jobId,
+        resultReadToken,
         exactGroupBuildId,
         analysisBuildId,
         report,
@@ -793,7 +1092,7 @@ function MetadataRawDetailPanel({
         setIsLoading(false)
       }
     }
-  }, [analysisBuildId, exactGroupBuildId, field, jobId, report])
+  }, [analysisBuildId, exactGroupBuildId, field, report, resultReadToken])
 
   useEffect(() => {
     setDetail(null)
@@ -858,7 +1157,7 @@ function MetadataFieldCard({
   exactGroupBuildId,
   field,
   isExpanded,
-  jobId,
+  resultReadToken,
   onToggle,
   report,
 }: {
@@ -866,7 +1165,7 @@ function MetadataFieldCard({
   exactGroupBuildId: string
   field: CaptureTimeMetadataField
   isExpanded: boolean
-  jobId: string
+  resultReadToken: string
   onToggle: () => void
   report: CaptureTimeMetadataReport
 }) {
@@ -892,7 +1191,7 @@ function MetadataFieldCard({
             analysisBuildId={analysisBuildId}
             exactGroupBuildId={exactGroupBuildId}
             field={field}
-            jobId={jobId}
+            resultReadToken={resultReadToken}
             key={`${field.ordinal}:${field.fieldId}`}
             report={report}
           />
@@ -905,12 +1204,12 @@ function MetadataFieldCard({
 function MetadataFieldPage({
   analysisBuildId,
   exactGroupBuildId,
-  jobId,
+  resultReadToken,
   report,
 }: {
   analysisBuildId: string
   exactGroupBuildId: string
-  jobId: string
+  resultReadToken: string
   report: CaptureTimeMetadataReport
 }) {
   const [expandedFieldId, setExpandedFieldId] = useState<string | null>(null)
@@ -921,7 +1220,7 @@ function MetadataFieldPage({
       label="原始元数据字段摘要"
       loadPage={async (cursor) => {
         const page = await loadCaptureTimeMetadataFieldPage(
-          jobId,
+          resultReadToken,
           exactGroupBuildId,
           analysisBuildId,
           report,
@@ -935,7 +1234,7 @@ function MetadataFieldPage({
           exactGroupBuildId={exactGroupBuildId}
           field={field}
           isExpanded={expandedFieldId === field.fieldId}
-          jobId={jobId}
+          resultReadToken={resultReadToken}
           onToggle={() => setExpandedFieldId((current) => (
             current === field.fieldId ? null : field.fieldId
           ))}
@@ -950,14 +1249,14 @@ function MetadataReportCard({
   analysisBuildId,
   exactGroupBuildId,
   isExpanded,
-  jobId,
+  resultReadToken,
   onToggle,
   report,
 }: {
   analysisBuildId: string
   exactGroupBuildId: string
   isExpanded: boolean
-  jobId: string
+  resultReadToken: string
   onToggle: () => void
   report: CaptureTimeMetadataReport
 }) {
@@ -989,7 +1288,7 @@ function MetadataReportCard({
           <MetadataFieldPage
             analysisBuildId={analysisBuildId}
             exactGroupBuildId={exactGroupBuildId}
-            jobId={jobId}
+            resultReadToken={resultReadToken}
             key={`${report.sourceOrdinal}:${report.reportId}`}
             report={report}
           />
@@ -1002,11 +1301,11 @@ function MetadataReportCard({
 function CaptureTimeMetadataReview({
   analysisBuildId,
   exactGroupBuildId,
-  jobId,
+  resultReadToken,
 }: {
   analysisBuildId: string
   exactGroupBuildId: string
-  jobId: string
+  resultReadToken: string
 }) {
   const [expandedReportId, setExpandedReportId] = useState<string | null>(null)
   return (
@@ -1020,7 +1319,7 @@ function CaptureTimeMetadataReview({
         label="原始元数据报告"
         loadPage={async (cursor) => {
           const page = await loadCaptureTimeMetadataReportPage(
-            jobId,
+            resultReadToken,
             exactGroupBuildId,
             analysisBuildId,
             cursor,
@@ -1032,7 +1331,7 @@ function CaptureTimeMetadataReview({
             analysisBuildId={analysisBuildId}
             exactGroupBuildId={exactGroupBuildId}
             isExpanded={expandedReportId === report.reportId}
-            jobId={jobId}
+            resultReadToken={resultReadToken}
             onToggle={() => setExpandedReportId((current) => (
               current === report.reportId ? null : report.reportId
             ))}
@@ -1046,11 +1345,11 @@ function CaptureTimeMetadataReview({
 
 function CaptureTimeEvidencePanel({
   group,
-  jobId,
+  resultReadToken,
   stageStatus,
 }: {
   group: DuplicateGroup
-  jobId?: string
+  resultReadToken?: string
   stageStatus?: CaptureTimeStageStatus
 }) {
   const [summary, setSummary] = useState<CaptureTimeGroupSummary | null>(null)
@@ -1062,7 +1361,7 @@ function CaptureTimeEvidencePanel({
   const [showIssues, setShowIssues] = useState(false)
 
   useEffect(() => {
-    if (!jobId || (stageStatus !== 'completed' && stageStatus !== 'partial')) return
+    if (!resultReadToken || (stageStatus !== 'completed' && stageStatus !== 'partial')) return
     let active = true
     setIsLoading(true)
     setLoadError(null)
@@ -1070,7 +1369,7 @@ function CaptureTimeEvidencePanel({
     setShowMetadata(false)
     setShowMembers(false)
     setShowIssues(false)
-    void loadCaptureTimeGroupSummary(jobId, group.id)
+    void loadCaptureTimeGroupSummary(resultReadToken, group.id)
       .then((nextSummary) => {
         if (active) setSummary(nextSummary)
       })
@@ -1083,9 +1382,9 @@ function CaptureTimeEvidencePanel({
     return () => {
       active = false
     }
-  }, [group.id, jobId, requestNonce, stageStatus])
+  }, [group.id, requestNonce, resultReadToken, stageStatus])
 
-  if (!jobId || !stageStatus || stageStatus === 'not_run') {
+  if (!resultReadToken || !stageStatus || stageStatus === 'not_run') {
     return <p className="capture-time-empty">本次没有运行拍摄时间分析。</p>
   }
   if (stageStatus === 'unavailable' || stageStatus === 'failed') {
@@ -1128,7 +1427,7 @@ function CaptureTimeEvidencePanel({
         label="拍摄时间候选"
         loadPage={async (cursor) => {
           const page = await loadCaptureTimeCandidatePage(
-            jobId,
+            resultReadToken,
             group.id,
             summary.analysisBuildId,
             cursor,
@@ -1152,7 +1451,7 @@ function CaptureTimeEvidencePanel({
           <CaptureTimeMetadataReview
             analysisBuildId={summary.analysisBuildId}
             exactGroupBuildId={group.id}
-            jobId={jobId}
+            resultReadToken={resultReadToken}
             key={`${group.id}:${summary.analysisBuildId}`}
           />
         ) : null}
@@ -1170,7 +1469,7 @@ function CaptureTimeEvidencePanel({
             label="文件时间关系"
             loadPage={async (cursor) => {
               const page = await loadCaptureTimeMemberPage(
-                jobId,
+                resultReadToken,
                 group.id,
                 summary.analysisBuildId,
                 cursor,
@@ -1194,7 +1493,7 @@ function CaptureTimeEvidencePanel({
             label="拍摄时间问题"
             loadPage={async (cursor) => {
               const page = await loadCaptureTimeIssuePage(
-                jobId,
+                resultReadToken,
                 group.id,
                 summary.analysisBuildId,
                 cursor,
@@ -1220,7 +1519,7 @@ function GroupInspector({
   group,
   isLive,
   isLoading,
-  jobId,
+  resultReadToken,
   loadError,
   memberPage,
   canLoadPrevious,
@@ -1233,7 +1532,7 @@ function GroupInspector({
   group: DuplicateGroup
   isLive: boolean
   isLoading: boolean
-  jobId?: string
+  resultReadToken?: string
   loadError: string | null
   memberPage: number
   canLoadPrevious: boolean
@@ -1321,7 +1620,7 @@ function GroupInspector({
         {isLive ? (
           <CaptureTimeEvidencePanel
             group={group}
-            jobId={jobId}
+            resultReadToken={resultReadToken}
             key={group.id}
             stageStatus={captureTimeStageStatus}
           />
@@ -1381,7 +1680,10 @@ function CaptureTimeStageNotice({ report }: { report: ScanReport }) {
         <span>{statusCopy[1]}</span>
         <small>
           已封存 {stage.groupsWritten.toLocaleString('zh-CN')} / {stage.groupsSeen.toLocaleString('zh-CN')} 组，
-          其中 {stage.evidenceGroups.toLocaleString('zh-CN')} 组有证据；实际读取 {formatBytes(stage.actualReadBytes)}。
+          其中 {stage.evidenceGroups.toLocaleString('zh-CN')} 组有证据；
+          {stage.usageScope === 'sealed_reports'
+            ? `封印报告可重建的双提取读取为 ${formatBytes(stage.actualReadBytes)}（失败探测未计入）。`
+            : `实际读取 ${formatBytes(stage.actualReadBytes)}。`}
           {stage.budgetExhausted ? ' 本次达到只读预算上限。' : ''}
           {stage.failure ? ` 终止原因：${stage.failure}。` : ''}
         </small>
@@ -1410,7 +1712,7 @@ function IssueDisclosure({ report }: { report: ScanReport }) {
 
   if (report.dataMode === 'live' && report.skippedFiles === 0) return null
   if (report.dataMode === 'synthetic' && report.issues.length === 0) return null
-  if (report.dataMode === 'live' && !report.resultJobId) {
+  if (report.dataMode === 'live' && !report.resultReadToken) {
     return (
       <div className="issue-disclosure" role="status">
         本次未完成任务记录了 {report.skippedFiles.toLocaleString('zh-CN')} 条问题；取消态不会开放未封印的问题分页。
@@ -1419,14 +1721,14 @@ function IssueDisclosure({ report }: { report: ScanReport }) {
   }
 
   async function fetchIssuePage(targetCursor: string | null): Promise<boolean> {
-    if (!report.resultJobId || requestBusyRef.current) return false
+    if (!report.resultReadToken || requestBusyRef.current) return false
     requestBusyRef.current = true
     const requestGeneration = requestGenerationRef.current + 1
     requestGenerationRef.current = requestGeneration
     setIsLoading(true)
     setLoadError(null)
     try {
-      const page = await loadScanIssuePage(report.resultJobId, targetCursor)
+      const page = await loadScanIssuePage(report.resultReadToken, targetCursor)
       if (requestGenerationRef.current !== requestGeneration) return false
       setIssues(page.issues)
       setCursor(targetCursor)
@@ -1595,7 +1897,7 @@ function ResultsWorkspace({
     group: DuplicateGroup,
     targetCursor: string | null,
   ): Promise<boolean> {
-    if (!report.resultJobId) {
+    if (!report.resultReadToken) {
       setMemberFiles(group.files)
       setMemberCursor(null)
       setNextMemberCursor(null)
@@ -1611,7 +1913,7 @@ function ResultsWorkspace({
     setMemberLoadError(null)
     try {
       const page = await loadDuplicateGroupMemberPage(
-        report.resultJobId,
+        report.resultReadToken,
         group.id,
         targetCursor,
       )
@@ -1634,7 +1936,7 @@ function ResultsWorkspace({
         setIsLoadingMembers(false)
       }
     }
-  }, [report.resultJobId])
+  }, [report.resultReadToken])
 
   useEffect(() => {
     memberRequestRef.current += 1
@@ -1647,11 +1949,11 @@ function ResultsWorkspace({
     setMemberHistory([])
     setMemberLoadError(null)
     setIsLoadingMembers(false)
-    if (selectedGroup && report.resultJobId) {
+    if (selectedGroup && report.resultReadToken) {
       setFailedMemberDirection('initial')
       void fetchMemberPage(selectedGroup, null)
     }
-  }, [fetchMemberPage, selectedGroup, report.resultJobId])
+  }, [fetchMemberPage, selectedGroup, report.resultReadToken])
 
   useEffect(() => () => {
     groupRequestGenerationRef.current += 1
@@ -1661,14 +1963,14 @@ function ResultsWorkspace({
   }, [])
 
   async function fetchGroupPage(targetCursor: string | null): Promise<boolean> {
-    if (!report.resultJobId || groupRequestBusyRef.current) return false
+    if (!report.resultReadToken || groupRequestBusyRef.current) return false
     groupRequestBusyRef.current = true
     const requestGeneration = groupRequestGenerationRef.current + 1
     groupRequestGenerationRef.current = requestGeneration
     setIsLoadingGroups(true)
     setGroupLoadError(null)
     try {
-      const page = await loadDuplicateGroupPage(report.resultJobId, targetCursor)
+      const page = await loadDuplicateGroupPage(report.resultReadToken, targetCursor)
       if (groupRequestGenerationRef.current !== requestGeneration) return false
       setGroups(page.groups)
       setGroupCursor(targetCursor)
@@ -1763,6 +2065,8 @@ function ResultsWorkspace({
           <span className="section-kicker">
             {report.dataMode === 'synthetic'
               ? '合成数据 · 设计演示'
+              : report.resultOrigin === 'history'
+                ? '历史封印报告 · 只读复核'
               : report.status === 'complete'
                 ? '只读报告已完成'
                 : report.status === 'cancelled'
@@ -1773,6 +2077,9 @@ function ResultsWorkspace({
           </span>
           <h1>发现 {report.totalDuplicateGroups.toLocaleString('zh-CN')} 组确定重复</h1>
           <p title={report.root}>{report.root}</p>
+          {report.resultOrigin === 'history' ? (
+            <span className="native-path-note">这是历史封存显示文本，不是当前文件系统位置或重新打开权限</span>
+          ) : null}
           {report.rootPath ? (
             <span className="native-path-note">
               路径身份按
@@ -1787,7 +2094,11 @@ function ResultsWorkspace({
           ) : null}
         </div>
         <button className="button button--quiet" onClick={onReset} type="button">
-          <RotateCcw aria-hidden="true" size={16} /> 扫描其他目录
+          {report.resultOrigin === 'history' ? (
+            <><ChevronLeft aria-hidden="true" size={16} /> 返回历史报告</>
+          ) : (
+            <><RotateCcw aria-hidden="true" size={16} /> 扫描其他目录</>
+          )}
         </button>
       </header>
 
@@ -1860,7 +2171,7 @@ function ResultsWorkspace({
               <button onClick={() => void retryGroups()} type="button">重试失败页</button>
             </div>
           ) : null}
-          {report.resultJobId && report.totalDuplicateGroups > 0 ? (
+          {report.resultReadToken && report.totalDuplicateGroups > 0 ? (
             <nav aria-busy={isLoadingGroups} aria-label="确定重复组分页" className="pagination-bar pagination-bar--groups">
               <button
                 disabled={groupHistory.length === 0 || isLoadingGroups}
@@ -1883,7 +2194,7 @@ function ResultsWorkspace({
           ) : null}
           <div className="group-panel__footer">
             <Info aria-hidden="true" size={15} />
-            本结果中的组已在当前挂载会话逐字节确认并持久化；未来执行隔离前仍会再次复核。当前阶段尚不分析伴随资产，也不会执行清理。
+            本结果中的组已由扫描当时的 descriptor-bound 挂载会话逐字节确认并持久化；未来执行隔离前仍会再次复核。当前阶段尚不分析伴随资产，也不会执行清理。
           </div>
         </section>
         {inspectedGroup ? (
@@ -1894,7 +2205,7 @@ function ResultsWorkspace({
             group={inspectedGroup}
             isLive={report.dataMode === 'live'}
             isLoading={isLoadingMembers}
-            jobId={report.resultJobId}
+            resultReadToken={report.resultReadToken}
             loadError={memberLoadError}
             memberPage={memberHistory.length + 1}
             onLoadNext={() => void loadNextMembers()}
@@ -1938,6 +2249,13 @@ function App() {
   const [scanStatusWarning, setScanStatusWarning] = useState<string | null>(null)
   const chooseButtonRef = useRef<HTMLButtonElement>(null)
   const scanAttemptRef = useRef(false)
+
+  useEffect(() => {
+    const resultReadToken = report?.resultReadToken
+    return () => {
+      if (resultReadToken) void closeResultRead(resultReadToken).catch(() => undefined)
+    }
+  }, [report?.resultReadToken])
 
   async function handleChoose() {
     let shouldRestoreFocus = false
@@ -1985,12 +2303,19 @@ function App() {
         setScanStatusWarning,
       )
       setActiveScanJobId(session.jobId)
-      const nextReport = await session.result
+      // The native root grant is one-shot and has already been consumed by
+      // start_scan. Never keep presenting it as reusable authority while the
+      // worker runs or after an error.
       setSelectedRootToken(null)
+      const nextReport = await session.result
       setSource(nextReport.root)
       setReport(nextReport)
       setPhase('results')
     } catch (scanError) {
+      // A start failure may race native one-shot token consumption or an IPC
+      // response loss. Its reuse status is unknowable, so the UI must never
+      // continue presenting the old selection as live authority.
+      setSelectedRootToken(null)
       setError(asScanError(scanError))
       setPhase('error')
     } finally {
@@ -2043,8 +2368,25 @@ function App() {
     }
   }
 
+  function handleHistory() {
+    setReport(null)
+    setError(null)
+    setScanActionError(null)
+    setScanStatusWarning(null)
+    setPhase('history')
+  }
+
+  function handleHistoryResult(nextReport: ScanReport) {
+    setSelectedRootToken(null)
+    setSource(nextReport.root)
+    setReport(nextReport)
+    setError(null)
+    setPhase('results')
+  }
+
   function reset() {
-    setPhase('idle')
+    const returnToHistory = report?.resultOrigin === 'history'
+    setPhase(returnToHistory ? 'history' : 'idle')
     setSource(null)
     setSelectedRootToken(null)
     setReport(null)
@@ -2058,6 +2400,15 @@ function App() {
   }
 
   const desktopRuntime = isDesktopRuntime()
+  const sourceOverviewKind: SourceOverviewKind = phase === 'results'
+    ? 'sealed'
+    : phase === 'scanning'
+      ? 'active'
+      : phase === 'error'
+        ? 'none'
+      : source && selectedRootToken
+        ? 'authorized'
+        : 'none'
 
   return (
     <div className="app-shell">
@@ -2067,7 +2418,7 @@ function App() {
           <div><strong>归影</strong><small>照片归档助手</small></div>
         </div>
         <WorkflowRail phase={phase} />
-        <SourceOverview source={source} />
+        <SourceOverview kind={sourceOverviewKind} source={source} />
         <div className="rail-privacy">
           <ShieldCheck aria-hidden="true" size={16} />
           <span><strong>完全本地运行</strong><small>照片、路径与 GPS 信息不会上传</small></span>
@@ -2093,8 +2444,15 @@ function App() {
             isChoosing={isChoosing}
             onChoose={handleChoose}
             onDemo={handleDemo}
+            onHistory={handleHistory}
             onScan={handleScan}
             source={source}
+          />
+        ) : null}
+        {phase === 'history' ? (
+          <HistoryWorkspace
+            onBack={() => setPhase(source && selectedRootToken ? 'ready-to-scan' : 'idle')}
+            onOpen={handleHistoryResult}
           />
         ) : null}
         {phase === 'scanning' && source ? (
