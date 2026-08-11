@@ -6,34 +6,40 @@
 
 #![deny(unsafe_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use guiying_core::{
-    DirectoryObservation, FileObservation, MediaKind, PathEncoding, PathRef, ScanControl,
-    ScanIssue, ScanIssueCode, ScanOptions, ScanProgress, Scanner, StreamBatchStatus, StreamEvent,
-    StreamLimits, StreamRootKind, StreamRootObservation, StreamingEnumerationOutcome,
-    StreamingScanSession, StreamingScanSink,
+    DirectoryObservation, FileObservation, FileObservationTicket, FreshFingerprintEvidence,
+    FreshReadOrigin, MediaKind, PathEncoding, PathRef, ScanControl, ScanIssue, ScanIssueCode,
+    ScanOptions, ScanProgress, Scanner, StageBatchOutcome, StreamBatchStatus, StreamEvent,
+    StreamLimits, StreamRootKind, StreamRootObservation, StreamTrustScope,
+    StreamingEnumerationOutcome, StreamingScanSession, StreamingScanSink,
 };
 use guiying_store::{
     CapabilityProfileInput, CoreDirectoryObservationInput, CoreFileObservationInput, CoreSessionId,
-    CoreSessionInput, DirectoryObjectSignature, FileObjectKey, FileTimestampParts, MountSessionKey,
-    NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue, NewScopedScanJob,
-    ObservationInput, RootObjectSignature, RootScopeKey, RunEvidenceGuard, ScanStage,
-    SourceSignature, StablePathKey, Store, StoreError, TicketSortKey, VolumeInput,
+    CoreSessionInput, DirectoryObjectSignature, FileObjectKey, FileTicketRecord,
+    FileTimestampParts, FingerprintReadOrigin, FreshFingerprintInput, FreshFingerprintKind,
+    MountSessionKey, NamespaceProfileInput, NamespaceProfileKey, NewBoundScanRun, NewScanIssue,
+    NewScopedScanJob, ObservationInput, ParametersHash, RootObjectSignature, RootScopeKey,
+    RunEvidenceGuard, SampleBucketCursor, ScanStage, SizeBucketCursor, SourceSignature,
+    StablePathKey, Store, StoreError, TicketSortKey, VolumeInput,
 };
 use guiying_volume::{
-    BoundVolumeSession, CaseBehaviorObservation, FileObjectIdentity, IdentityStrength, KeyStrategy,
-    NamespaceReuseScope, NativePathEncoding, PathError, RootObjectIdentity,
-    UnicodeNormalizationObservation, VolumeError, VolumeObservation,
+    BoundMediaPath, BoundVolumeSession, CaseBehaviorObservation, FileObjectIdentity,
+    IdentityStrength, KeyStrategy, NamespaceReuseScope, NativePathEncoding, PathError,
+    ReadOnlyFile, RootObjectIdentity, UnicodeNormalizationObservation, VolumeError,
+    VolumeObservation,
 };
 use serde_json::json;
 use thiserror::Error;
 
 const RUNTIME_CONTRACT_VERSION: u32 = 1;
 const STORE_BATCH_LIMIT: usize = 64;
+const STORE_PAGE_LIMIT: u32 = STORE_BATCH_LIMIT as u32;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -57,6 +63,10 @@ pub enum RuntimeError {
     InvalidSystemClock,
     #[error("path evidence could not be decoded: {0}")]
     PathDecode(String),
+    #[error("{0} was cancelled before its evidence set could be sealed")]
+    StageCancelled(&'static str),
+    #[error("{stage} could not be sealed because {failed} candidate reads failed")]
+    StageIncomplete { stage: &'static str, failed: u64 },
 }
 
 /// Read-only progress observer. Implementations must not call back into the
@@ -85,6 +95,30 @@ pub struct EnumerationSummary {
     pub directory_observations: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FingerprintSummary {
+    pub candidate_size_buckets: u64,
+    pub sampled_files: u64,
+    pub sampled_bytes_read: u64,
+    pub sample_collision_buckets: u64,
+    pub full_hashed_files: u64,
+    pub full_hash_bytes_read: u64,
+    pub issues: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FingerprintSpec {
+    algorithm: String,
+    algorithm_version: i64,
+    parameters_hash: ParametersHash,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FingerprintAnalysisState {
+    summary: FingerprintSummary,
+    full_hash_spec: Option<FingerprintSpec>,
+}
+
 /// One live descriptor-bound read-only scan.
 ///
 /// The core and volume sessions must remain alive together. Dropping this
@@ -100,6 +134,9 @@ pub struct ActiveReadOnlyScan {
     job_state_version: i64,
     run_state_version: i64,
     enumeration: Option<EnumerationSummary>,
+    fingerprint_analysis: Option<FingerprintAnalysisState>,
+    issues_recorded: u64,
+    files_fingerprinted: u64,
 }
 
 impl ActiveReadOnlyScan {
@@ -129,6 +166,9 @@ impl ActiveReadOnlyScan {
             job_state_version: setup.job_state_version,
             run_state_version: setup.run_state_version,
             enumeration: None,
+            fingerprint_analysis: None,
+            issues_recorded: 0,
+            files_fingerprinted: 0,
         })
     }
 
@@ -150,6 +190,12 @@ impl ActiveReadOnlyScan {
 
     pub const fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn fingerprint_summary(&self) -> Option<&FingerprintSummary> {
+        self.fingerprint_analysis
+            .as_ref()
+            .map(|analysis| &analysis.summary)
     }
 
     /// Enumerates once with synchronous storage backpressure. Every root,
@@ -256,8 +302,395 @@ impl ActiveReadOnlyScan {
                 )?;
             }
         }
+        self.issues_recorded = summary.issues;
         self.enumeration = Some(summary.clone());
         Ok(summary)
+    }
+
+    /// Samples every sealed duplicate-size candidate, then fully hashes only
+    /// sample-collision buckets. No historical digest can enter either fresh
+    /// stage, and no stage is sealed after a cancelled or failed read.
+    pub fn fingerprint_candidates(
+        &mut self,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<FingerprintSummary, RuntimeError> {
+        let Some(enumeration) = self.enumeration.as_ref() else {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "enumeration must finish before fingerprinting",
+            ));
+        };
+        if !matches!(
+            enumeration.status,
+            StreamBatchStatus::Completed | StreamBatchStatus::Partial
+        ) {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "a terminal enumeration cannot enter fingerprinting",
+            ));
+        }
+        if self.fingerprint_analysis.is_some() {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "fingerprint analysis is allowed exactly once per runtime attempt",
+            ));
+        }
+
+        match self.fingerprint_candidates_inner(control, observer) {
+            Ok(analysis) => {
+                let summary = analysis.summary.clone();
+                self.fingerprint_analysis = Some(analysis);
+                Ok(summary)
+            }
+            Err(error @ RuntimeError::StageCancelled(_)) => {
+                if let Err(transition) = self.transition_terminal("cancelled", "cancelled", None) {
+                    return Err(RuntimeError::Stream(format!(
+                        "{error}; additionally failed to persist cancellation: {transition}"
+                    )));
+                }
+                Err(error)
+            }
+            Err(error) => {
+                Err(self.interrupt_for_failure("RUNTIME_FINGERPRINT_PIPELINE_FAILED", error))
+            }
+        }
+    }
+
+    fn fingerprint_candidates_inner(
+        &mut self,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<FingerprintAnalysisState, RuntimeError> {
+        let mut candidate_size_buckets = 0_u64;
+        let mut sampled_files = 0_u64;
+        let mut sampled_bytes_read = 0_u64;
+        let mut sampled_logical_bytes = 0_u64;
+        let mut sample_specs = BTreeMap::<i64, FingerprintSpec>::new();
+        let mut size_cursor: Option<SizeBucketCursor> = None;
+
+        loop {
+            let page = self.store.list_size_candidate_buckets_page(
+                self.ids.scan_run_id,
+                size_cursor.as_ref(),
+                STORE_PAGE_LIMIT,
+            )?;
+            for bucket in page.items {
+                candidate_size_buckets = candidate_size_buckets
+                    .checked_add(1)
+                    .ok_or(RuntimeError::NumericRange("candidate size bucket count"))?;
+                let mut ticket_cursor = None;
+                loop {
+                    let tickets = self.store.list_file_tickets_for_size_page(
+                        &self.guard,
+                        &self.core_session_id,
+                        bucket.observed_size_bytes,
+                        ticket_cursor.as_ref(),
+                        STORE_PAGE_LIMIT,
+                    )?;
+                    if tickets.items.is_empty() {
+                        if tickets.next_cursor.is_some() {
+                            return Err(RuntimeError::EvidenceMismatch(
+                                "size candidate page advanced without records".to_owned(),
+                            ));
+                        }
+                        break;
+                    }
+                    let result = self.run_fingerprint_batch(
+                        tickets.items,
+                        FreshReadOrigin::CurrentSessionSample,
+                        "sampling",
+                        control,
+                        observer,
+                    )?;
+                    sampled_files = checked_add_u64(
+                        "sampled file count",
+                        sampled_files,
+                        result.outcome.completed,
+                    )?;
+                    sampled_bytes_read = checked_add_u64(
+                        "sample bytes read",
+                        sampled_bytes_read,
+                        result.bytes_read,
+                    )?;
+                    sampled_logical_bytes = checked_add_u64(
+                        "sample logical bytes",
+                        sampled_logical_bytes,
+                        result.logical_bytes,
+                    )?;
+                    if let Some(spec) = result.spec {
+                        if let Some(existing) = sample_specs.get(&bucket.observed_size_bytes) {
+                            if existing != &spec {
+                                return Err(RuntimeError::EvidenceMismatch(
+                                    "one size bucket produced multiple sampling specifications"
+                                        .to_owned(),
+                                ));
+                            }
+                        } else {
+                            sample_specs.insert(bucket.observed_size_bytes, spec);
+                        }
+                    }
+                    ensure_stage_batch_complete("sampling", &result.outcome)?;
+                    ticket_cursor = tickets.next_cursor;
+                    if ticket_cursor.is_none() {
+                        break;
+                    }
+                }
+            }
+            size_cursor = page.next_cursor;
+            if size_cursor.is_none() {
+                break;
+            }
+        }
+
+        self.store.write_transaction(|repository| {
+            repository.seal_scan_stage(
+                &self.guard,
+                ScanStage::Sampling,
+                checked_i64("sampled file count", sampled_files).map_err(runtime_store_error)?,
+                checked_i64("sample logical bytes", sampled_logical_bytes)
+                    .map_err(runtime_store_error)?,
+                now_ms().map_err(runtime_store_error)?,
+            )
+        })?;
+
+        let mut sample_collision_buckets = 0_u64;
+        let mut full_hashed_files = 0_u64;
+        let mut full_hash_bytes_read = 0_u64;
+        let mut full_hash_logical_bytes = 0_u64;
+        let mut full_hash_spec = None;
+        for sample_spec in sample_specs.values() {
+            let mut bucket_cursor: Option<SampleBucketCursor> = None;
+            loop {
+                let page = self.store.list_sample_candidate_buckets_page(
+                    self.ids.scan_run_id,
+                    &sample_spec.algorithm,
+                    sample_spec.algorithm_version,
+                    &sample_spec.parameters_hash,
+                    bucket_cursor.as_ref(),
+                    STORE_PAGE_LIMIT,
+                )?;
+                for bucket in page.items {
+                    sample_collision_buckets = sample_collision_buckets
+                        .checked_add(1)
+                        .ok_or(RuntimeError::NumericRange("sample collision bucket count"))?;
+                    let mut ticket_cursor = None;
+                    loop {
+                        let tickets = self.store.list_file_tickets_for_fingerprint_page(
+                            &self.guard,
+                            &self.core_session_id,
+                            FreshFingerprintKind::Sample,
+                            &sample_spec.algorithm,
+                            sample_spec.algorithm_version,
+                            &sample_spec.parameters_hash,
+                            bucket.observed_size_bytes,
+                            &bucket.digest,
+                            ticket_cursor.as_ref(),
+                            STORE_PAGE_LIMIT,
+                        )?;
+                        if tickets.items.is_empty() {
+                            if tickets.next_cursor.is_some() {
+                                return Err(RuntimeError::EvidenceMismatch(
+                                    "sample collision page advanced without records".to_owned(),
+                                ));
+                            }
+                            break;
+                        }
+                        let records = tickets
+                            .items
+                            .into_iter()
+                            .map(|record| record.ticket)
+                            .collect();
+                        let result = self.run_fingerprint_batch(
+                            records,
+                            FreshReadOrigin::CurrentSessionFullHash,
+                            "full_hash",
+                            control,
+                            observer,
+                        )?;
+                        full_hashed_files = checked_add_u64(
+                            "full-hashed file count",
+                            full_hashed_files,
+                            result.outcome.completed,
+                        )?;
+                        full_hash_bytes_read = checked_add_u64(
+                            "full-hash bytes read",
+                            full_hash_bytes_read,
+                            result.bytes_read,
+                        )?;
+                        full_hash_logical_bytes = checked_add_u64(
+                            "full-hash logical bytes",
+                            full_hash_logical_bytes,
+                            result.logical_bytes,
+                        )?;
+                        if let Some(spec) = result.spec {
+                            if full_hash_spec.as_ref().is_some_and(|value| value != &spec) {
+                                return Err(RuntimeError::EvidenceMismatch(
+                                    "full hashing produced inconsistent specifications".to_owned(),
+                                ));
+                            }
+                            full_hash_spec.get_or_insert(spec);
+                        }
+                        ensure_stage_batch_complete("full hashing", &result.outcome)?;
+                        ticket_cursor = tickets.next_cursor;
+                        if ticket_cursor.is_none() {
+                            break;
+                        }
+                    }
+                }
+                bucket_cursor = page.next_cursor;
+                if bucket_cursor.is_none() {
+                    break;
+                }
+            }
+        }
+
+        self.store.write_transaction(|repository| {
+            repository.seal_scan_stage(
+                &self.guard,
+                ScanStage::FullHash,
+                checked_i64("full-hashed file count", full_hashed_files)
+                    .map_err(runtime_store_error)?,
+                checked_i64("full-hash logical bytes", full_hash_logical_bytes)
+                    .map_err(runtime_store_error)?,
+                now_ms().map_err(runtime_store_error)?,
+            )
+        })?;
+
+        Ok(FingerprintAnalysisState {
+            summary: FingerprintSummary {
+                candidate_size_buckets,
+                sampled_files,
+                sampled_bytes_read,
+                sample_collision_buckets,
+                full_hashed_files,
+                full_hash_bytes_read,
+                issues: self.issues_recorded,
+            },
+            full_hash_spec,
+        })
+    }
+
+    fn run_fingerprint_batch(
+        &mut self,
+        records: Vec<FileTicketRecord>,
+        origin: FreshReadOrigin,
+        stage: &'static str,
+        control: &dyn ScanControl,
+        observer: &mut dyn RuntimeObserver,
+    ) -> Result<FingerprintBatchResult, RuntimeError> {
+        if records.is_empty() || records.len() > STORE_BATCH_LIMIT {
+            return Err(RuntimeError::EvidenceMismatch(
+                "fingerprint batch is empty or exceeds the trusted adapter limit".to_owned(),
+            ));
+        }
+        self.volume.revalidate()?;
+        let bound = records
+            .into_iter()
+            .map(|record| bind_file_ticket(&self.volume, record))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tickets = bound
+            .iter()
+            .map(|candidate| candidate.ticket.clone())
+            .collect::<Vec<_>>();
+        let mut sink = FingerprintSink::new(origin, tickets.len(), observer);
+        let core_result = match origin {
+            FreshReadOrigin::CurrentSessionSample => {
+                self.core.sample_batch(&tickets, &mut sink, control)
+            }
+            FreshReadOrigin::CurrentSessionFullHash => {
+                self.core.full_hash_batch(&tickets, &mut sink, control)
+            }
+        };
+
+        for candidate in &bound {
+            if !candidate
+                .file
+                .verify_unchanged(&self.volume, &candidate.path)?
+            {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "volume file identity changed while core produced a fingerprint".to_owned(),
+                ));
+            }
+        }
+        self.volume.revalidate()?;
+        let outcome = core_result.map_err(|error| RuntimeError::Stream(error.to_string()))?;
+        validate_stage_counts(tickets.len(), &outcome)?;
+
+        let completed_at_ms = now_ms()?;
+        let (inputs, bytes_read, logical_bytes, spec) = translate_fingerprint_evidence(
+            self.core.session_id().as_bytes(),
+            origin,
+            &bound,
+            &sink.fingerprints,
+            completed_at_ms,
+        )?;
+        if inputs.len()
+            != usize::try_from(outcome.completed)
+                .map_err(|_| RuntimeError::NumericRange("completed fingerprint count"))?
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core completion count differs from its sealed fingerprint events".to_owned(),
+            ));
+        }
+
+        let mut next_issue_count = self.issues_recorded;
+        let issues = sink
+            .issues
+            .iter()
+            .map(|issue| {
+                next_issue_count = next_issue_count
+                    .checked_add(1)
+                    .ok_or(RuntimeError::NumericRange("issue count"))?;
+                Ok(issue_input(
+                    self.ids.volume_id,
+                    self.guard,
+                    next_issue_count,
+                    stage,
+                    issue,
+                    completed_at_ms,
+                ))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        let sample_delta = if origin == FreshReadOrigin::CurrentSessionSample {
+            outcome.completed
+        } else {
+            0
+        };
+        let next_fingerprinted = self
+            .files_fingerprinted
+            .checked_add(sample_delta)
+            .ok_or(RuntimeError::NumericRange("fingerprinted file count"))?;
+        let enumeration = self
+            .enumeration
+            .as_ref()
+            .ok_or(RuntimeError::UnsupportedEvidence(
+                "enumeration summary disappeared",
+            ))?;
+        self.store.write_transaction(|repository| {
+            if !inputs.is_empty() {
+                repository.record_fingerprint_fresh_batch(&self.guard, &inputs)?;
+            }
+            for issue in &issues {
+                repository.record_bound_scan_issue(&self.guard, issue)?;
+            }
+            repository.update_bound_scan_progress(
+                &self.guard,
+                checked_i64("media file count", enumeration.media_files)
+                    .map_err(runtime_store_error)?,
+                checked_i64("fingerprinted file count", next_fingerprinted)
+                    .map_err(runtime_store_error)?,
+                checked_i64("issue count", next_issue_count).map_err(runtime_store_error)?,
+                checked_i64("logical byte count", enumeration.logical_bytes)
+                    .map_err(runtime_store_error)?,
+                completed_at_ms,
+            )
+        })?;
+        self.issues_recorded = next_issue_count;
+        self.files_fingerprinted = next_fingerprinted;
+        Ok(FingerprintBatchResult {
+            outcome,
+            bytes_read,
+            logical_bytes,
+            spec,
+        })
     }
 
     /// Explicitly closes an unfinished read-only attempt without authorizing
@@ -301,6 +734,306 @@ impl ActiveReadOnlyScan {
             )),
         }
     }
+}
+
+struct BoundFileTicket {
+    record: FileTicketRecord,
+    ticket: FileObservationTicket,
+    path: BoundMediaPath,
+    file: ReadOnlyFile,
+}
+
+struct FingerprintBatchResult {
+    outcome: StageBatchOutcome,
+    bytes_read: u64,
+    logical_bytes: u64,
+    spec: Option<FingerprintSpec>,
+}
+
+struct FingerprintSink<'a> {
+    expected_origin: FreshReadOrigin,
+    maximum_events: usize,
+    events_seen: usize,
+    fingerprints: Vec<FreshFingerprintEvidence>,
+    issues: Vec<ScanIssue>,
+    observer: &'a mut dyn RuntimeObserver,
+}
+
+impl<'a> FingerprintSink<'a> {
+    fn new(
+        expected_origin: FreshReadOrigin,
+        input_count: usize,
+        observer: &'a mut dyn RuntimeObserver,
+    ) -> Self {
+        Self {
+            expected_origin,
+            maximum_events: input_count.saturating_mul(3).saturating_add(4),
+            events_seen: 0,
+            fingerprints: Vec::with_capacity(input_count),
+            issues: Vec::new(),
+            observer,
+        }
+    }
+}
+
+impl StreamingScanSink for FingerprintSink<'_> {
+    type Error = RuntimeError;
+
+    fn write_batch(&mut self, events: &[StreamEvent]) -> Result<(), Self::Error> {
+        if events.len() > STORE_BATCH_LIMIT {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core fingerprint event batch exceeds the adapter limit".to_owned(),
+            ));
+        }
+        self.events_seen = self
+            .events_seen
+            .checked_add(events.len())
+            .ok_or(RuntimeError::NumericRange("fingerprint event count"))?;
+        if self.events_seen > self.maximum_events {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core emitted too many events for one fingerprint batch".to_owned(),
+            ));
+        }
+        for event in events {
+            match event {
+                StreamEvent::FreshFingerprint(evidence) => {
+                    if evidence.read_origin() != self.expected_origin {
+                        return Err(RuntimeError::EvidenceMismatch(
+                            "core emitted a fingerprint from the wrong read stage".to_owned(),
+                        ));
+                    }
+                    self.fingerprints.push(evidence.clone());
+                }
+                StreamEvent::Issue(issue) => self.issues.push(issue.clone()),
+                StreamEvent::Progress(progress) => self.observer.on_progress(progress),
+                StreamEvent::RootObservation(_)
+                | StreamEvent::FileObservation(_)
+                | StreamEvent::DirectoryObservation(_)
+                | StreamEvent::ExactComparison(_)
+                | StreamEvent::EnumerationFinished(_)
+                | StreamEvent::CoverageVerified(_) => {
+                    return Err(RuntimeError::EvidenceMismatch(
+                        "non-fingerprint evidence appeared in a fingerprint sink".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn bind_file_ticket(
+    volume: &BoundVolumeSession,
+    record: FileTicketRecord,
+) -> Result<BoundFileTicket, RuntimeError> {
+    if record.ticket_format_version != 1 {
+        return Err(RuntimeError::UnsupportedEvidence(
+            "unsupported core file-ticket format",
+        ));
+    }
+    if record.path_encoding != native_encoding(volume.path_semantics().encoding()) {
+        return Err(RuntimeError::EvidenceMismatch(
+            "stored file-ticket path encoding differs from the volume session".to_owned(),
+        ));
+    }
+    let ticket = FileObservationTicket::from_bytes(&record.ticket_blob)
+        .map_err(|error| RuntimeError::Stream(format!("invalid file ticket: {error:?}")))?;
+    if ticket.sort_key() != record.ticket_sort_key.as_bytes() {
+        return Err(RuntimeError::EvidenceMismatch(
+            "stored file-ticket bytes and sort key disagree".to_owned(),
+        ));
+    }
+    let path = volume.relative_path(record.root_relative_path_raw.clone())?;
+    if path.stable_path_key().as_bytes() != record.stable_path_key.as_bytes()
+        || path.mount_relative().raw() != record.mount_relative_path_raw
+    {
+        return Err(RuntimeError::EvidenceMismatch(
+            "stored file-ticket path does not derive from the live volume root".to_owned(),
+        ));
+    }
+    let file = volume.open_regular_file(&path)?;
+    let identity = file.initial_identity();
+    if checked_i64("file size", identity.size)? != record.size_bytes {
+        return Err(RuntimeError::EvidenceMismatch(
+            "stored file size differs from the live volume descriptor".to_owned(),
+        ));
+    }
+    if record.file_object_key != Some(file_object_key(identity)) {
+        return Err(RuntimeError::EvidenceMismatch(
+            "stored physical-file identity differs from the live volume descriptor".to_owned(),
+        ));
+    }
+    Ok(BoundFileTicket {
+        record,
+        ticket,
+        path,
+        file,
+    })
+}
+
+fn translate_fingerprint_evidence(
+    core_session_id: &[u8; 32],
+    expected_origin: FreshReadOrigin,
+    bound: &[BoundFileTicket],
+    evidence: &[FreshFingerprintEvidence],
+    completed_at_ms: i64,
+) -> Result<
+    (
+        Vec<FreshFingerprintInput>,
+        u64,
+        u64,
+        Option<FingerprintSpec>,
+    ),
+    RuntimeError,
+> {
+    let by_ticket = bound
+        .iter()
+        .map(|candidate| (*candidate.ticket.sort_key(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    if by_ticket.len() != bound.len() {
+        return Err(RuntimeError::EvidenceMismatch(
+            "fingerprint input repeated an authenticated ticket".to_owned(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut inputs = Vec::with_capacity(evidence.len());
+    let mut bytes_read = 0_u64;
+    let mut logical_bytes = 0_u64;
+    let mut common_spec = None;
+    for proof in evidence {
+        if proof.session_id().as_bytes() != core_session_id
+            || proof.trust_scope() != StreamTrustScope::CurrentCoreSessionOnly
+            || proof.read_origin() != expected_origin
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "fingerprint proof is not bound to the active core read stage".to_owned(),
+            ));
+        }
+        let ticket_id = *proof.observation_ticket_id();
+        if !seen.insert(ticket_id) {
+            return Err(RuntimeError::EvidenceMismatch(
+                "core emitted more than one fingerprint for one ticket".to_owned(),
+            ));
+        }
+        let candidate = by_ticket.get(&ticket_id).ok_or_else(|| {
+            RuntimeError::EvidenceMismatch(
+                "core emitted a fingerprint for a ticket outside the requested batch".to_owned(),
+            )
+        })?;
+        let expected_length = u64::try_from(candidate.record.size_bytes)
+            .map_err(|_| RuntimeError::NumericRange("stored file size"))?;
+        if proof.expected_length() != expected_length
+            || proof.before_source_signature() != candidate.record.source_signature.as_bytes()
+            || proof.after_source_signature() != candidate.record.source_signature.as_bytes()
+        {
+            return Err(RuntimeError::EvidenceMismatch(
+                "fresh fingerprint does not match its immutable observation".to_owned(),
+            ));
+        }
+        if proof.algorithm() != "blake3" || proof.algorithm_version() != 1 {
+            return Err(RuntimeError::UnsupportedEvidence(
+                "unexpected core fingerprint algorithm",
+            ));
+        }
+        match expected_origin {
+            FreshReadOrigin::CurrentSessionSample if proof.eof_verified() => {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "sample evidence unexpectedly claimed full EOF coverage".to_owned(),
+                ));
+            }
+            FreshReadOrigin::CurrentSessionFullHash
+                if !proof.eof_verified() || proof.bytes_read() != proof.expected_length() =>
+            {
+                return Err(RuntimeError::EvidenceMismatch(
+                    "full-hash evidence lacks exact-length EOF proof".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        let spec = FingerprintSpec {
+            algorithm: proof.algorithm().to_owned(),
+            algorithm_version: i64::from(proof.algorithm_version()),
+            parameters_hash: ParametersHash::from_runtime_evidence(*proof.parameters_hash()),
+        };
+        if common_spec.as_ref().is_some_and(|value| value != &spec) {
+            return Err(RuntimeError::EvidenceMismatch(
+                "one bounded fingerprint batch produced inconsistent parameters".to_owned(),
+            ));
+        }
+        common_spec.get_or_insert_with(|| spec.clone());
+        bytes_read = checked_add_u64("fingerprint bytes read", bytes_read, proof.bytes_read())?;
+        logical_bytes = checked_add_u64(
+            "fingerprint logical bytes",
+            logical_bytes,
+            proof.expected_length(),
+        )?;
+        inputs.push(FreshFingerprintInput {
+            observation_id: candidate.record.observation_id,
+            fingerprint_kind: match expected_origin {
+                FreshReadOrigin::CurrentSessionSample => FreshFingerprintKind::Sample,
+                FreshReadOrigin::CurrentSessionFullHash => FreshFingerprintKind::ExactBytes,
+            },
+            algorithm: proof.algorithm().to_owned(),
+            algorithm_version: i64::from(proof.algorithm_version()),
+            parameters_hash: ParametersHash::from_runtime_evidence(*proof.parameters_hash()),
+            read_origin: match expected_origin {
+                FreshReadOrigin::CurrentSessionSample => FingerprintReadOrigin::SampleRead,
+                FreshReadOrigin::CurrentSessionFullHash => FingerprintReadOrigin::FullHashRead,
+            },
+            source_signature_before: SourceSignature::from_runtime_evidence(
+                *proof.before_source_signature(),
+            ),
+            source_signature_after: SourceSignature::from_runtime_evidence(
+                *proof.after_source_signature(),
+            ),
+            digest: proof.digest().to_vec(),
+            observed_size_bytes: candidate.record.size_bytes,
+            bytes_read: checked_i64("fingerprint bytes read", proof.bytes_read())?,
+            reached_expected_eof: proof.eof_verified(),
+            completed_at_ms,
+            created_at_ms: completed_at_ms,
+        });
+    }
+    Ok((inputs, bytes_read, logical_bytes, common_spec))
+}
+
+fn validate_stage_counts(
+    input_count: usize,
+    outcome: &StageBatchOutcome,
+) -> Result<(), RuntimeError> {
+    let processed = outcome
+        .completed
+        .checked_add(outcome.failed)
+        .ok_or(RuntimeError::NumericRange("processed candidate count"))?;
+    let input_count = u64::try_from(input_count)
+        .map_err(|_| RuntimeError::NumericRange("fingerprint input count"))?;
+    if processed > input_count
+        || (outcome.status == StreamBatchStatus::Completed && processed != input_count)
+    {
+        return Err(RuntimeError::EvidenceMismatch(
+            "core fingerprint outcome count does not match the requested batch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_stage_batch_complete(
+    stage: &'static str,
+    outcome: &StageBatchOutcome,
+) -> Result<(), RuntimeError> {
+    match outcome.status {
+        StreamBatchStatus::Completed if outcome.failed == 0 => Ok(()),
+        StreamBatchStatus::Cancelled => Err(RuntimeError::StageCancelled(stage)),
+        _ => Err(RuntimeError::StageIncomplete {
+            stage,
+            failed: outcome.failed,
+        }),
+    }
+}
+
+fn checked_add_u64(field: &'static str, left: u64, right: u64) -> Result<u64, RuntimeError> {
+    left.checked_add(right)
+        .ok_or(RuntimeError::NumericRange(field))
 }
 
 struct StoreAttempt {
@@ -490,6 +1223,7 @@ impl StreamingScanSink for EnumerationSink<'_> {
                         self.volume_id,
                         self.guard,
                         next_issues,
+                        "enumeration",
                         issue,
                         now,
                     ));
@@ -839,6 +1573,7 @@ fn issue_input(
     volume_id: i64,
     guard: RunEvidenceGuard,
     issue_ordinal: u64,
+    stage: &'static str,
     issue: &ScanIssue,
     occurred_at_ms: i64,
 ) -> NewScanIssue {
@@ -847,6 +1582,7 @@ fn issue_input(
     hasher.update(b"guiying.runtime.issue.v1\0");
     hasher.update(&guard.scan_run_id.to_le_bytes());
     hasher.update(&issue_ordinal.to_le_bytes());
+    hasher.update(stage.as_bytes());
     hasher.update(code.as_bytes());
     hasher.update(issue.path.raw_base64.as_bytes());
     hasher.update(issue.detail.as_bytes());
@@ -856,7 +1592,7 @@ fn issue_input(
         scan_run_id: guard.scan_run_id,
         media_file_id: None,
         severity: "warning".to_owned(),
-        stage: "enumeration".to_owned(),
+        stage: stage.to_owned(),
         code: code.to_owned(),
         message: format!("{}: {}", issue.path.display, issue.detail),
         details: Some(json!({
@@ -1123,6 +1859,109 @@ mod tests {
             "TEST_FINISHED",
             "integration test closed the read-only attempt",
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_pipeline_samples_by_size_and_full_hashes_only_sample_collisions(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let database = application.path().join("runtime.sqlite3");
+        let duplicate = b"identical-photo-payload";
+        let different = b"different-photo-payload";
+        assert_eq!(duplicate.len(), different.len());
+        let first = media.path().join("first.jpg");
+        let second = media.path().join("second.jpg");
+        let third = media.path().join("third.jpg");
+        let unique = media.path().join("unique.jpg");
+        fs::write(&first, duplicate)?;
+        fs::write(&second, duplicate)?;
+        fs::write(&third, different)?;
+        fs::write(unique, b"different-size")?;
+        let names_before = directory_names(media.path())?;
+        let first_modified = fs::metadata(&first)?.modified()?;
+        let second_modified = fs::metadata(&second)?.modified()?;
+        let third_modified = fs::metadata(&third)?.modified()?;
+
+        let mut runtime = ActiveReadOnlyScan::start(
+            database,
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        let enumeration = runtime.enumerate(&NoopScanControl, &mut ())?;
+        assert_eq!(enumeration.status, StreamBatchStatus::Completed);
+        assert_eq!(enumeration.media_files, 4);
+
+        let summary = runtime.fingerprint_candidates(&NoopScanControl, &mut ())?;
+        assert_eq!(summary.candidate_size_buckets, 1);
+        assert_eq!(summary.sampled_files, 3);
+        assert_eq!(summary.sample_collision_buckets, 1);
+        assert_eq!(summary.full_hashed_files, 2);
+        assert_eq!(summary.full_hash_bytes_read, (duplicate.len() * 2) as u64);
+        assert_eq!(summary.issues, 0);
+
+        let full_spec = runtime
+            .fingerprint_analysis
+            .as_ref()
+            .and_then(|analysis| analysis.full_hash_spec.as_ref())
+            .ok_or("full-hash specification missing")?;
+        let buckets = runtime.store().list_exact_digest_buckets_page(
+            runtime.ids().scan_run_id,
+            &full_spec.algorithm,
+            full_spec.algorithm_version,
+            &full_spec.parameters_hash,
+            None,
+            10,
+        )?;
+        assert_eq!(buckets.items.len(), 1);
+        assert_eq!(buckets.items[0].member_count, 2);
+        assert_eq!(buckets.items[0].digest, blake3::hash(duplicate).as_bytes());
+
+        assert_eq!(fs::read(&first)?, duplicate);
+        assert_eq!(fs::read(&second)?, duplicate);
+        assert_eq!(fs::read(&third)?, different);
+        assert_eq!(fs::metadata(&first)?.modified()?, first_modified);
+        assert_eq!(fs::metadata(&second)?.modified()?, second_modified);
+        assert_eq!(fs::metadata(&third)?.modified()?, third_modified);
+        assert_eq!(directory_names(media.path())?, names_before);
+
+        runtime.interrupt(
+            "TEST_FINISHED",
+            "fingerprint integration test closed the read-only attempt",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_sampling_never_seals_or_leaves_an_active_attempt(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        let first = media.path().join("first.jpg");
+        let second = media.path().join("second.jpg");
+        fs::write(&first, b"same-size-a")?;
+        fs::write(&second, b"same-size-b")?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+        runtime.enumerate(&NoopScanControl, &mut ())?;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = runtime
+            .fingerprint_candidates(&cancellation, &mut ())
+            .expect_err("cancelled sampling unexpectedly completed");
+        assert!(matches!(error, RuntimeError::StageCancelled("sampling")));
+        assert!(runtime
+            .store()
+            .list_active_scan_jobs_page(None, 10)?
+            .items
+            .is_empty());
+        assert_eq!(fs::read(&first)?, b"same-size-a");
+        assert_eq!(fs::read(&second)?, b"same-size-b");
         Ok(())
     }
 
