@@ -443,6 +443,24 @@
   color: var(--semantic-text-primary);
 }
 
+.root-grant-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 14px;
+  color: var(--semantic-text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.root-grant-note svg {
+  flex: 0 0 auto;
+}
+
+.root-grant-note--expired {
+  color: var(--semantic-text-warning);
+}
+
 .safety-sheet {
   position: relative;
   max-width: 420px;

@@ -1,8 +1,25 @@
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test } from '@playwright/test'
-import type { Page } from '@playwright/test'
+import type { Page, TestInfo } from '@playwright/test'
 
 const evidenceDir = 'docs/ui-delivery/evidence'
+
+async function captureEvidence(
+  page: Page,
+  testInfo: TestInfo,
+  fileName: string,
+  options: { fullPage?: boolean } = {},
+) {
+  // Evidence PNGs are the canonical design-delivery record. Only the chromium
+  // project writes them so the webkit project cannot overwrite the captures
+  // with engine-specific rendering.
+  if (testInfo.project.name !== 'desktop-chromium') return
+  await page.screenshot({
+    animations: 'disabled',
+    path: `${evidenceDir}/${fileName}`,
+    fullPage: options.fullPage ?? true,
+  })
+}
 
 type HistoryExportFixtureMode =
   | 'warning'
@@ -87,7 +104,10 @@ async function installScanAttemptFixture(page: Page, mode: ScanAttemptFixtureMod
           calls.push({ command, payload })
           if (command === 'plugin:event|listen') return 1
           if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'9'.repeat(64)}` }
+          if (command === 'select_scan_root') return {
+            rootToken: `root-${'9'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
           if (command === 'start_scan') return { jobId: 'scan-attempt-fixture' }
           if (command === 'get_scan_status') {
             statusQueries += 1
@@ -274,7 +294,7 @@ async function openHistoryExportPanel(page: Page) {
   await expect(page.getByRole('heading', { name: '导出封存报告' })).toBeVisible()
 }
 
-test('landing page communicates the read-only boundary', async ({ page }) => {
+test('landing page communicates the read-only boundary', async ({ page }, testInfo) => {
   await page.goto('/')
 
   await expect(page).toHaveTitle(/归影/)
@@ -285,14 +305,10 @@ test('landing page communicates the read-only boundary', async ({ page }) => {
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
 
-  await page.screenshot({
-    animations: 'disabled',
-    path: `${evidenceDir}/landing-1280x820.png`,
-    fullPage: true,
-  })
+  await captureEvidence(page, testInfo, 'landing-1280x820.png')
 })
 
-test('read-only demo scan exposes progress and exact duplicate evidence', async ({ page }) => {
+test('read-only demo scan exposes progress and exact duplicate evidence', async ({ page }, testInfo) => {
   await page.goto('/')
   await page.clock.install()
 
@@ -300,11 +316,7 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
   await expect(page.getByRole('heading', { name: '正在建立内容证据' })).toBeVisible()
   await expect(page.getByText('阶段 1 / 5')).toBeVisible()
 
-  await page.screenshot({
-    animations: 'disabled',
-    path: `${evidenceDir}/scanning-1280x820.png`,
-    fullPage: true,
-  })
+  await captureEvidence(page, testInfo, 'scanning-1280x820.png')
 
   await page.clock.runFor(1_500)
 
@@ -321,32 +333,27 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
 
-  await page.screenshot({
-    animations: 'disabled',
-    path: `${evidenceDir}/results-1280x820.png`,
-    fullPage: true,
-  })
+  await captureEvidence(page, testInfo, 'results-1280x820.png')
 })
 
-test('core flow remains reachable using only the keyboard', async ({ page }) => {
+test('core flow remains reachable using only the keyboard', async ({ browserName, page }) => {
+  // WebKit keeps the macOS keyboard model: plain Tab skips buttons, and
+  // Option(Alt)+Tab is the canonical way Safari/WKWebView users reach them.
+  const focusNext = browserName === 'webkit' ? 'Alt+Tab' : 'Tab'
   await page.goto('/')
-  await page.keyboard.press('Tab')
+  await page.keyboard.press(focusNext)
   await expect(page.getByRole('button', { name: '运行合成数据扫描演示' })).toBeFocused()
   await page.keyboard.press('Enter')
   await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
 })
 
-test('results adapt at the compact desktop boundary', async ({ page }) => {
+test('results adapt at the compact desktop boundary', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1024, height: 768 })
   await page.goto('/')
   await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
   await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
 
-  await page.screenshot({
-    animations: 'disabled',
-    path: `${evidenceDir}/results-1024x768.png`,
-    fullPage: true,
-  })
+  await captureEvidence(page, testInfo, 'results-1024x768.png')
 })
 
 test('a transient native status failure keeps cancellation control and recovers', async ({ page }) => {
@@ -388,7 +395,10 @@ test('a transient native status failure keeps cancellation control and recovers'
         invoke: async (command: string) => {
           if (command === 'plugin:event|listen') return 1
           if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'a'.repeat(64)}` }
+          if (command === 'select_scan_root') return {
+            rootToken: `root-${'a'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
           if (command === 'start_scan') return { jobId: 'scan-fixture' }
           if (command === 'cancel_scan') return undefined
           if (command === 'acknowledge_scan') return { released: true }
@@ -469,12 +479,12 @@ test('a fresh full child is disclosed only after the late opaque attempt status 
 
   await expect(page.getByText('重新关联为新的全量扫描。')).toHaveCount(0)
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __SCAN_ATTEMPT_FIXTURE__: { statusQueries: () => number }
     }
   ).__SCAN_ATTEMPT_FIXTURE__.statusQueries())).toBeGreaterThan(0)
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __SCAN_ATTEMPT_FIXTURE__: { reveal: () => void }
     }
   ).__SCAN_ATTEMPT_FIXTURE__.reveal())
@@ -487,7 +497,7 @@ test('a fresh full child is disclosed only after the late opaque attempt status 
   await expect(disclosure).toContainText('不证明是同一块物理磁盘')
 
   const calls = await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __SCAN_ATTEMPT_FIXTURE__: {
         calls: Array<{ command: string; payload: Record<string, unknown> }>
       }
@@ -530,13 +540,13 @@ test('an established attempt rejects a later scan-run identity drift', async ({ 
   await page.getByRole('button', { name: '选择照片目录' }).click()
   await page.getByRole('button', { name: '开始只读扫描' }).click()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __SCAN_ATTEMPT_FIXTURE__: { statusQueries: () => number }
     }
   ).__SCAN_ATTEMPT_FIXTURE__.statusQueries())).toBeGreaterThan(0)
 
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __SCAN_ATTEMPT_FIXTURE__: { reveal: () => void }
     }
   ).__SCAN_ATTEMPT_FIXTURE__.reveal())
@@ -594,7 +604,10 @@ test('enumeration pause is same-open only, resumes, and remains cancellable whil
         invoke: async (command: string) => {
           if (command === 'plugin:event|listen') return 1
           if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'b'.repeat(64)}` }
+          if (command === 'select_scan_root') return {
+            rootToken: `root-${'b'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
           if (command === 'start_scan') return { jobId: 'scan-pause-fixture' }
           if (command === 'pause_scan') {
             fixture.pauseCalls += 1
@@ -642,7 +655,7 @@ test('enumeration pause is same-open only, resumes, and remains cancellable whil
   await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
 
   const calls = await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __PAUSE_FIXTURE__: { pauseCalls: number; resumeCalls: number; cancelCalls: number }
     }
   ).__PAUSE_FIXTURE__)
@@ -688,7 +701,10 @@ for (const delayedControl of ['pause', 'resume'] as const) {
           invoke: async (command: string) => {
             if (command === 'plugin:event|listen') return 1
             if (command === 'plugin:event|unlisten') return undefined
-            if (command === 'select_scan_root') return { rootToken: `root-${'c'.repeat(64)}` }
+            if (command === 'select_scan_root') return {
+            rootToken: `root-${'c'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
             if (command === 'start_scan') return { jobId: 'scan-race-fixture' }
             if (command === 'pause_scan') {
               phase = 'pausing'
@@ -746,7 +762,7 @@ for (const delayedControl of ['pause', 'resume'] as const) {
 
     await page.getByRole('button', { name: '停止扫描' }).click()
     await page.evaluate(() => (
-      window as Window & {
+      window as unknown as Window & {
         __SCAN_CONTROL_RACE_FIXTURE__: { releaseDelayed: () => void }
       }
     ).__SCAN_CONTROL_RACE_FIXTURE__.releaseDelayed())
@@ -755,7 +771,7 @@ for (const delayedControl of ['pause', 'resume'] as const) {
     await expect(page.getByText('正在继续')).toHaveCount(0)
 
     await page.evaluate(() => (
-      window as Window & {
+      window as unknown as Window & {
         __SCAN_CONTROL_RACE_FIXTURE__: { allowTerminal: () => void }
       }
     ).__SCAN_CONTROL_RACE_FIXTURE__.allowTerminal())
@@ -806,7 +822,10 @@ test('enumeration completion clears a concurrent pausing state and advances the 
         invoke: async (command: string) => {
           if (command === 'plugin:event|listen') return 1
           if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'d'.repeat(64)}` }
+          if (command === 'select_scan_root') return {
+            rootToken: `root-${'d'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
           if (command === 'start_scan') return { jobId: 'scan-enumeration-race' }
           if (command === 'pause_scan') {
             pauseRequested = true
@@ -830,7 +849,6 @@ test('enumeration completion clears a concurrent pausing state and advances the 
                     stage: 'sampling',
                     completed: 0,
                     total: null,
-                    currentPath: null,
                   },
                 })
               }
@@ -853,7 +871,7 @@ test('enumeration completion clears a concurrent pausing state and advances the 
   await expect(page.getByRole('heading', { name: '筛选候选' })).toBeVisible()
   await expect(page.getByText('正在暂停')).toHaveCount(0)
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __PAUSE_ENUMERATION_RACE_FIXTURE__: { releasePause: () => void }
     }
   ).__PAUSE_ENUMERATION_RACE_FIXTURE__.releasePause())
@@ -874,7 +892,9 @@ test('webview rejects a path-shaped root authority instead of starting a scan', 
         transformCallback: () => 1,
         unregisterCallback: () => undefined,
         invoke: async (command: string) => {
-          if (command === 'select_scan_root') return { rootToken: '/Users/example/.ssh' }
+          if (command === 'select_scan_root') {
+            return { rootToken: '/Users/example/.ssh', expiresAtUnixMs: '9999999999999' }
+          }
           if (command === 'start_scan') {
             fixtureState.startCalls += 1
             throw new Error('start_scan must not be reached')
@@ -893,12 +913,144 @@ test('webview rejects a path-shaped root authority instead of starting a scan', 
   await expect(page.getByText('尚未选择目录。')).toBeVisible()
   await expect(page.getByText('已授权')).toHaveCount(0)
   const startCalls = await page.evaluate(() => (
-    window as Window & { __ROOT_TOKEN_FIXTURE__: { startCalls: number } }
+    window as unknown as Window & { __ROOT_TOKEN_FIXTURE__: { startCalls: number } }
   ).__ROOT_TOKEN_FIXTURE__.startCalls)
   expect(startCalls).toBe(0)
 })
 
-test('historical reports are paged, opened with a read token, and revoked on return', async ({ page }) => {
+test('an expired root authorization disables scan start and prompts reselection', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fixtureState = { startCalls: 0 }
+    Object.assign(window, {
+      isTauri: true,
+      __ROOT_EXPIRY_FIXTURE__: fixtureState,
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string) => {
+          if (command === 'select_scan_root') {
+            return {
+              rootToken: `root-${'1'.repeat(64)}`,
+              expiresAtUnixMs: String(Date.now() + 900),
+            }
+          }
+          if (command === 'start_scan') {
+            fixtureState.startCalls += 1
+            throw new Error('start_scan must not be reached after the disclosed deadline')
+          }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '选择照片目录' }).click()
+  await expect(page.getByText(/目录授权有效至/)).toBeVisible()
+  await expect(page.getByRole('button', { name: '开始只读扫描' })).toBeEnabled()
+
+  const expiredNotice = page.getByRole('status').filter({ hasText: '目录授权已过期' })
+  await expect(expiredNotice).toBeVisible()
+  await expect(expiredNotice).toContainText('请重新选择照片目录')
+  await expect(page.getByRole('button', { name: '开始只读扫描' })).toBeDisabled()
+  await expect(page.getByText(/目录授权有效至/)).toHaveCount(0)
+  await expect(page.getByText('已授权')).toHaveCount(0)
+  const startCalls = await page.evaluate(() => (
+    window as unknown as Window & { __ROOT_EXPIRY_FIXTURE__: { startCalls: number } }
+  ).__ROOT_EXPIRY_FIXTURE__.startCalls)
+  expect(startCalls).toBe(0)
+})
+
+test('an unexpired root authorization starts the scan before its deadline', async ({ page }) => {
+  await page.addInitScript(() => {
+    const result = {
+      schemaVersion: 1,
+      scanRunId: '7',
+      root: '/Volumes/Deadline Photos',
+      status: 'complete',
+      mediaFiles: '0',
+      logicalBytes: '0',
+      candidateSizeBuckets: '0',
+      sampledFiles: '0',
+      sampledBytesRead: '0',
+      fullHashedFiles: '0',
+      fullHashBytesRead: '0',
+      verifiedGroups: '0',
+      verifiedMembers: '0',
+      redundantIndependentFiles: '0',
+      comparedPairs: '0',
+      comparedBytes: '0',
+      logicalReclaimableBytes: '0',
+      issues: '0',
+    }
+    Object.assign(window, {
+      isTauri: true,
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string) => {
+          if (command === 'plugin:event|listen') return 1
+          if (command === 'plugin:event|unlisten') return undefined
+          if (command === 'select_scan_root') {
+            return {
+              rootToken: `root-${'2'.repeat(64)}`,
+              expiresAtUnixMs: String(Date.now() + 60_000),
+            }
+          }
+          if (command === 'start_scan') return { jobId: 'scan-deadline-fixture' }
+          if (command === 'acknowledge_scan') return { released: true }
+          if (command === 'open_scan_history') {
+            return {
+              schemaVersion: 1,
+              historyEntryId: '7',
+              resultReadToken: `result-${'3'.repeat(64)}`,
+              expiresAtUnixMs: '9999999999999',
+              summary: {
+                historyEntryId: '7', rootDisplay: '/Volumes/Deadline Photos', scanMode: 'full',
+                startedAtUnixMs: '1000', finishedAtUnixMs: '1400', durationMs: '400',
+                coverageStatus: 'complete', observedFiles: '0', logicalBytes: '0',
+                verifiedGroups: '0', verifiedMembers: '0', redundantCopies: '0',
+                logicalReclaimableBytes: '0', issues: '0', unresolvedIssues: '0',
+                captureTime: {
+                  status: 'not_run', expectedGroups: '0', evidenceGroups: '0',
+                  unavailableGroups: '0', failedGroups: '0', sealedReportReadBytes: '0',
+                  sealedReportReadOperations: '0',
+                },
+              },
+            }
+          }
+          if (command === 'list_duplicate_groups') return { items: [], nextCursor: null }
+          if (command === 'get_scan_status') {
+            return {
+              jobId: 'scan-deadline-fixture',
+              phase: 'completed',
+              attemptKind: 'initial_full',
+              historyEntryId: '7',
+              startedAtUnixMs: 1_000,
+              finishedAtUnixMs: 1_400,
+              scanRunId: '7',
+              progress: null,
+              result,
+              error: null,
+            }
+          }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '选择照片目录' }).click()
+  await expect(page.getByText(/目录授权有效至/)).toBeVisible()
+  const startButton = page.getByRole('button', { name: '开始只读扫描' })
+  await expect(startButton).toBeEnabled()
+  await startButton.click()
+  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+})
+
+test('historical reports are paged, opened with a read token, and revoked on return', async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     const fixture = {
       calls: [] as Array<{ command: string; payload: Record<string, unknown> }>,
@@ -975,7 +1127,7 @@ test('historical reports are paged, opened with a read token, and revoked on ret
   await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
   await expect(page.getByText('卷根目录 · 封存显示文本')).toBeVisible()
   expect(await page.evaluate(() => (
-    window as Window & { __HISTORY_FIXTURE__: { calls: Array<{ command: string }> } }
+    window as unknown as Window & { __HISTORY_FIXTURE__: { calls: Array<{ command: string }> } }
   ).__HISTORY_FIXTURE__.calls.filter((call) => call.command === 'open_scan_history'))).toHaveLength(0)
 
   const accessibility = await new AxeBuilder({ page }).analyze()
@@ -986,19 +1138,15 @@ test('historical reports are paged, opened with a read token, and revoked on ret
   await expect(page.getByText('卷根目录 · 封存显示文本')).toBeVisible()
   await page.getByRole('button', { name: '重试失败页' }).click()
   await expect(page.getByText('Archive/2025 · 封存显示文本')).toBeVisible()
-  await page.screenshot({
-    animations: 'disabled',
-    path: `${evidenceDir}/history-1280x820.png`,
-    fullPage: true,
-  })
+  await captureEvidence(page, testInfo, 'history-1280x820.png')
 
-  await page.getByRole('button', { name: '打开 Archive/2025 的封存报告' }).evaluate((button) => {
+  await page.getByRole('button', { name: '打开 Archive/2025 的封存报告' }).evaluate((button: HTMLElement) => {
     button.click()
     button.click()
   })
   await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
   expect(await page.evaluate(() => (
-    window as Window & { __HISTORY_FIXTURE__: { calls: Array<{ command: string }> } }
+    window as unknown as Window & { __HISTORY_FIXTURE__: { calls: Array<{ command: string }> } }
   ).__HISTORY_FIXTURE__.calls.filter((call) => call.command === 'open_scan_history'))).toHaveLength(1)
   await expect(page.getByText('历史封印报告 · 只读复核')).toBeVisible()
   await expect(page.getByText('扫描未覆盖全部条目。')).toBeVisible()
@@ -1007,7 +1155,7 @@ test('historical reports are paged, opened with a read token, and revoked on ret
   await page.getByRole('button', { name: '返回历史报告' }).click()
   await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & { __HISTORY_FIXTURE__: { closes: number } }
+    window as unknown as Window & { __HISTORY_FIXTURE__: { closes: number } }
   ).__HISTORY_FIXTURE__.closes)).toBe(1)
 })
 
@@ -1062,17 +1210,17 @@ test('a late history-open response cannot restore an exited view or retain its t
   await page.getByRole('button', { name: '查看历史报告' }).click()
   await page.getByRole('button', { name: '打开 Archive/Late 的封存报告' }).click()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & { __LATE_HISTORY_FIXTURE__: { openCalls: number } }
+    window as unknown as Window & { __LATE_HISTORY_FIXTURE__: { openCalls: number } }
   ).__LATE_HISTORY_FIXTURE__.openCalls)).toBe(1)
   await page.getByRole('button', { name: '返回扫描入口' }).click()
   await expect(page.getByRole('heading', { name: /先看证据/ })).toBeVisible()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & { __LATE_HISTORY_FIXTURE__: { closes: number } }
+    window as unknown as Window & { __LATE_HISTORY_FIXTURE__: { closes: number } }
   ).__LATE_HISTORY_FIXTURE__.closes)).toBe(1)
   await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toHaveCount(0)
 })
 
-test('persistent results page groups, members, and issues without unbounded accumulation', async ({ page }) => {
+test('persistent results page groups, members, and issues without unbounded accumulation', async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     let callbackId = 0
     let groupSecondPageAttempts = 0
@@ -1185,7 +1333,10 @@ test('persistent results page groups, members, and issues without unbounded accu
           try {
             if (command === 'plugin:event|listen') return 1
             if (command === 'plugin:event|unlisten') return undefined
-            if (command === 'select_scan_root') return { rootToken: `root-${'b'.repeat(64)}` }
+            if (command === 'select_scan_root') return {
+            rootToken: `root-${'b'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
             if (command === 'start_scan') {
               pagingCalls.push({ command, payload })
               return { jobId: 'scan-paged' }
@@ -1370,11 +1521,7 @@ test('persistent results page groups, members, and issues without unbounded accu
   await expect(page.getByText('文件系统实际精度未知，需人工审阅')).toBeVisible()
   await page.getByText('时间问题（1 项）').click()
   await expect(page.getByText('FS_PRECISION_UNKNOWN', { exact: true })).toBeVisible()
-  await page.screenshot({
-    animations: 'disabled',
-    path: `${evidenceDir}/results-paged-1280x820.png`,
-    fullPage: true,
-  })
+  await captureEvidence(page, testInfo, 'results-paged-1280x820.png')
 
   await page.getByLabel('组内文件分页').getByRole('button', { name: '下一页' }).click()
   await expect(page.getByText('member page fixture failure')).toBeVisible()
@@ -1385,7 +1532,7 @@ test('persistent results page groups, members, and issues without unbounded accu
   await expect(page.locator('code').filter({ hasText: '/Volumes/Test Photos/A-copy.JPG' })).toBeVisible()
 
   const groupNext = page.getByLabel('确定重复组分页').getByRole('button', { name: '下一页' })
-  await groupNext.evaluate((button) => {
+  await groupNext.evaluate((button: HTMLElement) => {
     button.click()
     button.click()
   })
@@ -1408,7 +1555,7 @@ test('persistent results page groups, members, and issues without unbounded accu
   await expect(page.getByText('ISSUE_ONE')).toHaveCount(0)
 
   const calls = await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __PAGING_CALLS__: Array<{ command: string; payload: Record<string, unknown> }>
     }
   ).__PAGING_CALLS__)
@@ -1424,7 +1571,7 @@ test('persistent results page groups, members, and issues without unbounded accu
     .filter((call) => call.command !== 'start_scan')
     .every((call) => typeof call.payload.limit === 'number')).toBe(true)
   const singleFlight = await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __RESULT_SINGLE_FLIGHT__: { inFlight: number; maxInFlight: number; busyConflicts: number }
     }
   ).__RESULT_SINGLE_FLIGHT__)
@@ -1434,7 +1581,7 @@ test('persistent results page groups, members, and issues without unbounded accu
   expect(accessibility.violations).toEqual([])
 })
 
-test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', async ({ page }) => {
+test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     let callbackId = 0
     let reportSecondPageAttempts = 0
@@ -1628,7 +1775,10 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
           calls.push({ command, payload })
           if (command === 'plugin:event|listen') return 1
           if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'f'.repeat(64)}` }
+          if (command === 'select_scan_root') return {
+            rootToken: `root-${'f'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
           if (command === 'start_scan') return { jobId: 'scan-raw-metadata' }
           if (command === 'acknowledge_scan') return { released: true }
           if (command === 'open_scan_history') {
@@ -1782,7 +1932,7 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
   await expect(page.getByRole('heading', { name: '发现 2 组确定重复' })).toBeVisible()
 
   const metadataCalls = async (command: string) => page.evaluate((target) => (
-    window as Window & {
+    window as unknown as Window & {
       __RAW_METADATA_FIXTURE__: {
         calls: Array<{ command: string; payload: Record<string, unknown> }>
       }
@@ -1850,10 +2000,7 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
 
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
-  await page.screenshot({
-    animations: 'disabled',
-    path: `${evidenceDir}/results-raw-metadata-1280x820.png`,
-  })
+  await captureEvidence(page, testInfo, 'results-raw-metadata-1280x820.png', { fullPage: false })
 
   await page.getByLabel('原始元数据字段摘要分页').getByRole('button', { name: '下一页' }).click()
   await expect(page.getByText(/偏移与长度超过来源文件大小/)).toBeVisible()
@@ -1916,7 +2063,10 @@ test('a malformed terminal summary is acknowledged before the adaptation error i
         invoke: async (command: string) => {
           if (command === 'plugin:event|listen') return 1
           if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'c'.repeat(64)}` }
+          if (command === 'select_scan_root') return {
+            rootToken: `root-${'c'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
           if (command === 'start_scan') return { jobId: 'scan-malformed' }
           if (command === 'open_scan_history') {
             return {
@@ -1963,7 +2113,7 @@ test('a malformed terminal summary is acknowledged before the adaptation error i
   await expect(page.getByRole('heading', { name: '没有执行主动修改操作' })).toBeVisible()
   await expect(page.getByText(/冗余独立副本数不是有效的非负十进制数/)).toBeVisible()
   const acknowledgements = await page.evaluate(() => (
-    window as Window & { __TERMINAL_FIXTURE__: { acknowledgements: number } }
+    window as unknown as Window & { __TERMINAL_FIXTURE__: { acknowledgements: number } }
   ).__TERMINAL_FIXTURE__.acknowledgements)
   expect(acknowledgements).toBe(1)
 })
@@ -2001,7 +2151,10 @@ test('a permanently failing acknowledgement still delivers the sealed report and
         invoke: async (command: string) => {
           if (command === 'plugin:event|listen') return 1
           if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'e'.repeat(64)}` }
+          if (command === 'select_scan_root') return {
+            rootToken: `root-${'e'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
           if (command === 'start_scan') return { jobId: 'scan-ack-pending' }
           if (command === 'open_scan_history') {
             return {
@@ -2050,11 +2203,11 @@ test('a permanently failing acknowledgement still delivers the sealed report and
   await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
   await expect(page.getByText('报告已封存，但任务回执仍待确认。')).toBeVisible()
   expect(await page.evaluate(() => (
-    window as Window & { __ACK_RETRY_FIXTURE__: { acknowledgements: number } }
+    window as unknown as Window & { __ACK_RETRY_FIXTURE__: { acknowledgements: number } }
   ).__ACK_RETRY_FIXTURE__.acknowledgements)).toBe(4)
 
   await page.evaluate(() => {
-    (window as Window & {
+    (window as unknown as Window & {
       __ACK_RETRY_FIXTURE__: { allowAcknowledgement: boolean }
     }).__ACK_RETRY_FIXTURE__.allowAcknowledgement = true
   })
@@ -2095,7 +2248,10 @@ test('cancelled work exposes no unsealed duplicate or issue pages', async ({ pag
         invoke: async (command: string) => {
           if (command === 'plugin:event|listen') return 1
           if (command === 'plugin:event|unlisten') return undefined
-          if (command === 'select_scan_root') return { rootToken: `root-${'d'.repeat(64)}` }
+          if (command === 'select_scan_root') return {
+            rootToken: `root-${'d'.repeat(64)}`,
+            expiresAtUnixMs: '9999999999999',
+          }
           if (command === 'start_scan') return { jobId: 'scan-cancelled' }
           if (command === 'get_scan_status') {
             return {
@@ -2122,7 +2278,7 @@ test('cancelled work exposes no unsealed duplicate or issue pages', async ({ pag
   await expect(page.getByText(/取消态不会开放未封印的问题分页/)).toBeVisible()
   await expect(page.getByText('0 B', { exact: true })).toBeVisible()
   const resultPageCalls = await page.evaluate(() => (
-    window as Window & { __CANCELLED_FIXTURE__: { resultPageCalls: number } }
+    window as unknown as Window & { __CANCELLED_FIXTURE__: { resultPageCalls: number } }
   ).__CANCELLED_FIXTURE__.resultPageCalls)
   expect(resultPageCalls).toBe(0)
 })
@@ -2144,7 +2300,7 @@ test('history export sends only strict token payloads and surfaces commit warnin
   await expect(status).toContainText('sealed-report.csv 已生成')
   await expect(status).toContainText('临时文件清理延后，且目录持久化确认不可用')
   const calls = await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: {
         calls: Array<{ command: string; payload: Record<string, unknown> }>
       }
@@ -2170,7 +2326,7 @@ test('history export waits behind the result read queue while cancellation bypas
 
   await page.getByLabel('确定重复组分页').getByRole('button', { name: '下一页' }).click()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
@@ -2179,12 +2335,12 @@ test('history export waits behind the result read queue while cancellation bypas
   await page.getByRole('button', { name: '选择文件并导出' }).click()
   await expect(page.locator('.history-export-status')).toContainText('正在生成 sealed-report.json')
   expect(await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.some((call) => call.command === 'export_scan_history'))).toBe(false)
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { releaseQueuedRead: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.releaseQueuedRead())
@@ -2197,7 +2353,7 @@ test('a confirmed cancel invalidates an export still waiting in the result queue
 
   await page.getByLabel('确定重复组分页').getByRole('button', { name: '下一页' }).click()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
@@ -2207,7 +2363,7 @@ test('a confirmed cancel invalidates an export still waiting in the result queue
   await page.getByRole('button', { name: '选择文件并导出' }).click()
   await expect(page.locator('.history-export-status')).toContainText('正在生成 sealed-report.json')
   expect(await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.some((call) => call.command === 'export_scan_history'))).toBe(false)
@@ -2217,12 +2373,12 @@ test('a confirmed cancel invalidates an export still waiting in the result queue
   await expect(page.getByRole('button', { name: '选择文件并导出' })).toBeEnabled()
 
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { releaseQueuedRead: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.releaseQueuedRead())
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
@@ -2241,12 +2397,12 @@ test('history export cancel reaches native code before the queued export settles
   await expect(page.getByRole('button', { name: '取消导出' })).toBeVisible()
   await page.getByRole('button', { name: '取消导出' }).click()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.some((call) => call.command === 'cancel_history_export'))).toBe(true)
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { rejectExport: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.rejectExport())
@@ -2260,7 +2416,7 @@ test('a write failure racing cancel remains a write error unless native returns 
   await page.getByRole('button', { name: '选择文件并导出' }).click()
   await page.getByRole('button', { name: '取消导出' }).click()
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { rejectExport: (code?: string) => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.rejectExport('HISTORY_EXPORT_WRITE_FAILED'))
@@ -2275,13 +2431,13 @@ test('a late cancel-false response cannot overwrite an already completed export'
   await page.getByRole('button', { name: '选择文件并导出' }).click()
   await page.getByRole('button', { name: '取消导出' }).click()
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { releaseExport: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.releaseExport())
   await expect(page.locator('.history-export-status')).toContainText('sealed-report.json 已生成')
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { releaseCancelFalse: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.releaseCancelFalse())
@@ -2297,20 +2453,20 @@ test('a late history export selection is revoked and cannot overwrite the exited
   await expect(page.getByText('请在系统窗口中选择新文件名。')).toBeVisible()
   await page.getByRole('button', { name: '返回历史报告' }).click()
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { releaseSelection: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.releaseSelection())
   await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
     call.command === 'cancel_history_export'
   )).length)).toBe(1)
   expect(await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.some((call) => call.command === 'export_scan_history'))).toBe(false)
@@ -2324,14 +2480,14 @@ test('leaving a running history export cancels it and ignores a late completion'
   await expect(page.getByRole('button', { name: '取消导出' })).toBeVisible()
   await page.getByRole('button', { name: '返回历史报告' }).click()
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
     call.command === 'cancel_history_export'
   )).length)).toBe(1)
   await page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { releaseExport: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.releaseExport())
@@ -2347,7 +2503,7 @@ test('history export adapter rejects any native response that adds a parent path
   await expect(page.locator('.history-export-status')).toContainText('未知或缺失字段')
   expect(await page.locator('body').innerText()).not.toContain('/Users/private/export')
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (
@@ -2362,7 +2518,7 @@ test('history export adapter revokes a canonical grant whose file extension is w
   await page.getByRole('button', { name: '选择文件并导出' }).click()
   await expect(page.locator('.history-export-status')).toContainText('扩展名与所选格式不一致')
   await expect.poll(async () => page.evaluate(() => (
-    window as Window & {
+    window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
     }
   ).__HISTORY_EXPORT_FIXTURE__.calls.filter((call) => (

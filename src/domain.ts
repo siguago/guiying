@@ -376,7 +376,8 @@ export interface ScanErrorShape {
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  // Divisor is 1024, so the labels must be the binary units.
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
   const unitIndex = Math.min(
     Math.floor(Math.log(bytes) / Math.log(1024)),
     units.length - 1,

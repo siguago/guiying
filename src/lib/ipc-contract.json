@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "storeMaxPageSize": 256,
+  "maxScanHistoryPageLimit": 64,
+  "resultPageSize": 64,
+  "memberPageSize": 256,
+  "issuePageSize": 128,
+  "captureTimePageSize": 128,
+  "captureTimeMetadataReportPageSize": 32,
+  "captureTimeMetadataFieldPageSize": 128,
+  "scanHistoryPageSize": 32,
+  "maxResultJsonBytes": 16777216,
+  "maxRawMetadataFieldBytes": 1048576,
+  "maxCursorBytes": 16384,
+  "maxHistoryRootDisplayBytes": 65536,
+  "maxHistoryScanModeBytes": 64
+}

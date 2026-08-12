@@ -2,6 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { createDemoReport } from '../demo'
 import { fileNameFromPath } from '../domain'
+import ipcContract from './ipc-contract.json'
 import type {
   CancelHistoryExportResult,
   CaptureTimeCandidate,
@@ -89,7 +90,6 @@ export interface ScanProgress {
   stage: 'enumerating' | 'sampling' | 'full_hashing' | 'verifying' | 'complete'
   completed: number
   total?: number | null
-  currentPath?: string | null
 }
 
 interface CoreAppError {
@@ -461,13 +461,17 @@ interface CoreCancelHistoryExportResponse {
   cancelled: unknown
 }
 
-const RESULT_PAGE_SIZE = 64
-const MEMBER_PAGE_SIZE = 256
-const ISSUE_PAGE_SIZE = 128
-const CAPTURE_TIME_PAGE_SIZE = 128
-const CAPTURE_TIME_METADATA_REPORT_PAGE_SIZE = 32
-const CAPTURE_TIME_METADATA_FIELD_PAGE_SIZE = 128
-const SCAN_HISTORY_PAGE_SIZE = 32
+// Shared with src-tauri via src/lib/ipc-contract.json. The desktop test
+// `webview_ipc_contract_constants_match_the_native_boundary` pins these values
+// against the native validators, so edit the JSON — never fork numbers here.
+const RESULT_PAGE_SIZE = ipcContract.resultPageSize
+const MEMBER_PAGE_SIZE = ipcContract.memberPageSize
+const ISSUE_PAGE_SIZE = ipcContract.issuePageSize
+const CAPTURE_TIME_PAGE_SIZE = ipcContract.captureTimePageSize
+const CAPTURE_TIME_METADATA_REPORT_PAGE_SIZE = ipcContract.captureTimeMetadataReportPageSize
+const CAPTURE_TIME_METADATA_FIELD_PAGE_SIZE = ipcContract.captureTimeMetadataFieldPageSize
+const SCAN_HISTORY_PAGE_SIZE = ipcContract.scanHistoryPageSize
+const MAX_CURSOR_TEXT_LENGTH = ipcContract.maxCursorBytes
 
 function formatFromPath(path: string): string {
   const extension = fileNameFromPath(path).split('.').at(-1)
@@ -1052,7 +1056,7 @@ function adaptScanHistoryItem(item: CoreScanHistoryItem): ScanHistoryItem {
     : requireBoundedMetadataText(
         item.rootDisplay,
         '历史报告扫描范围显示文本',
-        65_536,
+        ipcContract.maxHistoryRootDisplayBytes,
       )
   const startedAt = parseSignedDecimal(item.startedAtUnixMs, '历史报告开始时间')
   const finishedAt = parseSignedDecimal(item.finishedAtUnixMs, '历史报告完成时间')
@@ -1105,7 +1109,12 @@ function adaptScanHistoryItem(item: CoreScanHistoryItem): ScanHistoryItem {
   return {
     historyEntryId: item.historyEntryId,
     rootDisplay,
-    scanMode: requireBoundedMetadataText(item.scanMode, '历史报告扫描模式', 64, true),
+    scanMode: requireBoundedMetadataText(
+      item.scanMode,
+      '历史报告扫描模式',
+      ipcContract.maxHistoryScanModeBytes,
+      true,
+    ),
     startedAtUnixMs: item.startedAtUnixMs,
     finishedAtUnixMs: item.finishedAtUnixMs,
     durationMs,
@@ -1214,7 +1223,7 @@ async function readPage<T>(
   ) {
     throw new Error(`${label}分页结构无效；该页已拒绝接收。`)
   }
-  if (page.nextCursor !== null && page.nextCursor.length > 16 * 1024) {
+  if (page.nextCursor !== null && page.nextCursor.length > MAX_CURSOR_TEXT_LENGTH) {
     throw new Error(`${label}分页游标超过界面硬上限；该页已拒绝接收。`)
   }
   if (page.items.length > limit) {
@@ -1599,8 +1608,8 @@ const METADATA_CONTAINER_KINDS = ['tiff', 'jpeg_exif', 'iso_bmff'] as const
 const TIFF_BYTE_ORDERS = ['little_endian', 'big_endian'] as const
 const LOWER_HEX_DIGEST = /^[0-9a-f]{64}$/
 const PADDED_STANDARD_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
-const MAX_METADATA_RAW_BYTES = 1024 * 1024
-const MAX_METADATA_PAGE_BYTES = 16 * 1024 * 1024
+const MAX_METADATA_RAW_BYTES = ipcContract.maxRawMetadataFieldBytes
+const MAX_METADATA_PAGE_BYTES = ipcContract.maxResultJsonBytes
 const MAX_I64 = 9_223_372_036_854_775_807n
 
 function requireEnumValue<const T extends readonly string[]>(
@@ -2376,7 +2385,7 @@ export async function loadScanHistoryPage(
     || !Array.isArray(page.items)
     || page.items.length > SCAN_HISTORY_PAGE_SIZE
     || (page.nextCursor !== null && typeof page.nextCursor !== 'string')
-    || (page.nextCursor !== null && page.nextCursor.length > 16 * 1024)
+    || (page.nextCursor !== null && page.nextCursor.length > MAX_CURSOR_TEXT_LENGTH)
     || (page.nextCursor !== null && page.nextCursor === cursor)
   ) {
     throw new Error('历史报告分页结构无效；该页已拒绝接收。')
@@ -2493,16 +2502,41 @@ export function isDesktopRuntime(): boolean {
 
 export interface SelectedScanRoot {
   rootToken: string
+  expiresAtUnixMs: string
 }
 
 export async function chooseScanDirectory(): Promise<SelectedScanRoot | null> {
   if (!isTauri()) return null
-  const selection = await invoke<{ rootToken: string | null }>('select_scan_root')
-  if (selection.rootToken === null) return null
-  if (!/^root-[0-9a-f]{64}$/.test(selection.rootToken)) {
+  const response = await invoke<unknown>('select_scan_root')
+  const selection = requireStrictDto(
+    response,
+    ['rootToken', 'expiresAtUnixMs'],
+    '原生目录授权',
+  ) as { rootToken: unknown; expiresAtUnixMs: unknown }
+  if (selection.rootToken === null && selection.expiresAtUnixMs === null) return null
+  if (
+    typeof selection.rootToken !== 'string'
+    || !/^root-[0-9a-f]{64}$/.test(selection.rootToken)
+  ) {
     throw new Error('原生目录授权 token 格式无效；为避免扫描未授权位置，本次选择已拒绝。')
   }
-  return { rootToken: selection.rootToken }
+  if (typeof selection.expiresAtUnixMs !== 'string') {
+    throw new Error('原生目录授权缺少有效期；本次选择已拒绝。')
+  }
+  const expiresAt = requireUnsignedI64Decimal(
+    selection.expiresAtUnixMs,
+    '目录授权到期时间',
+    true,
+  )
+  // Display-layer advice only: the native side re-checks its monotonic
+  // deadline when the token is consumed by start_scan.
+  if (expiresAt <= BigInt(Date.now())) {
+    throw new Error('目录授权已经过期；请重新选择照片目录。')
+  }
+  return {
+    rootToken: selection.rootToken,
+    expiresAtUnixMs: selection.expiresAtUnixMs,
+  }
 }
 
 export async function scanDirectoryReadOnly(

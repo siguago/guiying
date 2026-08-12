@@ -52,6 +52,7 @@ import type {
   ScanHistoryItem,
 } from './domain'
 import { fileNameFromPath, formatBytes } from './domain'
+import type { SelectedScanRoot } from './lib/backend'
 import {
   chooseScanDirectory,
   cancelHistoryExport,
@@ -252,6 +253,8 @@ function WorkflowRail({ phase }: { phase: AppPhase }) {
 
 function IdleWorkspace({
   source,
+  rootExpiresAtUnixMs,
+  rootAuthorizationExpired,
   onChoose,
   onHistory,
   onScan,
@@ -261,6 +264,8 @@ function IdleWorkspace({
   chooseButtonRef,
 }: {
   source: string | null
+  rootExpiresAtUnixMs: string | null
+  rootAuthorizationExpired: boolean
   onChoose: () => Promise<void>
   onHistory: () => void
   onScan: () => Promise<void>
@@ -286,7 +291,12 @@ function IdleWorkspace({
               {!isDesktop ? '请在桌面应用中选择目录' : isChoosing ? '正在打开…' : source ? '更换扫描目录' : '选择照片目录'}
             </button>
             {source ? (
-              <button className="button button--ink" onClick={() => void onScan()} type="button">
+              <button
+                className="button button--ink"
+                disabled={rootAuthorizationExpired}
+                onClick={() => void onScan()}
+                type="button"
+              >
                 <Play aria-hidden="true" size={17} fill="currentColor" />
                 开始只读扫描
               </button>
@@ -296,6 +306,18 @@ function IdleWorkspace({
               查看历史报告
             </button>
           </div>
+
+          {rootAuthorizationExpired ? (
+            <p className="root-grant-note root-grant-note--expired" role="status">
+              <TriangleAlert aria-hidden="true" size={14} />
+              目录授权已过期；请重新选择照片目录后再开始只读扫描。
+            </p>
+          ) : rootExpiresAtUnixMs ? (
+            <p className="root-grant-note" role="status">
+              <LockKeyhole aria-hidden="true" size={14} />
+              目录授权有效至 {historyInstantLabel(rootExpiresAtUnixMs)}；过期后需重新选择目录。启动时原生层仍会再次校验。
+            </p>
+          ) : null}
 
           {import.meta.env.DEV ? (
             <button className="demo-link" onClick={() => void onDemo()} type="button">
@@ -641,7 +663,10 @@ function ScanningWorkspace({
           ? '正在继续目录枚举…'
           : scanStages[stageIndex]?.label
   return (
-    <main aria-busy={!isPaused} className="workspace workspace--scan">
+    // aria-busy is scoped to the stage panel below; putting it on <main>
+    // for the whole scan would let screen readers suppress the polite live
+    // region that announces phase changes.
+    <main className="workspace workspace--scan">
       <header className="workspace-header">
         <div>
           <span className="section-kicker">只读扫描进行中</span>
@@ -686,7 +711,7 @@ function ScanningWorkspace({
         </div>
       </header>
 
-      <section className="scan-stage" aria-labelledby="scan-stage-title">
+      <section aria-busy={!isPaused} aria-labelledby="scan-stage-title" className="scan-stage">
         <div className="scan-stage__visual" aria-hidden="true">
           <div className="scan-disc"><Fingerprint size={34} /></div>
           <div className="scan-pulse" />
@@ -2570,10 +2595,15 @@ function ErrorWorkspace({ error, onReset }: { error: ScanErrorShape; onReset: ()
   )
 }
 
+function rootGrantExpired(grant: SelectedScanRoot | null): boolean {
+  return grant !== null && Number(grant.expiresAtUnixMs) <= Date.now()
+}
+
 function App() {
   const [phase, setPhase] = useState<AppPhase>('idle')
   const [source, setSource] = useState<string | null>(null)
-  const [selectedRootToken, setSelectedRootToken] = useState<string | null>(null)
+  const [selectedRoot, setSelectedRoot] = useState<SelectedScanRoot | null>(null)
+  const [rootAuthorizationExpired, setRootAuthorizationExpired] = useState(false)
   const [report, setReport] = useState<ScanReport | null>(null)
   const [error, setError] = useState<ScanErrorShape | null>(null)
   const [stageIndex, setStageIndex] = useState(0)
@@ -2618,6 +2648,25 @@ function App() {
     }
   }, [report?.resultReadToken])
 
+  useEffect(() => {
+    // Display-layer countdown only: the native registry re-validates its own
+    // monotonic deadline when start_scan consumes the grant. This effect just
+    // keeps the UI from advertising authority the backend would reject.
+    if (!selectedRoot) return
+    if (phase !== 'idle' && phase !== 'ready-to-scan' && phase !== 'history') return
+    const expire = () => {
+      setSelectedRoot(null)
+      setRootAuthorizationExpired(true)
+    }
+    const remaining = Number(selectedRoot.expiresAtUnixMs) - Date.now()
+    if (remaining <= 0) {
+      expire()
+      return
+    }
+    const timer = window.setTimeout(expire, remaining)
+    return () => window.clearTimeout(timer)
+  }, [phase, selectedRoot])
+
   async function handleChoose() {
     let shouldRestoreFocus = false
     setIsChoosing(true)
@@ -2625,7 +2674,8 @@ function App() {
       const selection = await chooseScanDirectory()
       if (selection) {
         shouldRestoreFocus = true
-        setSelectedRootToken(selection.rootToken)
+        setSelectedRoot(selection)
+        setRootAuthorizationExpired(false)
         setSource(AUTHORIZED_SOURCE_LABEL)
         setPhase('ready-to-scan')
       }
@@ -2641,7 +2691,16 @@ function App() {
   }
 
   async function handleScan() {
-    if (!source || !selectedRootToken || scanAttemptRef.current) return
+    if (!source || !selectedRoot || scanAttemptRef.current) return
+    if (rootGrantExpired(selectedRoot)) {
+      // Advisory pre-check so a knowably dead grant degrades into the
+      // reselect prompt instead of a native rejection error page. The native
+      // side remains the authority for any grant that passes this check.
+      setSelectedRoot(null)
+      setRootAuthorizationExpired(true)
+      return
+    }
+    const rootToken = selectedRoot.rootToken
     scanAttemptRef.current = true
     setStageIndex(0)
     setError(null)
@@ -2652,7 +2711,7 @@ function App() {
     setPhase('scanning')
     try {
       const session = await startDirectoryScanReadOnly(
-        selectedRootToken,
+        rootToken,
         (progress) => {
           const nextStage = {
             enumerating: 0,
@@ -2672,7 +2731,7 @@ function App() {
       // The native root grant is one-shot and has already been consumed by
       // start_scan. Never keep presenting it as reusable authority while the
       // worker runs or after an error.
-      setSelectedRootToken(null)
+      setSelectedRoot(null)
       const nextReport = await session.result
       setSource(nextReport.root)
       setReport(nextReport)
@@ -2681,7 +2740,7 @@ function App() {
       // A start failure may race native one-shot token consumption or an IPC
       // response loss. Its reuse status is unknowable, so the UI must never
       // continue presenting the old selection as live authority.
-      setSelectedRootToken(null)
+      setSelectedRoot(null)
       setError(asScanError(scanError))
       setPhase('error')
     } finally {
@@ -2780,7 +2839,8 @@ function App() {
     if (scanAttemptRef.current) return
     scanAttemptRef.current = true
     const demoRoot = createDemoReport().root
-    setSelectedRootToken(null)
+    setSelectedRoot(null)
+    setRootAuthorizationExpired(false)
     setSource(demoRoot)
     setStageIndex(0)
     setError(null)
@@ -2818,7 +2878,8 @@ function App() {
   }
 
   function handleHistoryResult(nextReport: ScanReport) {
-    setSelectedRootToken(null)
+    setSelectedRoot(null)
+    setRootAuthorizationExpired(false)
     setSource(nextReport.root)
     setReport(nextReport)
     setError(null)
@@ -2829,7 +2890,8 @@ function App() {
     const returnToHistory = report?.resultOrigin === 'history'
     setPhase(returnToHistory ? 'history' : 'idle')
     setSource(null)
-    setSelectedRootToken(null)
+    setSelectedRoot(null)
+    setRootAuthorizationExpired(false)
     setReport(null)
     setError(null)
     setStageIndex(0)
@@ -2851,7 +2913,7 @@ function App() {
       ? 'active'
       : phase === 'error'
         ? 'none'
-      : source && selectedRootToken
+      : source && selectedRoot
         ? 'authorized'
         : 'none'
 
@@ -2891,12 +2953,24 @@ function App() {
             onDemo={handleDemo}
             onHistory={handleHistory}
             onScan={handleScan}
+            rootAuthorizationExpired={rootAuthorizationExpired}
+            rootExpiresAtUnixMs={selectedRoot?.expiresAtUnixMs ?? null}
             source={source}
           />
         ) : null}
         {phase === 'history' ? (
           <HistoryWorkspace
-            onBack={() => setPhase(source && selectedRootToken ? 'ready-to-scan' : 'idle')}
+            onBack={() => {
+              // Re-judge the grant on the way back: an expiry that fired while
+              // the history view was open must not resurface a dead grant.
+              if (rootGrantExpired(selectedRoot)) {
+                setSelectedRoot(null)
+                setRootAuthorizationExpired(true)
+                setPhase('idle')
+                return
+              }
+              setPhase(source && selectedRoot ? 'ready-to-scan' : 'idle')
+            }}
             onOpen={handleHistoryResult}
           />
         ) : null}

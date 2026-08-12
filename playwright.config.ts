@@ -20,6 +20,16 @@ export default defineConfig({
         viewport: { width: 1280, height: 820 },
       },
     },
+    {
+      // The shipped desktop shell renders in WKWebView; WebKit is the closest
+      // engine Playwright can drive. Evidence screenshots stay chromium-only
+      // (see captureEvidence) so the two engines never overwrite each other.
+      name: 'desktop-webkit',
+      use: {
+        ...devices['Desktop Safari'],
+        viewport: { width: 1280, height: 820 },
+      },
+    },
   ],
   webServer: {
     command: 'pnpm dev',

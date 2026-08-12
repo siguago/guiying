@@ -419,7 +419,6 @@ pub(crate) struct ScanProgressEvent {
     stage: &'static str,
     completed: u64,
     total: Option<u64>,
-    current_path: Option<String>,
 }
 
 impl ScanProgressEvent {
@@ -429,10 +428,6 @@ impl ScanProgressEvent {
             stage: progress_stage_name(progress.stage),
             completed: progress.completed,
             total: progress.total,
-            current_path: progress
-                .current_path
-                .as_ref()
-                .map(|path| path.display.clone()),
         }
     }
 }
@@ -673,16 +668,21 @@ impl From<&ScanJobStatus> for ScanJobStatusEvent {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SelectScanRootResponse {
     root_token: Option<String>,
+    expires_at_unix_ms: Option<String>,
 }
 
 impl SelectScanRootResponse {
     fn cancelled() -> Self {
-        Self { root_token: None }
+        Self {
+            root_token: None,
+            expires_at_unix_ms: None,
+        }
     }
 
-    fn selected(root_token: String) -> Self {
+    fn selected(root_token: String, expires_at_unix_ms: u64) -> Self {
         Self {
             root_token: Some(root_token),
+            expires_at_unix_ms: Some(expires_at_unix_ms.to_string()),
         }
     }
 }
@@ -2883,6 +2883,13 @@ fn issue_scan_root_token(
     let expires_at = now
         .checked_add(SCAN_ROOT_TOKEN_TTL)
         .ok_or_else(|| AppError::root_token_unavailable("无法计算目录授权的安全过期时间。"))?;
+    // The unix-ms deadline is display-only advice for the WebView. Enforcement
+    // stays on the monotonic `expires_at` checked at consumption time.
+    let ttl_ms = u64::try_from(SCAN_ROOT_TOKEN_TTL.as_millis())
+        .map_err(|_| AppError::root_token_unavailable("目录授权有效期超出时间范围。"))?;
+    let expires_at_unix_ms = unix_time_ms()
+        .checked_add(ttl_ms)
+        .ok_or_else(|| AppError::root_token_unavailable("无法计算目录授权的显示时间。"))?;
     registry.grants.retain(|_, grant| now < grant.expires_at);
     if registry.grants.len() >= MAX_PENDING_SCAN_ROOT_TOKENS {
         return Err(AppError::root_token_registry_full());
@@ -2905,7 +2912,7 @@ fn issue_scan_root_token(
                 expires_at,
             },
         );
-        return Ok(SelectScanRootResponse::selected(token));
+        return Ok(SelectScanRootResponse::selected(token, expires_at_unix_ms));
     }
     Err(AppError::root_token_unavailable(
         "目录授权令牌发生重复，已安全终止签发。",
@@ -5924,6 +5931,85 @@ mod tests {
     use super::*;
     use guiying_core::{CancellationToken, NoopScanControl};
 
+    /// Mirror of `src/lib/ipc-contract.json`. `deny_unknown_fields` makes any
+    /// key added on the WebView side without a matching assertion here fail
+    /// this suite instead of drifting silently.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct IpcContract {
+        schema_version: u32,
+        store_max_page_size: u32,
+        max_scan_history_page_limit: u32,
+        result_page_size: u32,
+        member_page_size: u32,
+        issue_page_size: u32,
+        capture_time_page_size: u32,
+        capture_time_metadata_report_page_size: u32,
+        capture_time_metadata_field_page_size: u32,
+        scan_history_page_size: u32,
+        max_result_json_bytes: usize,
+        max_raw_metadata_field_bytes: usize,
+        max_cursor_bytes: usize,
+        max_history_root_display_bytes: usize,
+        max_history_scan_mode_bytes: usize,
+    }
+
+    #[test]
+    fn webview_ipc_contract_constants_match_the_native_boundary() {
+        let contract: IpcContract =
+            serde_json::from_str(include_str!("../../src/lib/ipc-contract.json"))
+                .expect("ipc-contract.json must parse against the frozen schema");
+        assert_eq!(contract.schema_version, 1);
+
+        // Shared hard limits must be byte-identical on both sides.
+        assert_eq!(contract.store_max_page_size, guiying_store::MAX_PAGE_SIZE);
+        assert_eq!(
+            contract.max_scan_history_page_limit,
+            MAX_SCAN_HISTORY_PAGE_LIMIT
+        );
+        assert_eq!(contract.max_result_json_bytes, MAX_RESULT_JSON_BYTES);
+        assert_eq!(
+            contract.max_raw_metadata_field_bytes,
+            MAX_RAW_METADATA_FIELD_BYTES
+        );
+        assert_eq!(contract.max_cursor_bytes, MAX_CURSOR_BYTES);
+        assert_eq!(
+            contract.max_history_root_display_bytes,
+            MAX_HISTORY_ROOT_DISPLAY_BYTES
+        );
+        assert_eq!(
+            contract.max_history_scan_mode_bytes,
+            MAX_HISTORY_SCAN_MODE_BYTES
+        );
+        assert_eq!(
+            contract.capture_time_metadata_report_page_size,
+            MAX_METADATA_REPORT_PAGE_LIMIT
+        );
+        assert_eq!(
+            contract.capture_time_metadata_field_page_size,
+            MAX_METADATA_FIELD_PAGE_LIMIT
+        );
+
+        // Requested page sizes must stay inside the native validators so a
+        // frontend bump cannot silently start failing every page read.
+        for (label, requested) in [
+            ("resultPageSize", contract.result_page_size),
+            ("memberPageSize", contract.member_page_size),
+            ("issuePageSize", contract.issue_page_size),
+            ("captureTimePageSize", contract.capture_time_page_size),
+        ] {
+            assert!(
+                (1..=guiying_store::MAX_PAGE_SIZE).contains(&requested),
+                "{label} must satisfy 1..={} but is {requested}",
+                guiying_store::MAX_PAGE_SIZE,
+            );
+        }
+        assert!(
+            (1..=MAX_SCAN_HISTORY_PAGE_LIMIT).contains(&contract.scan_history_page_size),
+            "scanHistoryPageSize must satisfy 1..={MAX_SCAN_HISTORY_PAGE_LIMIT}",
+        );
+    }
+
     fn result(scan_run_id: i64) -> ScanResultSummary {
         ScanResultSummary {
             schema_version: 1,
@@ -6839,8 +6925,52 @@ mod tests {
         assert_eq!(manager.pending_scan_root_selection_count(), 0);
         let serialized = serde_json::to_value(response).expect("response should serialize");
         assert_eq!(serialized["rootToken"], serde_json::Value::Null);
+        assert_eq!(serialized["expiresAtUnixMs"], serde_json::Value::Null);
         assert!(serialized.get("root").is_none());
         assert!(serialized.get("path").is_none());
+    }
+
+    #[test]
+    fn issued_scan_root_token_discloses_a_server_authoritative_unix_deadline() {
+        let manager = ScanJobManager::default();
+        let ttl_ms = u64::try_from(SCAN_ROOT_TOKEN_TTL.as_millis()).expect("ttl fits u64");
+        let before = unix_time_ms();
+        let response = manager
+            .authorize_selected_scan_root_at(
+                "main",
+                Some(std::env::temp_dir().join("guiying-root-deadline")),
+                Instant::now(),
+            )
+            .expect("native root should be authorized");
+        let after = unix_time_ms();
+        assert!(response.root_token.is_some());
+        let disclosed = response
+            .expires_at_unix_ms
+            .expect("selected response should disclose its deadline");
+        let disclosed: u64 = disclosed
+            .parse()
+            .expect("deadline should be a canonical decimal");
+        assert!(disclosed >= before + ttl_ms);
+        assert!(disclosed <= after + ttl_ms);
+        let serialized = serde_json::to_value(
+            manager
+                .authorize_selected_scan_root_at(
+                    "main",
+                    Some(std::env::temp_dir().join("guiying-root-deadline-shape")),
+                    Instant::now(),
+                )
+                .expect("second root should be authorized"),
+        )
+        .expect("response should serialize");
+        assert!(serialized["expiresAtUnixMs"].is_string());
+        assert_eq!(
+            serialized
+                .as_object()
+                .expect("response should be an object")
+                .len(),
+            2,
+            "response must stay {{rootToken, expiresAtUnixMs}} with no path material",
+        );
     }
 
     #[test]
