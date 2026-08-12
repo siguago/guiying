@@ -1601,6 +1601,30 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
     let rawListAttempt = 0
     const callbacks = new Map<number, (...args: unknown[]) => void>()
     const calls: Array<{ command: string; payload: Record<string, unknown> }> = []
+    // Each of the three "a late response must not leak into the view the user
+    // switched to" checks parks its first response here until the test opens
+    // the gate. A wall-clock delay made those checks race the runner: the
+    // switching click landed exactly while the parked response finished and
+    // relaid out the panel, so on a slow machine the click could miss.
+    const settled: string[] = []
+    const makeGate = (name: string) => {
+      let release: (() => void) | null = null
+      let isOpen = false
+      return {
+        wait: async () => {
+          if (!isOpen) await new Promise<void>((resolve) => { release = resolve })
+          settled.push(name)
+        },
+        open: () => {
+          isOpen = true
+          release?.()
+          release = null
+        },
+      }
+    }
+    const reportGate = makeGate('reports-201')
+    const fieldListGate = makeGate('fields-701')
+    const fieldRawGate = makeGate('raw-802')
     const digest = 'a'.repeat(64)
     const manifestDigest = 'b'.repeat(64)
     const fieldDigest = 'c'.repeat(64)
@@ -1774,7 +1798,13 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
 
     Object.assign(window, {
       isTauri: true,
-      __RAW_METADATA_FIXTURE__: { calls },
+      __RAW_METADATA_FIXTURE__: {
+        calls,
+        settled,
+        openReportGate: () => reportGate.open(),
+        openFieldListGate: () => fieldListGate.open(),
+        openFieldRawGate: () => fieldRawGate.open(),
+      },
       __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
       __TAURI_INTERNALS__: {
         transformCallback: (callback: (...args: unknown[]) => void) => {
@@ -1847,7 +1877,7 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
           if (command === 'list_capture_time_metadata_reports') {
             const groupId = String(payload.exactGroupBuildId)
             if (groupId === '201') {
-              await new Promise((resolve) => window.setTimeout(resolve, 180))
+              await reportGate.wait()
               return { items: [report('601', '201', '0', '701', 'A.JPG', '1')], nextCursor: null }
             }
             if (payload.cursor === 'reports-2') {
@@ -1894,7 +1924,7 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
               }
             }
             if (payload.reportId === '701') {
-              await new Promise((resolve) => window.setTimeout(resolve, 180))
+              await fieldListGate.wait()
               return {
                 items: [field('0', '701', '801', '0', 'exif_create_date', '3')],
                 nextCursor: null,
@@ -1911,7 +1941,7 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
           if (command === 'get_capture_time_metadata_field_raw_detail') {
             const reportValue = report('602', '202', '1', '702', 'B-two.JPG', '3')
             if (payload.fieldId === '802') {
-              await new Promise((resolve) => window.setTimeout(resolve, 180))
+              await fieldRawGate.wait()
               return rawDetail(
                 reportValue,
                 field('1', '702', '802', '0', 'exif_date_time_original', '3'),
@@ -1951,6 +1981,27 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
     }
   ).__RAW_METADATA_FIXTURE__.calls.filter((call) => call.command === target), command)
 
+  const settleFrames = async () => page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  }))
+  // Releases one parked response and waits until it has actually been handed
+  // back to the app and the view has repainted, so the assertion that follows
+  // observes the state *after* the late response rather than racing it.
+  const releaseLate = async (
+    gate: 'openReportGate' | 'openFieldListGate' | 'openFieldRawGate',
+    marker: string,
+  ) => {
+    await page.evaluate((target) => (
+      window as unknown as Window & {
+        __RAW_METADATA_FIXTURE__: Record<string, () => void>
+      }
+    ).__RAW_METADATA_FIXTURE__[target](), gate)
+    await expect.poll(async () => page.evaluate((name) => (
+      window as unknown as Window & { __RAW_METADATA_FIXTURE__: { settled: string[] } }
+    ).__RAW_METADATA_FIXTURE__.settled.includes(name), marker)).toBe(true)
+    await settleFrames()
+  }
+
   expect(await metadataCalls('list_capture_time_metadata_reports')).toHaveLength(0)
   expect(await metadataCalls('list_capture_time_metadata_fields')).toHaveLength(0)
   expect(await metadataCalls('get_capture_time_metadata_field_raw_detail')).toHaveLength(0)
@@ -1962,11 +2013,14 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
   expect(await metadataCalls('list_capture_time_metadata_fields')).toHaveLength(0)
   expect(await metadataCalls('get_capture_time_metadata_field_raw_detail')).toHaveLength(0)
 
+  // The switch happens while the A.JPG report request is still parked, so the
+  // click lands on a settled layout; releasing it here makes its response
+  // unambiguously later than the switch without stalling the read queue.
   await page.getByRole('button', { name: /B\.JPG/ }).click()
+  await releaseLate('openReportGate', 'reports-201')
   await expect(page.getByText('原始元数据证据（3 个来源）')).toBeVisible()
   await page.getByText('原始元数据证据（3 个来源）').click()
   await expect(page.getByRole('button', { name: /B-one\.JPG/ })).toBeVisible()
-  await page.waitForTimeout(220)
   await expect(page.getByRole('button', { name: /A\.JPG.*guiying-metadata/ })).toHaveCount(0)
 
   await page.getByRole('button', { name: /B-one\.JPG/ }).click()
@@ -1975,8 +2029,8 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
   ).length).toBe(1)
   expect(await metadataCalls('get_capture_time_metadata_field_raw_detail')).toHaveLength(0)
   await page.getByRole('button', { name: /B-two\.JPG/ }).click()
+  await releaseLate('openFieldListGate', 'fields-701')
   await expect(page.getByRole('button', { name: /EXIF OffsetTimeOriginal/ })).toBeVisible()
-  await page.waitForTimeout(220)
   await expect(page.getByRole('button', { name: /EXIF CreateDate/ })).toHaveCount(0)
 
   await page.getByRole('button', { name: /EXIF DateTimeOriginal/ }).click()
@@ -1984,6 +2038,7 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
     await metadataCalls('get_capture_time_metadata_field_raw_detail')
   ).length).toBe(1)
   await page.getByRole('button', { name: /EXIF OffsetTimeOriginal/ }).click()
+  await releaseLate('openFieldRawGate', 'raw-802')
   await expect(page.getByText(/原生路径字节不是有界、规范的 Base64/)).toBeVisible()
   await page.getByRole('button', { name: '重试原始字段' }).click()
   await expect.poll(async () => (
@@ -1997,7 +2052,9 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
   await page.getByRole('button', { name: '重试原始字段' }).click()
   const rawCode = page.getByLabel('字段原始字节 Base64')
   await expect(rawCode).toHaveText('AP/DKA==')
-  await page.waitForTimeout(220)
+  // The parked DateTimeOriginal response was already released above, so this
+  // re-assertion confirms it never displaced the field the user switched to.
+  await settleFrames()
   await expect(rawCode).toHaveText('AP/DKA==')
   await expect(page.getByText('QUJD', { exact: true })).toHaveCount(0)
   await expect(page.locator('.metadata-raw-detail')).not.toContainText('�')
