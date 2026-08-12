@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::reader::{checked_add, checked_mul, BudgetedReader, ParseError};
+use crate::reader::{checked_add, checked_mul, BudgetedReader, ParseError, ParseOutcome};
 use crate::{
     FieldEncoding, MetadataContainer, MetadataField, MetadataFieldKind, MetadataLocator,
     TiffByteOrder, PARSER_IDENTITY,
@@ -40,18 +40,45 @@ struct IfdTask {
     depth: u16,
 }
 
-pub(crate) fn parse_direct(
-    reader: &mut BudgetedReader<'_>,
-) -> Result<Vec<MetadataField>, ParseError> {
-    parse_in_range(reader, 0, reader.source_len(), TiffOrigin::Direct)
+/// Shared, copyable location facts for one TIFF container walk.
+#[derive(Clone, Copy, Debug)]
+struct TiffWalk {
+    header_offset: u64,
+    container_end: u64,
+    byte_order: TiffByteOrder,
+    origin: TiffOrigin,
 }
 
+pub(crate) fn parse_direct(reader: &mut BudgetedReader<'_>) -> Result<ParseOutcome, ParseError> {
+    let mut outcome = ParseOutcome::default();
+    match parse_in_range(
+        reader,
+        0,
+        reader.source_len(),
+        TiffOrigin::Direct,
+        &mut outcome.fields,
+        &mut outcome.issues,
+    ) {
+        Ok(()) => Ok(outcome),
+        Err(error) if error.is_structural() => {
+            outcome.issues.push(error);
+            Ok(outcome)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Walk one TIFF container. Structural problems local to one IFD or one entry
+/// are appended to `issues` and the walk continues; already extracted fields
+/// stay in `fields`. Only non-structural failures are returned as `Err`.
 pub(crate) fn parse_in_range(
     reader: &mut BudgetedReader<'_>,
     header_offset: u64,
     container_end: u64,
     origin: TiffOrigin,
-) -> Result<Vec<MetadataField>, ParseError> {
+    fields: &mut Vec<MetadataField>,
+    issues: &mut Vec<ParseError>,
+) -> Result<(), ParseError> {
     if container_end > reader.source_len() || header_offset > container_end {
         return Err(ParseError::out_of_bounds(
             header_offset,
@@ -76,10 +103,15 @@ pub(crate) fn parse_in_range(
 
     let first_ifd = u64::from(read_u32(byte_order, &header[4..8]));
     if first_ifd == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    let mut fields = Vec::new();
+    let walk = TiffWalk {
+        header_offset,
+        container_end,
+        byte_order,
+        origin,
+    };
     let mut visited = HashSet::new();
     let mut pending = vec![IfdTask {
         relative_offset: first_ifd,
@@ -88,177 +120,230 @@ pub(crate) fn parse_in_range(
     }];
 
     while let Some(task) = pending.pop() {
-        let ifd_offset = checked_add(
-            header_offset,
-            task.relative_offset,
-            Some(header_offset),
-            "TIFF IFD offset overflow",
-        )?;
-        if task.relative_offset < TIFF_HEADER_BYTES {
-            return Err(ParseError::invalid(
-                ifd_offset,
-                "TIFF IFD points into header",
-            ));
-        }
-        if !visited.insert(ifd_offset) {
-            return Err(ParseError::cycle(ifd_offset, "TIFF IFD pointer cycle"));
-        }
-        reader.observe_depth(
-            task.depth,
-            reader.limits().max_ifd_depth,
-            ifd_offset,
-            "TIFF IFD depth limit",
-        )?;
-
-        ensure_in_container(ifd_offset, 2, container_end, "TIFF IFD entry count")?;
-        let count_bytes = reader.read_vec(ifd_offset, 2, "read TIFF IFD entry count")?;
-        let count = u32::from(read_u16(byte_order, &count_bytes));
-        reader.visit_ifd_entries(ifd_offset, count)?;
-
-        let entries_bytes = checked_mul(
-            u64::from(count),
-            IFD_ENTRY_BYTES,
-            Some(ifd_offset),
-            "TIFF IFD table length overflow",
-        )?;
-        let table_bytes = checked_add(
-            entries_bytes,
-            IFD_NEXT_POINTER_BYTES,
-            Some(ifd_offset),
-            "TIFF IFD table length overflow",
-        )?;
-        let table_offset = checked_add(
-            ifd_offset,
-            2,
-            Some(ifd_offset),
-            "TIFF IFD table offset overflow",
-        )?;
-        ensure_in_container(table_offset, table_bytes, container_end, "TIFF IFD table")?;
-        let table = reader.read_vec(table_offset, table_bytes, "read TIFF IFD table")?;
-        let entries_len = usize::try_from(entries_bytes).map_err(|_| {
-            ParseError::limit(Some(table_offset), "TIFF IFD table does not fit usize")
-        })?;
-
-        let mut exif_ifd = None;
-        for (index, entry) in table[..entries_len].chunks_exact(12).enumerate() {
-            let index_u64 = u64::try_from(index).map_err(|_| {
-                ParseError::overflow(Some(table_offset), "TIFF IFD index does not fit u64")
-            })?;
-            let entry_delta = checked_mul(
-                index_u64,
-                IFD_ENTRY_BYTES,
-                Some(table_offset),
-                "TIFF entry offset overflow",
-            )?;
-            let entry_offset = checked_add(
-                table_offset,
-                entry_delta,
-                Some(table_offset),
-                "TIFF entry offset overflow",
-            )?;
-            let tag = read_u16(byte_order, &entry[0..2]);
-            let field_type = read_u16(byte_order, &entry[2..4]);
-            let value_count = read_u32(byte_order, &entry[4..8]);
-
-            if tag == TAG_EXIF_IFD && task.role == IfdRole::Primary {
-                if field_type != TIFF_TYPE_LONG || value_count != 1 {
-                    return Err(ParseError::invalid(
-                        entry_offset,
-                        "Exif IFD pointer type/count",
-                    ));
-                }
-                let relative = u64::from(read_u32(byte_order, &entry[8..12]));
-                if relative != 0 && exif_ifd.replace(relative).is_some() {
-                    return Err(ParseError::invalid(
-                        entry_offset,
-                        "duplicate Exif IFD pointer",
-                    ));
-                }
-                continue;
-            }
-
-            let Some(kind) = field_kind(task.role, tag) else {
-                continue;
-            };
-            if field_type != TIFF_TYPE_ASCII || value_count == 0 {
-                return Err(ParseError::invalid(
-                    entry_offset,
-                    "timestamp field is not non-empty TIFF ASCII",
-                ));
-            }
-            let value_length = u64::from(value_count);
-            let value_offset = if value_length <= 4 {
-                checked_add(
-                    entry_offset,
-                    8,
-                    Some(entry_offset),
-                    "inline TIFF value offset overflow",
-                )?
-            } else {
-                checked_add(
-                    header_offset,
-                    u64::from(read_u32(byte_order, &entry[8..12])),
-                    Some(entry_offset),
-                    "external TIFF value offset overflow",
-                )?
-            };
-            ensure_in_container(
-                value_offset,
-                value_length,
-                container_end,
-                "TIFF timestamp value",
-            )?;
-            let raw_bytes = reader.read_field_bytes(value_offset, value_length)?;
-            let container = match origin {
-                TiffOrigin::Direct => MetadataContainer::Tiff {
-                    header_offset,
-                    ifd_offset,
-                    tag,
-                    byte_order,
-                },
-                TiffOrigin::Jpeg { app1_offset } => MetadataContainer::JpegExif {
-                    app1_offset,
-                    header_offset,
-                    ifd_offset,
-                    tag,
-                    byte_order,
-                },
-            };
-            fields.push(MetadataField {
-                parser: PARSER_IDENTITY,
-                kind,
-                encoding: FieldEncoding::DeclaredAscii,
-                locator: MetadataLocator {
-                    absolute_offset: value_offset,
-                    byte_len: value_length,
-                    container,
-                },
-                raw_bytes,
-            });
-        }
-
-        let next_relative = u64::from(read_u32(byte_order, &table[entries_len..]));
-        let next_depth = task
-            .depth
-            .checked_add(1)
-            .ok_or_else(|| ParseError::overflow(Some(ifd_offset), "TIFF IFD depth overflow"))?;
-        if next_relative != 0 {
-            pending.push(IfdTask {
-                relative_offset: next_relative,
-                role: IfdRole::Other,
-                depth: next_depth,
-            });
-        }
-        if let Some(relative_offset) = exif_ifd {
-            pending.push(IfdTask {
-                relative_offset,
-                role: IfdRole::Exif,
-                depth: next_depth,
-            });
+        match process_ifd(
+            reader,
+            walk,
+            task,
+            &mut visited,
+            &mut pending,
+            fields,
+            issues,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.is_structural() => issues.push(error),
+            Err(error) => return Err(error),
         }
     }
 
-    Ok(fields)
+    Ok(())
+}
+
+fn process_ifd(
+    reader: &mut BudgetedReader<'_>,
+    walk: TiffWalk,
+    task: IfdTask,
+    visited: &mut HashSet<u64>,
+    pending: &mut Vec<IfdTask>,
+    fields: &mut Vec<MetadataField>,
+    issues: &mut Vec<ParseError>,
+) -> Result<(), ParseError> {
+    let ifd_offset = checked_add(
+        walk.header_offset,
+        task.relative_offset,
+        Some(walk.header_offset),
+        "TIFF IFD offset overflow",
+    )?;
+    if task.relative_offset < TIFF_HEADER_BYTES {
+        return Err(ParseError::invalid(
+            ifd_offset,
+            "TIFF IFD points into header",
+        ));
+    }
+    if !visited.insert(ifd_offset) {
+        return Err(ParseError::cycle(ifd_offset, "TIFF IFD pointer cycle"));
+    }
+    reader.observe_depth(
+        task.depth,
+        reader.limits().max_ifd_depth,
+        ifd_offset,
+        "TIFF IFD depth limit",
+    )?;
+
+    ensure_in_container(ifd_offset, 2, walk.container_end, "TIFF IFD entry count")?;
+    let count_bytes = reader.read_vec(ifd_offset, 2, "read TIFF IFD entry count")?;
+    let count = u32::from(read_u16(walk.byte_order, &count_bytes));
+    reader.visit_ifd_entries(ifd_offset, count)?;
+
+    let entries_bytes = checked_mul(
+        u64::from(count),
+        IFD_ENTRY_BYTES,
+        Some(ifd_offset),
+        "TIFF IFD table length overflow",
+    )?;
+    let table_bytes = checked_add(
+        entries_bytes,
+        IFD_NEXT_POINTER_BYTES,
+        Some(ifd_offset),
+        "TIFF IFD table length overflow",
+    )?;
+    let table_offset = checked_add(
+        ifd_offset,
+        2,
+        Some(ifd_offset),
+        "TIFF IFD table offset overflow",
+    )?;
+    ensure_in_container(
+        table_offset,
+        table_bytes,
+        walk.container_end,
+        "TIFF IFD table",
+    )?;
+    let table = reader.read_vec(table_offset, table_bytes, "read TIFF IFD table")?;
+    let entries_len = usize::try_from(entries_bytes)
+        .map_err(|_| ParseError::limit(Some(table_offset), "TIFF IFD table does not fit usize"))?;
+
+    let mut exif_ifd = None;
+    for (index, entry) in table[..entries_len].chunks_exact(12).enumerate() {
+        let index_u64 = u64::try_from(index).map_err(|_| {
+            ParseError::overflow(Some(table_offset), "TIFF IFD index does not fit u64")
+        })?;
+        let entry_delta = checked_mul(
+            index_u64,
+            IFD_ENTRY_BYTES,
+            Some(table_offset),
+            "TIFF entry offset overflow",
+        )?;
+        let entry_offset = checked_add(
+            table_offset,
+            entry_delta,
+            Some(table_offset),
+            "TIFF entry offset overflow",
+        )?;
+        let tag = read_u16(walk.byte_order, &entry[0..2]);
+        let field_type = read_u16(walk.byte_order, &entry[2..4]);
+        let value_count = read_u32(walk.byte_order, &entry[4..8]);
+
+        if tag == TAG_EXIF_IFD && task.role == IfdRole::Primary {
+            if field_type != TIFF_TYPE_LONG || value_count != 1 {
+                issues.push(ParseError::invalid(
+                    entry_offset,
+                    "Exif IFD pointer type/count",
+                ));
+                continue;
+            }
+            let relative = u64::from(read_u32(walk.byte_order, &entry[8..12]));
+            if relative == 0 {
+                continue;
+            }
+            if exif_ifd.is_some() {
+                issues.push(ParseError::invalid(
+                    entry_offset,
+                    "duplicate Exif IFD pointer",
+                ));
+            } else {
+                exif_ifd = Some(relative);
+            }
+            continue;
+        }
+
+        let Some(kind) = field_kind(task.role, tag) else {
+            continue;
+        };
+        match extract_timestamp_field(reader, walk, ifd_offset, entry_offset, entry, kind) {
+            Ok(field) => fields.push(field),
+            Err(error) if error.is_structural() => issues.push(error),
+            Err(error) => return Err(error),
+        }
+    }
+
+    let next_relative = u64::from(read_u32(walk.byte_order, &table[entries_len..]));
+    let next_depth = task
+        .depth
+        .checked_add(1)
+        .ok_or_else(|| ParseError::overflow(Some(ifd_offset), "TIFF IFD depth overflow"))?;
+    if next_relative != 0 {
+        pending.push(IfdTask {
+            relative_offset: next_relative,
+            role: IfdRole::Other,
+            depth: next_depth,
+        });
+    }
+    if let Some(relative_offset) = exif_ifd {
+        pending.push(IfdTask {
+            relative_offset,
+            role: IfdRole::Exif,
+            depth: next_depth,
+        });
+    }
+    Ok(())
+}
+
+fn extract_timestamp_field(
+    reader: &mut BudgetedReader<'_>,
+    walk: TiffWalk,
+    ifd_offset: u64,
+    entry_offset: u64,
+    entry: &[u8],
+    kind: MetadataFieldKind,
+) -> Result<MetadataField, ParseError> {
+    let tag = read_u16(walk.byte_order, &entry[0..2]);
+    let field_type = read_u16(walk.byte_order, &entry[2..4]);
+    let value_count = read_u32(walk.byte_order, &entry[4..8]);
+    if field_type != TIFF_TYPE_ASCII || value_count == 0 {
+        return Err(ParseError::invalid(
+            entry_offset,
+            "timestamp field is not non-empty TIFF ASCII",
+        ));
+    }
+    let value_length = u64::from(value_count);
+    let value_offset = if value_length <= 4 {
+        checked_add(
+            entry_offset,
+            8,
+            Some(entry_offset),
+            "inline TIFF value offset overflow",
+        )?
+    } else {
+        checked_add(
+            walk.header_offset,
+            u64::from(read_u32(walk.byte_order, &entry[8..12])),
+            Some(entry_offset),
+            "external TIFF value offset overflow",
+        )?
+    };
+    ensure_in_container(
+        value_offset,
+        value_length,
+        walk.container_end,
+        "TIFF timestamp value",
+    )?;
+    let raw_bytes = reader.read_field_bytes(value_offset, value_length)?;
+    let container = match walk.origin {
+        TiffOrigin::Direct => MetadataContainer::Tiff {
+            header_offset: walk.header_offset,
+            ifd_offset,
+            tag,
+            byte_order: walk.byte_order,
+        },
+        TiffOrigin::Jpeg { app1_offset } => MetadataContainer::JpegExif {
+            app1_offset,
+            header_offset: walk.header_offset,
+            ifd_offset,
+            tag,
+            byte_order: walk.byte_order,
+        },
+    };
+    Ok(MetadataField {
+        parser: PARSER_IDENTITY,
+        kind,
+        encoding: FieldEncoding::DeclaredAscii,
+        locator: MetadataLocator {
+            absolute_offset: value_offset,
+            byte_len: value_length,
+            container,
+        },
+        raw_bytes,
+    })
 }
 
 fn field_kind(role: IfdRole, tag: u16) -> Option<MetadataFieldKind> {

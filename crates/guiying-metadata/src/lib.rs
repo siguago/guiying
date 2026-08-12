@@ -176,9 +176,13 @@ pub enum ExtractionStatus {
     ExtractedUnvalidated,
     /// A recognized container was valid but had no supported timestamp field.
     NoMetadata,
-    /// Some evidence was recovered, but another recognized structure failed.
+    /// Raw fields were recovered, but another recognized structure inside the
+    /// same source was malformed and had to be skipped. The recovered fields
+    /// carry the same caveats as [`ExtractionStatus::ExtractedUnvalidated`].
     Partial,
     /// A recognized source could not be parsed safely. No evidence is trusted.
+    /// Budget exhaustion, arithmetic overflow, and I/O failures always fail
+    /// the whole report closed, discarding any partially extracted fields.
     Failed,
     /// The source is not one of the supported containers.
     Unsupported,
@@ -332,7 +336,11 @@ pub fn extract_timestamp_evidence(
     };
 
     match parsed {
-        Ok(fields) => reader.finish(Some(format), fields, Vec::new()),
+        // Structural problems local to one container region arrive as issues
+        // next to the fields that other regions still produced.
+        Ok(outcome) => reader.finish(Some(format), outcome.fields, outcome.issues),
+        // Budget, arithmetic, and I/O failures stay whole-report failures so
+        // that repeated extraction passes remain deterministic and comparable.
         Err(error) => reader.finish(Some(format), Vec::new(), vec![error]),
     }
 }

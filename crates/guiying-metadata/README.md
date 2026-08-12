@@ -14,7 +14,15 @@ The first parser version recognizes:
 - little- and big-endian TIFF IFDs with strict bounds and cycle checks;
 - ISO-BMFF/QuickTime `mvhd` creation time;
 - QuickTime `com.apple.quicktime.creationdate` and `©day` text values in
-  `meta`/`ilst` atoms.
+  `meta`/`ilst` atoms, accepting both `meta` dialects: the ISO full box
+  (version/flags) and the QuickTime-style versionless layout used by Apple
+  `.mov` files (detected by the mandatory leading `hdlr` child);
+- HEIF/HEIC `Exif` items in a root-level `pict` `meta`: `iinf` (versions 0/1,
+  `infe` versions 2/3) resolves the `Exif` item, `iloc` (versions 0/1/2) must
+  address it with construction method 0 (absolute file offset), no external
+  data reference, and exactly one extent; anything else fails closed as a
+  structural issue. The item payload's four-byte TIFF header offset is applied
+  before the embedded TIFF is parsed with the ordinary bounded TIFF walker.
 
 All reads, structure visits, recursion depth, extracted fields, and retained
 field bytes are subject to caller-controlled limits.
@@ -27,8 +35,13 @@ field bytes are subject to caller-controlled limits.
 - Every offset and length calculation uses checked arithmetic and is bounded by
   both its enclosing container and the advertised source length.
 - Short positional reads are completed exactly; premature EOF, I/O errors,
-  malformed structures, cycles, excessive counts, and unsupported versions
-  become a fail-closed report status with no trusted fields.
+  budget exhaustion, and arithmetic overflow always fail the whole report
+  closed with no trusted fields, keeping repeated extraction passes
+  deterministic and comparable.
+- Malformed structures, cycles, and unsupported versions are structural
+  issues isolated to their own container region: fields recovered from other
+  regions of the same source are kept and the report status becomes
+  `Partial`. A report with any issue never claims `ExtractedUnvalidated`.
 - The caller remains responsible for pinning the source identity and checking
   that it did not change before/after extraction. Guiying's scanner does this
   around the already-open file descriptor.

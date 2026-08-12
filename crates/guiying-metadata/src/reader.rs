@@ -87,6 +87,22 @@ impl ParseError {
         Self::new(MetadataIssueCode::InvalidSource, Some(offset), context)
     }
 
+    /// Whether this error describes malformed source structure that can be
+    /// isolated to one container region while sibling evidence is kept.
+    ///
+    /// Budget, arithmetic, and source/I-O failures are deliberately excluded:
+    /// they must stay whole-report failures so the two extraction passes of
+    /// the sealing gate remain deterministic and comparable.
+    pub(crate) const fn is_structural(&self) -> bool {
+        matches!(
+            self.code,
+            MetadataIssueCode::InvalidStructure
+                | MetadataIssueCode::OutOfBounds
+                | MetadataIssueCode::CycleDetected
+                | MetadataIssueCode::UnsupportedVersion
+        )
+    }
+
     pub(crate) fn into_issue(self) -> MetadataIssue {
         MetadataIssue {
             parser: PARSER_IDENTITY,
@@ -95,6 +111,16 @@ impl ParseError {
             context: self.context,
         }
     }
+}
+
+/// Fields plus isolated structural issues produced by one parser invocation.
+///
+/// A parser returns `Err` only for non-structural (budget, arithmetic, I/O)
+/// failures; those still fail the whole extraction closed.
+#[derive(Default)]
+pub(crate) struct ParseOutcome {
+    pub(crate) fields: Vec<MetadataField>,
+    pub(crate) issues: Vec<ParseError>,
 }
 
 pub(crate) struct BudgetedReader<'a> {

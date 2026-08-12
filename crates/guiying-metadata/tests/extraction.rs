@@ -461,6 +461,247 @@ fn unknown_bytes_are_unsupported_without_an_issue() {
     assert!(report.fields.is_empty());
 }
 
+#[test]
+fn extracts_quicktime_style_meta_and_movie_header_together() {
+    // Apple `.mov` layout: `meta` directly under `moov` with NO version/flags
+    // and the mandatory `hdlr` as its first child. The pre-fix parser treated
+    // this dialect as an ISO full box and failed the whole file, discarding
+    // the already extracted `mvhd` creation time as well.
+    let text = b"2024-02-03T04:05:06+08:00";
+    let mut key_entry = Vec::new();
+    let key_entry_size = 8_u32
+        .checked_add(len_u32(CREATION_DATE_KEY))
+        .expect("synthetic key entry size does not overflow");
+    key_entry.extend_from_slice(&key_entry_size.to_be_bytes());
+    key_entry.extend_from_slice(b"mdta");
+    key_entry.extend_from_slice(CREATION_DATE_KEY);
+    let mut keys_payload = vec![0_u8; 4];
+    keys_payload.extend_from_slice(&1_u32.to_be_bytes());
+    keys_payload.extend_from_slice(&key_entry);
+    let keys = bmff_box(*b"keys", keys_payload);
+
+    let mut data_payload = Vec::new();
+    data_payload.extend_from_slice(&1_u32.to_be_bytes());
+    data_payload.extend_from_slice(&0_u32.to_be_bytes());
+    data_payload.extend_from_slice(text);
+    let item = bmff_box(1_u32.to_be_bytes(), bmff_box(*b"data", data_payload));
+    let ilst = bmff_box(*b"ilst", item);
+
+    let mut meta_payload = Vec::new();
+    meta_payload.extend_from_slice(&quicktime_hdlr(*b"mdta"));
+    meta_payload.extend_from_slice(&keys);
+    meta_payload.extend_from_slice(&ilst);
+    let meta = bmff_box(*b"meta", meta_payload);
+    let movie = iso_movie(vec![mvhd_v0(3_800_000_000), meta]);
+
+    let report = extract_timestamp_evidence(&movie, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::ExtractedUnvalidated);
+    assert!(report.issues.is_empty());
+    assert_field(
+        &report,
+        MetadataFieldKind::QuickTimeMovieHeaderCreationTime,
+        &3_800_000_000_u32.to_be_bytes(),
+    );
+    assert_field(
+        &report,
+        MetadataFieldKind::QuickTimeMetadataCreationDate,
+        text,
+    );
+    assert_locators_resolve(&movie, &report);
+}
+
+#[test]
+fn a_malformed_sibling_box_is_isolated_and_keeps_movie_header_evidence() {
+    // Unsupported `meta` version: the box is rejected structurally, but the
+    // valid sibling `mvhd` evidence must survive with a `Partial` status.
+    let mut meta_payload = vec![9_u8, 0, 0, 0];
+    meta_payload.extend_from_slice(&bmff_box(*b"ilst", Vec::new()));
+    let movie = iso_movie(vec![
+        mvhd_v0(3_800_000_000),
+        bmff_box(*b"meta", meta_payload),
+    ]);
+
+    let report = extract_timestamp_evidence(&movie, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::Partial);
+    assert_field(
+        &report,
+        MetadataFieldKind::QuickTimeMovieHeaderCreationTime,
+        &3_800_000_000_u32.to_be_bytes(),
+    );
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(report.issues[0].code, MetadataIssueCode::UnsupportedVersion);
+}
+
+#[test]
+fn a_malformed_second_exif_segment_keeps_first_segment_evidence() {
+    let mut bytes = vec![0xff, 0xd8];
+    push_app1_exif(&mut bytes, &little_endian_tiff());
+    push_app1_exif(&mut bytes, b"XXXXXXXX");
+    bytes.extend_from_slice(&[0xff, 0xd9]);
+
+    let report = extract_timestamp_evidence(&bytes, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::Partial);
+    assert_eq!(report.format, Some(DetectedFormat::Jpeg));
+    assert_field(
+        &report,
+        MetadataFieldKind::ExifDateTimeOriginal,
+        ORIGINAL_DATE,
+    );
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(report.issues[0].code, MetadataIssueCode::InvalidStructure);
+}
+
+#[test]
+fn budget_failures_still_discard_partially_extracted_fields() {
+    // Budget-class failures must stay whole-report failures so both passes of
+    // the double-extraction sealing gate remain deterministic and comparable.
+    let movie = iso_movie(vec![mvhd_v0(3_800_000_000), mvhd_v0(3_800_000_001)]);
+    let limits = ExtractionLimits {
+        max_fields: 1,
+        ..ExtractionLimits::default()
+    };
+
+    let report = extract_timestamp_evidence(&movie, limits);
+    assert_eq!(report.status, ExtractionStatus::Failed);
+    assert!(report.fields.is_empty());
+    assert_eq!(report.issues[0].code, MetadataIssueCode::LimitExceeded);
+}
+
+#[test]
+fn extracts_heif_exif_date_time_original() {
+    let item_payload = exif_item_payload(&little_endian_tiff());
+    let file = heif_file_with(
+        |offset, length| {
+            vec![
+                heif_hdlr(*b"pict"),
+                heif_iinf_with_items(vec![heif_infe_v2(1, *b"Exif")]),
+                heif_iloc_v0(&[(1, vec![(offset, length)])]),
+            ]
+        },
+        &item_payload,
+    );
+
+    let report = extract_timestamp_evidence(&file, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::ExtractedUnvalidated);
+    assert_eq!(report.format, Some(DetectedFormat::IsoBmff));
+    assert!(report.issues.is_empty());
+    assert_field(
+        &report,
+        MetadataFieldKind::ExifDateTimeOriginal,
+        ORIGINAL_DATE,
+    );
+    assert_field(&report, MetadataFieldKind::ExifModifyDate, MODIFY_DATE);
+    assert!(report.fields.iter().all(|field| matches!(
+        field.locator.container,
+        guiying_metadata::MetadataContainer::Tiff { .. }
+    )));
+    assert_locators_resolve(&file, &report);
+}
+
+#[test]
+fn heif_exif_extent_beyond_the_file_is_out_of_bounds() {
+    let item_payload = exif_item_payload(&little_endian_tiff());
+    let file = heif_file_with(
+        |_offset, length| {
+            vec![
+                heif_hdlr(*b"pict"),
+                heif_iinf_with_items(vec![heif_infe_v2(1, *b"Exif")]),
+                heif_iloc_v0(&[(1, vec![(u32::MAX - 8, length)])]),
+            ]
+        },
+        &item_payload,
+    );
+
+    let report = extract_timestamp_evidence(&file, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::Failed);
+    assert!(report.fields.is_empty());
+    assert_eq!(report.issues[0].code, MetadataIssueCode::OutOfBounds);
+    assert!(report.usage.bytes_read < 4096);
+}
+
+#[test]
+fn heif_exif_with_unsupported_construction_method_fails_closed() {
+    let item_payload = exif_item_payload(&little_endian_tiff());
+    let file = heif_file_with(
+        |offset, length| {
+            vec![
+                heif_hdlr(*b"pict"),
+                heif_iinf_with_items(vec![heif_infe_v2(1, *b"Exif")]),
+                heif_iloc_v1_with_method(1, 1, &[(offset, length)]),
+            ]
+        },
+        &item_payload,
+    );
+
+    let report = extract_timestamp_evidence(&file, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::Failed);
+    assert!(report.fields.is_empty());
+    assert_eq!(report.issues[0].code, MetadataIssueCode::InvalidStructure);
+    assert!(report.usage.bytes_read < 4096);
+}
+
+#[test]
+fn heif_exif_with_multiple_extents_fails_closed() {
+    let item_payload = exif_item_payload(&little_endian_tiff());
+    let file = heif_file_with(
+        |offset, length| {
+            vec![
+                heif_hdlr(*b"pict"),
+                heif_iinf_with_items(vec![heif_infe_v2(1, *b"Exif")]),
+                heif_iloc_v0(&[(1, vec![(offset, 4), (offset + 4, length - 4)])]),
+            ]
+        },
+        &item_payload,
+    );
+
+    let report = extract_timestamp_evidence(&file, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::Failed);
+    assert!(report.fields.is_empty());
+    assert_eq!(report.issues[0].code, MetadataIssueCode::InvalidStructure);
+    assert!(report.usage.bytes_read < 4096);
+}
+
+#[test]
+fn heif_declared_exif_item_without_location_fails_closed() {
+    let item_payload = exif_item_payload(&little_endian_tiff());
+    let file = heif_file_with(
+        |offset, length| {
+            vec![
+                heif_hdlr(*b"pict"),
+                heif_iinf_with_items(vec![heif_infe_v2(1, *b"Exif")]),
+                heif_iloc_v0(&[(2, vec![(offset, length)])]),
+            ]
+        },
+        &item_payload,
+    );
+
+    let report = extract_timestamp_evidence(&file, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::Failed);
+    assert!(report.fields.is_empty());
+    assert_eq!(report.issues[0].code, MetadataIssueCode::InvalidStructure);
+    assert!(report.usage.bytes_read < 4096);
+}
+
+#[test]
+fn heif_without_exif_item_is_no_metadata() {
+    let item_payload = exif_item_payload(&little_endian_tiff());
+    let file = heif_file_with(
+        |offset, length| {
+            vec![
+                heif_hdlr(*b"pict"),
+                heif_iinf_with_items(vec![heif_infe_v2(1, *b"mime")]),
+                heif_iloc_v0(&[(1, vec![(offset, length)])]),
+            ]
+        },
+        &item_payload,
+    );
+
+    let report = extract_timestamp_evidence(&file, ExtractionLimits::default());
+    assert_eq!(report.status, ExtractionStatus::NoMetadata);
+    assert!(report.fields.is_empty());
+    assert!(report.issues.is_empty());
+}
+
 const CREATION_DATE_KEY: &[u8] = b"com.apple.quicktime.creationdate";
 const COPYRIGHT_DAY: [u8; 4] = [0xa9, b'd', b'a', b'y'];
 
@@ -582,6 +823,128 @@ fn tiff_with_modify_date(value: &[u8]) -> Vec<u8> {
     );
     put_u32_le(&mut bytes, 22, 0);
     bytes
+}
+
+fn push_app1_exif(bytes: &mut Vec<u8>, tiff: &[u8]) {
+    let segment_length = tiff
+        .len()
+        .checked_add(8)
+        .expect("synthetic APP1 length does not overflow");
+    let segment_length = u16::try_from(segment_length).expect("synthetic APP1 fits u16");
+    bytes.extend_from_slice(&[0xff, 0xe1]);
+    bytes.extend_from_slice(&segment_length.to_be_bytes());
+    bytes.extend_from_slice(b"Exif\0\0");
+    bytes.extend_from_slice(tiff);
+}
+
+/// QuickTime-style handler atom whose type field sits at payload offset 8.
+fn quicktime_hdlr(handler: [u8; 4]) -> Vec<u8> {
+    let mut payload = vec![0_u8; 8];
+    payload.extend_from_slice(&handler);
+    payload.extend_from_slice(&[0_u8; 12]);
+    bmff_box(*b"hdlr", payload)
+}
+
+/// ISO full-box `hdlr` used inside a HEIF root `meta`; the handler type also
+/// sits at payload offset 8.
+fn heif_hdlr(handler: [u8; 4]) -> Vec<u8> {
+    quicktime_hdlr(handler)
+}
+
+/// ISO full-box root-level `meta` (version 0) with the given children.
+fn heif_meta(children: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut payload = vec![0_u8; 4];
+    for child in children {
+        payload.extend_from_slice(&child);
+    }
+    bmff_box(*b"meta", payload)
+}
+
+fn heif_iinf_with_items(entries: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut payload = vec![0_u8; 4];
+    let count = u16::try_from(entries.len()).expect("synthetic iinf entry count fits u16");
+    payload.extend_from_slice(&count.to_be_bytes());
+    for entry in entries {
+        payload.extend_from_slice(&entry);
+    }
+    bmff_box(*b"iinf", payload)
+}
+
+fn heif_infe_v2(item_id: u16, item_type: [u8; 4]) -> Vec<u8> {
+    let mut payload = vec![2_u8, 0, 0, 0];
+    payload.extend_from_slice(&item_id.to_be_bytes());
+    payload.extend_from_slice(&0_u16.to_be_bytes());
+    payload.extend_from_slice(&item_type);
+    payload.push(0);
+    bmff_box(*b"infe", payload)
+}
+
+/// `iloc` version 0 with offset/length size 4 and no base offset.
+fn heif_iloc_v0(items: &[(u16, Vec<(u32, u32)>)]) -> Vec<u8> {
+    let mut payload = vec![0_u8, 0, 0, 0, 0x44, 0x00];
+    let count = u16::try_from(items.len()).expect("synthetic iloc item count fits u16");
+    payload.extend_from_slice(&count.to_be_bytes());
+    for (item_id, extents) in items {
+        payload.extend_from_slice(&item_id.to_be_bytes());
+        payload.extend_from_slice(&0_u16.to_be_bytes());
+        let extent_count = u16::try_from(extents.len()).expect("synthetic extent count fits u16");
+        payload.extend_from_slice(&extent_count.to_be_bytes());
+        for (extent_offset, extent_length) in extents {
+            payload.extend_from_slice(&extent_offset.to_be_bytes());
+            payload.extend_from_slice(&extent_length.to_be_bytes());
+        }
+    }
+    bmff_box(*b"iloc", payload)
+}
+
+/// `iloc` version 1 carrying an explicit construction method for one item.
+fn heif_iloc_v1_with_method(item_id: u16, method: u16, extents: &[(u32, u32)]) -> Vec<u8> {
+    let mut payload = vec![1_u8, 0, 0, 0, 0x44, 0x00];
+    payload.extend_from_slice(&1_u16.to_be_bytes());
+    payload.extend_from_slice(&item_id.to_be_bytes());
+    payload.extend_from_slice(&method.to_be_bytes());
+    payload.extend_from_slice(&0_u16.to_be_bytes());
+    let extent_count = u16::try_from(extents.len()).expect("synthetic extent count fits u16");
+    payload.extend_from_slice(&extent_count.to_be_bytes());
+    for (extent_offset, extent_length) in extents {
+        payload.extend_from_slice(&extent_offset.to_be_bytes());
+        payload.extend_from_slice(&extent_length.to_be_bytes());
+    }
+    bmff_box(*b"iloc", payload)
+}
+
+/// HEIF `ExifDataBlock`: four-byte TIFF header offset (zero) then the payload.
+fn exif_item_payload(tiff: &[u8]) -> Vec<u8> {
+    let mut payload = vec![0_u8; 4];
+    payload.extend_from_slice(tiff);
+    payload
+}
+
+/// Assemble `ftyp` + root `meta` + `mdat`, resolving the absolute item offset
+/// with a two-pass build (`iloc` fields are fixed width, so sizes are stable).
+fn heif_file_with(
+    meta_children: impl Fn(u32, u32) -> Vec<Vec<u8>>,
+    item_payload: &[u8],
+) -> Vec<u8> {
+    let ftyp = bmff_box(*b"ftyp", b"heic\0\0\0\0".to_vec());
+    let item_length = len_u32(item_payload);
+    let probe_meta = heif_meta(meta_children(0, item_length));
+    let data_offset = ftyp
+        .len()
+        .checked_add(probe_meta.len())
+        .and_then(|length| length.checked_add(8))
+        .expect("synthetic HEIF prefix length does not overflow");
+    let data_offset = u32::try_from(data_offset).expect("synthetic HEIF offset fits u32");
+    let meta = heif_meta(meta_children(data_offset, item_length));
+    assert_eq!(
+        meta.len(),
+        probe_meta.len(),
+        "two-pass build must be stable"
+    );
+    let mut file = ftyp;
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&bmff_box(*b"mdat", item_payload.to_vec()));
+    file
 }
 
 fn bmff_box(box_type: [u8; 4], payload: Vec<u8>) -> Vec<u8> {
