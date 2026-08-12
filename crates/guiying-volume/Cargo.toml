@@ -11,7 +11,8 @@ publish = false
 
 [dependencies]
 base64 = "=0.23.1"
-blake3 = { version = "=1.5.5", features = ["pure"] }
+# 不启用 "pure"：BLAKE3 输出与实现无关，默认 SIMD/NEON 路径换取大文件哈希吞吐。
+blake3 = "=1.5.5"
 getrandom = "=0.3.4"
 serde = { version = "=1.0.229", features = ["derive"] }
 thiserror = "=2.0.20"

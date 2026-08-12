@@ -11,7 +11,10 @@ publish = false
 
 [dependencies]
 base64 = "0.23.1"
-blake3 = { version = "=1.5.5", features = ["pure"] }
+# BLAKE3 output is implementation independent, so the default SIMD/NEON
+# backends are used for large-media throughput instead of the pure-Rust
+# fallback that the `pure` feature would force.
+blake3 = "=1.5.5"
 getrandom = "=0.3.4"
 libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
