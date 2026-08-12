@@ -94,3 +94,7 @@ cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets -
 ## 安全原则
 
 任何未知能力、歧义资产、扫描中变化、强时间冲突或复核失败都必须 fail closed：保留原文件并只报告问题。未来的清理动作也只能先移动到同卷隔离区，并以密封计划、审计账本和可恢复事务为前提；不会默认永久删除。
+
+## 许可证
+
+本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。

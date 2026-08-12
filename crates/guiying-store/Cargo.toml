@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.77.2"
 description = "Fail-closed SQLite persistence for Guiying scan evidence"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 readme = "README.md"
 repository = "https://github.com/siguago/guiying"
 
