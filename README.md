@@ -14,7 +14,7 @@
 - 已完成或部分覆盖的 D1 运行会进入本机历史目录。catalog 由 owner-window 并发门有界读取；打开后的详细证据只通过 `READ_ONLY + query_only` 读取器和窗口绑定、限时的随机结果 token 分页复核。封存根路径只是显示文本，不会恢复目录权限。进程级数据库锁在任何 Store 打开前取得，避免第二实例把活动会话误判成崩溃残留。
 - 历史结果可导出版本化 JSON 或 CSV。导出可选 `summary` 或 `complete_evidence`；后者只含 D1 摘要、确定重复组、组成员和扫描问题，不含拍摄时间明细、raw metadata、原生 locator 或文件动作权限。默认脱敏，只有用户显式选择 display 投影才带展示文本。
 - Unix 导出把用户选择的目录绑定为原生目录句柄，以私有临时文件写入、同步后通过 no-replace 发布，已有同名文件绝不覆盖；非 Unix 目标绑定尚未实现时 fail closed。导出路径和目录句柄不会交给 WebView。
-- D1 组完成后，在同一 descriptor-bound 会话中对最多四个来源执行两次有界 EXIF / TIFF / QuickTime 提取；只有报告摘要一致且 descriptor、路径、挂载会话再次复核通过，才封印时间证据。原始报告、字段摘要和单字段原始字节通过上下文绑定的懒加载页面复核，列表不携带原始字节。
+- D1 组完成后，在同一 descriptor-bound 会话中对最多四个来源执行两次有界 EXIF / TIFF / QuickTime / HEIF item Exif 提取；`meta` box 同时支持 ISO FullBox 与 QuickTime 无 version/flags 两种方言，HEIC/HEIF 仅接受 construction_method 0 的单 extent Exif item，其余 fail closed。结构性解析错误按 box/IFD/段隔离为 issue 并保留已提取字段（报告可为 partial）；预算、IO 与溢出类错误仍使整份报告硬失败。只有报告摘要一致且 descriptor、路径、挂载会话再次复核通过，才封印时间证据。原始报告、字段摘要和单字段原始字节通过上下文绑定的懒加载页面复核，列表不携带原始字节。
 - 重复成员详情展示扫描时记录的文件系统 birth/mtime，使用 UTC 且保留“卷精度未知”状态；这些只用于发现复制导致的时间漂移，明确不冒充拍摄时间。
 - 把硬链接从独立副本估算中剔除；容量只显示逻辑重复上限，clone、稀疏文件和快照仍会影响实际释放。
 - 输出版本化重复组报告；当前没有照片写入、隔离、移动、改时、重命名或删除 API。
@@ -82,7 +82,7 @@ cargo +1.92.0 test --locked --manifest-path src-tauri/Cargo.toml --all-targets -
 
 - `crates/guiying-core/`：不提供变更 API 的扫描与逐字节复核核心。读取在部分卷上可能更新文件系统管理的 atime。
 - `crates/guiying-runtime/`：唯一能把 core/volume 的不可构造证明转换为 Store 证据的只读适配层；新 attempt 只携带 job/run 血缘。
-- `crates/guiying-metadata/`：有硬预算的原始 EXIF / QuickTime 时间字段提取；不负责日期可信度、时区推断或写回。
+- `crates/guiying-metadata/`：有硬预算的原始 EXIF / QuickTime / HEIF item Exif 时间字段提取；不负责日期可信度、时区推断或写回。
 - `crates/guiying-time/`：时间语义、冲突与证据资格策略；资格结果不构成照片写入授权。
 - `crates/guiying-volume/`：macOS descriptor-bound 卷会话和无损路径证据；其他平台绑定目前 fail closed。
 - `crates/guiying-store/`：应用数据目录内的 SQLite 证据持久化、迁移、分页、审计 checkpoint、v9 新 attempt 血缘、历史导出快照与备份；不打开用户媒体。

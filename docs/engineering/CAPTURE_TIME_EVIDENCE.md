@@ -92,6 +92,11 @@ D1 组中的复制份数共享同一个 lineage，成员数量永远不能增加
 - 普通运行时采用更紧的 256 KiB retained raw、128 fields、8 MiB read、32,768 read operations；
 - offset 与 length 使用 checked arithmetic，且不能越过 source size；
 - BMFF box path 必须是完整 4-byte component 序列并受组件数上限约束；
+- `meta` box 同时支持 ISO FullBox 与 QuickTime 无 version/flags 两种方言，按 `hdlr` 探测；
+- HEIC/HEIF 仅提取 iinf 声明、未加保护、construction_method 0 且单 extent 的 Exif item，
+  其余形态记 issue fail closed；无 Exif item 的 HEIF 是干净的 NoMetadata；
+- 结构性解析错误按 box/IFD/段隔离为 issue 并保留已提取字段（报告可为 partial）；
+  预算、IO、EOF 与溢出类错误仍使整份报告硬失败，保证双提取报告可比；
 - parser、format、locator、usage 或 limits 自相矛盾时 fail closed。
 
 列表 API 不返回 raw bytes。显式 field-detail API 仍受单字段上限与页总预算约束。
@@ -105,6 +110,8 @@ D1 组中的复制份数共享同一个 lineage，成员数量永远不能增加
 - floating 值保持 floating；
 - 1904、1970、1980 sentinel、明显未来、非法日历与 parser/locator 矛盾阻断自动资格；
 - 两个强来源超出容差时标冲突，禁止平均、取最早或多数决；
+- 同一优先级的近值（容差内但非同一语义时刻）跨精度也标歧义并交人工复核，
+  不允许静默偏好精度更细的候选；同一时刻的不同精度表达合并为细化，不算歧义；
 - 恰差整数小时或八小时等情形标记疑似时区解释冲突，不自动修正；
 - sidecar 在建立可靠 asset binding 之前不得成为可执行 donor；
 - metadata 报告为 partial/failed 时，候选最多用于人工审阅。

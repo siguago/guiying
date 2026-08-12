@@ -348,7 +348,7 @@
       "id": "responsive-compact-capture",
       "kind": "screenshot",
       "path": "evidence/results-1024x768.png",
-      "captured_at": "2026-08-11T20:54:30+08:00",
+      "captured_at": "2026-08-12T01:01:39+08:00",
       "tool": "Playwright Chromium",
       "version": "1.62.1",
       "command": "pnpm test:ui",
@@ -356,13 +356,13 @@
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "Synthetic data is persistently labelled; the 1024x768 master-detail view retains the safety footer and evidence rail; SHA-256 4ef89dc3003e13e743d1668a4a6dc3ed081fba0c7abbf5515510c30bf251cbc2."
+      "notes": "Synthetic data is persistently labelled; the 1024x768 master-detail view retains the safety footer and evidence rail; SHA-256 70fff1c1678b1b8cf662d10cbd2f4c52cf5d629cf6ab5cb16ad6e208f54c1fd4."
     },
     {
       "id": "responsive-large-capture",
       "kind": "screenshot",
       "path": "evidence/results-1280x820.png",
-      "captured_at": "2026-08-11T20:54:27+08:00",
+      "captured_at": "2026-08-12T01:01:35+08:00",
       "tool": "Playwright Chromium",
       "version": "1.62.1",
       "command": "pnpm test:ui",
@@ -370,7 +370,7 @@
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "The 1280x820 evidence workspace shows group ordering, synthetic notice, exact-byte proof, and weak time evidence without overlap; SHA-256 185a51d8898f2cd9a20f49ac40ab15bd9e64c2a250f79c43e9dc3b79356a5f0c."
+      "notes": "The 1280x820 evidence workspace shows group ordering, synthetic notice, exact-byte proof, and weak time evidence without overlap; SHA-256 5d718ea955d4c1107fcf86b4436bb93e9a39ae5e4c1c0dc04776055251aedfd5."
     },
     {
       "id": "paged-results-capture",
@@ -404,7 +404,7 @@
       "id": "historical-catalog-capture",
       "kind": "screenshot",
       "path": "evidence/history-1280x820.png",
-      "captured_at": "2026-08-11T20:54:36+08:00",
+      "captured_at": "2026-08-12T01:01:50+08:00",
       "tool": "Playwright Chromium, axe-core and full-size image inspection",
       "version": "Playwright 1.62.1; axe-core 4.12.1",
       "command": "pnpm test:ui",
@@ -412,7 +412,7 @@
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "The 1280x820 historical catalog distinguishes sealed display text from current filesystem authority, labels partial coverage and optional capture-time outcomes, contains no PII, and passed axe; SHA-256 4eb65f5643eb508e0d32fc624628a8b4633bedb429c34832b5febed60d56578c."
+      "notes": "The 1280x820 historical catalog distinguishes sealed display text from current filesystem authority, labels partial coverage and optional capture-time outcomes, contains no PII, and passed axe; SHA-256 25df634b04fea231090b5d59f3ce541d0f570cf58a2904c1acfcdc1803b9cacc."
     },
     {
       "id": "packaged-icon-inspection",
