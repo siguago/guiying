@@ -1457,12 +1457,23 @@ fn decide(candidates: &[TimeCandidate], global_conflict: bool) -> AnalysisDecisi
     }
 }
 
+/// Blocks every equal-priority high-confidence candidate whose UTC instant is
+/// near, but not identical to, another candidate's instant.
+///
+/// Grouping uses evidence priority only. Every instant is compared on the one
+/// shared total-nanosecond scale regardless of its declared precision, so a
+/// coarse and a fine reading of two different instants cannot silently bypass
+/// review through the fine value's automatic preference. Candidates whose
+/// instants are exactly equal share one entry and never block each other:
+/// consistent with [`semantic_timestamp`] equality, differing precision or
+/// offset representations of the same instant are a refinement, not an
+/// ambiguity.
 fn block_equal_rank_near_ambiguity(
     candidates: &mut [TimeCandidate],
     context: &PolicyContext,
     issues: &mut Vec<PolicyIssue>,
 ) {
-    let mut groups = BTreeMap::<(u8, TimePrecision), BTreeMap<i128, Vec<usize>>>::new();
+    let mut groups = BTreeMap::<u8, BTreeMap<i128, Vec<usize>>>::new();
     for (index, candidate) in candidates.iter().enumerate() {
         if candidate.confidence != Confidence::High {
             continue;
@@ -1475,10 +1486,7 @@ fn block_equal_rank_near_ambiguity(
             continue;
         };
         groups
-            .entry((
-                evidence_priority(&candidate.evidence_kinds),
-                candidate.timestamp.precision(),
-            ))
+            .entry(evidence_priority(&candidate.evidence_kinds))
             .or_default()
             .entry(value)
             .or_default()

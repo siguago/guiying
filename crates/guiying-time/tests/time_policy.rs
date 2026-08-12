@@ -1,7 +1,8 @@
 use guiying_metadata::{
     extract_timestamp_evidence, DetectedFormat, ExtractionLimits, ExtractionReport,
     ExtractionStatus, ExtractionUsage, FieldEncoding, MetadataContainer, MetadataField,
-    MetadataFieldKind, MetadataLocator, ParserIdentity, TiffByteOrder, PARSER_IDENTITY,
+    MetadataFieldKind, MetadataLocator, ParserIdentity, ReadAtSource, TiffByteOrder,
+    PARSER_IDENTITY,
 };
 use guiying_time::{
     analyze_timestamp_evidence, parse_exif_timestamp, parse_quicktime_mvhd,
@@ -528,6 +529,90 @@ fn equal_rank_values_inside_tolerance_require_review_of_exact_value() {
                 )
         )
     }));
+}
+
+#[test]
+fn cross_precision_near_values_inside_tolerance_are_ambiguous_for_review() {
+    // 08:09:10.123 at millisecond precision vs 08:09:10 at second precision:
+    // two different instants 123 ms apart must not silently prefer the finer
+    // reading; the exact value is a review decision.
+    let fine =
+        synthetic_tiff_with_exif_original(b"2024:06:07 08:09:10\0", b"+00:00\0", Some(*b"123\0"));
+    let coarse = synthetic_tiff_with_exif_original(b"2024:06:07 08:09:10\0", b"+00:00\0", None);
+    let fine_verified = pinned_verified_report(1, &fine);
+    let coarse_verified = pinned_verified_report(2, &coarse);
+    let analysis = analyze_timestamp_evidence(
+        &[
+            verified_source(1, &fine_verified),
+            verified_source(2, &coarse_verified),
+        ],
+        &context_at("2025-01-01T00:00:00Z"),
+    );
+
+    assert_eq!(analysis.candidates.len(), 2);
+    assert!(analysis
+        .candidates
+        .iter()
+        .all(|candidate| candidate.confidence == Confidence::High));
+    assert!(matches!(
+        analysis.decision,
+        AnalysisDecision::ReviewRequired { .. }
+    ));
+    assert!(analysis
+        .issues
+        .iter()
+        .any(|issue| issue.code == PolicyIssueCode::StrongEvidenceWithinToleranceAmbiguous));
+    assert!(analysis.candidates.iter().all(|candidate| {
+        matches!(
+            candidate.evidence_gate,
+            EvidenceGateDecision::Blocked(ref blockers)
+                if blockers.contains(
+                    &EvidenceGateBlocker::MultipleStrongValuesWithinTolerance
+                )
+        )
+    }));
+}
+
+#[test]
+fn same_instant_across_precisions_is_refinement_not_ambiguity() {
+    // 08:09:10.000 at millisecond precision and 08:09:10 at second precision
+    // are the same semantic instant; restating it more precisely is a
+    // refinement and must not be misreported as near-value ambiguity.
+    let fine =
+        synthetic_tiff_with_exif_original(b"2024:06:07 08:09:10\0", b"+00:00\0", Some(*b"000\0"));
+    let coarse = synthetic_tiff_with_exif_original(b"2024:06:07 08:09:10\0", b"+00:00\0", None);
+    let fine_verified = pinned_verified_report(1, &fine);
+    let coarse_verified = pinned_verified_report(2, &coarse);
+    let analysis = analyze_timestamp_evidence(
+        &[
+            verified_source(1, &fine_verified),
+            verified_source(2, &coarse_verified),
+        ],
+        &context_at("2025-01-01T00:00:00Z"),
+    );
+
+    assert_eq!(analysis.candidates.len(), 2);
+    assert!(!analysis
+        .issues
+        .iter()
+        .any(|issue| issue.code == PolicyIssueCode::StrongEvidenceWithinToleranceAmbiguous));
+    assert!(analysis.candidates.iter().all(|candidate| {
+        candidate.confidence == Confidence::High
+            && candidate.evidence_gate == EvidenceGateDecision::Eligible
+    }));
+    let AnalysisDecision::EvidenceEligible { candidate_index } = analysis.decision else {
+        panic!(
+            "same-instant refinement must stay eligible, observed {:?}",
+            analysis.decision
+        );
+    };
+    let selected = &analysis.candidates[candidate_index];
+    let other = &analysis.candidates[1 - candidate_index];
+    assert_eq!(selected.timestamp.precision().nanoseconds(), 1_000_000);
+    assert_eq!(
+        selected.timestamp.utc_instant(),
+        other.timestamp.utc_instant()
+    );
 }
 
 #[test]
@@ -1343,6 +1428,16 @@ fn verified_source(lineage: u8, report: &SourceVerifiedExtractionReport) -> Evid
     EvidenceSource::source_verified(LineageKey::new([lineage; 32]), report)
 }
 
+fn pinned_verified_report(source: u8, bytes: &impl ReadAtSource) -> SourceVerifiedExtractionReport {
+    let retained = extract_timestamp_evidence(bytes, ExtractionLimits::default());
+    SourceVerifiedExtractionReport::revalidate_from_pinned_source(
+        SourceKey::new([source; 32]),
+        bytes,
+        &retained,
+    )
+    .expect("the pinned source reproduces its report")
+}
+
 fn verified_exif_analysis(raw: &[u8], context: &PolicyContext) -> TimeAnalysis {
     let bytes = synthetic_tiff_with_date_and_offset(raw, b"+00:00\0");
     let retained = extract_timestamp_evidence(&bytes, ExtractionLimits::default());
@@ -1510,6 +1605,14 @@ fn synthetic_tiff_with_date(original: &[u8]) -> Vec<u8> {
 }
 
 fn synthetic_tiff_with_date_and_offset(original: &[u8], offset: &[u8]) -> Vec<u8> {
+    synthetic_tiff_with_exif_original(original, offset, Some(*b"123\0"))
+}
+
+fn synthetic_tiff_with_exif_original(
+    original: &[u8],
+    offset: &[u8],
+    subsecond: Option<[u8; 4]>,
+) -> Vec<u8> {
     assert_eq!(original.len(), 20, "Exif fixture must be 19 bytes plus NUL");
     assert_eq!(
         offset.len(),
@@ -1522,7 +1625,8 @@ fn synthetic_tiff_with_date_and_offset(original: &[u8], offset: &[u8]) -> Vec<u8
     put_ifd_entry_le(&mut bytes, 10, 0x8769, 4, 1, 64);
     put_u32_le(&mut bytes, 22, 0);
 
-    put_u16_le(&mut bytes, 64, 3);
+    let entry_count = if subsecond.is_some() { 3 } else { 2 };
+    put_u16_le(&mut bytes, 64, entry_count);
     put_ifd_entry_le(
         &mut bytes,
         66,
@@ -1539,8 +1643,13 @@ fn synthetic_tiff_with_date_and_offset(original: &[u8], offset: &[u8]) -> Vec<u8
         u32::try_from(offset.len()).expect("fixture length"),
         180,
     );
-    put_ifd_entry_le(&mut bytes, 90, 0x9291, 2, 4, u32::from_le_bytes(*b"123\0"));
-    put_u32_le(&mut bytes, 102, 0);
+    let next_ifd_offset = if let Some(subsecond) = subsecond {
+        put_ifd_entry_le(&mut bytes, 90, 0x9291, 2, 4, u32::from_le_bytes(subsecond));
+        102
+    } else {
+        90
+    };
+    put_u32_le(&mut bytes, next_ifd_offset, 0);
     bytes[150..150 + original.len()].copy_from_slice(original);
     bytes[180..180 + offset.len()].copy_from_slice(offset);
     bytes

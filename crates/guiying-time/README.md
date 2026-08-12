@@ -40,6 +40,11 @@ time, additional sentinel rules, and tolerance policy through `PolicyContext`.
   ceilings (5 seconds for strong agreement, 5 seconds around integer hours,
   7 days for obvious-future tolerance, and ±14 hours for offset suspicion), so
   configuration cannot silently disable the evidence gates.
+- Equal-priority strong instants within the strong tolerance of each other are
+  blocked for review as one ambiguity regardless of each value's declared
+  precision, so a finer reading of a different instant is never silently
+  preferred. Only an exactly identical instant restated at another precision
+  counts as the same value: a refinement, not an ambiguity.
 - Automatic UTC instants are hard-limited to signed-64-bit Unix nanoseconds.
   Parsed values outside roughly 1677--2262 remain fully visible for review but
   cannot become eligible. Caller lower/upper bounds can only tighten that
