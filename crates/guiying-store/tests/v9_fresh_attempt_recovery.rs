@@ -540,6 +540,40 @@ fn select(
     store.write_transaction(|repository| repository.select_fresh_attempt_recovery(query))
 }
 
+#[test]
+fn poisoned_transaction_rejects_fresh_attempt_recovery_selection(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let mut store = Store::open_or_create(temporary.path().join("poisoned-selection.sqlite3"))?;
+
+    let query = FreshAttemptRecoveryQuery {
+        volume_id: 1,
+        namespace_profile_id: 1,
+        mount_relative_root_raw: b"DCIM".to_vec(),
+        path_encoding: "utf8".into(),
+        stable_root_path_key: StablePathKey::from_volume_adapter([12; 32]),
+        root_scope_key: RootScopeKey::from_volume_adapter([13; 32]),
+        config: None,
+    };
+    let error = store
+        .write_transaction(|repository| {
+            let mutation_error = repository
+                .upsert_volume(&VolumeInput {
+                    identity_key: String::new(),
+                    ..strong_volume("poisoned", 100)
+                })
+                .expect_err("an empty volume identity key was accepted");
+            assert!(matches!(mutation_error, StoreError::InvalidInput { .. }));
+            // The caught mutator error poisons the transaction; recovery
+            // selection must refuse instead of returning coordination data
+            // from a transaction that can only roll back.
+            repository.select_fresh_attempt_recovery(&query)
+        })
+        .expect_err("a poisoned transaction returned recovery coordination data");
+    assert!(matches!(error, StoreError::WriteTransactionPoisoned));
+    Ok(())
+}
+
 fn recovery_query(scope: StableScope, config: serde_json::Value) -> FreshAttemptRecoveryQuery {
     FreshAttemptRecoveryQuery {
         volume_id: scope.volume_id,

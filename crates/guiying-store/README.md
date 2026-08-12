@@ -33,7 +33,10 @@ Safety properties:
   disabled;
 - migrations are atomic and registered with a BLAKE3 checksum, application id,
   and `user_version`; unknown, missing, reordered, or modified history fails
-  closed;
+  closed. The whole-database runtime-invariant and capability-hash walk always
+  runs before migrating and is repeated only after at least one migration
+  actually applied; an already-current database is walked once per `migrate`
+  call instead of twice;
 - opening runs `quick_check` plus `foreign_key_check`; a public full integrity
   check is available;
 - backups use SQLite's online Backup API, are written to a private temporary
@@ -208,7 +211,13 @@ Safety properties:
   manifests, and a monotonic generation; it is audit evidence and never restores
   a descriptor, walker, root token, or cross-process authority. Cancel supersedes
   pause/resume, stale generations fail closed, and direct-SQL half states are
-  rejected during validation;
+  rejected during validation. The crate exposes no lease-heartbeat mutator:
+  `last_heartbeat_at_ms` is fixed at acquisition time. Release is tolerant of a
+  wall clock that rolled back past acquisition: `release_started_at_ms` is
+  clamped to `MAX(now, last_heartbeat_at_ms)` and `released_at_ms` to
+  `MAX(now, release_started_at_ms)` — the same clamp the restart reconcile
+  pass uses — so the persisted release ordering always holds and a rollback
+  can never dead-end an in-process terminal transition;
 - version 9 adds fresh-attempt recovery without treating a pause checkpoint or
   historical fingerprint as live filesystem authority. An immutable companion
   policy separates `fresh_attempt_only` lineage from

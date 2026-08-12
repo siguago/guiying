@@ -232,10 +232,17 @@ impl<'transaction> RepositoryTx<'transaction> {
     /// `create_bound_scan_run` in the same `Store::write_transaction` callback.
     /// The returned ids are association evidence only; they grant no durable
     /// filesystem authority and copy no evidence from the parent run.
+    ///
+    /// Like every mutator, this read refuses a poisoned transaction: after a
+    /// caught repository error the whole transaction is doomed to roll back,
+    /// so its selection must not escape as recovery coordination data.
     pub fn select_fresh_attempt_recovery(
         &self,
         query: &FreshAttemptRecoveryQuery,
     ) -> Result<FreshAttemptRecoverySelection> {
+        if self.poisoned {
+            return Err(StoreError::WriteTransactionPoisoned);
+        }
         self.select_fresh_attempt_recovery_impl(query)
     }
 
@@ -268,16 +275,6 @@ impl<'transaction> RepositoryTx<'transaction> {
         input: &AcquireRuntimeLeaseInput,
     ) -> Result<RuntimeLeaseGuard> {
         self.run_mutator(|repository| repository.acquire_runtime_lease_impl(guard, input))
-    }
-
-    pub fn heartbeat_runtime_lease(
-        &mut self,
-        guard: &RuntimeLeaseGuard,
-        heartbeat_at_ms: i64,
-    ) -> Result<()> {
-        self.run_mutator(|repository| {
-            repository.heartbeat_runtime_lease_impl(guard, heartbeat_at_ms)
-        })
     }
 
     pub fn request_scan_control(
@@ -4182,28 +4179,6 @@ impl<'transaction> RepositoryTx<'transaction> {
         ))
     }
 
-    fn heartbeat_runtime_lease_impl(
-        &mut self,
-        guard: &RuntimeLeaseGuard,
-        heartbeat_at_ms: i64,
-    ) -> Result<()> {
-        self.validate_runtime_lease_guard(guard)?;
-        require_nonnegative("heartbeat_at_ms", heartbeat_at_ms)?;
-        let changed = self.transaction.execute(
-            "UPDATE scan_runtime_leases SET last_heartbeat_at_ms = ?2 \
-             WHERE scan_run_id = ?1 AND state = 'active' \
-               AND last_heartbeat_at_ms <= ?2",
-            params![guard.scan_run_id(), heartbeat_at_ms],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::ConcurrencyConflict {
-                entity: "runtime_lease_heartbeat",
-                id: guard.scan_run_id(),
-            });
-        }
-        Ok(())
-    }
-
     fn request_scan_control_impl(
         &mut self,
         guard: &RuntimeLeaseGuard,
@@ -5923,6 +5898,11 @@ impl<'transaction> RepositoryTx<'transaction> {
         Ok(())
     }
 
+    /// Moves the active lease to `releasing`, tolerating a wall clock that
+    /// rolled back below the persisted `last_heartbeat_at_ms`. The effective
+    /// release start is `MAX(now_ms, last_heartbeat_at_ms)`, matching the
+    /// restart reconcile pass, so the durable ordering invariant holds while
+    /// terminal transitions can never dead-end on a clock rollback.
     fn begin_runtime_lease_release(
         &self,
         guard: &RuntimeLeaseGuard,
@@ -5932,9 +5912,9 @@ impl<'transaction> RepositoryTx<'transaction> {
         require_nonnegative("release_started_at_ms", now_ms)?;
         let changed = self.transaction.execute(
             "UPDATE scan_runtime_leases \
-             SET state = 'releasing', release_reason = ?2, release_started_at_ms = ?3 \
-             WHERE scan_run_id = ?1 AND state = 'active' \
-               AND last_heartbeat_at_ms <= ?3",
+             SET state = 'releasing', release_reason = ?2, \
+                 release_started_at_ms = MAX(?3, last_heartbeat_at_ms) \
+             WHERE scan_run_id = ?1 AND state = 'active'",
             params![guard.scan_run_id(), reason, now_ms],
         )?;
         if changed != 1 {
@@ -5946,15 +5926,19 @@ impl<'transaction> RepositoryTx<'transaction> {
         Ok(())
     }
 
+    /// Completes a release begun in this same transaction with the same
+    /// rollback tolerance: `released_at_ms` is clamped to
+    /// `MAX(now_ms, release_started_at_ms)` so the persisted ordering
+    /// `released_at_ms >= release_started_at_ms` always holds.
     fn finish_runtime_lease_release(
         &mut self,
         guard: &RuntimeLeaseGuard,
         now_ms: i64,
     ) -> Result<()> {
         let changed = self.transaction.execute(
-            "UPDATE scan_runtime_leases SET state = 'released', released_at_ms = ?2 \
-             WHERE scan_run_id = ?1 AND state = 'releasing' \
-               AND release_started_at_ms <= ?2",
+            "UPDATE scan_runtime_leases \
+             SET state = 'released', released_at_ms = MAX(?2, release_started_at_ms) \
+             WHERE scan_run_id = ?1 AND state = 'releasing'",
             params![guard.scan_run_id(), now_ms],
         )?;
         if changed != 1 {

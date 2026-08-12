@@ -246,7 +246,19 @@ fn reopen_invalidates_live_guard_and_honours_pending_cancel(
 
     let mut reopened = Store::open_existing(&database)?;
     let stale_guard_error = reopened
-        .write_transaction(|repository| repository.heartbeat_runtime_lease(&runtime.lease, 200))
+        .write_transaction(|repository| {
+            repository.request_scan_control(
+                &runtime.lease,
+                &ScanControlRequestInput::new(
+                    ScanControlRequestKey::from_runtime_evidence([58; 32]),
+                    ScanControlKind::Cancel,
+                    1,
+                    1,
+                    None,
+                    200,
+                )?,
+            )
+        })
         .expect_err("a previous Store instance's lease guard remained live");
     assert!(matches!(
         stale_guard_error,
@@ -406,6 +418,69 @@ fn leased_terminal_is_atomic_and_v8_schema_tamper_fails_closed(
 }
 
 #[test]
+fn leased_terminal_release_tolerates_a_clock_rollback() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let database = temporary.path().join("clock-rollback.sqlite3");
+    let mut store = Store::open_or_create(&database)?;
+    let (guard, _job_id, core_session_id) = create_running_run(&mut store, "clock-rollback", 91)?;
+    // Acquire the lease while the wall clock reads a "future" instant, then
+    // drive the terminal transition with an earlier now_ms. The release must
+    // clamp its timestamps instead of dead-ending every terminal edge.
+    let lease = store.write_transaction(|repository| {
+        repository.bind_core_session(
+            &guard,
+            &CoreSessionInput {
+                core_session_id,
+                root_object_signature: RootObjectSignature::from_volume_adapter([14; 32]),
+                root_source_signature: SourceSignature::from_runtime_evidence([15; 32]),
+                bound_at_ms: 151,
+            },
+        )?;
+        repository.acquire_runtime_lease(
+            &guard,
+            &AcquireRuntimeLeaseInput::new(
+                RuntimeLeaseKey::from_runtime_evidence([93; 32]),
+                core_session_id,
+                1_000_000,
+            )?,
+        )
+    })?;
+    assert_eq!(
+        store.write_transaction(|repository| {
+            repository.transition_leased_scan_job_and_run(
+                &lease,
+                "running",
+                1,
+                "running",
+                1,
+                LeasedScanTerminalOutcome::Interrupted,
+                200,
+                Some(("CLOCK_ROLLBACK", "terminal transition after clock rollback")),
+            )
+        })?,
+        (2, 2)
+    );
+    store.close()?;
+
+    let connection = Connection::open(&database)?;
+    let lease_row: (String, i64, i64, i64) = connection.query_row(
+        "SELECT state, last_heartbeat_at_ms, release_started_at_ms, released_at_ms \
+         FROM scan_runtime_leases WHERE scan_run_id = ?1",
+        [guard.scan_run_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(
+        lease_row,
+        ("released".into(), 1_000_000, 1_000_000, 1_000_000)
+    );
+    drop(connection);
+
+    // The persisted ordering must satisfy every open-time lease validator.
+    Store::open_existing(&database)?.close()?;
+    Ok(())
+}
+
+#[test]
 fn reopen_rejects_an_impossible_releasing_terminal_half() -> Result<(), Box<dyn std::error::Error>>
 {
     let temporary = TempDir::new()?;
@@ -495,7 +570,7 @@ fn bound_core_cannot_write_or_finish_before_runtime_lease_acquisition(
         wrong_core_error,
         StoreError::ConcurrencyConflict { .. }
     ));
-    let lease = store.write_transaction(|repository| {
+    store.write_transaction(|repository| {
         repository.acquire_runtime_lease(
             &guard,
             &AcquireRuntimeLeaseInput::new(
@@ -509,7 +584,6 @@ fn bound_core_cannot_write_or_finish_before_runtime_lease_acquisition(
         repository.record_core_directory_batch(&guard, &core_session_id, &[observation])
     })?;
     assert_eq!(ids.len(), 1);
-    store.write_transaction(|repository| repository.heartbeat_runtime_lease(&lease, 190))?;
     Ok(())
 }
 
@@ -520,7 +594,7 @@ fn first_core_batch_can_bind_acquire_and_record_atomically(
     let mut store = Store::open_or_create(temporary.path().join("first-batch.sqlite3"))?;
     let (guard, _, core_session_id) = create_running_run(&mut store, "first-batch", 77)?;
     let observation = directory_ticket("atomic-first", 78, vec![1, 4, 9]);
-    let (lease, ids) = store.write_transaction(|repository| {
+    let (_lease, ids) = store.write_transaction(|repository| {
         repository.bind_core_session(
             &guard,
             &CoreSessionInput {
@@ -543,7 +617,6 @@ fn first_core_batch_can_bind_acquire_and_record_atomically(
         Ok((lease, ids))
     })?;
     assert_eq!(ids.len(), 1);
-    store.write_transaction(|repository| repository.heartbeat_runtime_lease(&lease, 300))?;
     Ok(())
 }
 

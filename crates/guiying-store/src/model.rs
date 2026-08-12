@@ -232,7 +232,19 @@ impl MountSessionKey {
     }
 }
 
-/// Capability/session proof required by every v5 run-scoped write.
+/// Caller-supplied consistency assertion required by every v5 run-scoped
+/// write.
+///
+/// This is deliberately not an unforgeable capability: all fields are public
+/// so the trusted in-process runtime adapter can construct it, and any code
+/// that knows the ids could do the same. The actual enforcement happens in
+/// the repository, which re-checks every guard against the current database
+/// state (`validate_v5_bound_run_guard`): the run must exist, be bound to
+/// exactly this capability profile and mount-session key, and be in the
+/// state the operation requires. A mismatched or stale guard is rejected;
+/// a matching guard proves agreement with the database, not authority over
+/// it. Contrast `TimeEvidenceGuard` and `RuntimeLeaseGuard`, whose private
+/// store-instance binding cannot be reconstructed outside this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunEvidenceGuard {
     pub scan_run_id: i64,

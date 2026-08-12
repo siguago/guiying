@@ -137,11 +137,13 @@ pub(crate) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<()> {
     validate_runtime_invariants(connection, current_version)?;
     crate::repository::validate_capability_profile_hashes(connection, current_version)?;
 
+    let mut applied_migration = false;
     for migration in MIGRATIONS
         .iter()
         .filter(|item| item.version > current_version)
     {
         apply_migration(connection, migration, now_ms, false)?;
+        applied_migration = true;
     }
 
     let final_version = read_user_version(connection)?;
@@ -151,8 +153,15 @@ pub(crate) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<()> {
         )));
     }
     validate_registry(&read_registry(connection)?)?;
-    validate_runtime_invariants(connection, final_version)?;
-    crate::repository::validate_capability_profile_hashes(connection, final_version)
+    // The entry pass above already validated this exact data. Re-running the
+    // whole-database invariant and capability-hash walk is only meaningful
+    // after a migration changed the schema or rows; an already-current
+    // database is validated exactly once per `migrate` call.
+    if applied_migration {
+        validate_runtime_invariants(connection, final_version)?;
+        crate::repository::validate_capability_profile_hashes(connection, final_version)?;
+    }
+    Ok(())
 }
 
 /// Invalidates process-local scan sessions whenever an existing database is
@@ -594,7 +603,25 @@ pub(crate) fn validate_current_schema(connection: &Connection) -> Result<()> {
     crate::repository::validate_capability_profile_hashes(connection, version)
 }
 
+#[cfg(test)]
+thread_local! {
+    static RUNTIME_INVARIANT_VALIDATION_COUNT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_runtime_invariant_validation_count() {
+    RUNTIME_INVARIANT_VALIDATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_runtime_invariant_validation_count() -> u64 {
+    RUNTIME_INVARIANT_VALIDATION_COUNT.with(std::cell::Cell::get)
+}
+
 fn validate_runtime_invariants(connection: &Connection, version: i64) -> Result<()> {
+    #[cfg(test)]
+    RUNTIME_INVARIANT_VALIDATION_COUNT.with(|count| count.set(count.get() + 1));
     reject_if_exists(
         connection,
         "SELECT EXISTS( \
@@ -4760,6 +4787,41 @@ mod tests {
         validate_current_schema(&connection)?;
         connection.execute_batch("DROP TRIGGER trg_capture_time_recommendations_no_update_v7;")?;
         assert!(validate_current_schema(&connection).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_validates_a_current_database_once_and_still_fails_closed() -> crate::Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+
+        super::reset_test_runtime_invariant_validation_count();
+        migrate(&mut connection, 1_000)?;
+        // A fresh database runs the entry pass plus the mandatory post-apply pass.
+        assert_eq!(super::test_runtime_invariant_validation_count(), 2);
+
+        super::reset_test_runtime_invariant_validation_count();
+        migrate(&mut connection, 1_001)?;
+        // Zero pending migrations: exactly one whole-database validation pass.
+        assert_eq!(super::test_runtime_invariant_validation_count(), 1);
+
+        // That single pass still fails closed on a broken runtime invariant.
+        connection.execute_batch("DROP TRIGGER trg_volumes_identity_insert_guard_v4;")?;
+        connection.execute_batch(
+            "INSERT INTO volumes ( \
+                 id, identity_key, identity_strength, filesystem_type, is_network, \
+                 is_read_only, first_seen_at_ms, last_seen_at_ms, created_at_ms, updated_at_ms \
+             ) VALUES (900, 'strong-without-uuid', 'strong', 'apfs', 0, 1, 1, 1, 1, 1);",
+        )?;
+        super::reset_test_runtime_invariant_validation_count();
+        let tampered = migrate(&mut connection, 1_002)
+            .expect_err("a strong volume without identity evidence was accepted");
+        assert!(matches!(
+            tampered,
+            crate::StoreError::MigrationHistoryMismatch(ref reason)
+                if reason.contains("strong-identity")
+        ));
+        assert_eq!(super::test_runtime_invariant_validation_count(), 1);
         Ok(())
     }
 
