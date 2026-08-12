@@ -1045,7 +1045,7 @@ verified groups、members 与 scan issues，不含拍摄时间明细、raw metad
 - 历史 catalog 的 `(finished_at_ms, run_id)` 当前没有专用 schema 索引；现实扫描次数下可接受，但大规模历史分页仍是后续 schema 性能债，不能通过取消查询预算来放宽安全检查。
 - EvidenceReader 首开会在 64 GiB 文件族/逻辑上限内执行 quick/FK 与完整 manifest 重算，目前没有 wall-clock deadline、取消或进度回调；它不复制整库到内存，但损坏或超大私有数据库仍可能造成较长首开延迟。
 - app-data 进程锁与 SQLite 身份已做 owner/mode/nlink、NOFOLLOW 和路径前后复核，但还不是目录 handle/openat 到 SQLite 已开句柄的全链绑定；同 UID 恶意路径替换属于后续本机硬化，当前依赖 0700 私有目录和单实例所有权。
-- Windows Store 的既有数据库读取仍 fail closed，desktop runtime-lock 也没有原生 Windows CI；项目保持 macOS-first，不能把交叉编译或离线 Windows 路径模型宣传成可用后端。
+- Windows Store 的既有数据库读取仍 fail closed；desktop runtime-lock 的 Windows 分支只有 `cargo check` 编译门禁，卷序列号、file index 与硬链接数改由 `GetFileInformationByHandle` 读取（std 的 by-handle 访问器仍是 nightly 特性），路径一侧为此单独开句柄，链接数不再有“读不到就放行”的余地。这些分支没有任何原生 Windows 运行时测试；项目保持 macOS-first，不能把交叉编译或离线 Windows 路径模型宣传成可用后端。
 - pause checkpoint 不支持跨进程恢复；窗口退出、进程重启或挂载变化后必须取消/中断当前 run。v9 fresh child 只保留血缘并从根全量扫描；自动化门禁已通过，但它不证明同一物理介质，真实外置卷矩阵仍待验证。
 - 历史导出 v1 不含拍摄时间明细、raw metadata 或 locator；非 Unix 发布在具备等价目录句柄与 no-replace 证明前 fail closed。
 - Phase 1 不创建隔离目录、不修改照片时间、不移动或删除照片；M2 写能力必须另行设计、

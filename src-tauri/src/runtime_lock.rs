@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -277,20 +279,21 @@ fn validate_runtime_lock_file(file: &File, path: &Path) -> Result<(), RuntimeLoc
                 "进程锁不能是Windows重解析点",
             ));
         }
-        if handle_metadata.volume_serial_number() != path_metadata.volume_serial_number()
-            || handle_metadata.file_index() != path_metadata.file_index()
+        // The by-handle identity accessors on std's Windows Metadata are still
+        // unstable, so read the same fields through GetFileInformationByHandle.
+        // The path side needs its own handle: only a handle can report volume
+        // serial, file index, and link count on stable.
+        let handle_identity = read_windows_lock_identity(file, "检查应用进程锁句柄")?;
+        let path_handle = open_runtime_lock_path_identity_handle(path)?;
+        let path_identity = read_windows_lock_identity(&path_handle, "检查应用进程锁路径")?;
+        if handle_identity.volume_serial != path_identity.volume_serial
+            || handle_identity.file_index != path_identity.file_index
         {
             return Err(RuntimeLockError::InvalidAppDataDirectory(
                 "进程锁路径在打开期间发生替换",
             ));
         }
-        if handle_metadata
-            .number_of_links()
-            .is_some_and(|links| links != 1)
-            || path_metadata
-                .number_of_links()
-                .is_some_and(|links| links != 1)
-        {
+        if handle_identity.number_of_links != 1 || path_identity.number_of_links != 1 {
             return Err(RuntimeLockError::InvalidAppDataDirectory(
                 "进程锁不能存在硬链接别名",
             ));
@@ -298,6 +301,55 @@ fn validate_runtime_lock_file(file: &File, path: &Path) -> Result<(), RuntimeLoc
     }
 
     Ok(())
+}
+
+/// Identity fields Windows only exposes through an open handle.
+#[cfg(windows)]
+struct WindowsLockIdentity {
+    volume_serial: u32,
+    file_index: u64,
+    number_of_links: u32,
+}
+
+#[cfg(windows)]
+fn open_runtime_lock_path_identity_handle(path: &Path) -> Result<File, RuntimeLockError> {
+    // Reparse points stay unfollowed here for the same reason the lock itself
+    // is opened that way: a swapped path must be reported, not silently
+    // resolved to whatever it now points at.
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| RuntimeLockError::io("检查应用进程锁路径", source))
+}
+
+#[cfg(windows)]
+fn read_windows_lock_identity(
+    handle: &File,
+    operation: &'static str,
+) -> Result<WindowsLockIdentity, RuntimeLockError> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the handle outlives the call and the OS fully initializes the
+    // structure whenever it reports success.
+    let succeeded = unsafe {
+        GetFileInformationByHandle(handle.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(RuntimeLockError::io(operation, io::Error::last_os_error()));
+    }
+    // SAFETY: the call above reported success, so the structure is initialized.
+    let information = unsafe { information.assume_init() };
+    Ok(WindowsLockIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        number_of_links: information.nNumberOfLinks,
+    })
 }
 
 #[cfg(test)]
