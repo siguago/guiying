@@ -1161,7 +1161,12 @@ test('historical reports are paged, opened with a read token, and revoked on ret
 
 test('a late history-open response cannot restore an exited view or retain its token', async ({ page }) => {
   await page.addInitScript(() => {
-    const fixture = { openCalls: 0, closes: 0 }
+    // The open response stays parked until the test releases it, so the
+    // "late response" window is bounded by the test rather than by a timer
+    // the runner has to beat. A wall-clock delay made this race depend on how
+    // fast the machine repaints the history view.
+    let releaseOpen: () => void = () => undefined
+    const fixture = { openCalls: 0, closes: 0, releaseOpen: () => releaseOpen() }
     const historyItem = {
       historyEntryId: '9', rootDisplay: 'Archive/Late', scanMode: 'full',
       startedAtUnixMs: '1000', finishedAtUnixMs: '2000', durationMs: '1000',
@@ -1186,7 +1191,9 @@ test('a late history-open response cannot restore an exited view or retain its t
           }
           if (command === 'open_scan_history') {
             fixture.openCalls += 1
-            await new Promise((resolve) => window.setTimeout(resolve, 120))
+            await new Promise<void>((resolve) => {
+              releaseOpen = resolve
+            })
             return {
               schemaVersion: 1,
               historyEntryId: '9',
@@ -1214,6 +1221,11 @@ test('a late history-open response cannot restore an exited view or retain its t
   ).__LATE_HISTORY_FIXTURE__.openCalls)).toBe(1)
   await page.getByRole('button', { name: '返回扫描入口' }).click()
   await expect(page.getByRole('heading', { name: /先看证据/ })).toBeVisible()
+  // Only now does the open response land, so it is unambiguously later than
+  // the exit rather than merely likely to be.
+  await page.evaluate(() => (
+    window as unknown as Window & { __LATE_HISTORY_FIXTURE__: { releaseOpen: () => void } }
+  ).__LATE_HISTORY_FIXTURE__.releaseOpen())
   await expect.poll(async () => page.evaluate(() => (
     window as unknown as Window & { __LATE_HISTORY_FIXTURE__: { closes: number } }
   ).__LATE_HISTORY_FIXTURE__.closes)).toBe(1)
