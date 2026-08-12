@@ -4,12 +4,31 @@
 | --- | --- |
 | 文档状态 | Living document |
 | 版本 | 0.1 |
-| 最近更新 | 2026-08-11 |
+| 最近更新 | 2026-08-12 |
 
-## 当前实施快照（2026-08-11）
+## 当前实施快照（2026-08-12）
 
-- 已完成：产品/安全/文件系统/数据模型规范、设计系统与桌面证据界面、无主动变更的内存扫描核心、完整 BLAKE3 后逐字节 D1 定案、根句柄路径保护、版本化报告、SQLite 安全迁移与自动化门禁。
-- 正在进入：Phase 1 的持久化索引、暂停/续扫、真实外置卷矩阵与基础时间元数据提取。
+- 深评修复轮已落地：metadata 的 `meta` box 支持 ISO/QuickTime 双方言并新增 HEIC/HEIF
+  有界 Exif item 提取（construction_method 0、单 extent，其余 fail closed），结构性解析
+  错误按区域隔离、Partial 状态可达，iPhone .mov 与 HEIC 的时间证据链路打通；time 对同
+  优先级跨精度近值强制歧义复核；core 流式枚举改为会话级全局目录身份去重、完整哈希按声明
+  长度封顶、票据 MAC 常数时间比较、抽样域串升 v2、blake3 恢复 SIMD；store 消除零迁移时的
+  冗余全库校验遍、封堵 fresh-attempt 选择器的投毒绕过、移除无消费者的 lease 心跳 API 并使
+  终态释放对时钟回拨鲁棒；桌面端进度事件不再携带文件路径、根授权响应披露服务端权威过期
+  时刻并在界面禁用过期启动、IPC 镜像常量收敛为单一契约文件并由双侧门禁互锁、CSP 移除未
+  启用的 asset 允许项；Playwright 增加 WebKit 引擎全量执行，CI 新增 Windows 桌面壳编译
+  检查与七个 lockfile 的供应链审计。单扫描互斥的精确边界（进程锁提供产品级独占、库级
+  reconcile 无条件收敛）已在 Phase 1 运行时文档中明示。
+
+- 已完成：产品/安全/文件系统/数据模型规范、设计系统与桌面证据界面、无主动变更的流式扫描核心、完整 BLAKE3 后逐字节 D1 定案、根句柄路径保护、枚举阶段可同进程暂停/继续且可取消的单任务桌面运行时、SQLite 安全迁移与自动化门禁。
+- 已完成基础层：有硬预算、路径无关、保留原始字节与定位符的 EXIF/TIFF/QuickTime 时间字段提取；所有结果均为未验证原始证据，不会直接升级为可信拍摄时间。
+- Phase 1 的 D1 主链与历史只读入口已接通：core 的不可构造读取证明、volume 的 descriptor/mount 复核、Store 的 session-bound 不可变观察与阶段封印由唯一 runtime 适配；历史 catalog 受 owner-window 有界门控制，详细证据只通过窗口绑定 result token 读取有界游标页，不传整库报告，也不把封存路径当作当前权限。
+- 已完成重复成员的文件系统 birth/mtime 展示并保留卷精度未知状态；它们明确是低可信线索，不冒充拍摄时间。
+- 已完成 [拍摄时间证据契约](./engineering/CAPTURE_TIME_EVIDENCE.md)的只读主链：descriptor-bound 双重 metadata 提取、时间策略与原始证据封印、候选/成员/问题分页，以及报告→字段→单字段原始字节的三级懒加载复核。keeper、time donor 与任何写授权均保持为空或关闭。
+- 已实现同一进程、同一次打开期间的枚举暂停/继续：v8 Store 保存 append-only 审计 checkpoint、runtime lease 和持久控制请求，但 checkpoint 不恢复 descriptor、目录 walker 或文件系统权限。窗口退出、进程重启或挂载变化会取消/中断当前 run，暂停仍不可跨进程继续。
+- v9 fresh-attempt 已接入并通过自动化门禁：用户重新选择根后，只有同一逻辑文件系统 UUID、精确原生根字节和完全相同配置的唯一合格候选，才在同一 job 下建立 `fresh_full_child_v1`。子 attempt 使用全新 volume/core/mount session 和 lease，并从根开始全量重扫；它不恢复 fd/cursor/checkpoint/token，也不继承父 run 的 observation/fingerprint/group/seal，不证明同一物理盘或目录对象。候选为零或有歧义时建立独立 `initial_full_v1` job。
+- 已实现历史只读 JSON/CSV 导出：范围为 `summary` 或仅含 D1 摘要、确定重复组、成员及扫描问题的 `complete_evidence`；默认脱敏，可显式选择 display 投影，不导出拍摄时间明细、raw metadata 或 locator。Unix 以目录句柄和 no-replace 发布，非 Unix 当前 fail closed。
+- 仍在后续门槛中：掉盘重连完整体验和真实 APFS/HFS+/exFAT 外置卷的拔插、重挂、同名替换及克隆 UUID 矩阵；自动化临时卷测试不能替代真实介质验收。
 - 尚未开放：任何时间写入、隔离、恢复或永久清理。相关 SQL 只是一份受测试的安全契约，不是可执行写能力。
 - 本轮复核记录：[engineering/M0_REVIEW.md](./engineering/M0_REVIEW.md)。
 
@@ -75,7 +94,7 @@
 
 - 扫描根选择、重叠目录去重、挂载边界与默认排除；
 - 流水线：大小分桶、分段快速指纹、流式 BLAKE3；
-- 本机 SQLite 增量索引、暂停/继续、掉盘等待与重新识别；
+- 本机 SQLite 增量索引、同进程枚举暂停/继续；跨进程或重新挂载后必须重新授权根，唯一精确候选只建立同 job 的新全量 child attempt，零/歧义候选建立独立 initial job；
 - D1 重复组、路径/大小/时间对比和 keeper 建议；
 - 基础 EXIF/QuickTime/sidecar 时间提取，原始值与置信度留档；
 - 只读卷信息与未经写探测的风险提示；
@@ -87,7 +106,7 @@
 - 基准语料 D1 召回率和准确率 100%；
 - 文件名、时间或快速指纹碰撞不会产生 D1；
 - 旋转硬盘与 SSD 上均无失控并发，单文件内存使用为常数级；
-- 重启、暂停、重新插入原卷可安全续扫；同名替换卷不能复用索引；
+- 同进程暂停/继续不丢失或越权提升证据；v9 fresh-attempt 必须证明新 session/全量起点、旧证据不复用、零/歧义候选 fail closed；重新插入逻辑卷与替换介质路径仍需通过真实介质门禁；
 - 损坏媒体只影响自身解析，不影响哈希主进程；
 - 用户可完整理解 keeper 建议和 time donor 建议是两个决策；
 - 发布为 Preview Read-only。

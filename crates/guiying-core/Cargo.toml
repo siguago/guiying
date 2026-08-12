@@ -4,11 +4,18 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.77.2"
 description = "Read-only duplicate media scanner for Guiying"
-license = "MIT OR Apache-2.0"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/siguago/guiying"
+publish = false
 
 [dependencies]
 base64 = "0.23.1"
-blake3 = "1.8.6"
+# BLAKE3 output is implementation independent, so the default SIMD/NEON
+# backends are used for large-media throughput instead of the pure-Rust
+# fallback that the `pure` feature would force.
+blake3 = "=1.5.5"
+getrandom = "=0.3.4"
 libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
@@ -16,7 +23,7 @@ thiserror = "2.0.20"
 [dev-dependencies]
 filetime = "0.2.29"
 serde_json = "1.0.151"
-tempfile = "3.27.0"
+tempfile = "=3.15.0"
 
 [target."cfg(unix)".dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }

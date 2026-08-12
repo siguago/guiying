@@ -1,5 +1,5 @@
-归影 Tauri debug bundle 构建
-时间：2026-08-11T00:16:19+08:00
+归影 Tauri debug bundle 历史记录（非本轮证据）
+时间：2026-08-11T17:43:13+08:00
 环境：Tauri CLI 2.11.4; Rust 1.92.0; macOS arm64
 
 命令：pnpm exec tauri build --debug
@@ -7,8 +7,13 @@
 
 结果：
 - beforeBuildCommand 的 TypeScript + Vite build 通过。
-- Rust dev profile 构建通过。
-- 生成 src-tauri/target/debug/bundle/macos/归影.app。
-- 生成 src-tauri/target/debug/bundle/dmg/归影_0.1.0_aarch64.dmg。
+- Rust dev profile 构建、Tauri command codegen 与链接通过。
+- command 面包含原生 root token、扫描控制、历史 catalog/open/close、重复与时间证据分页；没有 legacy
+  scan_directory，也没有移动、重命名、改时、删除、shell、HTTP 或 WebView 路径读取命令。
+- 生成 src-tauri/target/debug/bundle/macos/归影.app（约 43 MiB）。
+- 生成 src-tauri/target/debug/bundle/dmg/归影_0.1.0_aarch64.dmg（约 11 MiB）。
 
-说明：此前一次 `pnpm tauri:build -- --debug` 将参数错误转发给 cargo 并失败；已改为上面的 Tauri CLI 正确语法并完整通过。
+说明：这份日志只记录 17:43 的旧树，早于后续 result token、同进程暂停/继续与历史 JSON/CSV 导出变更。
+旧可重建 target、bundle、dist 和测试缓存已按磁盘治理删除。本轮只完成 Tauri cargo
+check/test/strict clippy/rustdoc/fmt，没有执行 bundle；因此本文件不映射为当前 `qa-evidence.json` 的构建
+通过证据，也不证明当前树存在 `.app` 或 `.dmg`。

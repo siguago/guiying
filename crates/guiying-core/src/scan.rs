@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::compare::compare_bound_files_exact;
 use crate::directory_io::{
-    BindDirectoryError, BindFileError, BoundDirectory, BoundFile, EntryKind,
+    BindDirectoryError, BindFileError, BoundDirectory, BoundDirectoryAudit, BoundFile, EntryKind,
 };
 use crate::error::{ScanError, VerificationError};
 use crate::file_io::{snapshot_path, FileSnapshot, StableOpenError};
@@ -19,15 +20,48 @@ use crate::model::{
 
 const MAX_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_READ_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DIRECTORY_DEPTH: u16 = 512;
 
-/// Observer and cancellation interface used by long-running scans and exact
-/// verification. Implementations must keep callbacks quick and non-blocking.
+/// Cooperative instruction observed at bounded scan safe points.
+///
+/// `Pause` is resumable only for APIs that explicitly document resumability.
+/// It must never be treated as cancellation or as terminal evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanDirective {
+    Continue,
+    Pause,
+    Cancel,
+}
+
+/// Observer and cooperative-control interface used by long-running scans and
+/// exact verification. Implementations must keep callbacks quick and
+/// non-blocking.
 pub trait ScanControl: Send + Sync {
     fn is_cancelled(&self) -> bool {
         false
     }
 
+    /// Returns the instruction to apply at the next safe point.
+    ///
+    /// Legacy cancellation is resolved by the internal effective-directive
+    /// path before this method is consulted. Keeping this default side-effect
+    /// free avoids polling an existing `is_cancelled` implementation twice at
+    /// one safe point.
+    fn directive(&self) -> ScanDirective {
+        ScanDirective::Continue
+    }
+
     fn on_progress(&self, _progress: &ScanProgress) {}
+}
+
+/// Resolves legacy cancellation and the tri-state directive through one
+/// fail-closed path. A legacy cancellation bit always wins over `Pause`.
+pub(crate) fn effective_scan_directive(control: &dyn ScanControl) -> ScanDirective {
+    if control.is_cancelled() {
+        ScanDirective::Cancel
+    } else {
+        control.directive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -90,6 +124,11 @@ impl Scanner {
                 "read_buffer_bytes must be in 1..={MAX_READ_BUFFER_BYTES}"
             )));
         }
+        if options.max_directory_depth == 0 || options.max_directory_depth > MAX_DIRECTORY_DEPTH {
+            return Err(ScanError::InvalidOption(format!(
+                "max_directory_depth must be in 1..={MAX_DIRECTORY_DEPTH}"
+            )));
+        }
 
         options.media_extensions = normalize_values(options.media_extensions, true);
         options.excluded_directory_names =
@@ -147,10 +186,11 @@ impl Scanner {
         let mut stats = ScanStats::default();
         let mut seen_paths = BTreeSet::new();
         let mut visited_directory_ids = BTreeSet::<FileId>::new();
+        let mut directory_audits = Vec::<BoundDirectoryAudit>::new();
         let mut enumeration_completed = 0_u64;
 
         for root in &root_sessions {
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 return Ok(finish_report(
                     roots,
                     scanned,
@@ -163,15 +203,10 @@ impl Scanner {
 
             if root.is_directory {
                 if let Some(reason) = self.options.directory_exclusion(&root.path) {
-                    stats.excluded_directories_skipped =
-                        stats.excluded_directories_skipped.saturating_add(1);
-                    push_issue(
-                        &mut issues,
-                        ScanIssueCode::DirectoryExcluded,
-                        root.path.clone(),
+                    return Err(ScanError::ExcludedRoot {
+                        path: root.path.clone(),
                         reason,
-                    );
-                    continue;
+                    });
                 }
 
                 let bound_root = match BoundDirectory::bind_root(root.path.clone(), &root.snapshot)
@@ -198,10 +233,29 @@ impl Scanner {
                     continue;
                 }
                 let root_device = root.snapshot.device();
-                let mut directories = vec![bound_root];
+                directory_audits.push(bound_root.audit());
+                let mut bound_root = bound_root;
+                let mut root_names = match bound_root.read_names() {
+                    Ok(names) => names,
+                    Err(error) => {
+                        push_issue(
+                            &mut issues,
+                            ScanIssueCode::DirectoryUnreadable,
+                            bound_root.path().to_path_buf(),
+                            error.to_string(),
+                        );
+                        continue;
+                    }
+                };
+                root_names.sort();
+                let mut directories = vec![DirectoryFrame {
+                    directory: bound_root,
+                    names: root_names,
+                    depth: 0,
+                }];
 
-                while let Some(mut directory) = directories.pop() {
-                    if control.is_cancelled() {
+                while let Some(mut frame) = directories.pop() {
+                    if effective_scan_directive(control) == ScanDirective::Cancel {
                         return Ok(finish_report(
                             roots,
                             scanned,
@@ -212,82 +266,84 @@ impl Scanner {
                         ));
                     }
 
-                    let mut names = match directory.read_names() {
-                        Ok(names) => names,
+                    let Some(name) = frame.names.pop() else {
+                        continue;
+                    };
+                    let path = frame.directory.path().join(&name);
+                    if !seen_paths.insert(path.clone()) {
+                        directories.push(frame);
+                        continue;
+                    }
+                    stats.entries_seen = stats.entries_seen.saturating_add(1);
+                    enumeration_completed = enumeration_completed.saturating_add(1);
+                    emit_progress(
+                        control,
+                        ProgressStage::Enumerating,
+                        enumeration_completed,
+                        None,
+                        Some(&path),
+                    );
+                    if effective_scan_directive(control) == ScanDirective::Cancel {
+                        return Ok(finish_report(
+                            roots,
+                            scanned,
+                            Vec::new(),
+                            issues,
+                            stats,
+                            ScanStatus::Cancelled,
+                        ));
+                    }
+
+                    let kind = match frame.directory.entry_kind(&name) {
+                        Ok(kind) => kind,
                         Err(error) => {
                             push_issue(
                                 &mut issues,
-                                ScanIssueCode::DirectoryUnreadable,
-                                directory.path().to_path_buf(),
+                                ScanIssueCode::MetadataUnreadable,
+                                path,
                                 error.to_string(),
                             );
+                            directories.push(frame);
                             continue;
                         }
                     };
-                    names.sort_by(|left, right| right.cmp(left));
+                    let mut child_to_visit = None;
+                    let child_depth = frame.depth.saturating_add(1);
 
-                    for name in names {
-                        let path = directory.path().join(&name);
-                        if !seen_paths.insert(path.clone()) {
-                            continue;
+                    match kind {
+                        EntryKind::Symlink => {
+                            stats.symlinks_skipped = stats.symlinks_skipped.saturating_add(1);
+                            push_issue(
+                                &mut issues,
+                                ScanIssueCode::SymlinkSkipped,
+                                path,
+                                "symbolic links are never followed".to_owned(),
+                            );
                         }
-                        stats.entries_seen = stats.entries_seen.saturating_add(1);
-                        enumeration_completed = enumeration_completed.saturating_add(1);
-                        emit_progress(
-                            control,
-                            ProgressStage::Enumerating,
-                            enumeration_completed,
-                            None,
-                            Some(&path),
-                        );
-                        if control.is_cancelled() {
-                            return Ok(finish_report(
-                                roots,
-                                scanned,
-                                Vec::new(),
-                                issues,
-                                stats,
-                                ScanStatus::Cancelled,
-                            ));
-                        }
-
-                        let kind = match directory.entry_kind(&name) {
-                            Ok(kind) => kind,
-                            Err(error) => {
+                        EntryKind::Directory => {
+                            if let Some(reason) = self.options.directory_exclusion(&path) {
+                                stats.excluded_directories_skipped =
+                                    stats.excluded_directories_skipped.saturating_add(1);
                                 push_issue(
                                     &mut issues,
-                                    ScanIssueCode::MetadataUnreadable,
+                                    ScanIssueCode::DirectoryExcluded,
                                     path,
-                                    error.to_string(),
+                                    reason,
                                 );
-                                continue;
-                            }
-                        };
-
-                        match kind {
-                            EntryKind::Symlink => {
-                                stats.symlinks_skipped = stats.symlinks_skipped.saturating_add(1);
+                            } else if child_depth > self.options.max_directory_depth {
+                                stats.directory_depth_limit_skipped =
+                                    stats.directory_depth_limit_skipped.saturating_add(1);
                                 push_issue(
                                     &mut issues,
-                                    ScanIssueCode::SymlinkSkipped,
+                                    ScanIssueCode::DirectoryDepthLimitReached,
                                     path,
-                                    "symbolic links are never followed".to_owned(),
+                                    format!(
+                                        "directory depth {child_depth} exceeds the configured safe limit {}",
+                                        self.options.max_directory_depth
+                                    ),
                                 );
-                            }
-                            EntryKind::Directory => {
-                                if let Some(reason) = self.options.directory_exclusion(&path) {
-                                    stats.excluded_directories_skipped =
-                                        stats.excluded_directories_skipped.saturating_add(1);
-                                    push_issue(
-                                        &mut issues,
-                                        ScanIssueCode::DirectoryExcluded,
-                                        path,
-                                        reason,
-                                    );
-                                    continue;
-                                }
-
-                                match directory.bind_child(&name, path.clone()) {
+                            } else {
+                                match frame.directory.bind_child(&name, path.clone()) {
                                     Ok(child) => {
                                         if self.options.stay_on_filesystem
                                             && root_device.is_some()
@@ -303,15 +359,13 @@ impl Scanner {
                                                 "nested filesystem is outside the scan root volume"
                                                     .to_owned(),
                                             );
-                                        } else if !accept_directory_identity(
+                                        } else if accept_directory_identity(
                                             &child,
                                             &mut visited_directory_ids,
                                             &mut issues,
                                             &mut stats,
                                         ) {
-                                            continue;
-                                        } else {
-                                            directories.push(child);
+                                            child_to_visit = Some(child);
                                         }
                                     }
                                     Err(error) => push_directory_binding_issue(
@@ -322,14 +376,10 @@ impl Scanner {
                                     ),
                                 }
                             }
-                            EntryKind::RegularFile => {
-                                let Some(media_kind) = self.options.media_kind(&path) else {
-                                    stats.non_media_files_skipped =
-                                        stats.non_media_files_skipped.saturating_add(1);
-                                    continue;
-                                };
-
-                                match directory.bind_regular_file(&name, path.clone()) {
+                        }
+                        EntryKind::RegularFile => {
+                            if let Some(media_kind) = self.options.media_kind(&path) {
+                                match frame.directory.bind_regular_file(&name, path.clone()) {
                                     Ok(bound_file) => {
                                         if self.options.stay_on_filesystem
                                             && root_device.is_some()
@@ -357,17 +407,41 @@ impl Scanner {
                                     }
                                     Err(error) => push_file_binding_issue(&mut issues, path, error),
                                 }
+                            } else {
+                                stats.non_media_files_skipped =
+                                    stats.non_media_files_skipped.saturating_add(1);
                             }
-                            EntryKind::Other => {
-                                stats.special_files_skipped =
-                                    stats.special_files_skipped.saturating_add(1);
-                                push_issue(
-                                    &mut issues,
-                                    ScanIssueCode::UnsupportedFileType,
-                                    path,
-                                    "only regular files are scanned".to_owned(),
-                                );
+                        }
+                        EntryKind::Other => {
+                            stats.special_files_skipped =
+                                stats.special_files_skipped.saturating_add(1);
+                            push_issue(
+                                &mut issues,
+                                ScanIssueCode::UnsupportedFileType,
+                                path,
+                                "only regular files are scanned".to_owned(),
+                            );
+                        }
+                    }
+
+                    directories.push(frame);
+                    if let Some(mut child) = child_to_visit {
+                        directory_audits.push(child.audit());
+                        match child.read_names() {
+                            Ok(mut names) => {
+                                names.sort();
+                                directories.push(DirectoryFrame {
+                                    directory: child,
+                                    names,
+                                    depth: child_depth,
+                                });
                             }
+                            Err(error) => push_issue(
+                                &mut issues,
+                                ScanIssueCode::DirectoryUnreadable,
+                                child.path().to_path_buf(),
+                                error.to_string(),
+                            ),
                         }
                     }
                 }
@@ -421,7 +495,7 @@ impl Scanner {
                 Some(sample_total),
                 Some(&path),
             );
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 return Ok(finish_report(
                     roots,
                     scanned,
@@ -468,7 +542,7 @@ impl Scanner {
                 Some(full_total),
                 Some(&path),
             );
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 return Ok(finish_report(
                     roots,
                     scanned,
@@ -504,30 +578,66 @@ impl Scanner {
             }
         }
 
-        let mut groups =
-            match build_exact_duplicate_groups(&scanned, control, &mut issues, &mut stats) {
-                Ok(groups) => groups,
-                Err(ExactBuildError::Cancelled) => {
-                    return Ok(finish_report(
-                        roots,
-                        scanned,
-                        Vec::new(),
-                        issues,
-                        stats,
-                        ScanStatus::Cancelled,
-                    ));
-                }
-            };
-
-        emit_progress(
+        let mut groups = match build_exact_duplicate_groups(
+            &scanned,
+            self.read_buffer_bytes,
             control,
-            ProgressStage::Complete,
-            scanned.len() as u64,
-            Some(scanned.len() as u64),
-            None,
-        );
-        let roots_stable = revalidate_roots(&root_sessions, &mut issues);
-        let status = if roots_stable {
+            &mut issues,
+            &mut stats,
+        ) {
+            Ok(groups) => groups,
+            Err(ExactBuildError::Cancelled) => {
+                return Ok(finish_report(
+                    roots,
+                    scanned,
+                    Vec::new(),
+                    issues,
+                    stats,
+                    ScanStatus::Cancelled,
+                ));
+            }
+        };
+
+        let Some(directories_stable) =
+            revalidate_directories(&directory_audits, &mut issues, control)
+        else {
+            return Ok(finish_report(
+                roots,
+                scanned,
+                Vec::new(),
+                issues,
+                stats,
+                ScanStatus::Cancelled,
+            ));
+        };
+        let Some(roots_stable) = revalidate_roots(&root_sessions, &mut issues, control) else {
+            return Ok(finish_report(
+                roots,
+                scanned,
+                Vec::new(),
+                issues,
+                stats,
+                ScanStatus::Cancelled,
+            ));
+        };
+        if effective_scan_directive(control) == ScanDirective::Cancel {
+            return Ok(finish_report(
+                roots,
+                scanned,
+                Vec::new(),
+                issues,
+                stats,
+                ScanStatus::Cancelled,
+            ));
+        }
+        let status = if roots_stable && directories_stable {
+            emit_progress(
+                control,
+                ProgressStage::Complete,
+                scanned.len() as u64,
+                Some(scanned.len() as u64),
+                None,
+            );
             ScanStatus::Complete
         } else {
             groups.clear();
@@ -535,6 +645,29 @@ impl Scanner {
         };
         Ok(finish_report(roots, scanned, groups, issues, stats, status))
     }
+}
+
+fn revalidate_directories(
+    directories: &[BoundDirectoryAudit],
+    issues: &mut Vec<ScanIssue>,
+    control: &dyn ScanControl,
+) -> Option<bool> {
+    let mut stable = true;
+    for directory in directories {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
+            return None;
+        }
+        if let Err(error) = directory.revalidate() {
+            stable = false;
+            push_issue(
+                issues,
+                ScanIssueCode::DirectoryChangedDuringScan,
+                directory.path().to_path_buf(),
+                format!("enumerated directory could not be revalidated: {error:?}"),
+            );
+        }
+    }
+    (effective_scan_directive(control) != ScanDirective::Cancel).then_some(stable)
 }
 
 fn normalize_values(values: BTreeSet<String>, trim_dot: bool) -> BTreeSet<String> {
@@ -582,9 +715,16 @@ fn validate_roots(roots: &[PathBuf]) -> Result<Vec<RootSession>, ScanError> {
     Ok(sessions)
 }
 
-fn revalidate_roots(root_sessions: &[RootSession], issues: &mut Vec<ScanIssue>) -> bool {
+fn revalidate_roots(
+    root_sessions: &[RootSession],
+    issues: &mut Vec<ScanIssue>,
+    control: &dyn ScanControl,
+) -> Option<bool> {
     let mut stable = true;
     for root in root_sessions {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
+            return None;
+        }
         let result = snapshot_path(&root.path);
         match result {
             Ok((metadata, snapshot))
@@ -610,7 +750,7 @@ fn revalidate_roots(root_sessions: &[RootSession], issues: &mut Vec<ScanIssue>) 
             }
         }
     }
-    stable
+    (effective_scan_directive(control) != ScanDirective::Cancel).then_some(stable)
 }
 
 fn child_device(directory: &BoundDirectory) -> Option<u64> {
@@ -685,6 +825,12 @@ struct ScannedFile {
     binding: BoundFile,
 }
 
+struct DirectoryFrame {
+    directory: BoundDirectory,
+    names: Vec<OsString>,
+    depth: u16,
+}
+
 fn candidates_by_size(scanned: &[ScannedFile]) -> Vec<usize> {
     let mut groups = BTreeMap::<u64, Vec<usize>>::new();
     for (index, file) in scanned.iter().enumerate() {
@@ -729,24 +875,20 @@ fn sample_fingerprint(
     control: &dyn ScanControl,
 ) -> Result<(String, u64), ReadHashError> {
     let (mut file, before) = binding.open_stable(expected).map_err(map_stable_open)?;
-    let chunk = (before.len.min(sample_bytes as u64)) as usize;
-    let mut offsets = vec![0_u64];
-    if before.len > chunk as u64 {
-        offsets.push(before.len / 2 - chunk as u64 / 2);
-        offsets.push(before.len - chunk as u64);
-    }
-    offsets.sort_unstable();
-    offsets.dedup();
+    let (chunk, offsets) = sample_layout(before.len, sample_bytes);
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"guiying-sample-v1\0");
+    // v2: sample windows are guaranteed disjoint since the overlapping-window
+    // fix; the domain tag version tracks that layout change so persisted v1
+    // fingerprints can never be compared as if they used the same layout.
+    hasher.update(b"guiying-sample-v2\0");
     hasher.update(&before.len.to_le_bytes());
     hasher.update(&(sample_bytes as u64).to_le_bytes());
     let mut buffer = vec![0_u8; chunk];
     let mut bytes_read = 0_u64;
 
     for offset in offsets {
-        if control.is_cancelled() {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(ReadHashError::Cancelled);
         }
         hasher.update(&offset.to_le_bytes());
@@ -763,6 +905,22 @@ fn sample_fingerprint(
     Ok((hasher.finalize().to_hex().to_string(), bytes_read))
 }
 
+/// Select at most three non-overlapping sample windows. Keeping the windows
+/// disjoint guarantees that the reported physical bytes read never exceeds
+/// the immutable file length, even when a file is only slightly larger than
+/// the configured per-window target.
+pub(crate) fn sample_layout(length: u64, sample_bytes: usize) -> (usize, Vec<u64>) {
+    let target = sample_bytes as u64;
+    if length <= target {
+        return (length as usize, vec![0]);
+    }
+    let chunk = target.min((length / 3).max(1));
+    let mut offsets = vec![0, (length - chunk) / 2, length - chunk];
+    offsets.sort_unstable();
+    offsets.dedup();
+    (chunk as usize, offsets)
+}
+
 fn full_hash(
     binding: &BoundFile,
     expected: &FileSnapshot,
@@ -772,25 +930,69 @@ fn full_hash(
     let (mut file, before) = binding.open_stable(expected).map_err(map_stable_open)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| classify_read_error(binding, &file, &before, error))?;
+    let (digest, bytes_read) = hash_reader_exact(&mut file, before.len, buffer_bytes, control)
+        .map_err(|error| match error {
+            ReadHashError::Io(error) => classify_read_error(binding, &file, &before, error),
+            other => other,
+        })?;
+
+    verify_unchanged(binding, &file, &before)?;
+    Ok((digest, bytes_read))
+}
+
+fn hash_reader_exact(
+    reader: &mut impl Read,
+    expected_len: u64,
+    buffer_bytes: usize,
+    control: &dyn ScanControl,
+) -> Result<(String, u64), ReadHashError> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; buffer_bytes];
     let mut bytes_read = 0_u64;
 
-    loop {
-        if control.is_cancelled() {
+    // Read exactly the declared length. A file that keeps growing during
+    // hashing must not turn this loop into unbounded work; the appended data
+    // is detected by the explicit EOF probe below and by the caller's
+    // post-read snapshot verification.
+    while bytes_read < expected_len {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(ReadHashError::Cancelled);
         }
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| classify_read_error(binding, &file, &before, error))?;
+        let remaining = expected_len - bytes_read;
+        let chunk = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = match reader.read(&mut buffer[..chunk]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ReadHashError::Io(error)),
+        };
         if read == 0 {
-            break;
+            return Err(ReadHashError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("expected {expected_len} bytes, read {bytes_read}"),
+            )));
         }
         hasher.update(&buffer[..read]);
         bytes_read = bytes_read.saturating_add(read as u64);
     }
 
-    verify_unchanged(binding, &file, &before)?;
+    let mut probe = [0_u8; 1];
+    loop {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
+            return Err(ReadHashError::Cancelled);
+        }
+        match reader.read(&mut probe) {
+            Ok(0) => break,
+            Ok(read) => {
+                return Err(ReadHashError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected {expected_len} bytes, then read {read} more"),
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(ReadHashError::Io(error)),
+        }
+    }
+
     Ok((hasher.finalize().to_hex().to_string(), bytes_read))
 }
 
@@ -899,6 +1101,7 @@ where
 
 fn build_exact_duplicate_groups(
     scanned: &[ScannedFile],
+    read_buffer_bytes: usize,
     control: &dyn ScanControl,
     issues: &mut Vec<ScanIssue>,
     stats: &mut ScanStats,
@@ -928,7 +1131,7 @@ fn build_exact_duplicate_groups(
                 None,
                 Some(&right_file.path),
             );
-            if control.is_cancelled() {
+            if effective_scan_directive(control) == ScanDirective::Cancel {
                 return PairRelation::Cancelled;
             }
 
@@ -937,6 +1140,7 @@ fn build_exact_duplicate_groups(
                 &left_file.snapshot,
                 &right_file.binding,
                 &right_file.snapshot,
+                read_buffer_bytes,
                 control,
             ) {
                 Ok(comparison) => {
@@ -1165,6 +1369,8 @@ fn issue_makes_report_partial(code: ScanIssueCode) -> bool {
         ScanIssueCode::DirectoryIdentityAlreadyVisited
             | ScanIssueCode::MetadataUnreadable
             | ScanIssueCode::DirectoryUnreadable
+            | ScanIssueCode::DirectoryChangedDuringScan
+            | ScanIssueCode::DirectoryDepthLimitReached
             | ScanIssueCode::FileUnreadable
             | ScanIssueCode::ChangedDuringScan
             | ScanIssueCode::ExactVerificationFailed
@@ -1225,11 +1431,98 @@ fn finish_report(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, ErrorKind};
     use std::path::Path;
 
     use crate::model::{FileRecord, MediaKind, PathRef};
 
-    use super::{make_duplicate_group, partition_equivalence_classes, PairRelation};
+    use super::{
+        hash_reader_exact, make_duplicate_group, partition_equivalence_classes,
+        revalidate_directories, revalidate_roots, sample_layout, CancellationToken,
+        NoopScanControl, PairRelation, ReadHashError,
+    };
+
+    #[test]
+    fn sample_windows_never_overlap_or_exceed_the_file() {
+        for length in 0_u64..=300_000 {
+            let (chunk, offsets) = sample_layout(length, 64 * 1024);
+            let chunk = chunk as u64;
+            assert!(offsets.len() <= 3);
+            assert!(offsets.iter().all(|offset| offset + chunk <= length));
+            assert!(offsets.windows(2).all(|pair| pair[0] + chunk <= pair[1]));
+            assert!(chunk.saturating_mul(offsets.len() as u64) <= length);
+        }
+    }
+
+    #[test]
+    fn final_revalidation_observes_cancellation_before_completion() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut issues = Vec::new();
+
+        assert_eq!(revalidate_directories(&[], &mut issues, &token), None);
+        assert_eq!(revalidate_roots(&[], &mut issues, &token), None);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn full_hash_rejects_premature_eof() {
+        let mut reader = Cursor::new(b"abc");
+
+        let error = hash_reader_exact(&mut reader, 4, 2, &NoopScanControl)
+            .expect_err("a short hash input must fail closed");
+
+        assert!(matches!(
+            error,
+            ReadHashError::Io(error) if error.kind() == ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn full_hash_rejects_data_beyond_the_declared_length() {
+        let mut reader = Cursor::new(b"abcd");
+
+        let error = hash_reader_exact(&mut reader, 3, 2, &NoopScanControl)
+            .expect_err("an overlong hash input must fail closed");
+
+        assert!(matches!(
+            error,
+            ReadHashError::Io(error) if error.kind() == ErrorKind::InvalidData
+        ));
+    }
+
+    /// A reader that never reaches EOF, simulating a file that keeps being
+    /// appended to while it is hashed.
+    #[derive(Default)]
+    struct EndlesslyGrowingReader {
+        bytes_served: u64,
+    }
+
+    impl std::io::Read for EndlesslyGrowingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            for byte in buffer.iter_mut() {
+                *byte = 0x67;
+            }
+            self.bytes_served = self.bytes_served.saturating_add(buffer.len() as u64);
+            Ok(buffer.len())
+        }
+    }
+
+    #[test]
+    fn full_hash_stops_reading_a_file_that_grows_beyond_its_declared_length() {
+        let mut reader = EndlesslyGrowingReader::default();
+
+        let error = hash_reader_exact(&mut reader, 8, 3, &NoopScanControl)
+            .expect_err("a growing file must fail closed, not extend the read");
+
+        assert!(matches!(
+            error,
+            ReadHashError::Io(error) if error.kind() == ErrorKind::InvalidData
+        ));
+        // Declared length plus the single-byte EOF probe is the hard ceiling;
+        // the pre-fix implementation would have read until EOF (never, here).
+        assert!(reader.bytes_served <= 8 + 1);
+    }
 
     #[test]
     fn a_single_hash_bucket_is_partitioned_by_byte_equality() {

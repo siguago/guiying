@@ -12,3 +12,14 @@
 pnpm tokens:build
 pnpm tokens:check
 ```
+
+导出器位于 `scripts/export-design-tokens.mjs`，只依赖 Node.js 22 内置模块，CI
+和新检出的仓库无需用户目录下的 Codex 技能或 Python 环境。它对本项目使用的
+DTCG 子集（`color`、`fontFamily`、`dimension`、`duration`、`cubicBezier`
+以及花括号引用）做有界校验，并拒绝重复键、未知字段、类型不匹配、未解析引用、
+循环引用和会碰撞的 CSS 变量名。当前颜色导出仅接受 `srgb`，尺寸单位仅接受
+`px`/`rem`，时长单位仅接受 `ms`/`s`。
+
+`tokens:build` 以令牌完整路径排序后原子替换 CSS；`tokens:check` 不写文件，按
+UTF-8 字节比较仓库中的 CSS 与同一确定性输出。生成的
+`src/styles/tokens.css` 不应手工修改。

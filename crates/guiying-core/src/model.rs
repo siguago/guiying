@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::PathRefDecodeError;
 
 /// Version of the serialized [`ScanReport`] contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
 
 /// Lossless, IPC-safe representation of a native filesystem path.
 ///
@@ -165,8 +165,29 @@ impl FileTimestamp {
 /// aliases. It must not be treated as durable across remounts.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct FileId {
+    #[serde(with = "u64_decimal_string")]
     pub device: u64,
+    #[serde(with = "u64_decimal_string")]
     pub inode: u64,
+}
+
+mod u64_decimal_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -199,9 +220,13 @@ pub struct ScanOptions {
     /// Number of bytes read at each of the beginning, middle, and end sample.
     pub sample_bytes: u64,
     /// Streaming buffer used for full hashing and byte-for-byte comparison.
+    /// Exact comparison clamps this to at most 1 MiB per compared side.
     pub read_buffer_bytes: u64,
     /// Do not descend into a nested mount point by default.
     pub stay_on_filesystem: bool,
+    /// Maximum nested directory depth kept open during descriptor-anchored
+    /// traversal. Deeper scopes are reported and skipped fail closed.
+    pub max_directory_depth: u16,
     /// Lowercase media-payload extensions considered by M0. Sidecars such as
     /// AAE, XMP, JSON, and THM are intentionally not enumerated or linked yet.
     pub media_extensions: BTreeSet<String>,
@@ -246,6 +271,7 @@ impl Default for ScanOptions {
             sample_bytes: 64 * 1024,
             read_buffer_bytes: 1024 * 1024,
             stay_on_filesystem: true,
+            max_directory_depth: 64,
             media_extensions: EXTENSIONS.iter().map(|value| (*value).to_owned()).collect(),
             excluded_directory_names: EXCLUDED_NAMES
                 .iter()
@@ -262,6 +288,12 @@ impl Default for ScanOptions {
 
 impl ScanOptions {
     pub(crate) fn media_kind(&self, path: &std::path::Path) -> Option<MediaKind> {
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("._"))
+        {
+            return None;
+        }
         let extension = path.extension()?.to_str()?.to_ascii_lowercase();
         if !self.media_extensions.contains(&extension) {
             return None;
@@ -336,6 +368,8 @@ pub enum ScanIssueCode {
     DirectoryExcluded,
     MetadataUnreadable,
     DirectoryUnreadable,
+    DirectoryChangedDuringScan,
+    DirectoryDepthLimitReached,
     UnsupportedFileType,
     FileUnreadable,
     ChangedDuringScan,
@@ -362,6 +396,7 @@ pub struct ScanStats {
     pub special_files_skipped: u64,
     pub cross_filesystem_directories_skipped: u64,
     pub cross_filesystem_files_skipped: u64,
+    pub directory_depth_limit_skipped: u64,
     pub directory_identity_revisits_skipped: u64,
     pub excluded_directories_skipped: u64,
     pub files_sampled: u64,

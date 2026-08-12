@@ -3,9 +3,9 @@ name = "guiying-desktop"
 version = "0.1.0"
 description = "A local-first, evidence-led photo archive deduplication desktop app"
 authors = ["siguago"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.92.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -18,9 +18,23 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
 serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 log = "0.4"
 tauri = { version = "2.10.3", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2.7.2"
 guiying-core = { version = "0.1.0", path = "../crates/guiying-core" }
+tokio = { version = "1.53.1", features = ["sync"] }
+guiying-runtime = { version = "0.1.0", path = "../crates/guiying-runtime" }
+guiying-store = { version = "0.1.0", path = "../crates/guiying-store" }
+uuid = { version = "=1.20.0", default-features = false }
+getrandom = "=0.3.4"
+base64 = "=0.23.1"
+blake3 = "=1.5.5"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "=3.15.0"

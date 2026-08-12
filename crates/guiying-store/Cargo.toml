@@ -1,0 +1,24 @@
+[package]
+name = "guiying-store"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+description = "Fail-closed SQLite persistence for Guiying scan evidence"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/siguago/guiying"
+
+[dependencies]
+blake3 = "=1.5.5"
+indexmap = "=2.11.4"
+rusqlite = { version = "=0.32.1", features = ["bundled", "backup", "limits"], default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+tempfile = "=3.15.0"
+thiserror = "2.0.20"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=0.38.44", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

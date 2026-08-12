@@ -16,7 +16,7 @@
       "result": "unavailable",
       "evidence_ids": [],
       "limitation_id": "limitation-native-core-flow",
-      "notes": "Native launch and the read-only core are verified independently, but the system directory dialog through a real external-volume scan was not automated or manually completed in this run."
+      "notes": "The read-only core and Tauri command layer passed independent cargo gates, but this iteration did not launch a native bundle and did not automate or manually complete the system directory dialog through a real external-volume scan."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-contrast",
@@ -50,12 +50,10 @@
       "check": "visual",
       "method": "assisted",
       "capability": "native_runner",
-      "result": "passed",
-      "evidence_ids": [
-        "native-landing-capture"
-      ],
-      "limitation_id": null,
-      "notes": "The actual Tauri macOS window was captured in isolation and inspected at full decoded resolution."
+      "result": "unavailable",
+      "evidence_ids": [],
+      "limitation_id": "limitation-native-visual",
+      "notes": "This iteration did not build or launch a Tauri bundle. The archived M0 native screenshot and historical native-run log are intentionally excluded from current visual proof."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-privacy",
@@ -63,7 +61,7 @@
       "entrypoint_id": "desktop-product-entrypoint",
       "platform": "desktop",
       "locale": "zh-CN",
-      "state": "m0-command-boundary",
+      "state": "phase1-command-boundary",
       "theme": "default",
       "viewport": null,
       "check": "privacy",
@@ -72,10 +70,11 @@
       "result": "passed",
       "evidence_ids": [
         "core-rust-test-log",
+        "scan-jobs-rust-test-log",
         "manual-safety-review"
       ],
       "limitation_id": null,
-      "notes": "Code review found no network, move, rename, timestamp, or delete operation in the M0 command. UI text discloses possible filesystem-managed atime updates."
+      "notes": "Code review found no WebView path authority and no network, photo move, rename, timestamp, or delete command. Same-process pause/resume retains live descriptors only for the current run; report export creates a separately selected new JSON/CSV file and never grants photo mutation authority. UI text discloses possible filesystem-managed atime updates."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-responsive",
@@ -89,13 +88,10 @@
       "check": "responsive",
       "method": "assisted",
       "capability": "native_runner",
-      "result": "passed",
-      "evidence_ids": [
-        "frontend-qa-log",
-        "responsive-compact-capture"
-      ],
-      "limitation_id": null,
-      "notes": "The Tauri webview implementation was exercised at the declared 1024x768 compact desktop boundary without lost evidence or overlap."
+      "result": "unavailable",
+      "evidence_ids": [],
+      "limitation_id": "limitation-native-visual",
+      "notes": "The production React frontend passed the 1024x768 browser boundary, but this required target needs a current native WebView capture and remains unavailable. Browser evidence is mapped to the optional inspection target."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-screen-reader",
@@ -125,11 +121,13 @@
       "viewport": null,
       "check": "assets",
       "method": "manual",
-      "capability": "manual",
-      "result": "unavailable",
-      "evidence_ids": [],
-      "limitation_id": "limitation-brand-assets",
-      "notes": "In-product Lucide icons and the original brand mark render correctly, but the bundled app icon remains the Tauri scaffold asset and is not release-ready."
+      "capability": "image_inspection",
+      "result": "passed",
+      "evidence_ids": [
+        "packaged-icon-inspection"
+      ],
+      "limitation_id": null,
+      "notes": "The original Guiying photo-and-check icon is present in the deterministic source and configured 512px/32px Tauri assets; both were decoded and inspected. This iteration did not bundle them into a new app."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-keyboard",
@@ -148,7 +146,7 @@
         "frontend-qa-log"
       ],
       "limitation_id": null,
-      "notes": "A keyboard-only Playwright test reaches the explicitly labelled synthetic scan and results; focus indicators and focus restoration are covered."
+      "notes": "Keyboard-only Playwright coverage reaches the explicitly labelled synthetic scan and results, exercises same-process enumeration pause/resume controls, and reaches the sealed-history export panel; focus indicators and focus restoration are covered."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-build",
@@ -162,12 +160,10 @@
       "check": "build",
       "method": "automated",
       "capability": "build_toolchain",
-      "result": "passed",
-      "evidence_ids": [
-        "tauri-build-log"
-      ],
-      "limitation_id": null,
-      "notes": "The corrected Tauri debug build command produces both the macOS application bundle and arm64 DMG."
+      "result": "unavailable",
+      "evidence_ids": [],
+      "limitation_id": "limitation-build-freshness",
+      "notes": "The frontend production build and Tauri cargo check/test/strict clippy/rustdoc/fmt passed, but this iteration intentionally did not run Tauri bundle. No exact-current-tree .app or .dmg is claimed."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-runtime",
@@ -181,12 +177,10 @@
       "check": "runtime",
       "method": "assisted",
       "capability": "native_runner",
-      "result": "passed",
-      "evidence_ids": [
-        "native-run-log"
-      ],
-      "limitation_id": null,
-      "notes": "The native development binary launches a titled 1280x820 macOS window and exits cleanly after inspection."
+      "result": "unavailable",
+      "evidence_ids": [],
+      "limitation_id": "limitation-native-visual",
+      "notes": "No Tauri native process was launched in this iteration. Historical process evidence is not promoted to a current runtime result."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large",
@@ -200,13 +194,10 @@
       "check": "responsive",
       "method": "assisted",
       "capability": "native_runner",
-      "result": "passed",
-      "evidence_ids": [
-        "frontend-qa-log",
-        "responsive-large-capture"
-      ],
-      "limitation_id": null,
-      "notes": "At 1280x820 the master-detail evidence layout, persistent synthetic-data notice, metrics, and inspector remain legible."
+      "result": "unavailable",
+      "evidence_ids": [],
+      "limitation_id": "limitation-native-visual",
+      "notes": "The production React frontend passed the 1280x820 browser boundary, but this required target needs a current native WebView capture and remains unavailable. Browser evidence is mapped to the optional inspection target."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-image-inspection",
@@ -214,7 +205,7 @@
       "entrypoint_id": "desktop-product-entrypoint",
       "platform": "desktop",
       "locale": "zh-CN",
-      "state": "full-resolution-native-review",
+      "state": "full-resolution-evidence-review",
       "theme": "default",
       "viewport": "desktop-large",
       "check": "visual",
@@ -222,10 +213,16 @@
       "capability": "image_inspection",
       "result": "passed",
       "evidence_ids": [
-        "native-landing-capture"
+        "landing-phase1-capture",
+        "scanning-phase1-capture",
+        "responsive-compact-capture",
+        "responsive-large-capture",
+        "paged-results-capture",
+        "raw-metadata-review-capture",
+        "historical-catalog-capture"
       ],
       "limitation_id": null,
-      "notes": "The native raster was decoded and inspected at original Retina resolution; browser captures were also reviewed at original size."
+      "notes": "Current landing, scanning, compact/large results, paged-result with history export controls, historical-catalog and expanded raw-metadata browser captures were reviewed at original size. Their current SHA-256 values are mapped below; the packaged icon has its own asset report."
     },
     {
       "id": "desktop-system-entrypoint-desktop-zh-cn-visual",
@@ -255,7 +252,7 @@
       "captured_at": "2026-08-11T00:18:03+08:00",
       "tool": "craft-ui-design delivery validator",
       "version": "v2 contract",
-      "command": "python3 /Users/sigua/.codex/skills/craft-ui-design/scripts/validate_delivery.py docs/ui-delivery",
+      "command": "python3 <codex-skills>/craft-ui-design/scripts/validate_delivery.py docs/ui-delivery",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-contrast"
@@ -266,125 +263,178 @@
       "id": "frontend-qa-log",
       "kind": "test-output",
       "path": "evidence/frontend-qa.txt",
-      "captured_at": "2026-08-11T00:15:28+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "Playwright, axe-core, Vite, Oxlint",
-      "version": "Playwright 1.62.1; axe-core 4.12.1; Vite 8.2.1; Oxlint 1.75.0",
-      "command": "pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui",
+      "version": "Playwright 1.62.1; axe-core 4.12.1; Vite 8.2.1; Oxlint 1.78.0",
+      "command": "pnpm exec tsc --noEmit && pnpm tokens:check && pnpm build && pnpm lint && pnpm test:ui",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-contrast",
-        "desktop-product-entrypoint-desktop-zh-cn-responsive",
-        "desktop-product-entrypoint-desktop-zh-cn-keyboard",
-        "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
+        "desktop-product-entrypoint-desktop-zh-cn-keyboard"
       ],
-      "notes": "Four tests pass after correcting contrast, scroll focus, dialog-return focus, synthetic-data disclosure, and metric wording."
+      "notes": "Twenty-eight tests pass, covering token-only root authority, same-process enumeration pause/resume and cancel races, enumeration completion during pausing, historical catalog pagination and result-token revocation, late-open isolation, per-token serial evidence reads, paged duplicate evidence, exact retry and stale-response behavior, terminal acknowledgement, cancelled-result locking, three-level raw-metadata review, strict JSON/CSV export payload/result validation, export queue/cancel/late-response races, parent-path rejection, and axe checks on historical and expanded raw states. Native locking, checkpoint, export target and cancellation semantics are covered separately by Rust tests."
     },
     {
       "id": "core-rust-test-log",
       "kind": "test-output",
       "path": "evidence/core-rust-tests.txt",
-      "captured_at": "2026-08-11T00:15:22+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "Cargo",
-      "version": "1.92.0",
-      "command": "cargo fmt --manifest-path crates/guiying-core/Cargo.toml -- --check && cargo clippy --manifest-path crates/guiying-core/Cargo.toml --all-targets --all-features -- -D warnings && cargo test --manifest-path crates/guiying-core/Cargo.toml --all-features",
+      "version": "1.77.2",
+      "command": "Main-task local gate record: cargo fmt/check/test, strict clippy, and rustdoc with Rust 1.77.2 and a repository-external temporary target directory.",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-privacy"
       ],
-      "notes": "The core exposes no mutation API and fail-closed edge behavior is covered by the recorded Rust suite."
+      "notes": "Sixty-five core tests cover legacy and bounded streaming scanners, descriptor-relative traversal, pause-safe enumeration stepping, same-process resume, pause/cancel dominance, short-read/change rejection and unforgeable current-session read proofs; the core exposes no mutation API."
+    },
+    {
+      "id": "scan-jobs-rust-test-log",
+      "kind": "test-output",
+      "path": "evidence/scan-jobs-rust-tests.txt",
+      "captured_at": "2026-08-11T20:57:52+08:00",
+      "tool": "Cargo",
+      "version": "1.77.2 and 1.92.0",
+      "command": "Main-task local gate record: Store and runtime cargo fmt/check/test, strict clippy and rustdoc with Rust 1.77.2; Tauri cargo fmt/check/test, strict clippy and rustdoc with Rust 1.92.0; repository-external temporary target directory.",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-privacy"
+      ],
+      "notes": "Store 134, runtime 32 and Tauri 70 tests pass. Coverage includes runtime leases, control requests, append-only pause checkpoints, same-process pause/resume, pause-then-cancel without synthetic resume, root/result/export authority, single-job/process exclusion, terminal acknowledgement, consistent history export snapshots, one-shot window-bound export tokens, directory-handle target binding, create-new publication, limits/deadlines/cancellation, owner cleanup, cursor scope, path replacement and structured failures. No bundle or native run was performed."
     },
     {
       "id": "manual-safety-review",
       "kind": "manual-review",
       "path": "handoff/qa-report.md",
-      "captured_at": "2026-08-11T00:14:30+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "independent code and documentation review",
-      "version": "M0 review 2",
+      "version": "Phase 1 review 1",
       "command": "Review src-tauri capabilities, Rust command calls, UI claims, synthetic fixtures, and captured window contents.",
       "exit_code": 0,
       "target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-privacy"
       ],
-      "notes": "The review corrected atime, partial-report, synthetic-data, metric, path, mount-session, and capability-language overclaims."
+      "notes": "The review corrected atime, partial-report, synthetic-data, metric, path, mount-session, result/export-token concurrency, history display-only, same-process pause, complete-evidence export scope, native-evidence and capability-language overclaims."
     },
     {
-      "id": "tauri-build-log",
-      "kind": "build-log",
-      "path": "evidence/tauri-build.txt",
-      "captured_at": "2026-08-11T00:16:19+08:00",
-      "tool": "Tauri CLI",
-      "version": "2.11.4",
-      "command": "pnpm exec tauri build --debug",
-      "exit_code": 0,
-      "target_ids": [
-        "desktop-product-entrypoint-desktop-zh-cn-build"
-      ],
-      "notes": "The successful corrected command and the earlier argument-forwarding mistake are both disclosed in the log."
-    },
-    {
-      "id": "native-run-log",
-      "kind": "run-log",
-      "path": "evidence/native-run.txt",
-      "captured_at": "2026-08-11T00:03:52+08:00",
-      "tool": "Tauri CLI and macOS CoreGraphics window listing",
-      "version": "Tauri 2.11.x; macOS 26.5.2",
-      "command": "pnpm tauri:dev",
-      "exit_code": 0,
-      "target_ids": [
-        "desktop-product-entrypoint-desktop-zh-cn-runtime"
-      ],
-      "notes": "The app process and titled native window were observed before a clean developer-session termination."
-    },
-    {
-      "id": "native-landing-capture",
+      "id": "landing-phase1-capture",
       "kind": "screenshot",
-      "path": "evidence/native-landing-1280x820.png",
-      "captured_at": "2026-08-11T00:03:52+08:00",
-      "tool": "macOS screencapture and full-size image inspection",
-      "version": "macOS 26.5.2",
-      "command": "Resolve the Guiying CoreGraphics window id, then screencapture -x -l WINDOW_ID evidence/native-landing-1280x820.png.",
+      "path": "evidence/landing-1280x820.png",
+      "captured_at": "2026-08-11T20:54:25+08:00",
+      "tool": "Playwright Chromium and full-size image inspection",
+      "version": "Playwright 1.62.1",
+      "command": "pnpm test:ui",
       "exit_code": 0,
       "target_ids": [
-        "desktop-product-entrypoint-desktop-zh-cn-visual",
         "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "Only the Guiying native window is present; the capture contains no other desktop windows or user media."
+      "notes": "The current 1280x820 Phase 1 landing state shows native-token selection, historical entry and no-active-mutation language; SHA-256 88b5d43f440b0fbc978ebf0ef54696cc108cbb849942988c9ecc7a0c8ec6ddd0."
+    },
+    {
+      "id": "scanning-phase1-capture",
+      "kind": "screenshot",
+      "path": "evidence/scanning-1280x820.png",
+      "captured_at": "2026-08-11T20:54:26+08:00",
+      "tool": "Playwright Chromium and full-size image inspection",
+      "version": "Playwright 1.62.1",
+      "command": "pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The current 1280x820 scanning ledger retains the authority and atime boundaries without overflow; SHA-256 2c58ba82acf1904d8d89dce472425cc05fa12790d0416416bfdbfa13b51be3d7."
     },
     {
       "id": "responsive-compact-capture",
       "kind": "screenshot",
       "path": "evidence/results-1024x768.png",
-      "captured_at": "2026-08-11T00:15:28+08:00",
+      "captured_at": "2026-08-12T01:01:39+08:00",
       "tool": "Playwright Chromium",
       "version": "1.62.1",
       "command": "pnpm test:ui",
       "exit_code": 0,
       "target_ids": [
-        "desktop-product-entrypoint-desktop-zh-cn-responsive"
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "Synthetic data is persistently labelled; the 1024x768 master-detail view retains the safety footer and evidence rail."
+      "notes": "Synthetic data is persistently labelled; the 1024x768 master-detail view retains the safety footer and evidence rail; SHA-256 70fff1c1678b1b8cf662d10cbd2f4c52cf5d629cf6ab5cb16ad6e208f54c1fd4."
     },
     {
       "id": "responsive-large-capture",
       "kind": "screenshot",
       "path": "evidence/results-1280x820.png",
-      "captured_at": "2026-08-11T00:15:24+08:00",
+      "captured_at": "2026-08-12T01:01:35+08:00",
       "tool": "Playwright Chromium",
       "version": "1.62.1",
       "command": "pnpm test:ui",
       "exit_code": 0,
       "target_ids": [
-        "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
-      "notes": "The 1280x820 evidence workspace shows group ordering, synthetic notice, exact-byte proof, and weak time evidence without overlap."
+      "notes": "The 1280x820 evidence workspace shows group ordering, synthetic notice, exact-byte proof, and weak time evidence without overlap; SHA-256 5d718ea955d4c1107fcf86b4436bb93e9a39ae5e4c1c0dc04776055251aedfd5."
+    },
+    {
+      "id": "paged-results-capture",
+      "kind": "screenshot",
+      "path": "evidence/results-paged-1280x820.png",
+      "captured_at": "2026-08-11T20:54:37+08:00",
+      "tool": "Playwright Chromium and full-size image inspection",
+      "version": "Playwright 1.62.1",
+      "command": "pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The current 1280x820 synthetic result shows bounded group/member/issue pagination and the JSON/CSV sealed-history export controls without accumulating previous pages; SHA-256 d5646fbe8e4db37ef8e7a748daaa03bb95a0873b87a55b57adb354c17919b8ae."
+    },
+    {
+      "id": "raw-metadata-review-capture",
+      "kind": "screenshot",
+      "path": "evidence/results-raw-metadata-1280x820.png",
+      "captured_at": "2026-08-11T20:54:41+08:00",
+      "tool": "Playwright Chromium, axe-core and full-size image inspection",
+      "version": "Playwright 1.62.1; axe-core 4.12.1",
+      "command": "pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The 1280x820 synthetic inspector shows report to field to byte-exact raw detail alongside the separate history-export controls, contains no PII, and passed axe; SHA-256 17d1ed2f9d3937e9f561bae388bc59066a5e065c497c3d33b1536a511f3b491c."
+    },
+    {
+      "id": "historical-catalog-capture",
+      "kind": "screenshot",
+      "path": "evidence/history-1280x820.png",
+      "captured_at": "2026-08-12T01:01:50+08:00",
+      "tool": "Playwright Chromium, axe-core and full-size image inspection",
+      "version": "Playwright 1.62.1; axe-core 4.12.1",
+      "command": "pnpm test:ui",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The 1280x820 historical catalog distinguishes sealed display text from current filesystem authority, labels partial coverage and optional capture-time outcomes, contains no PII, and passed axe; SHA-256 25df634b04fea231090b5d59f3ce541d0f570cf58a2904c1acfcdc1803b9cacc."
+    },
+    {
+      "id": "packaged-icon-inspection",
+      "kind": "asset-report",
+      "path": "evidence/packaged-icon-inspection.txt",
+      "captured_at": "2026-08-11T17:51:31+08:00",
+      "tool": "repository source, file metadata, SHA-256 and full-size inspection",
+      "version": "Phase 1 packaged icon set",
+      "command": "Inspect deterministic icon source, packaged raster/ICNS/ICO assets, hashes and repository history.",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-assets"
+      ],
+      "notes": "The report records the SVG source, packaged formats, 512px/32px hashes and original-size inspection; it does not claim unperformed Dock/Finder/DMG manual review."
     },
     {
       "id": "system-direction-artifact",
       "kind": "design-artifact",
       "path": "design-direction.md",
-      "captured_at": "2026-08-11T00:15:30+08:00",
+      "captured_at": "2026-08-11T20:57:52+08:00",
       "tool": "repository design review",
-      "version": "M0 direction 1",
+      "version": "Phase 1 direction 1",
       "command": "Review design-direction.md against src/App.tsx, src/App.css, and the product safety documents.",
       "exit_code": 0,
       "target_ids": [
@@ -404,6 +454,27 @@
       "mitigation": "Run the P0 external-volume matrix on disposable APFS and exFAT fixtures, exercise dialog selection and interruption cases, and attach the native run recording before changing this target to passed."
     },
     {
+      "id": "limitation-build-freshness",
+      "capability": "build_toolchain",
+      "affected_target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-build"
+      ],
+      "impact": "Tauri cargo check/test/strict clippy/rustdoc/fmt and the frontend production build passed, but this iteration did not run Tauri bundle and retained no exact-current-tree .app/.dmg.",
+      "mitigation": "Let CI build the exact pushed tree, or run one clean Tauri bundle build on a runner with an explicit artifact-space budget and attach that result before promoting this target."
+    },
+    {
+      "id": "limitation-native-visual",
+      "capability": "native_runner",
+      "affected_target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-visual",
+        "desktop-product-entrypoint-desktop-zh-cn-responsive",
+        "desktop-product-entrypoint-desktop-zh-cn-runtime",
+        "desktop-product-entrypoint-desktop-zh-cn-responsive-desktop-large"
+      ],
+      "impact": "This iteration did not build or launch the current Phase 1 bundle, so there is no fresh isolated native visual, responsive or runtime evidence; historical bundle/run logs and the archived M0 capture are not current proof.",
+      "mitigation": "Capture and exercise the current signed or debug bundle at 1024x768 and 1280x820 on a machine where Screen Recording/CoreGraphics window enumeration is available, then inspect the native states at full resolution."
+    },
+    {
       "id": "limitation-screen-reader",
       "capability": "manual",
       "affected_target_ids": [
@@ -411,15 +482,6 @@
       ],
       "impact": "Automated semantics cannot establish VoiceOver reading order, Chinese pronunciation, live progress behavior, or native dialog usability.",
       "mitigation": "Complete a VoiceOver-only walkthrough of idle, dialog return, scanning, partial report, result selection, issue disclosure, and error recovery on macOS."
-    },
-    {
-      "id": "limitation-brand-assets",
-      "capability": "manual",
-      "affected_target_ids": [
-        "desktop-product-entrypoint-desktop-zh-cn-assets"
-      ],
-      "impact": "The debug application and DMG still use scaffold packaging icons and must not be treated as release-branded artifacts.",
-      "mitigation": "Design the canonical application icon, export all macOS sizes, replace src-tauri/icons, and inspect the Dock, Finder, DMG, and 16px rendering before release."
     }
   ]
 }

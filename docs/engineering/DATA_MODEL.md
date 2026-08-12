@@ -134,7 +134,7 @@ interrupted -> 新建 mode=resume 的子 scan_run
 
 `link_key` 是证据和关系归一化后的 32 字节幂等键。拒绝关系保留为 `relation_state='rejected'`，避免下次扫描重新提出同一错误配对。
 
-资产链接的扫描、起点和终点都用 `volume_id` 复合外键约束，跨卷关系不能写入。XMP/JSON 边车时间候选必须通过 `source_asset_link_id` 精确指向“来源边车 -> 目标媒体”的 `sidecar_for` 链接；重复副本时间候选必须通过 `source_duplicate_group_id` 证明两端位于同一个 `exact_bytes` 组。候选证据可以先于人工批准保存，但用于修复时间时必须已批准；关系被拒绝、组被拒绝或成员被排除后，执行门会再次检查并停止放行。
+资产链接的扫描、起点和终点都用 `volume_id` 复合外键约束，跨卷关系不能写入。XMP/JSON 边车时间候选必须通过 `source_asset_link_id` 精确指向“来源边车 -> 目标媒体”的 `sidecar_for` 链接；重复副本时间候选必须通过 `source_duplicate_group_id` 证明两端位于同一个 `exact_bytes` 组。候选证据可以先于人工批准保存，但用于修复时间时 sidecar 关系必须为 `confirmed`；仅由文件名等方式得到的 `inferred` 关系永不具备执行资格。关系被拒绝、组被拒绝或成员被排除后，执行门会再次检查并停止放行。
 
 ### 跨实体绑定原则
 
@@ -156,6 +156,10 @@ SQLite 事务不能与文件系统 rename/delete 组成原子事务。因此操�
 - `operation_item_dependencies`：跨操作的不可变依赖；当前用于证明 time donor 在离开原路径前，其目标文件的时间修复项目已经成功并完成双日志验证。
 - `operation_events`：追加式审计日志。状态变化由触发器自动写入；应用也可以用全局唯一 `event_key` 写 attempt、verification、reconciliation 或 note 事件。
 - `volume_manifest_outbox`：卷端追加日志的本机耐久 outbox。它保存将写入目标卷的精确规范字节、密封计划摘要、卷身份快照、哈希链、落盘阶段和回读证据。
+
+`operation_items` 中的 `source_relative_path_snapshot` 与 `destination_relative_path` 只用于显示；执行寻址必须使用对应的 `*_relative_path_raw` 与 `*_path_encoding`。Unix 原始字节在数据库层拒绝绝对路径、NUL、空组件、`.` 和 `..` 组件，执行层仍必须从已绑定卷根 fd 逐组件解码和打开，不能调用 `root.join(display_text)`。密封后显示值、原始值与编码一起不可变，非 UTF-8 路径不需要经过有损字符串往返。
+
+非 `mixed` 批次只能包含与批次同类的 item；`dry-run` 批次不能进入 `running`。`quarantine` 与 `restore` 必须同时密封源和目标路径；`purge` 不编译为用户可调用命令。隔离/清理的 source 必须是明确的 `candidate`，且不能与 keeper 是同一文件。
 
 `operation_events` 禁止 UPDATE/DELETE；`volume_manifest_outbox` 的记录身份、规范字节和已经取得的落盘证据不可修改，整行禁止 DELETE。其他审计相关表也使用 `ON DELETE RESTRICT`。数据保留策略不得直接级联删除操作历史。
 

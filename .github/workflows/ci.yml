@@ -1,0 +1,269 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "agent/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-and-schema:
+    name: Frontend and schema
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.32.1
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.22.1
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate tokens, lint, and build frontend
+        run: |
+          pnpm tokens:check
+          pnpm lint
+          pnpm build
+
+      - name: Install browser test runtimes
+        run: pnpm exec playwright install --with-deps chromium webkit
+
+      - name: Run UI and accessibility tests
+        run: pnpm test:ui
+
+      - name: Validate SQLite safety migration
+        run: bash tests/sqlite_migration.sh
+
+  rust-msrv:
+    name: Core crates on Rust 1.77.2
+    runs-on: macos-14
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.77.2
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.77.2
+          components: clippy,rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            crates/guiying-core -> target
+            crates/guiying-metadata -> target
+            crates/guiying-runtime -> target
+            crates/guiying-store -> target
+            crates/guiying-time -> target
+            crates/guiying-volume -> target
+
+      - name: Check formatting
+        run: |
+          for manifest in \
+            crates/guiying-core/Cargo.toml \
+            crates/guiying-metadata/Cargo.toml \
+            crates/guiying-runtime/Cargo.toml \
+            crates/guiying-store/Cargo.toml \
+            crates/guiying-time/Cargo.toml \
+            crates/guiying-volume/Cargo.toml
+          do
+            cargo fmt --manifest-path "$manifest" -- --check
+          done
+
+      - name: Deny compiler and Clippy warnings
+        run: |
+          for manifest in \
+            crates/guiying-core/Cargo.toml \
+            crates/guiying-metadata/Cargo.toml \
+            crates/guiying-runtime/Cargo.toml \
+            crates/guiying-store/Cargo.toml \
+            crates/guiying-time/Cargo.toml \
+            crates/guiying-volume/Cargo.toml
+          do
+            cargo clippy --locked --manifest-path "$manifest" --all-targets --all-features -- -D warnings
+          done
+
+      - name: Run Rust tests
+        run: |
+          for manifest in \
+            crates/guiying-core/Cargo.toml \
+            crates/guiying-metadata/Cargo.toml \
+            crates/guiying-runtime/Cargo.toml \
+            crates/guiying-store/Cargo.toml \
+            crates/guiying-time/Cargo.toml \
+            crates/guiying-volume/Cargo.toml
+          do
+            cargo test --locked --manifest-path "$manifest" --all-targets --all-features
+          done
+
+  desktop-macos:
+    name: Desktop on Rust 1.92.0
+    runs-on: macos-14
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.92.0
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.92.0
+          components: clippy,rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Check desktop Rust code
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.32.1
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.22.1
+          cache: pnpm
+
+      - name: Build release desktop bundle
+        run: pnpm install --frozen-lockfile && pnpm tauri build -- --locked
+
+  desktop-windows-check:
+    name: Desktop shell compiles on Windows
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.92.0
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.92.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Type-check the desktop shell and its Windows cfg branches
+        shell: pwsh
+        run: |
+          # Windows desktop delivery is not enabled; runtime_lock and
+          # export_target keep dedicated fail-closed Windows branches that
+          # must at least stay compilable so cfg(windows) code cannot rot
+          # silently. Tests still run on macOS only.
+          cargo check --locked --manifest-path src-tauri/Cargo.toml
+
+  supply-chain-audit:
+    name: Supply chain audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.32.1
+          run_install: false
+
+      - name: Audit npm production dependencies
+        run: pnpm audit --prod
+
+      - name: Install Rust 1.92.0
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.92.0
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Rust lockfiles
+        run: |
+          # Fails on known vulnerabilities; unmaintained/unsound advisories
+          # stay warnings and are tracked in
+          # docs/engineering/SECURITY_AUDIT_2026-08-11.md with owners.
+          for lock in \
+            crates/guiying-core/Cargo.lock \
+            crates/guiying-metadata/Cargo.lock \
+            crates/guiying-runtime/Cargo.lock \
+            crates/guiying-store/Cargo.lock \
+            crates/guiying-time/Cargo.lock \
+            crates/guiying-volume/Cargo.lock \
+            src-tauri/Cargo.lock
+          do
+            cargo audit --file "$lock"
+          done
+
+  store-windows:
+    name: Store on Windows
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.77.2
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.77.2
+          components: clippy,rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: crates/guiying-store -> target
+
+      - name: Check store on the native Windows toolchain
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path crates/guiying-store/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path crates/guiying-store/Cargo.toml --all-targets --all-features -- -D warnings
+          # Existing-database open deliberately fails closed on Windows until
+          # descriptor-relative file-family staging has a native equivalent.
+          # The complete Store suite runs on Unix; Windows compiles every
+          # target above and executes the explicit platform contract below.
+          cargo test --locked --manifest-path crates/guiying-store/Cargo.toml --test store_integration windows_existing_database_open_fails_closed -- --exact

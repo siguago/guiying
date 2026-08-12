@@ -1,0 +1,21 @@
+归影 Phase 1 Store、运行时、桌面任务与历史导出验证
+时间：2026-08-11T20:57:52+08:00
+环境：rustc/cargo 1.77.2 与 1.92.0; macOS arm64
+
+来源：主任务本机门禁实时输出；本文件是静态结果摘要，不伪造独立原生日志。
+
+门禁：Store/runtime 使用 Rust 1.77.2，Tauri 使用 Rust 1.92.0；均完成 cargo fmt/check/test、strict clippy
+（-D warnings）与 rustdoc（-D warnings），构建输出定向到仓库外临时 target。
+
+退出码：全部为 0。
+
+结果：Store 134/134、runtime 32/32、Tauri 70/70 tests passed；fmt、cargo check、strict clippy 与 rustdoc
+均通过，0 failed。本轮没有执行 Tauri bundle 或 native-run。
+
+覆盖：运行租约、控制请求、追加式暂停检查点、同进程暂停/继续、暂停后取消不伪造 resume、原生一次性
+root token、单活动任务、终态回执；历史 catalog、completed/exact/coverage 资格门、持久 EvidenceReader、
+窗口绑定 result/export token、owner/TTL/generation/DB-scope 二次门、pending/in-flight 硬上限、关闭窗口
+tombstone、迟到结果丢弃；一致性历史导出快照、JSON/CSV 规范记录、目录句柄目标绑定、只创建新文件、
+大小/记录数/时限、取消与发布竞态。`complete_evidence` 只含摘要、确定重复组、成员和扫描问题，不含拍摄
+时间候选/成员/元数据记录、原始字段或定位器；摘要可保留既有 time_outcome 汇总。所有照片证据读取只接受 resultReadToken；jobId 仅用于当前进程控制，
+暂停状态不构成跨进程续扫，且没有照片移动、重命名、改时或删除命令。

@@ -1,0 +1,29 @@
+[package]
+name = "guiying-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+description = "Trusted read-only runtime adapter for Guiying core, volume, and store evidence"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/siguago/guiying"
+publish = false
+
+[dependencies]
+base64 = "=0.23.1"
+# 不启用 "pure"：BLAKE3 输出与实现无关，默认 SIMD/NEON 路径换取大文件哈希吞吐；
+# 特性按依赖图取并集，任何一个 crate 请求 "pure" 都会让桌面构建整体退回纯软件实现。
+blake3 = "=1.5.5"
+guiying-core = { version = "0.1.0", path = "../guiying-core" }
+guiying-metadata = { version = "0.1.0", path = "../guiying-metadata" }
+guiying-store = { version = "0.1.0", path = "../guiying-store" }
+guiying-time = { version = "0.1.0", path = "../guiying-time" }
+guiying-volume = { version = "0.1.0", path = "../guiying-volume" }
+getrandom = "=0.3.4"
+serde_json = "=1.0.151"
+thiserror = "=2.0.20"
+
+[dev-dependencies]
+filetime = "=0.2.29"
+rusqlite = { version = "=0.32.1", default-features = false }
+tempfile = "=3.15.0"

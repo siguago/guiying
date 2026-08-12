@@ -1,7 +1,7 @@
 {
   "schema_version": "2.0",
   "project": "归影 Guiying",
-  "scope": "M0 desktop interface for no-mutation exact-byte duplicate evidence scanning and honest timestamp-boundary disclosure",
+  "scope": "Phase 1 desktop interface for no-active-mutation exact-byte scanning, same-process enumeration pause/resume, sealed capture-time evidence, bounded result paging, read-only historical review, and JSON/CSV duplicate-evidence export",
   "delivery_tier": "complete",
   "delivery_mode": "implementation",
   "integration_mode": "existing_repository",
@@ -17,7 +17,7 @@
         "macOS 26.5.2 arm64 verified"
       ],
       "implementation_stack": "Tauri + React + TypeScript + Rust",
-      "implementation_stack_version": "Tauri 2.11.x; React 19.2.8; TypeScript 6.0.2; Rust 1.92.0",
+      "implementation_stack_version": "Tauri 2.11.x; React 19.2.8; TypeScript 6.0.2; Rust 1.77.2 and 1.92.0 validation toolchains",
       "design_guidance": "Repository desktop safety model, platform-app guidance, and native macOS interaction conventions",
       "design_guidance_version": "reviewed 2026-08-10",
       "guidance_checked_at": "2026-08-10",
@@ -50,8 +50,8 @@
       "locales": [
         "zh-CN"
       ],
-      "target": "src-tauri/target/debug/bundle/macos/归影.app",
-      "open_instructions": "From the repository root run pnpm install, then pnpm tauri:dev. Build the debug app and DMG with pnpm exec tauri build --debug.",
+      "target": "src-tauri",
+      "open_instructions": "From the repository root run pnpm install, then pnpm tauri:dev. No current .app or .dmg is retained or claimed by this delivery record.",
       "qa_target_ids": [
         "desktop-product-entrypoint-desktop-zh-cn-core-flow",
         "desktop-product-entrypoint-desktop-zh-cn-contrast",
@@ -115,7 +115,7 @@
     "design_direction": {
       "status": "created",
       "kind": "documentation",
-      "notes": "Scoped M0 direction, grammar, signature evidence spine, anti-goals, states, and safety language are documented.",
+      "notes": "The evidence-led direction, grammar, signature spine, same-process pause boundary, export scope, anti-goals, current Phase 1 states, and safety language are documented.",
       "path": "design-direction.md"
     },
     "token_source": {
@@ -147,12 +147,12 @@
     "icon_source": {
       "status": "inherited",
       "kind": "source",
-      "notes": "Functional icons use lucide-react under ISC and the in-product brand mark is original; packaged app icons remain scaffold defaults and are a declared limitation."
+      "notes": "Functional icons use lucide-react under ISC; the original app icon is generated from design-system/assets/guiying-app-icon.svg and configured for macOS and Windows sizes. No current bundle is claimed."
     },
     "implementation_source": {
       "status": "inherited",
       "kind": "implementation_source",
-      "notes": "Production sources are src, src-tauri, and crates/guiying-core; this package records the handoff without copying those sources."
+      "notes": "Production sources are src, src-tauri, and the guiying core, metadata, runtime, store, time, and volume crates; this package records the handoff without copying those sources."
     }
   },
   "capabilities": {
@@ -170,19 +170,19 @@
       "notes": "No Figma artifact was requested; the canonical implementation and design system live in the repository."
     },
     "native_runner": {
-      "status": "used",
-      "notes": "The Tauri app was launched, captured in a native macOS window, and bundled as an app and DMG."
+      "status": "unavailable",
+      "notes": "This iteration did not build a Tauri bundle or perform a native run. Native visual, responsive, runtime and end-to-end targets therefore remain explicit limitations; historical bundle/run logs and the archived M0 screenshot are not reused as current evidence."
     },
     "image_inspection": {
       "status": "used",
-      "notes": "All four browser captures and the native-window capture were decoded and inspected at full size."
+      "notes": "All current browser captures, including landing, scanning, paged results, historical catalog and expanded raw-metadata states, plus the packaged icon were decoded and inspected at full size."
     }
   },
   "evidence": {
     "qa": {
       "status": "partial",
       "path": "qa-evidence.json",
-      "notes": "Automated and native evidence passed where mapped; real external-volume dialog flow, VoiceOver, and final branded app icon remain explicit limitations."
+      "notes": "Core 65, Store 134, runtime 32, Tauri 70 and Playwright 28 tests plus strict static gates passed where mapped. This iteration has no Tauri bundle/native-run; current native visuals, real external-volume dialog/export flow and VoiceOver remain explicit limitations."
     },
     "sources": {
       "path": "handoff/sources.md",
@@ -196,8 +196,9 @@
   "status": "ready_with_limitations",
   "limitations": [
     "limitation-native-core-flow",
-    "limitation-screen-reader",
-    "limitation-brand-assets"
+    "limitation-build-freshness",
+    "limitation-native-visual",
+    "limitation-screen-reader"
   ],
   "created_at": "2026-08-10T23:20:04+08:00"
 }

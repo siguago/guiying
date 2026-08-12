@@ -4,7 +4,9 @@
 | --- | --- |
 | 复核日期 | 2026-08-11 |
 | 复核范围 | 只读精确重复扫描核心、Tauri 桥接、React 证据界面、SQLite 安全模型 |
-| 结论 | 可提交为内部 M0；未发现会导致数据损坏或错误 D1 定案的 P0 blocker |
+| 结论 | 历史 M0 基线；当前主链已进入持久化只读 Phase 1，写能力仍锁定 |
+
+> 本文保留 M0 当时的审计记录。当前实现已由 `guiying-runtime` 把 core、volume 与 Store 接成 descriptor-bound 持久化主链，Tauri 不再返回完整内存报告；最新任务与 IPC 边界见 [扫描任务协议](SCAN_JOBS.md) 和 [Phase 1 运行时](PHASE1_RUNTIME.md)。
 
 ## 1. 本轮实际交付
 
@@ -16,7 +18,7 @@
 - 14 张 STRICT 表的 SQLite 迁移和可重复安全约束测试；
 - 前端、原生窗口、Rust 与构建证据归档。
 
-M0 的唯一原生 command 是 `scan_directory`。当前没有移动、重命名、改时、隔离、恢复或删除 API，也没有把 SQLite 操作模型接入运行时。读取可能由文件系统更新 atime，因此 M0 的准确边界是“无主动变更”，不是 OS 级零写入保证。
+M0 当时的原生命令只负责内存扫描。当前已停止注册完整报告兼容命令，改为单任务 runtime、轻量状态和 SQLite 有界分页；应用数据库只位于每用户应用数据目录。仍没有移动、重命名、改时、隔离、恢复或删除照片的 API。读取可能由文件系统更新 atime，因此准确边界始终是“无主动变更”，不是 OS 级零写入保证。
 
 ## 2. D1 判定门槛
 
@@ -44,21 +46,25 @@ M0 的唯一原生 command 是 `scan_directory`。当前没有移动、重命名
 
 - 完整哈希候选曾被 UI 过早称为“确定重复”：现已在组生成前强制逐字节比较，并以 `proof=byte_for_byte` 跨层校验。
 - 目录路径曾存在检查后再按 `PathBuf` 打开的 TOCTOU：现已改为根 fd 锚定的逐组件打开。
-- 报告曾丢失取消状态、issue 细节与非 UTF-8 路径：现已使用 schema v2 完整传递。
+- 报告曾丢失取消状态、issue 细节与非 UTF-8 路径：现已使用 schema v3 完整传递，并把可能超过 JavaScript 安全整数范围的文件身份编码为十进制字符串。
 - 浏览器预览曾可能让合成数据看起来像真实扫描：现在真实目录入口只在 Tauri 可用，合成模式全程固定提示。
 - “零写入”“可回收容量”“已读取字节”等文案曾过强：现已分别改为无主动变更、逻辑重复上限和媒体逻辑大小，并披露 atime。
 - 真实扫描进度曾有定时器自动推进：现已仅由 Rust 事件驱动；合成演示使用独立且明确的合成事件。
 - 目录身份循环、根路径祖先 symlink 语义和 opaque path 在前端的保留曾不完整：现已补齐并测试。
 - SQLite 裸 id 曾可能跨卷/跨文件错绑，且 donor 与双日志顺序缺少硬门：现已用复合外键、触发器、不可变依赖和卷端 manifest outbox 阻断。
+- 后续故障模型审计发现完整哈希与逐字节比较对异常提前 EOF 的校验不够：现已要求精确声明长度并额外验证 EOF，短读与超长流均有回归测试。
+- 操作模型曾允许 keeper 自身成为 source、`../` 路径和 batch/item 类型错配：现已增加原始路径字节、角色/同一性、目标路径、dry-run 与动作类型硬约束。
+- 任务状态查询曾可能因一次瞬时 IPC 失败丢失取消控制，终态报告也可能被下一任务提前淘汰：现已用自动退避重试、状态未确认警告、显式 acknowledge 和未确认报告门禁修复，并增加 Tauri 模拟恢复测试。
+- 取消无法抢占阻塞中的内核 I/O：最终目录/根复核已增加取消点，界面明确说明需等待当前读取返回；真正硬超时仍要求后续隔离工作进程。
 
 ## 5. 验证结果
 
 | 门禁 | 结果 |
 | --- | --- |
-| Core `fmt + clippy -D warnings + test` | 5 unit + 19 integration，全通过 |
-| Tauri `fmt + clippy -D warnings + test` | 通过 |
+| Core `fmt + clippy -D warnings + test` | 10 unit + 24 integration，全通过 |
+| Tauri `fmt + clippy -D warnings + test` | 7/7，全通过 |
 | 前端 tokens / TypeScript / Vite / Oxlint | 通过 |
-| Playwright + axe | 4/4 通过；首屏与结果态 0 violation |
+| Playwright + axe | 5/5 通过；含瞬时 IPC 失败恢复，首屏与结果态 0 violation |
 | SQLite 迁移安全脚本 | 14 张 STRICT 表；合法链与非法用例全部通过 |
 | Tauri debug bundle | `.app` 与 arm64 `.dmg` 均生成成功 |
 | 独立 M0 代码/文案复核 | 无 P0 blocker；提出项均已修复或明确降级 |

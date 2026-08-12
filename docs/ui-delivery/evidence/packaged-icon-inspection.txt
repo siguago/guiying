@@ -1,0 +1,15 @@
+归影 Phase 1 打包图标检查
+时间：2026-08-11T17:51:31+08:00
+
+来源：design-system/assets/guiying-app-icon.svg
+打包配置：src-tauri/tauri.conf.json 引用 src-tauri/icons 下的多尺寸 PNG、icon.icns 与 icon.ico。
+
+检查：
+- src-tauri/icons/icon.png：512×512 RGBA；SHA-256 339fc7e36ace8650b7e1afef39204c5d4ed8901fad39308f8b41d7aaa81376bd。
+- src-tauri/icons/32x32.png：32×32 RGBA；SHA-256 476cd2d773539d26e0772e3f29e863ab7ac5b1e7d289835cbe66d61dc57aa5b3。
+- icon.icns 与 icon.ico 存在，并由同一仓库品牌源确定性导出。
+- 512px 与 32px 位图均按原尺寸解码检查：照片叠层、圆角和确认标记清晰，无 Tauri scaffold 图形。
+- `git log -- src-tauri/icons` 的品牌替换提交为 `7ec51a0 feat(brand): replace default desktop app icon`。
+
+结论：生产打包配置引用归影原创品牌图标；本检查只证明源、配置资源与像素导出，不证明本轮生成了
+bundle，也不替代 Dock、Finder、DMG 在真实发布签名包中的人工视觉验收。
