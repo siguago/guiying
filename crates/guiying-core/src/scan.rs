@@ -578,20 +578,25 @@ impl Scanner {
             }
         }
 
-        let mut groups =
-            match build_exact_duplicate_groups(&scanned, control, &mut issues, &mut stats) {
-                Ok(groups) => groups,
-                Err(ExactBuildError::Cancelled) => {
-                    return Ok(finish_report(
-                        roots,
-                        scanned,
-                        Vec::new(),
-                        issues,
-                        stats,
-                        ScanStatus::Cancelled,
-                    ));
-                }
-            };
+        let mut groups = match build_exact_duplicate_groups(
+            &scanned,
+            self.read_buffer_bytes,
+            control,
+            &mut issues,
+            &mut stats,
+        ) {
+            Ok(groups) => groups,
+            Err(ExactBuildError::Cancelled) => {
+                return Ok(finish_report(
+                    roots,
+                    scanned,
+                    Vec::new(),
+                    issues,
+                    stats,
+                    ScanStatus::Cancelled,
+                ));
+            }
+        };
 
         let Some(directories_stable) =
             revalidate_directories(&directory_audits, &mut issues, control)
@@ -873,7 +878,10 @@ fn sample_fingerprint(
     let (chunk, offsets) = sample_layout(before.len, sample_bytes);
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"guiying-sample-v1\0");
+    // v2: sample windows are guaranteed disjoint since the overlapping-window
+    // fix; the domain tag version tracks that layout change so persisted v1
+    // fingerprints can never be compared as if they used the same layout.
+    hasher.update(b"guiying-sample-v2\0");
     hasher.update(&before.len.to_le_bytes());
     hasher.update(&(sample_bytes as u64).to_le_bytes());
     let mut buffer = vec![0_u8; chunk];
@@ -942,32 +950,47 @@ fn hash_reader_exact(
     let mut buffer = vec![0_u8; buffer_bytes];
     let mut bytes_read = 0_u64;
 
-    loop {
+    // Read exactly the declared length. A file that keeps growing during
+    // hashing must not turn this loop into unbounded work; the appended data
+    // is detected by the explicit EOF probe below and by the caller's
+    // post-read snapshot verification.
+    while bytes_read < expected_len {
         if effective_scan_directive(control) == ScanDirective::Cancel {
             return Err(ReadHashError::Cancelled);
         }
-        let read = match reader.read(&mut buffer) {
+        let remaining = expected_len - bytes_read;
+        let chunk = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = match reader.read(&mut buffer[..chunk]) {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(ReadHashError::Io(error)),
         };
         if read == 0 {
-            break;
+            return Err(ReadHashError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("expected {expected_len} bytes, read {bytes_read}"),
+            )));
         }
         hasher.update(&buffer[..read]);
         bytes_read = bytes_read.saturating_add(read as u64);
     }
 
-    if bytes_read != expected_len {
-        let kind = if bytes_read < expected_len {
-            io::ErrorKind::UnexpectedEof
-        } else {
-            io::ErrorKind::InvalidData
-        };
-        return Err(ReadHashError::Io(io::Error::new(
-            kind,
-            format!("expected {expected_len} bytes, read {bytes_read}"),
-        )));
+    let mut probe = [0_u8; 1];
+    loop {
+        if effective_scan_directive(control) == ScanDirective::Cancel {
+            return Err(ReadHashError::Cancelled);
+        }
+        match reader.read(&mut probe) {
+            Ok(0) => break,
+            Ok(read) => {
+                return Err(ReadHashError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected {expected_len} bytes, then read {read} more"),
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(ReadHashError::Io(error)),
+        }
     }
 
     Ok((hasher.finalize().to_hex().to_string(), bytes_read))
@@ -1078,6 +1101,7 @@ where
 
 fn build_exact_duplicate_groups(
     scanned: &[ScannedFile],
+    read_buffer_bytes: usize,
     control: &dyn ScanControl,
     issues: &mut Vec<ScanIssue>,
     stats: &mut ScanStats,
@@ -1116,6 +1140,7 @@ fn build_exact_duplicate_groups(
                 &left_file.snapshot,
                 &right_file.binding,
                 &right_file.snapshot,
+                read_buffer_bytes,
                 control,
             ) {
                 Ok(comparison) => {
@@ -1464,6 +1489,39 @@ mod tests {
             error,
             ReadHashError::Io(error) if error.kind() == ErrorKind::InvalidData
         ));
+    }
+
+    /// A reader that never reaches EOF, simulating a file that keeps being
+    /// appended to while it is hashed.
+    #[derive(Default)]
+    struct EndlesslyGrowingReader {
+        bytes_served: u64,
+    }
+
+    impl std::io::Read for EndlesslyGrowingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            for byte in buffer.iter_mut() {
+                *byte = 0x67;
+            }
+            self.bytes_served = self.bytes_served.saturating_add(buffer.len() as u64);
+            Ok(buffer.len())
+        }
+    }
+
+    #[test]
+    fn full_hash_stops_reading_a_file_that_grows_beyond_its_declared_length() {
+        let mut reader = EndlesslyGrowingReader::default();
+
+        let error = hash_reader_exact(&mut reader, 8, 3, &NoopScanControl)
+            .expect_err("a growing file must fail closed, not extend the read");
+
+        assert!(matches!(
+            error,
+            ReadHashError::Io(error) if error.kind() == ErrorKind::InvalidData
+        ));
+        // Declared length plus the single-byte EOF probe is the hard ceiling;
+        // the pre-fix implementation would have read until EOF (never, here).
+        assert!(reader.bytes_served <= 8 + 1);
     }
 
     #[test]

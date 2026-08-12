@@ -1150,3 +1150,65 @@ fn a_short_or_changed_read_cannot_emit_an_eof_proof() {
         StreamEvent::FreshFingerprint(evidence) if evidence.eof_verified()
     )));
 }
+
+#[test]
+fn streaming_deduplicates_directory_identities_across_the_whole_session() {
+    let temporary = TempDir::new().expect("tempdir");
+    let parent = temporary.path().join("parent");
+    let child = parent.join("child");
+    fs::create_dir(&parent).expect("create parent");
+    fs::create_dir(&child).expect("create child");
+    write_media(&child, "photo.jpg", b"one media file");
+
+    // `child` is already enumerated while walking `parent`; selecting it again
+    // as its own root must be skipped by the session-global identity set,
+    // matching the batch scanner's global de-duplication semantics.
+    let mut session = guiying_core::Scanner::default()
+        .start_streaming([parent.as_path(), child.as_path()], StreamLimits::default())
+        .expect("start session");
+    let mut sink = RecordingSink::default();
+    let outcome = session
+        .enumerate(&mut sink, &NoopScanControl)
+        .expect("bounded enumeration");
+
+    assert_eq!(outcome.status, StreamBatchStatus::Partial);
+    assert_eq!(outcome.stats.directory_identity_revisits_skipped, 1);
+    let file_observations = sink
+        .events
+        .iter()
+        .filter(|event| matches!(event, StreamEvent::FileObservation(_)))
+        .count();
+    assert_eq!(file_observations, 1);
+    let revisit_issues = sink
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                StreamEvent::Issue(issue)
+                    if issue.code == ScanIssueCode::DirectoryIdentityAlreadyVisited
+            )
+        })
+        .count();
+    assert_eq!(revisit_issues, 1);
+
+    // The skipped duplicate root emitted no directory ticket, so replaying the
+    // enumerated ticket set still matches exactly, but the coverage decision
+    // must stay `Partial` instead of granting a complete seal.
+    let mut directories = sink.directory_tickets();
+    directories.sort_by_key(|ticket| *ticket.sort_key());
+    let mut coverage_sink = RecordingSink::default();
+    for page in directories.chunks(STREAM_INPUT_BATCH_HARD_MAX) {
+        session
+            .revalidate_directory_batch(page, &mut coverage_sink, &NoopScanControl)
+            .expect("revalidate directory page");
+    }
+    let coverage = session
+        .finalize_coverage(&mut coverage_sink, &NoopScanControl)
+        .expect("finalize coverage");
+    assert_eq!(coverage.status, StreamBatchStatus::Partial);
+    assert!(!coverage_sink
+        .events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::CoverageVerified(_))));
+}

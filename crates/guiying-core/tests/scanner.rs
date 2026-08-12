@@ -99,6 +99,36 @@ fn a_sample_collision_is_resolved_by_the_full_hash() {
     assert_ne!(report.files[0].content_hash, report.files[1].content_hash);
 }
 
+#[test]
+fn a_tiny_read_buffer_still_produces_byte_for_byte_groups() {
+    // Regression for the exact-comparison stage ignoring `read_buffer_bytes`:
+    // the configured buffer (clamped to at most 1 MiB) now drives the
+    // byte-for-byte loop, so the smallest legal value must still group
+    // duplicates correctly across many chunked reads.
+    let temporary = TempDir::new().expect("tempdir");
+    let contents = vec![0x42; 8 * 1024];
+    write_media(temporary.path(), "one.jpg", &contents);
+    write_media(temporary.path(), "two.jpg", &contents);
+    let options = ScanOptions {
+        read_buffer_bytes: 1,
+        ..ScanOptions::default()
+    };
+
+    let report = Scanner::new(options)
+        .expect("valid options")
+        .scan([temporary.path()])
+        .expect("scan succeeds");
+
+    assert_eq!(report.status, ScanStatus::Complete);
+    assert_eq!(report.duplicate_groups.len(), 1);
+    assert_eq!(report.duplicate_groups[0].files.len(), 2);
+    assert_eq!(
+        report.duplicate_groups[0].proof,
+        DuplicateProof::ByteForByte
+    );
+    assert_eq!(report.stats.bytes_exactly_compared, contents.len() as u64);
+}
+
 #[cfg(unix)]
 #[test]
 fn symbolic_links_are_reported_and_never_followed() {

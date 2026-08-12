@@ -7,6 +7,7 @@
 //! per-session secret and are useless after the [`StreamingScanSession`] is
 //! dropped. They are locators, never durable capabilities.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -626,7 +627,11 @@ struct EnumerationProgress {
     stack: Vec<StreamDirectoryFrame>,
     stats: ScanStats,
     partial: bool,
-    accepted_root_directory_ids: Vec<FileId>,
+    /// Every accepted directory identity (roots and descendants) for this
+    /// enumeration. Matches the batch scanner's global de-duplication: the
+    /// same opened (device, inode) is entered exactly once per session, which
+    /// also breaks alias and mount loops that are not ancestor cycles.
+    visited_directory_identities: BTreeSet<FileId>,
 }
 
 impl EnumerationProgress {
@@ -636,7 +641,7 @@ impl EnumerationProgress {
             stack: Vec::new(),
             stats: ScanStats::default(),
             partial: false,
-            accepted_root_directory_ids: Vec::new(),
+            visited_directory_identities: BTreeSet::new(),
         }
     }
 }
@@ -1071,10 +1076,7 @@ impl StreamingScanSession {
                     progress.root_index = progress.root_index.saturating_add(1);
                     continue;
                 };
-                if progress
-                    .accepted_root_directory_ids
-                    .contains(&root_identity)
-                {
+                if !progress.visited_directory_identities.insert(root_identity) {
                     progress.stats.directory_identity_revisits_skipped = progress
                         .stats
                         .directory_identity_revisits_skipped
@@ -1087,7 +1089,7 @@ impl StreamingScanSession {
                             ScanIssueCode::DirectoryIdentityAlreadyVisited,
                             root.path,
                             format!(
-                                "root directory identity ({}, {}) was already selected",
+                                "root directory identity ({}, {}) was already visited",
                                 root_identity.device, root_identity.inode
                             ),
                         ),
@@ -1095,7 +1097,6 @@ impl StreamingScanSession {
                     progress.root_index = progress.root_index.saturating_add(1);
                     continue;
                 }
-                progress.accepted_root_directory_ids.push(root_identity);
                 self.emit_directory_observation(root_index, &bound_root, &mut events)?;
                 progress.stack.push(StreamDirectoryFrame {
                     root_index,
@@ -1245,50 +1246,57 @@ impl StreamingScanSession {
                                                 .to_owned(),
                                         ),
                                     )?;
-                                } else if child.identity().is_some_and(|identity| {
-                                    progress.stack.iter().any(|ancestor| {
-                                        ancestor.directory.identity() == Some(identity)
-                                    })
-                                }) {
-                                    progress.stats.directory_identity_revisits_skipped = progress
-                                        .stats
-                                        .directory_identity_revisits_skipped
-                                        .saturating_add(1);
-                                    emit_issue(
-                                        &mut events,
-                                        &mut progress.stats,
-                                        &mut progress.partial,
-                                        make_issue(
-                                            ScanIssueCode::DirectoryIdentityAlreadyVisited,
-                                            path,
-                                            "directory identity matches an active ancestor; possible mount loop"
-                                                .to_owned(),
-                                        ),
-                                    )?;
-                                } else if child.identity().is_none() {
-                                    emit_issue(
-                                        &mut events,
-                                        &mut progress.stats,
-                                        &mut progress.partial,
-                                        make_issue(
-                                            ScanIssueCode::MetadataUnreadable,
-                                            path,
-                                            "opened directory has no stable device/inode identity"
-                                                .to_owned(),
-                                        ),
-                                    )?;
                                 } else {
-                                    self.emit_directory_observation(
-                                        frame_root_index,
-                                        &child,
-                                        &mut events,
-                                    )?;
-                                    progress.stack.push(StreamDirectoryFrame {
-                                        root_index: frame_root_index,
-                                        root_device: frame_root_device,
-                                        depth: child_depth,
-                                        directory: child,
-                                    });
+                                    match child.identity() {
+                                        None => emit_issue(
+                                            &mut events,
+                                            &mut progress.stats,
+                                            &mut progress.partial,
+                                            make_issue(
+                                                ScanIssueCode::MetadataUnreadable,
+                                                path,
+                                                "opened directory has no stable device/inode identity"
+                                                    .to_owned(),
+                                            ),
+                                        )?,
+                                        Some(identity)
+                                            if !progress
+                                                .visited_directory_identities
+                                                .insert(identity) =>
+                                        {
+                                            progress.stats.directory_identity_revisits_skipped =
+                                                progress
+                                                    .stats
+                                                    .directory_identity_revisits_skipped
+                                                    .saturating_add(1);
+                                            emit_issue(
+                                                &mut events,
+                                                &mut progress.stats,
+                                                &mut progress.partial,
+                                                make_issue(
+                                                    ScanIssueCode::DirectoryIdentityAlreadyVisited,
+                                                    path,
+                                                    format!(
+                                                        "directory identity ({}, {}) was already visited; possible alias or mount loop",
+                                                        identity.device, identity.inode
+                                                    ),
+                                                ),
+                                            )?;
+                                        }
+                                        Some(_) => {
+                                            self.emit_directory_observation(
+                                                frame_root_index,
+                                                &child,
+                                                &mut events,
+                                            )?;
+                                            progress.stack.push(StreamDirectoryFrame {
+                                                root_index: frame_root_index,
+                                                root_device: frame_root_device,
+                                                depth: child_depth,
+                                                directory: child,
+                                            });
+                                        }
+                                    }
                                 }
                             }
                             Err(error) => emit_issue(
@@ -2129,7 +2137,8 @@ impl StreamingScanSession {
             .checked_sub(TICKET_MAC_BYTES)
             .ok_or(TicketDecodeError::Malformed)?;
         let expected_mac = blake3::keyed_hash(&self.ticket_key, &ticket.bytes[..payload_len]);
-        if expected_mac.as_bytes() != &ticket.bytes[payload_len..] {
+        // `blake3::Hash` compares in constant time; never compare raw bytes.
+        if expected_mac != ticket.bytes[payload_len..] {
             return Err(TicketDecodeError::AuthenticationFailed);
         }
         Ok(claims)
@@ -2580,11 +2589,12 @@ fn read_sample_fresh(
     let (chunk, offsets) = crate::scan::sample_layout(before.len, sample_bytes);
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"guiying-sample-v1\0");
+    // v2 tracks the disjoint sample-window layout, matching the batch scanner.
+    hasher.update(b"guiying-sample-v2\0");
     hasher.update(&before.len.to_le_bytes());
     hasher.update(&(sample_bytes as u64).to_le_bytes());
     let mut parameters = blake3::Hasher::new();
-    parameters.update(b"guiying.sample-parameters.v1\0");
+    parameters.update(b"guiying.sample-parameters.v2\0");
     parameters.update(&before.len.to_le_bytes());
     parameters.update(&(sample_bytes as u64).to_le_bytes());
     let mut buffer = vec![0_u8; chunk];
@@ -2677,8 +2687,8 @@ fn compare_opened_fresh(
         .open_stable(&right.snapshot)
         .map_err(|error| map_exact_open_error(right.path.clone(), error))?;
     if left_before.len != right_before.len {
-        let left_after = verified_after_signature_exact(left, &left_file, &left_before)?;
-        let right_after = verified_after_signature_exact(right, &right_file, &right_before)?;
+        let left_after = verified_after_signature_exact(left, &left_file, &left_before, true)?;
+        let right_after = verified_after_signature_exact(right, &right_file, &right_before, false)?;
         return Ok(PendingExactEvidence {
             left_path: PathRef::from_path(&left.path),
             right_path: PathRef::from_path(&right.path),
@@ -2731,8 +2741,8 @@ fn compare_opened_fresh(
         ensure_eof(&mut right_file)
             .map_err(|error| ExactReadError::Right(right.path.clone(), error))?;
     }
-    let left_after = verified_after_signature_exact(left, &left_file, &left_before)?;
-    let right_after = verified_after_signature_exact(right, &right_file, &right_before)?;
+    let left_after = verified_after_signature_exact(left, &left_file, &left_before, true)?;
+    let right_after = verified_after_signature_exact(right, &right_file, &right_before, false)?;
     Ok(PendingExactEvidence {
         left_path: PathRef::from_path(&left.path),
         right_path: PathRef::from_path(&right.path),
@@ -2772,6 +2782,7 @@ fn verified_after_signature_exact(
     opened: &OpenedObservation,
     file: &File,
     before: &FileSnapshot,
+    left_side: bool,
 ) -> Result<[u8; 32], ExactReadError> {
     match opened.binding.snapshot_after_read(file, before) {
         Ok(Some(after)) => Ok(observation_source_signature(
@@ -2782,7 +2793,8 @@ fn verified_after_signature_exact(
             SnapshotKind::File,
         )),
         Ok(None) => Err(ExactReadError::Changed(opened.path.clone())),
-        Err(error) => Err(ExactReadError::Left(opened.path.clone(), error)),
+        Err(error) if left_side => Err(ExactReadError::Left(opened.path.clone(), error)),
+        Err(error) => Err(ExactReadError::Right(opened.path.clone(), error)),
     }
 }
 

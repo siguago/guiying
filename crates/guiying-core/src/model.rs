@@ -220,6 +220,7 @@ pub struct ScanOptions {
     /// Number of bytes read at each of the beginning, middle, and end sample.
     pub sample_bytes: u64,
     /// Streaming buffer used for full hashing and byte-for-byte comparison.
+    /// Exact comparison clamps this to at most 1 MiB per compared side.
     pub read_buffer_bytes: u64,
     /// Do not descend into a nested mount point by default.
     pub stay_on_filesystem: bool,

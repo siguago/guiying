@@ -19,7 +19,8 @@ pub struct ByteComparison {
 /// Both open file descriptors and both paths are checked again before a result
 /// is returned. A concurrent change is therefore an error, never an equality
 /// result. Higher layers should call this immediately before acting on a
-/// duplicate candidate.
+/// duplicate candidate. This standalone helper always uses a fixed 1 MiB
+/// buffer per side.
 ///
 /// This standalone path API protects the final path component and assumes its
 /// ancestor directories are trusted and stable. [`crate::Scanner`] does not
@@ -35,7 +36,14 @@ pub fn compare_files_exact(
     let right = right.as_ref();
     let left_access = PathAccess(left);
     let right_access = PathAccess(right);
-    compare_files_exact_inner(&left_access, None, &right_access, None, control)
+    compare_files_exact_inner(
+        &left_access,
+        None,
+        &right_access,
+        None,
+        VERIFY_BUFFER_BYTES,
+        control,
+    )
 }
 
 pub(crate) fn compare_bound_files_exact(
@@ -43,6 +51,7 @@ pub(crate) fn compare_bound_files_exact(
     left_expected: &crate::file_io::FileSnapshot,
     right: &crate::directory_io::BoundFile,
     right_expected: &crate::file_io::FileSnapshot,
+    buffer_bytes: usize,
     control: &dyn ScanControl,
 ) -> Result<ByteComparison, VerificationError> {
     compare_files_exact_inner(
@@ -50,6 +59,7 @@ pub(crate) fn compare_bound_files_exact(
         Some(left_expected),
         right,
         Some(right_expected),
+        buffer_bytes,
         control,
     )
 }
@@ -59,8 +69,12 @@ fn compare_files_exact_inner(
     left_expected: Option<&crate::file_io::FileSnapshot>,
     right: &dyn ComparisonAccess,
     right_expected: Option<&crate::file_io::FileSnapshot>,
+    buffer_bytes: usize,
     control: &dyn ScanControl,
 ) -> Result<ByteComparison, VerificationError> {
+    // Same clamp semantics as the streaming exact comparison: the configured
+    // buffer is honored up to 1 MiB per side and can never be zero.
+    let buffer_bytes = buffer_bytes.min(VERIFY_BUFFER_BYTES).max(1);
     if effective_scan_directive(control) == ScanDirective::Cancel {
         return Err(VerificationError::Cancelled);
     }
@@ -81,8 +95,8 @@ fn compare_files_exact_inner(
         });
     }
 
-    let mut left_buffer = vec![0_u8; VERIFY_BUFFER_BYTES];
-    let mut right_buffer = vec![0_u8; VERIFY_BUFFER_BYTES];
+    let mut left_buffer = vec![0_u8; buffer_bytes];
+    let mut right_buffer = vec![0_u8; buffer_bytes];
     let mut bytes_compared = 0_u64;
     let mut identical = true;
 
@@ -92,7 +106,7 @@ fn compare_files_exact_inner(
         }
 
         let remaining = left_before.len - bytes_compared;
-        let chunk = cmp::min(remaining, VERIFY_BUFFER_BYTES as u64) as usize;
+        let chunk = cmp::min(remaining, buffer_bytes as u64) as usize;
         read_exact_or_unexpected_eof(&mut left_file, &mut left_buffer[..chunk]).map_err(
             |source| VerificationError::Read {
                 path: left.path().to_path_buf(),

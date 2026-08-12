@@ -10,7 +10,12 @@ available for small compatibility workloads. Production persistence should use
 `Scanner::start_streaming` and `StreamingScanSession`:
 
 1. `enumerate` emits root evidence, lossless file/directory observations,
-   issues, and progress to a synchronous `StreamingScanSink`.
+   issues, and progress to a synchronous `StreamingScanSink`. Directory
+   identities (device, inode) are de-duplicated globally across the whole
+   session, exactly like the batch scanner: a repeated identity (aliased
+   root, alias, or mount loop) is skipped with a
+   `DirectoryIdentityAlreadyVisited` issue and keeps the enumeration and any
+   later coverage decision `Partial`.
 2. The sink persists opaque file and directory tickets. A callback must return
    only after accepting the complete batch; a sink error poisons the session.
 3. Candidate selection happens in durable storage. At most 128 authenticated
