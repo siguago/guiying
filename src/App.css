@@ -720,7 +720,6 @@
   padding-inline: 18px;
 }
 
-.workspace-header,
 /* The scan's scale is context for the decision, not a metric wall: one line
    of prose under the heading, in the same reading rhythm as the page. */
 .results-scale {
@@ -732,6 +731,7 @@
   line-height: 1.7;
 }
 
+.workspace-header,
 .results-header {
   display: flex;
   flex: 0 0 auto;
@@ -811,7 +811,10 @@
 .scan-stage {
   display: grid;
   grid-template-columns: 160px minmax(0, 1fr);
-  gap: clamp(30px, 5vw, 74px);
+  /* Column gap separates the visual from the counts; the row gap only has to
+     set the disclosure below them, so keep it much tighter. */
+  column-gap: clamp(30px, 5vw, 74px);
+  row-gap: 0;
   align-items: center;
   width: min(calc(100% - 68px), 860px);
   margin: auto;
@@ -1429,7 +1432,7 @@
 
 .group-panel__header div,
 .group-panel__header span,
-.group-panel__header strong {
+.group-panel__header h2 {
   display: block;
 }
 
@@ -1438,9 +1441,12 @@
   font-size: 9px;
 }
 
-.group-panel__header strong {
-  margin-top: 2px;
+/* A real h2 so the section headings below it (h3) do not skip a level; the
+   visual weight stays what the panel header always had. */
+.group-panel__header h2 {
+  margin: 2px 0 0;
   font-size: 11px;
+  font-weight: 650;
 }
 
 .read-only-badge,
@@ -1457,6 +1463,69 @@
   min-height: 0;
   flex: 1 1 auto;
   overflow: auto;
+}
+
+/* Eligibility split. Withheld groups use the warning role (design direction
+   §5: amber means "held back for safety"), never danger — nothing is wrong
+   with the user's files, guiying is simply declining to move them. */
+.group-list__heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  padding: 18px 18px 8px;
+  color: var(--semantic-text-primary);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.group-list__heading + .group-row {
+  border-top: 0;
+}
+
+.group-list__heading small {
+  color: var(--semantic-text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.group-list__heading--withheld {
+  color: var(--semantic-text-warning);
+  border-top: 1px solid var(--semantic-border-default);
+  margin-top: 6px;
+}
+
+.group-list__note {
+  margin: 0;
+  padding: 0 18px 10px;
+  color: var(--semantic-text-secondary);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.review-action-bar--withheld {
+  border-top-color: color-mix(in srgb, var(--semantic-text-warning) 30%, var(--semantic-border-default));
+}
+
+.review-action-bar__status--withheld {
+  color: var(--semantic-text-warning);
+}
+
+.withheld-section__reason {
+  margin: 10px 0 0;
+  color: var(--semantic-text-primary);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.withheld-section__note {
+  margin: 10px 0 0;
+  color: var(--semantic-text-secondary);
+  font-size: 12px;
+  line-height: 1.65;
 }
 
 .group-row {
@@ -2700,6 +2769,14 @@
   color: var(--semantic-text-secondary);
   background: var(--semantic-surface-secondary);
   border-color: var(--semantic-border-default);
+}
+
+/* Withheld carries the warning role end to end. Inheriting the action colour
+   on the amber surface would both misread as actionable and fail AA. */
+.decision-proof--withheld {
+  color: var(--semantic-text-warning);
+  background: var(--semantic-surface-warning);
+  border-color: color-mix(in srgb, var(--semantic-text-warning) 26%, transparent);
 }
 
 .group-panel__footer {

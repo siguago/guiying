@@ -18,6 +18,7 @@ import type {
   CaptureTimeMetadataReport,
   CaptureTimeStageSummary,
   DuplicateGroup,
+  GroupEligibility,
   HistoryExportFormat,
   HistoryExportPathPolicy,
   HistoryExportResult,
@@ -246,6 +247,9 @@ interface CoreDuplicateGroupItem {
   previewPath: string
   logicalReclaimableBytes: string
   finalizedAtUnixMs: string
+  eligibility: string
+  blockReasonCode: string | null
+  blockReasonCopy: string | null
 }
 
 interface CoreDuplicateGroupMemberItem {
@@ -690,9 +694,56 @@ function formatUtcInstant(seconds: string | null, nanoseconds: string | null): s
   return `Unix ${seconds}.${nanos.toString().padStart(9, '0')} 秒 UTC`
 }
 
+function adaptGroupEligibility(group: CoreDuplicateGroupItem): {
+  eligibility: GroupEligibility
+  blockReasonCode: string | null
+  blockReasonCopy: string | null
+} {
+  // Fail closed: an unrecognised verdict, or a withheld group that cannot say
+  // why, is treated as blocked. Only an exact 'eligible' with no reason
+  // attached may offer the group for planning.
+  const withheld = (code: string, copy: string) => ({
+    eligibility: 'blocked' as const,
+    blockReasonCode: code,
+    blockReasonCopy: copy,
+  })
+  if (group.eligibility === 'eligible') {
+    if (group.blockReasonCode !== null || group.blockReasonCopy !== null) {
+      return withheld(
+        'GROUP_ELIGIBILITY_INCONSISTENT',
+        '这一组的资格判定自相矛盾，归影不会在结论不一致时提供整理入口。',
+      )
+    }
+    return { eligibility: 'eligible', blockReasonCode: null, blockReasonCopy: null }
+  }
+  if (group.eligibility !== 'review_required' && group.eligibility !== 'blocked') {
+    return withheld(
+      'GROUP_ELIGIBILITY_UNKNOWN',
+      '这一组返回了归影无法识别的资格结论，已按不可整理处理。',
+    )
+  }
+  if (
+    typeof group.blockReasonCode !== 'string'
+    || group.blockReasonCode.length === 0
+    || typeof group.blockReasonCopy !== 'string'
+    || group.blockReasonCopy.length === 0
+  ) {
+    return withheld(
+      'GROUP_ELIGIBILITY_UNEXPLAINED',
+      '这一组暂不能整理，但没有返回原因；归影不会在无法解释时提供整理入口。',
+    )
+  }
+  return {
+    eligibility: group.eligibility,
+    blockReasonCode: group.blockReasonCode,
+    blockReasonCopy: group.blockReasonCopy,
+  }
+}
+
 function adaptGroup(group: CoreDuplicateGroupItem): DuplicateGroup {
   const memberCount = decimalToSafeNumber(group.memberCount, '重复组成员数量')
   return {
+    ...adaptGroupEligibility(group),
     id: group.groupBuildId,
     hashPrefix: `组:${group.groupKeyHex.slice(0, 10)}…`,
     previewName: fileNameFromPath(group.previewPath),

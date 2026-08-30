@@ -291,6 +291,22 @@
 
 另修正测试中一条自基线起就失效的断言（`时间：高可信` 在应用中已不存在），并把两条只在展开态成立的断言移到展开之后。
 
+### R2-b：资格分区（已完成）
+
+判定放在核心层，前端只渲染结论：
+
+- 新增 `scan_service::classify_group_eligibility`，从 feature gate 中移出上限常量，成为唯一的资格判定入口。判定只用扫描已封存的证据：成员数、剔除硬链接后的独立文件数、逻辑大小。
+- `select_quarantine_plan_root` 改为调用同一函数。此前 UI 与执行准入是两套条件，可能让界面提供引擎会拒绝的组；现在不可能漂移。
+- `DuplicateGroupItem` 增加 `eligibility` / `blockReasonCode` / `blockReasonCopy`，withheld 组必定同时带机器码与用户可读原因。
+- 前端 `adaptGroupEligibility` fail closed：未识别的结论、自相矛盾的组合（eligible 却带原因）、以及说不出原因的 withheld 组，一律按 blocked 处理。前端无法把任何组提升为可整理。
+- 结果页分「可整理 / 为安全保留」两区；withheld 组没有 keeper 控件、没有预览入口——不是禁用态，而是根本不渲染；检查器回答「为什么这组暂时不能移动？」并说明照片未被改动。
+
+判定的当前覆盖范围：单成员组、硬链接组、大小证据异常（blocked），超过 256 个成员或 64 GiB 的组（review_required）。逻辑资产、独有 xattr/ACL、time donor 等 PRD 5.1 的其余条件仍待核心层补齐，届时只需扩展这一个函数。
+
+测试：4 条 Rust 单元测试锁定分类器（含「withheld 必须能解释自己」），1 条 UI 测试锁定 FR-03 验收。
+
+顺带修正：`.results-scale` 起初被插进 `.workspace-header, .results-header` 的选择器组中间，使扫描页标题失去内边距；分区标题用 `<h3>` 触发 heading-order，面板标题相应升为 `<h2>`；withheld 胶囊沿用了动作蓝，在琥珀底上既误读为可操作又不达 AA，已改为完整的 warning 语义。
+
 ### 待续批次
 
-R2-b（资格分区）、R1（一次扫描一份计划）、R3（三态语义与决策持久化）尚未开始。R2-b 与 R1 需要扩展 `DuplicateGroup` DTO 与 IPC 契约，R3 需要接通 `operation_batches` / `operation_items`。
+R1（一次扫描一份计划）与 R3（三态语义与决策持久化）尚未开始。R1 需要新增批量计划编译的 IPC 契约，R3 需要接通 `operation_batches` / `operation_items`。R2-b 已经建立的资格判定是 R1 计划编译器的准入基础：批量计划只能纳入 `eligible` 组。

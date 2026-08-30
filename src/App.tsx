@@ -842,7 +842,11 @@ function GroupRow({
         <small>{group.format} · {group.dimensions ?? '尺寸未知'} · {group.memberCount} 份</small>
       </span>
       <span className="group-row__proofs">
-        {keeperName ? (
+        {group.eligibility !== 'eligible' ? (
+          <span className="decision-proof decision-proof--withheld">
+            <ShieldCheck aria-hidden="true" size={12} /> 为安全保留
+          </span>
+        ) : keeperName ? (
           <span className="decision-proof"><CheckCircle2 aria-hidden="true" size={12} /> 已选保留：{keeperName}</span>
         ) : (
           <span className="decision-proof decision-proof--pending"><Circle aria-hidden="true" size={11} /> 请选择保留项</span>
@@ -1714,9 +1718,27 @@ function GroupInspector({
       <header className="inspector__header">
         <span>当前重复组</span>
         <strong id="inspector-title">{group.previewName}</strong>
-        <small>{group.memberCount} 份内容完全相同 · {formatBytes(group.reclaimableBytes)} 可隔离</small>
+        <small>
+          {group.memberCount} 份内容完全相同
+          {group.eligibility === 'eligible' ? ` · ${formatBytes(group.reclaimableBytes)} 可隔离` : null}
+        </small>
       </header>
 
+      {group.eligibility !== 'eligible' ? (
+        // PRD FR-03: a withheld group must be able to answer "why can't this
+        // one move?" — and it must not present a keeper control at all, since
+        // the engine would refuse the plan anyway.
+        <section aria-labelledby="withheld-title" className="inspector-section withheld-section">
+          <div className="inspector-section__title">
+            <span id="withheld-title">为什么这组暂时不能移动？</span>
+            <span>{group.eligibility === 'review_required' ? '需要复核' : '不可整理'}</span>
+          </div>
+          <p className="withheld-section__reason">{group.blockReasonCopy}</p>
+          <p className="withheld-section__note">
+            这一组的内容确实逐字节完全相同。归影只是不会在这种情况下移动文件；你的照片没有任何改变。
+          </p>
+        </section>
+      ) : (
       <section className="inspector-section keeper-section">
         <div className="inspector-section__title">
           <span>保留哪一份？</span>
@@ -1781,7 +1803,9 @@ function GroupInspector({
           </nav>
         ) : null}
       </section>
+      )}
 
+      {group.eligibility === 'eligible' ? (
       <section className="inspector-section">
         <div className="inspector-section__title"><span>本组决定</span><span>{hasSelectedKeeper ? '1 保留 · 其余隔离' : '尚未形成'}</span></div>
         {hasSelectedKeeper ? (
@@ -1802,6 +1826,7 @@ function GroupInspector({
           </div>
         )}
       </section>
+      ) : null}
 
       <details className="inspector-section inspector-details">
         <summary>为什么判定为完全相同</summary>
@@ -2535,6 +2560,18 @@ function ResultsWorkspace({
     [memberFiles, selectedGroup],
   )
 
+  // Split by the native verdict. Counts say "本页" because paging is by cursor:
+  // these are the groups on the current page, not the whole result set.
+  const eligibleGroups = useMemo(
+    () => groups.filter((group) => group.eligibility === 'eligible'),
+    [groups],
+  )
+  const withheldGroups = useMemo(
+    () => groups.filter((group) => group.eligibility !== 'eligible'),
+    [groups],
+  )
+  const selectedGroupWithheld = selectedGroup ? selectedGroup.eligibility !== 'eligible' : false
+
   const currentDecision = selectedGroup ? keeperSelections[selectedGroup.id] : undefined
   const currentKeeper = currentDecision
     ? memberFiles.find((file) => file.id === currentDecision.fileId)
@@ -2857,20 +2894,48 @@ function ResultsWorkspace({
       <div className="results-layout">
         <section aria-labelledby="groups-title" className="group-panel">
           <div className="group-panel__header">
-            <div><span>内容完全相同</span><strong id="groups-title">选择一组，然后决定保留哪份</strong></div>
+            <div><span>内容完全相同</span><h2 id="groups-title">选择一组，然后决定保留哪份</h2></div>
             <span className="read-only-badge"><CheckCircle2 size={13} /> 可逐组处理</span>
           </div>
           {groups.length > 0 ? (
             <div aria-busy={isLoadingGroups} className="group-list">
-              {groups.map((group) => (
-                <GroupRow
-                  group={group}
-                  isSelected={group.id === selectedGroup?.id}
-                  keeperName={keeperSelections[group.id]?.fileName}
-                  key={group.id}
-                  onSelect={() => setSelectedGroupId(group.id)}
-                />
-              ))}
+              {eligibleGroups.length > 0 ? (
+                <>
+                  <h3 className="group-list__heading" id="eligible-groups-heading">
+                    可整理
+                    <small>{eligibleGroups.length} 组，本页</small>
+                  </h3>
+                  {eligibleGroups.map((group) => (
+                    <GroupRow
+                      group={group}
+                      isSelected={group.id === selectedGroup?.id}
+                      keeperName={keeperSelections[group.id]?.fileName}
+                      key={group.id}
+                      onSelect={() => setSelectedGroupId(group.id)}
+                    />
+                  ))}
+                </>
+              ) : null}
+              {withheldGroups.length > 0 ? (
+                <>
+                  <h3 className="group-list__heading group-list__heading--withheld" id="withheld-groups-heading">
+                    为安全保留
+                    <small>{withheldGroups.length} 组，本页</small>
+                  </h3>
+                  <p className="group-list__note">
+                    这些组的内容确实完全相同，但归影不会移动它们。选中任意一组可以看到原因。
+                  </p>
+                  {withheldGroups.map((group) => (
+                    <GroupRow
+                      group={group}
+                      isSelected={group.id === selectedGroup?.id}
+                      keeperName={keeperSelections[group.id]?.fileName}
+                      key={group.id}
+                      onSelect={() => setSelectedGroupId(group.id)}
+                    />
+                  ))}
+                </>
+              ) : null}
             </div>
           ) : report.totalDuplicateGroups === 0 ? <EmptyResults status={report.status} /> : null}
           {groupLoadError ? (
@@ -2928,7 +2993,16 @@ function ResultsWorkspace({
           />
         ) : null}
       </div>
-      {selectedGroup ? (
+      {selectedGroup && selectedGroupWithheld ? (
+        <section aria-label="当前组操作" className="review-action-bar review-action-bar--withheld">
+          <div className="review-action-bar__summary">
+            <span className="review-action-bar__status review-action-bar__status--withheld">
+              <ShieldCheck size={14} /> 这一组为安全保留
+            </span>
+            <span>{selectedGroup.blockReasonCopy}</span>
+          </div>
+        </section>
+      ) : selectedGroup ? (
         <section aria-label="当前组操作" className="review-action-bar">
           <div className="review-action-bar__summary">
             <span className={`review-action-bar__status${currentDecision ? ' is-ready' : ''}`}>

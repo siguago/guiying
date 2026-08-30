@@ -3765,6 +3765,11 @@ pub(crate) struct DuplicateGroupItem {
     preview_path: String,
     logical_reclaimable_bytes: String,
     finalized_at_unix_ms: String,
+    /// Decided natively by `classify_group_eligibility`; the WebView renders
+    /// this verdict and can never widen it.
+    eligibility: String,
+    block_reason_code: Option<String>,
+    block_reason_copy: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -3785,10 +3790,97 @@ pub(crate) struct DuplicateGroupMemberItem {
     timestamp_granularity_ns: Option<String>,
 }
 
-#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
 const MAX_QUARANTINE_GROUP_MEMBERS: i64 = 256;
-#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
 const MAX_QUARANTINE_GROUP_LOGICAL_BYTES: i64 = 64 * 1024 * 1024 * 1024;
+
+/// Why a duplicate group cannot enter a quarantine plan, or that it can.
+///
+/// This is the single authority for the split the results page draws between
+/// 可整理 and 为安全保留. The read-only listing and the quarantine plan builder
+/// both call `classify_group_eligibility`, so what the UI offers and what the
+/// engine will actually accept cannot drift apart. Reasons carry a stable
+/// machine code for tests and diagnostics plus user-facing copy; the frontend
+/// renders the copy and must never derive eligibility itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GroupEligibility {
+    Eligible,
+    ReviewRequired {
+        code: &'static str,
+        copy: &'static str,
+    },
+    Blocked {
+        code: &'static str,
+        copy: &'static str,
+    },
+}
+
+impl GroupEligibility {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::ReviewRequired { .. } => "review_required",
+            Self::Blocked { .. } => "blocked",
+        }
+    }
+
+    fn reason_code(self) -> Option<&'static str> {
+        match self {
+            Self::Eligible => None,
+            Self::ReviewRequired { code, .. } | Self::Blocked { code, .. } => Some(code),
+        }
+    }
+
+    fn reason_copy(self) -> Option<&'static str> {
+        match self {
+            Self::Eligible => None,
+            Self::ReviewRequired { copy, .. } | Self::Blocked { copy, .. } => Some(copy),
+        }
+    }
+}
+
+/// Decide whether a sealed duplicate group may be planned for quarantine.
+///
+/// Uses only evidence already sealed by the scan: member count, the
+/// independent-file count that excludes hard links, and the logical size.
+/// Anything unknown or contradictory can only reduce eligibility — a group is
+/// never promoted to 可整理 by a missing signal.
+pub(crate) fn classify_group_eligibility(
+    member_count: i64,
+    independent_file_count: i64,
+    logical_reclaimable_bytes: i64,
+) -> GroupEligibility {
+    if member_count < 2 {
+        return GroupEligibility::Blocked {
+            code: "GROUP_SINGLE_MEMBER",
+            copy: "这一组只剩一个文件，没有需要移走的副本。",
+        };
+    }
+    if independent_file_count != member_count {
+        return GroupEligibility::Blocked {
+            code: "GROUP_NOT_INDEPENDENT_FILES",
+            copy: "这些文件互为硬链接，指向磁盘上的同一份内容。移走它们不会释放空间，也可能影响其他位置的引用。",
+        };
+    }
+    if logical_reclaimable_bytes < 0 {
+        return GroupEligibility::Blocked {
+            code: "GROUP_SIZE_EVIDENCE_INVALID",
+            copy: "这一组的大小记录异常，归影不会在证据不可信时移动文件。",
+        };
+    }
+    if member_count > MAX_QUARANTINE_GROUP_MEMBERS {
+        return GroupEligibility::ReviewRequired {
+            code: "GROUP_TOO_MANY_MEMBERS",
+            copy: "这一组的副本超过 256 个，超出一次整理的安全上限，需要分批处理。",
+        };
+    }
+    if logical_reclaimable_bytes > MAX_QUARANTINE_GROUP_LOGICAL_BYTES {
+        return GroupEligibility::ReviewRequired {
+            code: "GROUP_TOO_LARGE",
+            copy: "这一组的副本合计超过 64 GiB，超出一次整理的安全上限，需要分批处理。",
+        };
+    }
+    GroupEligibility::Eligible
+}
 
 /// Trusted, non-WebView projection used to construct one fail-closed
 /// quarantine plan. Native bytes never leave Rust; the result token remains
@@ -4956,10 +5048,13 @@ pub(crate) async fn load_quarantine_group_evidence(
                     ));
                 }
             };
-            if !(2..=MAX_QUARANTINE_GROUP_MEMBERS).contains(&group.member_count)
-                || group.independent_file_count != group.member_count
-                || group.logical_reclaimable_bytes < 0
-                || group.logical_reclaimable_bytes > MAX_QUARANTINE_GROUP_LOGICAL_BYTES
+            // Same verdict the results page showed. If these ever diverged the
+            // UI could offer a group the engine refuses, so both sides call it.
+            if classify_group_eligibility(
+                group.member_count,
+                group.independent_file_count,
+                group.logical_reclaimable_bytes,
+            ) != GroupEligibility::Eligible
                 || keeper_ordinal >= group.member_count
             {
                 return Err(AppError::quarantine(
@@ -5145,6 +5240,11 @@ fn map_group_page(
                     "已验证重复组缺少可显示的成员；结果已拒绝展示。",
                 )
             })?;
+        let eligibility = classify_group_eligibility(
+            group.member_count,
+            group.independent_file_count,
+            group.logical_reclaimable_bytes,
+        );
         items.push(DuplicateGroupItem {
             group_build_id: group.build_id.to_string(),
             group_key_hex: hex(group.group_key.as_bytes()),
@@ -5154,6 +5254,9 @@ fn map_group_page(
             preview_path: preview.display_path,
             logical_reclaimable_bytes: group.logical_reclaimable_bytes.to_string(),
             finalized_at_unix_ms: group.finalized_at_ms.to_string(),
+            eligibility: eligibility.kind().to_owned(),
+            block_reason_code: eligibility.reason_code().map(str::to_owned),
+            block_reason_copy: eligibility.reason_copy().map(str::to_owned),
         });
     }
     Ok(ResultPage {
@@ -6219,6 +6322,112 @@ fn emit_status_event(app: &AppHandle, owner_window_label: &str, status: &ScanJob
 mod tests {
     use super::*;
     use guiying_core::{CancellationToken, NoopScanControl};
+
+    #[test]
+    fn group_eligibility_admits_only_plain_independent_groups() {
+        assert_eq!(
+            classify_group_eligibility(3, 3, 7_340_032),
+            GroupEligibility::Eligible
+        );
+        assert_eq!(
+            classify_group_eligibility(2, 2, 0),
+            GroupEligibility::Eligible
+        );
+        assert_eq!(
+            classify_group_eligibility(
+                MAX_QUARANTINE_GROUP_MEMBERS,
+                MAX_QUARANTINE_GROUP_MEMBERS,
+                1
+            ),
+            GroupEligibility::Eligible
+        );
+        assert_eq!(
+            classify_group_eligibility(2, 2, MAX_QUARANTINE_GROUP_LOGICAL_BYTES),
+            GroupEligibility::Eligible
+        );
+    }
+
+    #[test]
+    fn group_eligibility_blocks_hard_links_and_degenerate_groups() {
+        // Hard links share one on-disk extent: moving them frees nothing and can
+        // strand references elsewhere in the tree.
+        assert!(matches!(
+            classify_group_eligibility(3, 2, 1_024),
+            GroupEligibility::Blocked {
+                code: "GROUP_NOT_INDEPENDENT_FILES",
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_group_eligibility(1, 1, 0),
+            GroupEligibility::Blocked {
+                code: "GROUP_SINGLE_MEMBER",
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_group_eligibility(0, 0, 0),
+            GroupEligibility::Blocked {
+                code: "GROUP_SINGLE_MEMBER",
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_group_eligibility(2, 2, -1),
+            GroupEligibility::Blocked {
+                code: "GROUP_SIZE_EVIDENCE_INVALID",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn group_eligibility_defers_batches_over_the_safety_ceiling() {
+        assert!(matches!(
+            classify_group_eligibility(
+                MAX_QUARANTINE_GROUP_MEMBERS + 1,
+                MAX_QUARANTINE_GROUP_MEMBERS + 1,
+                1_024
+            ),
+            GroupEligibility::ReviewRequired {
+                code: "GROUP_TOO_MANY_MEMBERS",
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_group_eligibility(2, 2, MAX_QUARANTINE_GROUP_LOGICAL_BYTES + 1),
+            GroupEligibility::ReviewRequired {
+                code: "GROUP_TOO_LARGE",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn group_eligibility_exposes_copy_only_for_withheld_groups() {
+        let ok = classify_group_eligibility(2, 2, 0);
+        assert_eq!(ok.kind(), "eligible");
+        assert!(ok.reason_code().is_none());
+        assert!(ok.reason_copy().is_none());
+
+        // A withheld group must always be able to answer "why not?" — PRD FR-03
+        // requires both a stable machine code and user-facing copy.
+        for withheld in [
+            classify_group_eligibility(3, 2, 1),
+            classify_group_eligibility(1, 1, 0),
+            classify_group_eligibility(2, 2, -1),
+            classify_group_eligibility(
+                MAX_QUARANTINE_GROUP_MEMBERS + 1,
+                MAX_QUARANTINE_GROUP_MEMBERS + 1,
+                1,
+            ),
+            classify_group_eligibility(2, 2, MAX_QUARANTINE_GROUP_LOGICAL_BYTES + 1),
+        ] {
+            assert_ne!(withheld.kind(), "eligible");
+            assert!(withheld.reason_code().is_some_and(|code| !code.is_empty()));
+            assert!(withheld.reason_copy().is_some_and(|copy| !copy.is_empty()));
+        }
+    }
 
     /// Mirror of `src/lib/ipc-contract.json`. `deny_unknown_fields` makes any
     /// key added on the WebView side without a matching assertion here fail

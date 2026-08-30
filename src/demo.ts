@@ -29,6 +29,9 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
     duplicateGroups: [
       {
         id: 'demo-heic-001',
+        eligibility: 'eligible',
+        blockReasonCode: null,
+        blockReasonCopy: null,
         hashPrefix: 'b3:9fb3c2a4…',
         previewName: 'IMG_4821.HEIC',
         mediaKind: 'image',
@@ -96,6 +99,9 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
       },
       {
         id: 'demo-mov-002',
+        eligibility: 'eligible',
+        blockReasonCode: null,
+        blockReasonCopy: null,
         hashPrefix: 'b3:3d1072aa…',
         previewName: 'IMG_7710.MOV',
         mediaKind: 'video',
@@ -152,6 +158,9 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
       },
       {
         id: 'demo-jpeg-003',
+        eligibility: 'blocked',
+        blockReasonCode: 'GROUP_NOT_INDEPENDENT_FILES',
+        blockReasonCopy: '这些文件互为硬链接，指向磁盘上的同一份内容。移走它们不会释放空间，也可能影响其他位置的引用。',
         hashPrefix: 'b3:6a1180e9…',
         previewName: 'PXL_20220712_092011.jpg',
         mediaKind: 'image',

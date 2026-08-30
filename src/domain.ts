@@ -279,8 +279,17 @@ export interface DuplicateFile {
   keeperReason?: string
 }
 
+/// Decided natively (scan_service::classify_group_eligibility) and rendered
+/// as-is. The frontend never derives or widens this verdict.
+export type GroupEligibility = 'eligible' | 'review_required' | 'blocked'
+
 export interface DuplicateGroup {
   id: string
+  eligibility: GroupEligibility
+  /// Stable machine code, present iff eligibility !== 'eligible'.
+  blockReasonCode: string | null
+  /// User-facing reason, present iff eligibility !== 'eligible'.
+  blockReasonCopy: string | null
   hashPrefix: string
   previewName: string
   mediaKind: 'image' | 'video' | 'asset'

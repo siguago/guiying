@@ -372,6 +372,45 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
   await expect(page.getByText('不参与重复判定')).toBeVisible()
 })
 
+test('withheld groups are separated, explained, and offer no keeper control', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
+
+  // PRD 4.3: results split by eligibility, not by evidence type.
+  await expect(page.getByRole('heading', { name: /可整理/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /为安全保留/ })).toBeVisible()
+
+  const withheldRow = page.getByRole('button').filter({ hasText: '为安全保留' }).first()
+  await expect(withheldRow).toBeVisible()
+  await withheldRow.click()
+
+  // PRD FR-03: the surface must answer "why can't this group move?" with a
+  // concrete reason, in plain language.
+  await expect(
+    page.getByRole('region', { name: '为什么这组暂时不能移动？' }),
+  ).toBeVisible()
+  await expect(page.getByText(/互为硬链接/).first()).toBeVisible()
+  await expect(page.getByText(/你的照片没有任何改变/)).toBeVisible()
+
+  // PRD 5.1: engine authorisation, not user risk acknowledgement — there is no
+  // keeper control and no route into a plan, not merely a disabled one.
+  await expect(page.getByRole('radio')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /预览本组/ })).toHaveCount(0)
+  await expect(page.getByText('保留哪一份？')).toHaveCount(0)
+
+  // Selecting an eligible group restores the decision controls.
+  await page.getByRole('button').filter({ hasText: 'IMG_4821.HEIC' }).first().click()
+  await expect(page.getByText('保留哪一份？')).toBeVisible()
+  await expect(page.getByRole('button', { name: /预览本组/ })).toBeVisible()
+
+  const accessibility = await new AxeBuilder({ page }).analyze()
+  expect(accessibility.violations).toEqual([])
+})
+
 test('demo workflow selects the recommended keeper, previews reversible isolation, and restores it', async ({ page }) => {
   await page.goto('/')
   await page.clock.install()
@@ -490,6 +529,9 @@ test('default release locks live quarantine while sealed adapters keep pathless 
                 previewPath: '/Volumes/Quarantine Fixture/KEEP.JPG',
                 logicalReclaimableBytes: '4096',
                 finalizedAtUnixMs: '2000',
+                eligibility: 'eligible',
+                blockReasonCode: null,
+                blockReasonCopy: null,
               }],
               nextCursor: null,
             }
@@ -1727,6 +1769,9 @@ test('persistent results page groups, members, and issues without unbounded accu
       previewPath: `/Volumes/Test Photos/${name}`,
       logicalReclaimableBytes: memberCount === '3' ? '8' : '4',
       finalizedAtUnixMs: '2000',
+      eligibility: 'eligible',
+      blockReasonCode: null,
+      blockReasonCopy: null,
     })
     const member = (groupBuildId: string, ordinal: string, name: string) => ({
       groupBuildId,
@@ -2094,6 +2139,9 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
       previewPath: `/Volumes/Test Photos/${name}`,
       logicalReclaimableBytes: '4',
       finalizedAtUnixMs: '1900',
+      eligibility: 'eligible',
+      blockReasonCode: null,
+      blockReasonCopy: null,
     })
     const member = (groupBuildId: string, ordinal: string, name: string) => ({
       groupBuildId,
