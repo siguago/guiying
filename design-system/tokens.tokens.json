@@ -67,7 +67,7 @@
       "amber": {
         "600": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.658824, 0.372549, 0], "alpha": 1, "hex": "#a85f00" }
+          "$value": { "colorSpace": "srgb", "components": [0.490196, 0.27451, 0], "alpha": 1, "hex": "#7d4600" }
         },
         "100": {
           "$type": "color",

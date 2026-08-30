@@ -26,6 +26,7 @@ import {
   Undo2,
   Video,
 } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode, RefObject } from 'react'
 import './App.css'
@@ -105,11 +106,21 @@ const scanStages = [
 const AUTHORIZED_SOURCE_LABEL = '已通过系统选择器授权的照片目录'
 const internalQuarantineEnabled = import.meta.env.VITE_GUIYING_INTERNAL_QUARANTINE === '1'
 
-const workflow = [
-  { id: 'source', label: '选择目录', detail: '一次系统授权', icon: FolderOpen },
-  { id: 'scan', label: '查找重复', detail: '只读逐字节确认', icon: ScanSearch },
-  { id: 'review', label: '选择保留项', detail: '每组只做一个决定', icon: Fingerprint },
-  { id: 'isolate', label: '预览并隔离', detail: '可恢复，不永久删除', icon: Archive },
+// Destinations, not development steps: every entry here is somewhere the user
+// can actually go in this build. Capabilities that are not shipped yet do not
+// get a placeholder — they are simply absent from the nav.
+type DestinationId = 'organize' | 'quarantine' | 'activity'
+
+const destinations: Array<{
+  id: DestinationId
+  label: string
+  detail: string
+  icon: LucideIcon
+  internalOnly?: boolean
+}> = [
+  { id: 'organize', label: '整理', detail: '扫描并决定保留哪份', icon: ScanSearch },
+  { id: 'quarantine', label: '隔离区', detail: '已移走的副本与恢复', icon: Archive, internalOnly: true },
+  { id: 'activity', label: '活动', detail: '过去的扫描与导出', icon: HistoryIcon },
 ]
 
 function confidenceLabel(confidence: Confidence): string {
@@ -136,16 +147,6 @@ function asScanError(error: unknown): ScanErrorShape {
   return {
     message: typeof error === 'string' ? error : '扫描没有完成，请重新选择目录后再试。',
   }
-}
-
-function Metric({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return (
-    <div className="metric">
-      <span className="metric__label">{label}</span>
-      <strong className="metric__value">{value}</strong>
-      <span className="metric__detail">{detail}</span>
-    </div>
-  )
 }
 
 function EvidenceRail({ group }: { group: DuplicateGroup }) {
@@ -180,7 +181,7 @@ function SourceOverview({
   return (
     <section aria-labelledby="source-heading" className="rail-section source-overview">
       <div className="rail-section__heading">
-        <span id="source-heading">{isSealed ? '封存范围文本' : '当前范围'}</span>
+        <span id="source-heading">{isSealed ? '扫描时的位置' : '当前位置'}</span>
         {hasVisibleSource ? (
           <span className="status-dot status-dot--ok">
             {kind === 'active' ? '扫描中' : isSealed ? '仅显示' : '已授权'}
@@ -199,76 +200,65 @@ function SourceOverview({
           <div className="source-facts">
             {isSealed ? (
               <>
-                <span><LockKeyhole size={13} aria-hidden="true" /> 显示文本不用于重新寻址</span>
-                <span><Check size={13} aria-hidden="true" /> 当前没有目录读取或写入权限</span>
+                <span><LockKeyhole size={13} aria-hidden="true" /> 这是扫描时记录的位置</span>
+                <span><Check size={13} aria-hidden="true" /> 归影现在没有这个文件夹的权限</span>
               </>
             ) : (
               <>
-                <span><Check size={13} aria-hidden="true" /> 绑定根后不跟随树内符号链接</span>
-                <span><Check size={13} aria-hidden="true" /> 不主动修改内容或时间</span>
+                <span><Check size={13} aria-hidden="true" /> 只读取这个文件夹里的照片</span>
+                <span><Check size={13} aria-hidden="true" /> 不修改照片内容或时间</span>
               </>
             )}
           </div>
         </>
       ) : (
-        <p className="rail-empty">尚未选择目录。扫描不主动修改内容、名称、birthtime 或 mtime；文件系统仍可能更新 atime。</p>
+        <p className="rail-empty">尚未选择文件夹。扫描只读取照片，不修改内容、名称或时间。</p>
       )}
     </section>
   )
 }
 
-function WorkflowRail({
-  phase,
-  resultStage,
-  showQuarantineCopy,
+function DestinationNav({
+  current,
+  busyReason,
+  onNavigate,
 }: {
-  phase: AppPhase
-  resultStage: ResultStage
-  showQuarantineCopy: boolean
+  current: DestinationId
+  busyReason: string | null
+  onNavigate: (id: DestinationId) => void
 }) {
-  const activeIndex =
-    phase === 'idle' || phase === 'ready-to-scan'
-      ? 0
-      : phase === 'history'
-        ? 2
-        : phase === 'restore'
-          ? 3
-      : phase === 'scanning'
-        ? 1
-        : phase === 'results'
-          ? resultStage === 'review' ? 2 : 3
-          : 1
-
+  const visible = destinations.filter((item) => !item.internalOnly || internalQuarantineEnabled)
   return (
-    <nav aria-label="整理流程" className="workflow-nav">
-      <span className="workflow-nav__label">整理流程</span>
-      <ol>
-        {workflow.map((step, index) => {
-          const Icon = step.icon
-          const isComplete = index < activeIndex
-          const isActive = index === activeIndex
-          const label = step.id === 'isolate' && !showQuarantineCopy ? '预览整理计划' : step.label
-          const detail = step.id === 'isolate' && !showQuarantineCopy ? '真实执行仍锁定' : step.detail
+    <nav aria-label="主导航" className="destination-nav">
+      <ul>
+        {visible.map((item) => {
+          const Icon = item.icon
+          const isCurrent = item.id === current
+          // A running scan or an in-flight quarantine owns the workspace;
+          // leaving would drop the job rather than keep it in the background,
+          // so say why instead of offering a destination that silently
+          // abandons work in progress.
+          const isBlocked = busyReason !== null && !isCurrent
           return (
-            <li
-              className={[
-                'workflow-step',
-                isComplete ? 'workflow-step--complete' : '',
-                isActive ? 'workflow-step--active' : '',
-              ].join(' ')}
-              key={step.id}
-            >
-              <span className="workflow-step__icon">
-                {isComplete ? <Check size={16} /> : <Icon size={16} />}
-              </span>
-              <span>
-                <strong>{label}</strong>
-                <small>{detail}</small>
-              </span>
+            <li key={item.id}>
+              <button
+                aria-current={isCurrent ? 'page' : undefined}
+                className={`destination${isCurrent ? ' destination--current' : ''}`}
+                disabled={isBlocked}
+                onClick={() => onNavigate(item.id)}
+                title={isBlocked ? busyReason : undefined}
+                type="button"
+              >
+                <span className="destination__icon"><Icon size={16} /></span>
+                <span>
+                  <strong>{item.label}</strong>
+                  <small>{item.detail}</small>
+                </span>
+              </button>
             </li>
           )
         })}
-      </ol>
+      </ul>
     </nav>
   )
 }
@@ -332,26 +322,20 @@ function IdleWorkspace({
             ) : null}
             <button className="button button--quiet" disabled={!isDesktop} onClick={onHistory} type="button">
               <HistoryIcon aria-hidden="true" size={17} />
-              查看历史报告
+              活动记录
             </button>
-            <button
-              className="button button--quiet"
-              disabled={!isDesktop || !internalQuarantineEnabled}
-              onClick={onRestore}
-              title={!internalQuarantineEnabled ? '当前没有已开放的隔离记录' : undefined}
-              type="button"
-            >
-              <Undo2 aria-hidden="true" size={17} />
-              恢复隔离文件
-            </button>
+            {internalQuarantineEnabled ? (
+              <button
+                className="button button--quiet"
+                disabled={!isDesktop}
+                onClick={onRestore}
+                type="button"
+              >
+                <Undo2 aria-hidden="true" size={17} />
+                恢复隔离文件
+              </button>
+            ) : null}
           </div>
-
-          {!internalQuarantineEnabled ? (
-            <p className="quarantine-release-note" role="status">
-              <LockKeyhole aria-hidden="true" size={14} />
-              当前没有已开放的隔离记录；真实隔离仍在安全验证中。合成数据演示不受影响。
-            </p>
-          ) : null}
 
           {rootAuthorizationExpired ? (
             <p className="root-grant-note root-grant-note--expired" role="status">
@@ -373,40 +357,6 @@ function IdleWorkspace({
           ) : null}
         </section>
 
-        <aside aria-label="扫描保护措施" className="safety-sheet">
-          <div className="safety-sheet__index">SAFE / 01</div>
-          <div className="safety-sheet__header">
-            <div className="safety-sheet__seal"><ShieldCheck size={22} /></div>
-            <div>
-              <span>安全整理原则</span>
-              <strong>扫描时不主动改文件</strong>
-            </div>
-          </div>
-          <ol className="safety-list">
-            <li>
-              <span>01</span>
-              <div><strong>扫描只读</strong><small>先确认哪些文件逐字节完全相同，不根据文件名猜测</small></div>
-            </li>
-            <li>
-              <span>02</span>
-              <div><strong>你来选择保留项</strong><small>归影提供信息和建议，但不会替你决定留下哪一份</small></div>
-            </li>
-            <li>
-              <span>03</span>
-              {internalQuarantineEnabled ? (
-                <div><strong>先预览，后隔离</strong><small>不会永久删除；隔离清单支持恢复，冲突时绝不覆盖</small></div>
-              ) : (
-                <div><strong>只预览，不执行</strong><small>当前版本不会移动或删除文件；真实隔离仍在安全验证中</small></div>
-              )}
-            </li>
-          </ol>
-          <div className="safety-sheet__footer">
-            <Info aria-hidden="true" size={15} />
-            {internalQuarantineEnabled
-              ? '首版只处理完全相同的副本，不修改照片时间，也不处理相似照片。'
-              : '当前版本只读识别完全相同的副本，不移动文件、不修改照片时间。'}
-          </div>
-        </aside>
       </div>
     </main>
   )
@@ -455,7 +405,7 @@ function quarantineOperationCanRestore(operation: QuarantineOperationItem): bool
 function historyCaptureTimeLabel(status: ScanHistoryItem['captureTimeStatus']): string {
   return {
     complete: '时间证据完整',
-    partial: '时间证据部分封印',
+    partial: '时间证据部分完成',
     not_run: '时间阶段未运行',
     unavailable: '时间阶段无可用终态',
     failed: '时间阶段失败',
@@ -584,9 +534,9 @@ function HistoryWorkspace({
     <main className="workspace workspace--history">
       <header className="workspace-header history-header">
         <div>
-          <span className="section-kicker"><HistoryIcon aria-hidden="true" size={15} /> 封存结果目录</span>
-          <h1>历史只读报告</h1>
-          <p>这里只列出覆盖阶段已终止且逐字节组已封印的扫描；部分覆盖与时间阶段失败都会明确标记。</p>
+          <span className="section-kicker"><HistoryIcon aria-hidden="true" size={15} /> 活动记录</span>
+          <h1>过去的扫描</h1>
+          <p>这里只列出已经完成内容比对的扫描。没有扫描完整个文件夹的，会明确标出来。</p>
         </div>
         <button className="button button--quiet" onClick={onBack} type="button">
           <ChevronLeft aria-hidden="true" size={16} /> 返回扫描入口
@@ -596,8 +546,8 @@ function HistoryWorkspace({
       <div className="history-boundary" role="note">
         <LockKeyhole aria-hidden="true" size={16} />
         <div>
-          <strong>历史记录不是新的文件系统权限。</strong>
-          <span>范围名称只是封存显示文本；打开报告不会重新读取照片，也不会恢复旧描述符或挂载会话。</span>
+          <strong>打开记录不会重新读取照片。</strong>
+          <span>这里显示的位置是扫描当时记录下来的文字，不代表归影现在还能访问那个文件夹。</span>
         </div>
       </div>
 
@@ -607,32 +557,32 @@ function HistoryWorkspace({
             <span>本地证据库</span>
             <strong id="history-list-title">按完成时间倒序</strong>
           </div>
-          <span className="read-only-badge"><LockKeyhole size={13} /> 仅查看封印证据</span>
+          <span className="read-only-badge"><LockKeyhole size={13} /> 只读查看</span>
         </div>
 
         {isLoading && items.length === 0 ? (
           <div className="history-state" role="status">
-            <LoaderCircle aria-hidden="true" className="is-spinning" size={18} /> 正在验证并读取历史报告目录…
+            <LoaderCircle aria-hidden="true" className="is-spinning" size={18} /> 正在读取活动记录…
           </div>
         ) : null}
         {loadError ? (
           <div className="history-state history-state--error" role="alert">
             <TriangleAlert aria-hidden="true" size={18} />
-            <div><strong>这一页历史报告没有通过读取。</strong><span>{loadError}</span></div>
+            <div><strong>这一页活动记录没有读取成功。</strong><span>{loadError}</span></div>
             <button onClick={() => void retryFailedPage()} type="button">重试失败页</button>
           </div>
         ) : null}
         {openError ? (
           <div className="history-state history-state--error" role="alert">
             <TriangleAlert aria-hidden="true" size={18} />
-            <div><strong>封存报告未能打开。</strong><span>{openError}</span></div>
+            <div><strong>这条记录打不开。</strong><span>{openError}</span></div>
           </div>
         ) : null}
         {!isLoading && !loadError && items.length === 0 ? (
           <div className="history-empty">
             <Database aria-hidden="true" size={26} />
-            <h2>还没有可复核的历史报告</h2>
-            <p>完成一次只读扫描后，封印结果会出现在这里；取消或尚未封印逐字节阶段的任务不会伪装成可复核报告。</p>
+            <h2>还没有扫描记录</h2>
+            <p>完成一次扫描后，结果会出现在这里。中途取消、还没完成内容比对的扫描不会记录为可复核的结果。</p>
           </div>
         ) : null}
 
@@ -641,7 +591,7 @@ function HistoryWorkspace({
             {items.map((entry) => (
               <li key={entry.historyEntryId}>
                 <button
-                  aria-label={`打开 ${entry.rootDisplay} 的封存报告`}
+                  aria-label={`打开 ${entry.rootDisplay} 的扫描记录`}
                   className="history-entry"
                   disabled={openingEntryId !== null}
                   onClick={() => void openEntry(entry)}
@@ -654,12 +604,12 @@ function HistoryWorkspace({
                   <span className="history-entry__scope" title={entry.rootDisplay}>
                     <strong>{fileNameFromPath(entry.rootDisplay) || '卷内根目录'}</strong>
                     <small>
-                      {entry.rootDisplay} · 封存显示文本 · {entry.coverageStatus === 'complete' ? '完整覆盖' : '部分覆盖'} · {historyCaptureTimeLabel(entry.captureTimeStatus)}
+                      {entry.rootDisplay} · {entry.coverageStatus === 'complete' ? '完整扫描' : '部分扫描'} · {historyCaptureTimeLabel(entry.captureTimeStatus)}
                     </small>
                   </span>
                   <span className="history-entry__metrics">
-                    <span><strong>{entry.verifiedGroups.toLocaleString('zh-CN')}</strong><small>确定重复组</small></span>
-                    <span><strong>{formatBytes(entry.logicalReclaimableBytes)}</strong><small>逻辑重复上限</small></span>
+                    <span><strong>{entry.verifiedGroups.toLocaleString('zh-CN')}</strong><small>完全相同的组</small></span>
+                    <span><strong>{formatBytes(entry.logicalReclaimableBytes)}</strong><small>重复占用</small></span>
                     <span><strong>{entry.unresolvedIssues.toLocaleString('zh-CN')}</strong><small>未解决问题</small></span>
                   </span>
                   <span className="history-entry__action">
@@ -674,7 +624,7 @@ function HistoryWorkspace({
         ) : null}
 
         {items.length > 0 && (cursorHistory.length > 0 || nextCursor !== null) ? (
-          <nav aria-busy={isLoading} aria-label="历史报告分页" className="pagination-bar history-pagination">
+          <nav aria-busy={isLoading} aria-label="活动记录分页" className="pagination-bar history-pagination">
             <button disabled={cursorHistory.length === 0 || isLoading} onClick={() => void loadPrevious()} type="button">
               <ChevronLeft aria-hidden="true" size={14} /> 上一页
             </button>
@@ -692,6 +642,9 @@ function HistoryWorkspace({
 function ScanningWorkspace({
   source,
   stageIndex,
+  completed,
+  total,
+  startedAtMs,
   attemptKind,
   canCancel,
   isCancelling,
@@ -704,6 +657,9 @@ function ScanningWorkspace({
 }: {
   source: string
   stageIndex: number
+  completed: number
+  total: number | null
+  startedAtMs: number | null
   attemptKind: ScanAttemptKind | null
   canCancel: boolean
   isCancelling: boolean
@@ -714,20 +670,38 @@ function ScanningWorkspace({
   onPause: () => Promise<void>
   onResume: () => Promise<void>
 }) {
+  // Elapsed time is data the user asked for, not decoration: keep it ticking
+  // under reduced-motion, and stop the timer as soon as the scan is paused so
+  // a paused scan does not keep reporting time it is not spending.
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  const isRunning = jobPhase === 'running' || jobPhase === 'pausing' || jobPhase === 'resuming'
+  useEffect(() => {
+    if (startedAtMs === null || !isRunning) return
+    setNowMs(Date.now())
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [startedAtMs, isRunning])
+  const elapsedLabel = startedAtMs === null
+    ? null
+    : historyDurationLabel(Math.max(0, nowMs - startedAtMs))
+  const remaining = total === null ? null : Math.max(0, total - completed)
   const isPaused = jobPhase === 'paused'
   const isPausing = jobPhase === 'pausing'
   const isResuming = jobPhase === 'resuming'
   const canPause = canCancel && stageIndex === 0 && jobPhase === 'running'
   const canResume = canCancel && stageIndex === 0 && isPaused
   const liveLabel = isCancelling
-    ? '等待当前读取返回并安全停止…'
+    ? '正在安全停止…'
     : isPausing
-      ? '正在到达枚举安全点…'
+      ? '正在暂停…'
       : isPaused
-        ? '目录枚举已暂停'
+        ? '扫描已暂停'
         : isResuming
-          ? '正在继续目录枚举…'
-          : scanStages[stageIndex]?.label
+          ? '正在继续…'
+          // The live region announces what the user can act on — running,
+          // pausing, stopped — not which internal stage the scan is in.
+          // Stage names stay inside the "如何确认？" disclosure.
+          : '正在检查文件'
   return (
     // aria-busy is scoped to the stage panel below; putting it on <main>
     // for the whole scan would let screen readers suppress the polite live
@@ -777,24 +751,40 @@ function ScanningWorkspace({
         </div>
       </header>
 
-      <section aria-busy={!isPaused} aria-labelledby="scan-stage-title" className="scan-stage">
+      <section aria-label="扫描进度" aria-busy={!isPaused} className="scan-stage">
         <div className="scan-stage__visual" aria-hidden="true">
           <div className="scan-disc"><Fingerprint size={34} /></div>
           <div className="scan-pulse" />
         </div>
-        <div className="scan-stage__copy">
-          <span>自动阶段 {stageIndex + 1} / {scanStages.length} · 无需操作</span>
-          <h2 id="scan-stage-title">{scanStages[stageIndex]?.label}</h2>
-          <p>{scanStages[stageIndex]?.description}</p>
-        </div>
-        <ol className="scan-checkpoints">
-          {scanStages.map((stage, index) => (
-            <li className={index < stageIndex ? 'is-done' : index === stageIndex ? 'is-active' : ''} key={stage.label}>
-              <span>{index < stageIndex ? <Check size={13} /> : index + 1}</span>
-              <div><strong>{stage.label}</strong><small>{stage.description}</small></div>
-            </li>
-          ))}
-        </ol>
+        <dl className="scan-counts">
+          <div>
+            <dt>已检查</dt>
+            <dd>{completed.toLocaleString('zh-CN')}</dd>
+          </div>
+          {remaining !== null ? (
+            <div>
+              <dt>待检查</dt>
+              <dd>{remaining.toLocaleString('zh-CN')}</dd>
+            </div>
+          ) : null}
+          {elapsedLabel ? (
+            <div>
+              <dt>已用时</dt>
+              <dd>{elapsedLabel}</dd>
+            </div>
+          ) : null}
+        </dl>
+        <details className="scan-method">
+          <summary>如何确认？</summary>
+          <ol className="scan-checkpoints">
+            {scanStages.map((stage, index) => (
+              <li className={index < stageIndex ? 'is-done' : index === stageIndex ? 'is-active' : ''} key={stage.label}>
+                <span>{index < stageIndex ? <Check size={13} /> : index + 1}</span>
+                <div><strong>{stage.label}</strong><small>{stage.description}</small></div>
+              </li>
+            ))}
+          </ol>
+        </details>
       </section>
 
       <div
@@ -813,11 +803,12 @@ function ScanningWorkspace({
         {cancelError ?? statusWarning ?? (attemptKind === 'fresh_full_child' ? (
           <span>
             <strong>重新关联为新的全量扫描。</strong>
-            {' '}已验证同一逻辑卷标识 + 精确原生根范围；本次从根开始全量重扫，不恢复旧进度、文件句柄、目录权限或历史证据，也不证明是同一块物理磁盘。
+            {' '}归影认出这可能是上次扫描过的位置，但无法确认是不是同一块硬盘，所以不会接着上次的进度：
+            本次从头完整重扫，不沿用旧的访问权限，之前的结果也不会被覆盖。
           </span>
         ) : stageIndex === 0
-          ? '暂停只在目录枚举安全点生效；仅本次打开期间可继续；退出后需重新扫描。停止扫描始终可用。'
-          : '停止请求会在当前系统读取返回后的安全检查点生效；不会触发移动、改名或改时，文件系统仍可能记录 atime。')}
+          ? '暂停后可以继续；退出应用需要重新扫描。随时可以停止。'
+          : '停止后已检查的结果仍会保留；扫描不会移动、改名或修改照片。')}
       </div>
     </main>
   )
@@ -836,7 +827,7 @@ function GroupRow({
 }) {
   const MediaIcon = group.mediaKind === 'video' ? Video : group.mediaKind === 'asset' ? Layers3 : ImageIcon
   const timeConfidence = group.evidence[0]?.confidence ?? 'low'
-  const timeEvidencePending = group.evidence[0]?.value === '选择该组后按需读取封印证据'
+  const timeEvidencePending = group.evidence[0]?.value === '选择该组后按需读取时间证据'
 
   return (
     <button
@@ -856,14 +847,13 @@ function GroupRow({
         ) : (
           <span className="decision-proof decision-proof--pending"><Circle aria-hidden="true" size={11} /> 请选择保留项</span>
         )}
-        <span className="content-proof"><CheckCircle2 aria-hidden="true" size={12} /> D1 · 逐字节确认</span>
         <span className="visually-hidden">
           {timeEvidencePending ? '时间证据按需审阅' : `时间证据${confidenceLabel(timeConfidence)}`}
         </span>
       </span>
       <span className="group-row__saving">
         <strong>{formatBytes(group.reclaimableBytes)}</strong>
-        <small>逻辑重复上限</small>
+        <small>重复占用</small>
       </span>
       <ChevronRight aria-hidden="true" className="group-row__chevron" size={17} />
     </button>
@@ -1558,7 +1548,7 @@ function CaptureTimeEvidencePanel({
     return <p className="capture-time-empty">本次没有运行拍摄时间分析。</p>
   }
   if (stageStatus === 'unavailable' || stageStatus === 'failed') {
-    return <p className="capture-time-empty">拍摄时间阶段不可用；D1 内容重复结论不受影响。</p>
+    return <p className="capture-time-empty">拍摄时间分析不可用；重复判定结果不受影响。</p>
   }
   if (isLoading) {
     return (
@@ -1817,7 +1807,7 @@ function GroupInspector({
         <summary>为什么判定为完全相同</summary>
         <div className="inspector-section__title">
           <span>内容验证</span>
-          <span className="verified-label"><CheckCircle2 size={13} /> D1 · 逐字节确认</span>
+          <span className="verified-label"><CheckCircle2 size={13} /> 内容已完整比对</span>
         </div>
         <EvidenceRail group={group} />
       </details>
@@ -1868,10 +1858,10 @@ function CaptureTimeStageNotice({ report }: { report: ScanReport }) {
   if (!stage || stage.status === 'not_run') return null
 
   const statusCopy = {
-    completed: ['拍摄时间证据已封存', '已完成当前范围内的描述符绑定双重提取。'],
-    partial: ['拍摄时间证据部分完成', '只展示已经封存的组；未完成组不会产生时间结论。'],
-    unavailable: ['拍摄时间证据不可用', 'D1 重复结论仍有效；当前没有可展示的内嵌时间证据。'],
-    failed: ['拍摄时间阶段失败', 'D1 重复结论仍保留；失败不会降级成文件系统时间猜测。'],
+    completed: ['拍摄时间已分析完成', '已对本次范围内的文件完成两次独立读取并核对一致。'],
+    partial: ['拍摄时间部分完成', '只显示已完成的组；未完成的组不会给出时间结论。'],
+    unavailable: ['拍摄时间不可用', '重复判定结果仍然有效；这些文件里没有可读的拍摄时间。'],
+    failed: ['拍摄时间分析失败', '重复判定结果仍然保留；归影不会改用文件时间来猜测拍摄时间。'],
     not_run: ['', ''],
   }[stage.status]
 
@@ -1887,10 +1877,10 @@ function CaptureTimeStageNotice({ report }: { report: ScanReport }) {
         <strong>{statusCopy[0]}</strong>
         <span>{statusCopy[1]}</span>
         <small>
-          已封存 {stage.groupsWritten.toLocaleString('zh-CN')} / {stage.groupsSeen.toLocaleString('zh-CN')} 组，
+          已完成 {stage.groupsWritten.toLocaleString('zh-CN')} / {stage.groupsSeen.toLocaleString('zh-CN')} 组，
           其中 {stage.evidenceGroups.toLocaleString('zh-CN')} 组有证据；
           {stage.usageScope === 'sealed_reports'
-            ? `封印报告可重建的双提取读取为 ${formatBytes(stage.actualReadBytes)}（失败探测未计入）。`
+            ? `两次读取共 ${formatBytes(stage.actualReadBytes)}（读取失败的不计入）。`
             : `实际读取 ${formatBytes(stage.actualReadBytes)}。`}
           {stage.budgetExhausted ? ' 本次达到只读预算上限。' : ''}
           {stage.failure ? ` 终止原因：${stage.failure}。` : ''}
@@ -1923,7 +1913,7 @@ function IssueDisclosure({ report }: { report: ScanReport }) {
   if (report.dataMode === 'live' && !report.resultReadToken) {
     return (
       <div className="issue-disclosure" role="status">
-        本次未完成任务记录了 {report.skippedFiles.toLocaleString('zh-CN')} 条问题；取消态不会开放未封印的问题分页。
+        本次未完成的扫描记录了 {report.skippedFiles.toLocaleString('zh-CN')} 条问题；扫描取消后不再展开未完成部分的问题列表。
       </div>
     )
   }
@@ -2218,7 +2208,7 @@ function HistoryExportPanel({ resultReadToken, defaultOpen = true }: {
       <div className="history-export-panel__heading">
         <div>
           <span className="section-kicker">本地副本</span>
-          <h2 id="history-export-title">导出封存报告</h2>
+          <h2 id="history-export-title">导出活动记录（可选）</h2>
           <p>由系统选择目标；界面只接收文件名，不接收或显示目标目录。</p>
         </div>
         <Archive aria-hidden="true" size={20} />
@@ -2257,7 +2247,7 @@ function HistoryExportPanel({ resultReadToken, defaultOpen = true }: {
       {pathPolicy === 'display' ? (
         <div className="history-export-privacy-note" id="history-export-display-note">
           <TriangleAlert aria-hidden="true" size={15} />
-          <span>文件会包含报告中封存的显示路径，以及扫描问题的阶段、代码和消息；路径和问题消息都可能含个人目录名称。不会导出原生路径字节或文件权限。</span>
+          <span>文件会包含记录中的显示路径，以及扫描问题的阶段、代码和消息；路径和问题消息都可能含个人目录名称。不会导出文件权限。</span>
         </div>
       ) : null}
 
@@ -2589,7 +2579,7 @@ function ResultsWorkspace({
       return
     }
     if (!report.resultReadToken || !selectedGroup || !currentDecision?.ordinal) {
-      setActionError('当前组缺少原生隔离所需的封存成员身份；请重新扫描后再试。')
+      setActionError('这一组缺少隔离所需的文件身份记录；请重新扫描后再试。')
       return
     }
     setStage('executing')
@@ -2676,7 +2666,7 @@ function ResultsWorkspace({
         <section aria-labelledby="plan-title" className="plan-sheet">
           <div className="plan-sheet__heading">
             <div>
-              <span>D1 · 已逐字节确认</span>
+              <span>内容已完整比对</span>
               <h2 id="plan-title">{selectedGroup.previewName}</h2>
             </div>
             <strong>{formatBytes(selectedGroup.reclaimableBytes)}</strong>
@@ -2778,19 +2768,24 @@ function ResultsWorkspace({
             {report.dataMode === 'synthetic'
               ? '合成数据 · 设计演示'
               : report.resultOrigin === 'history'
-                ? '历史封印报告 · 只读复核'
+                ? '活动记录 · 只读复核'
               : report.status === 'complete'
                 ? '扫描完成 · 下一步选择保留项'
                 : report.status === 'cancelled'
                   ? '扫描已取消 · 部分报告'
                   : report.status === 'interrupted'
-                    ? '扫描被中断 · 根目录身份变化'
+                    ? '扫描被中断 · 文件夹发生了变化'
                     : '只读报告部分完成'}
           </span>
-          <h1>发现 {report.totalDuplicateGroups.toLocaleString('zh-CN')} 组确定重复</h1>
+          <h1>发现 {report.totalDuplicateGroups.toLocaleString('zh-CN')} 组完全相同的文件</h1>
+          <p className="results-scale">
+            共检查 {report.mediaFiles.toLocaleString('zh-CN')} 个媒体文件，其中{' '}
+            {report.duplicateFiles.toLocaleString('zh-CN')} 个是重复副本，重复占用{' '}
+            {formatBytes(report.reclaimableBytes)}；移入隔离区暂不会释放空间。
+          </p>
           <p title={report.root}>{report.root}</p>
           {report.resultOrigin === 'history' ? (
-            <span className="native-path-note">这是历史封存显示文本，不是当前文件系统位置或重新打开权限</span>
+            <span className="native-path-note">这是扫描当时记录的位置，打开这份记录不会重新读取照片</span>
           ) : null}
           {report.rootPath ? (
             <span className="native-path-note">
@@ -2801,13 +2796,13 @@ function ResultsWorkspace({
                 : report.rootPath.encoding === 'windows_utf16_le'
                   ? 'Windows UTF-16LE'
                   : 'UTF-8'}
-              {' '}无损封存，显示文本不用于寻址
+              {' '}完整记录；界面上显示的文字不用于重新定位文件
             </span>
           ) : null}
         </div>
         <button className="button button--quiet" onClick={onReset} type="button">
           {report.resultOrigin === 'history' ? (
-            <><ChevronLeft aria-hidden="true" size={16} /> 返回历史报告</>
+            <><ChevronLeft aria-hidden="true" size={16} /> 返回活动记录</>
           ) : (
             <><RotateCcw aria-hidden="true" size={16} /> 扫描其他目录</>
           )}
@@ -2832,7 +2827,7 @@ function ResultsWorkspace({
         <div className="report-notice report-notice--partial" role="alert">
           <TriangleAlert aria-hidden="true" size={16} />
           <div>
-            <strong>报告已封存，但任务回执仍待确认。</strong>
+            <strong>结果已保存，但还需要确认一次。</strong>
             <span>你可以继续复核本页；在确认成功前，新扫描会恢复这个终态任务，而不会覆盖证据。</span>
             {acknowledgementError ? <small>{acknowledgementError}</small> : null}
           </div>
@@ -2858,13 +2853,6 @@ function ResultsWorkspace({
           resultReadToken={report.resultReadToken}
         />
       ) : null}
-
-      <section aria-label="扫描摘要" className="metrics-strip">
-        <Metric label="媒体文件" value={report.mediaFiles.toLocaleString('zh-CN')} detail={`${formatBytes(report.scannedBytes)} 逻辑大小`} />
-        <Metric label="冗余独立副本" value={report.duplicateFiles.toLocaleString('zh-CN')} detail={`${report.totalDuplicateGroups.toLocaleString('zh-CN')} 个证据组`} />
-        <Metric label="逻辑重复上限" value={formatBytes(report.reclaimableBytes)} detail="克隆、稀疏文件与快照会影响实际释放" />
-        <Metric label="需要留意" value={report.skippedFiles.toLocaleString('zh-CN')} detail="跳过、排除、变化或读取问题" />
-      </section>
 
       <div className="results-layout">
         <section aria-labelledby="groups-title" className="group-panel">
@@ -3215,6 +3203,11 @@ function App() {
   const [report, setReport] = useState<ScanReport | null>(null)
   const [error, setError] = useState<ScanErrorShape | null>(null)
   const [stageIndex, setStageIndex] = useState(0)
+  const [scanCounts, setScanCounts] = useState<{ completed: number; total: number | null }>({
+    completed: 0,
+    total: null,
+  })
+  const [scanStartedAtMs, setScanStartedAtMs] = useState<number | null>(null)
   const [isChoosing, setIsChoosing] = useState(false)
   const [activeScanJobId, setActiveScanJobId] = useState<string | null>(null)
   const [isCancelling, setIsCancelling] = useState(false)
@@ -3266,12 +3259,28 @@ function App() {
       setSelectedRoot(null)
       setRootAuthorizationExpired(true)
     }
-    const remaining = Number(selectedRoot.expiresAtUnixMs) - Date.now()
-    if (remaining <= 0) {
-      expire()
-      return
+    // setTimeout clamps its delay to a 32-bit signed integer, so a deadline
+    // more than ~24.8 days out fires almost immediately and would strand the
+    // user on an "expired" grant that the native layer still honours. Re-arm
+    // in bounded slices and only expire once the deadline has actually passed.
+    // A non-finite deadline is treated as already expired: fail closed rather
+    // than advertise authority we cannot reason about.
+    const MAX_TIMEOUT_MS = 2_147_483_647
+    let timer = 0
+    const arm = () => {
+      const deadline = Number(selectedRoot.expiresAtUnixMs)
+      if (!Number.isFinite(deadline)) {
+        expire()
+        return
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        expire()
+        return
+      }
+      timer = window.setTimeout(arm, Math.min(remaining, MAX_TIMEOUT_MS))
     }
-    const timer = window.setTimeout(expire, remaining)
+    arm()
     return () => window.clearTimeout(timer)
   }, [phase, selectedRoot])
 
@@ -3311,6 +3320,8 @@ function App() {
     const rootToken = selectedRoot.rootToken
     scanAttemptRef.current = true
     setStageIndex(0)
+    setScanCounts({ completed: 0, total: null })
+    setScanStartedAtMs(Date.now())
     setError(null)
     setScanActionError(null)
     setScanStatusWarning(null)
@@ -3329,6 +3340,7 @@ function App() {
             complete: 4,
           }[progress.stage]
           setStageIndex(nextStage)
+          setScanCounts({ completed: progress.completed, total: progress.total ?? null })
         },
         setScanStatusWarning,
         observeScanJobPhase,
@@ -3451,6 +3463,8 @@ function App() {
     setRootAuthorizationExpired(false)
     setSource(demoRoot)
     setStageIndex(0)
+    setScanCounts({ completed: 0, total: null })
+    setScanStartedAtMs(Date.now())
     setError(null)
     setScanActionError(null)
     setScanStatusWarning(null)
@@ -3467,12 +3481,21 @@ function App() {
           complete: 4,
         }[progress.stage]
         setStageIndex(nextStage)
+        setScanCounts({ completed: progress.completed, total: progress.total ?? null })
       })
       setReport(demo)
       setPhase('results')
     } finally {
       scanAttemptRef.current = false
     }
+  }
+
+  // The organize destination returns to wherever the main flow currently is:
+  // an in-memory report stays on its results page, otherwise start over at the
+  // picker. It never cancels a scan — the nav blocks that instead.
+  function handleOrganize() {
+    if (phase === 'scanning' || resultStage === 'executing') return
+    setPhase(report ? 'results' : 'idle')
   }
 
   function handleHistory() {
@@ -3517,6 +3540,8 @@ function App() {
     setReport(null)
     setError(null)
     setStageIndex(0)
+    setScanCounts({ completed: 0, total: null })
+    setScanStartedAtMs(null)
     setActiveScanJobId(null)
     activeScanJobIdRef.current = null
     scanControlGenerationRef.current += 1
@@ -3548,10 +3573,20 @@ function App() {
           <BrandMark />
           <div><strong>归影</strong><small>照片归档助手</small></div>
         </div>
-        <WorkflowRail
-          phase={phase}
-          resultStage={resultStage}
-          showQuarantineCopy={showQuarantineCopy}
+        <DestinationNav
+          current={phase === 'history' ? 'activity' : phase === 'restore' ? 'quarantine' : 'organize'}
+          busyReason={
+            phase === 'scanning'
+              ? '扫描进行中；停止扫描后可以离开'
+              : resultStage === 'executing'
+                ? '正在移动文件；完成后可以离开'
+                : null
+          }
+          onNavigate={(id) => {
+            if (id === 'activity') handleHistory()
+            else if (id === 'quarantine') handleRestore()
+            else handleOrganize()
+          }}
         />
         <SourceOverview kind={sourceOverviewKind} source={source} />
         <div className="rail-privacy">
@@ -3571,7 +3606,6 @@ function App() {
               <span className="status-dot status-dot--ok" />
               {showQuarantineCopy ? '本地处理 · 可恢复隔离' : '本地处理 · 无主动变更'}
             </span>
-            <span className="app-version">D1 安全整理</span>
           </div>
         </header>
 
@@ -3612,6 +3646,7 @@ function App() {
             attemptKind={scanAttemptKind}
             canCancel={activeScanJobId !== null}
             cancelError={scanActionError}
+            completed={scanCounts.completed}
             isCancelling={isCancelling}
             jobPhase={scanJobPhase}
             onCancel={handleCancelScan}
@@ -3619,7 +3654,9 @@ function App() {
             onResume={handleResumeScan}
             source={source}
             stageIndex={stageIndex}
+            startedAtMs={scanStartedAtMs}
             statusWarning={scanStatusWarning}
+            total={scanCounts.total}
           />
         ) : null}
         {phase === 'results' && report ? (

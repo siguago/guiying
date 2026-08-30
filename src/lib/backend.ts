@@ -710,7 +710,7 @@ function adaptGroup(group: CoreDuplicateGroupItem): DuplicateGroup {
     evidence: [
       {
         label: '拍摄时间',
-        value: '选择该组后按需读取封印证据',
+        value: '选择该组后按需读取时间证据',
         source: '拍摄时间分析与 D1 内容判定保持分离',
         confidence: 'low',
         note: '文件系统时间只作为独立关系线索，不会据此自动选择主副本。',

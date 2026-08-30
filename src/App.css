@@ -60,11 +60,10 @@
   stroke-width: 2.4;
 }
 
-.workflow-nav {
+.destination-nav {
   margin-top: 52px;
 }
 
-.workflow-nav__label,
 .rail-section__heading {
   display: flex;
   align-items: center;
@@ -77,15 +76,16 @@
   text-transform: uppercase;
 }
 
-.workflow-nav ol {
+.destination-nav ul {
   display: grid;
   gap: 4px;
-  margin: 12px 0 0;
+  margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.workflow-step {
+.destination {
+  width: 100%;
   display: grid;
   grid-template-columns: 30px minmax(0, 1fr);
   gap: 10px;
@@ -93,25 +93,36 @@
   min-height: 52px;
   padding: 7px 8px;
   color: color-mix(in srgb, var(--semantic-text-inverse) 72%, transparent);
+  background: none;
   border: 1px solid transparent;
   border-radius: var(--semantic-radius-control);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
 }
 
-.workflow-step--active {
+.destination:hover:not(:disabled):not(.destination--current) {
+  color: var(--semantic-text-inverse);
+  background: color-mix(in srgb, var(--semantic-text-inverse) 5%, transparent);
+}
+
+.destination:focus-visible {
+  outline: 2px solid var(--semantic-text-inverse);
+  outline-offset: 2px;
+}
+
+.destination:disabled {
+  color: color-mix(in srgb, var(--semantic-text-inverse) 38%, transparent);
+  cursor: not-allowed;
+}
+
+.destination--current {
   color: var(--semantic-text-inverse);
   background: color-mix(in srgb, var(--semantic-text-inverse) 8%, transparent);
   border-color: color-mix(in srgb, var(--semantic-text-inverse) 12%, transparent);
 }
 
-.workflow-step--complete {
-  color: color-mix(in srgb, var(--reference-color-emerald-100) 85%, white);
-}
-
-.workflow-step--locked {
-  color: color-mix(in srgb, var(--semantic-text-inverse) 67%, transparent);
-}
-
-.workflow-step__icon {
+.destination__icon {
   display: grid;
   place-items: center;
   width: 28px;
@@ -120,18 +131,18 @@
   border-radius: 50%;
 }
 
-.workflow-step strong,
-.workflow-step small {
+.destination strong,
+.destination small {
   display: block;
   min-width: 0;
 }
 
-.workflow-step strong {
+.destination strong {
   font-size: 13px;
   line-height: 1.35;
 }
 
-.workflow-step small {
+.destination small {
   margin-top: 2px;
   overflow: hidden;
   color: color-mix(in srgb, var(--semantic-text-inverse) 64%, transparent);
@@ -318,10 +329,8 @@
 
 .intro-grid {
   display: grid;
-  grid-template-columns: minmax(420px, 1.1fr) minmax(320px, 0.72fr);
-  gap: clamp(48px, 8vw, 108px);
-  align-items: center;
-  width: min(100%, 1100px);
+  grid-template-columns: 1fr;
+  width: min(100%, 660px);
 }
 
 .eyebrow,
@@ -459,121 +468,6 @@
 
 .root-grant-note--expired {
   color: var(--semantic-text-warning);
-}
-
-.safety-sheet {
-  position: relative;
-  max-width: 420px;
-  padding: 25px;
-  background: var(--semantic-surface-primary);
-  border: 1px solid var(--semantic-border-default);
-  border-radius: var(--semantic-radius-surface);
-}
-
-.safety-sheet::before {
-  position: absolute;
-  inset: 8px;
-  z-index: 0;
-  content: '';
-  pointer-events: none;
-  border: 1px solid color-mix(in srgb, var(--semantic-border-default) 55%, transparent);
-  border-radius: calc(var(--semantic-radius-surface) - 4px);
-}
-
-.safety-sheet > * {
-  position: relative;
-  z-index: 1;
-}
-
-.safety-sheet__index {
-  color: var(--semantic-text-secondary);
-  font-family: var(--semantic-font-numeric);
-  font-size: 9px;
-  letter-spacing: 0.12em;
-  text-align: right;
-}
-
-.safety-sheet__header {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-top: 7px;
-  padding-bottom: 20px;
-  border-bottom: 1px solid var(--semantic-border-default);
-}
-
-.safety-sheet__seal {
-  display: grid;
-  place-items: center;
-  width: 48px;
-  height: 48px;
-  color: var(--semantic-text-positive);
-  background: var(--semantic-surface-selected);
-  border: 1px solid color-mix(in srgb, var(--semantic-action-primary) 35%, transparent);
-  border-radius: 50%;
-}
-
-.safety-sheet__header span,
-.safety-sheet__header strong {
-  display: block;
-}
-
-.safety-sheet__header span {
-  color: var(--semantic-text-secondary);
-  font-size: 10px;
-}
-
-.safety-sheet__header strong {
-  margin-top: 3px;
-  font-size: 18px;
-}
-
-.safety-list {
-  margin: 3px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.safety-list li {
-  display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
-  gap: 12px;
-  align-items: start;
-  padding: 16px 0;
-  border-bottom: 1px solid var(--semantic-border-default);
-}
-
-.safety-list li > span {
-  padding-top: 2px;
-  color: var(--semantic-text-positive);
-  font-family: var(--semantic-font-numeric);
-  font-size: 10px;
-}
-
-.safety-list strong,
-.safety-list small {
-  display: block;
-}
-
-.safety-list strong {
-  font-size: 12px;
-}
-
-.safety-list small {
-  margin-top: 4px;
-  color: var(--semantic-text-secondary);
-  font-size: 10px;
-  line-height: 1.45;
-}
-
-.safety-sheet__footer {
-  display: flex;
-  gap: 8px;
-  align-items: flex-start;
-  margin-top: 17px;
-  color: var(--semantic-text-secondary);
-  font-size: 10px;
-  line-height: 1.45;
 }
 
 .workspace--scan,
@@ -827,6 +721,17 @@
 }
 
 .workspace-header,
+/* The scan's scale is context for the decision, not a metric wall: one line
+   of prose under the heading, in the same reading rhythm as the page. */
+.results-scale {
+  max-width: 62ch;
+  margin: 12px 0 0;
+  color: var(--semantic-text-secondary);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.7;
+}
+
 .results-header {
   display: flex;
   flex: 0 0 auto;
@@ -905,12 +810,63 @@
 
 .scan-stage {
   display: grid;
-  grid-template-columns: 160px minmax(220px, 0.7fr) minmax(320px, 1fr);
+  grid-template-columns: 160px minmax(0, 1fr);
   gap: clamp(30px, 5vw, 74px);
   align-items: center;
-  width: min(calc(100% - 68px), 1080px);
+  width: min(calc(100% - 68px), 860px);
   margin: auto;
   padding: 50px 0;
+}
+
+/* Counts are the scan's primary reading, so they get the numeric face and
+   room to breathe; the method list below is opt-in detail. */
+.scan-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: clamp(24px, 4vw, 52px);
+  margin: 0;
+}
+
+.scan-counts dt {
+  color: var(--semantic-text-secondary);
+  font-size: 12px;
+}
+
+.scan-counts dd {
+  margin: 6px 0 0;
+  font-family: var(--semantic-font-numeric);
+  font-size: clamp(26px, 3vw, 38px);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+}
+
+.scan-method {
+  grid-column: 2;
+  margin-top: 28px;
+  border-top: 1px solid var(--semantic-border-subtle);
+  padding-top: 18px;
+}
+
+.scan-method > summary {
+  width: fit-content;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  color: var(--semantic-text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.scan-method > summary:focus-visible {
+  outline: 2px solid var(--semantic-border-focus);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.scan-method[open] > summary {
+  margin-bottom: 18px;
+  color: var(--semantic-text-primary);
 }
 
 .scan-stage__visual {
@@ -953,27 +909,6 @@
   0% { opacity: 0.18; transform: scale(0.72); }
   55% { opacity: 0.72; }
   100% { opacity: 0; transform: scale(1); }
-}
-
-.scan-stage__copy > span {
-  color: var(--semantic-text-positive);
-  font-family: var(--semantic-font-numeric);
-  font-size: 10px;
-}
-
-.scan-stage__copy h2 {
-  margin: 10px 0 0;
-  font-size: clamp(24px, 2.6vw, 36px);
-  line-height: 1.12;
-  letter-spacing: -0.035em;
-}
-
-.scan-stage__copy p {
-  max-width: 380px;
-  margin: 13px 0 0;
-  color: var(--semantic-text-secondary);
-  font-size: 12px;
-  line-height: 1.65;
 }
 
 .scan-checkpoints {
@@ -1458,47 +1393,6 @@
   animation: spin 1s linear infinite;
 }
 
-.metrics-strip {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  flex: 0 0 auto;
-  background: var(--semantic-surface-primary);
-  border-bottom: 1px solid var(--semantic-border-default);
-}
-
-.metric {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-  padding: 16px 22px;
-  border-right: 1px solid var(--semantic-border-default);
-}
-
-.metric:last-child {
-  border-right: 0;
-}
-
-.metric__label,
-.metric__detail {
-  overflow: hidden;
-  color: var(--semantic-text-secondary);
-  font-size: 9px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.metric__label {
-  font-weight: 650;
-  letter-spacing: 0.06em;
-}
-
-.metric__value {
-  font-family: var(--semantic-font-numeric);
-  font-size: 20px;
-  font-weight: 650;
-  letter-spacing: -0.035em;
-}
-
 .results-layout {
   display: grid;
   grid-template-columns: minmax(470px, 1fr) minmax(320px, 390px);
@@ -1567,7 +1461,7 @@
 
 .group-row {
   display: grid;
-  grid-template-columns: 42px minmax(170px, 1fr) auto 88px 18px;
+  grid-template-columns: 42px minmax(0, 1fr) auto 88px 18px;
   gap: 13px;
   align-items: center;
   width: 100%;
@@ -2488,7 +2382,7 @@
   }
 
   .scan-stage {
-    grid-template-columns: 120px minmax(190px, 0.62fr) minmax(280px, 1fr);
+    grid-template-columns: 120px minmax(0, 1fr);
     gap: 28px;
   }
 
@@ -2573,10 +2467,6 @@
     grid-template-columns: 1fr;
   }
 
-  .safety-sheet {
-    max-width: none;
-  }
-
   .history-export-panel {
     grid-template-columns: 1fr;
   }
@@ -2610,17 +2500,6 @@
     border-left: 0;
   }
 
-  .metrics-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .metric:nth-child(2) {
-    border-right: 0;
-  }
-
-  .metric:nth-child(-n + 2) {
-    border-bottom: 1px solid var(--semantic-border-default);
-  }
 }
 
 /* v0.2 — local photo workbench ------------------------------------------------
@@ -2649,33 +2528,29 @@
   border-right-color: #263244;
 }
 
-.workflow-nav {
+.destination-nav {
   margin-top: 44px;
 }
 
-.workflow-step {
+.destination {
   min-height: 58px;
   border-radius: 8px;
 }
 
-.workflow-step--active {
+.destination--current {
   background: #21304a;
   border-color: #354969;
 }
 
-.workflow-step--complete {
-  color: #b9c9ff;
-}
-
-.workflow-step__icon {
+.destination__icon {
   border-radius: 8px;
 }
 
-.workflow-step strong {
+.destination strong {
   font-size: 13px;
 }
 
-.workflow-step small,
+.destination small,
 .source-facts,
 .rail-empty,
 .rail-privacy small {
@@ -2722,23 +2597,6 @@
   font-size: 11px;
 }
 
-.metrics-strip {
-  background: var(--semantic-surface-primary);
-}
-
-.metric {
-  padding-block: 12px;
-}
-
-.metric__label,
-.metric__detail {
-  font-size: 10px;
-}
-
-.metric__value {
-  font-size: 22px;
-}
-
 .results-layout {
   grid-template-columns: minmax(430px, 0.92fr) minmax(410px, 1.08fr);
   gap: 12px;
@@ -2779,7 +2637,10 @@
 }
 
 .group-row {
-  grid-template-columns: 44px minmax(150px, 1fr) minmax(140px, auto) 88px 18px;
+  /* Both flexible columns had a fixed minimum, so at 1280px the row was wider
+     than the panel and .group-panel (overflow: hidden) clipped the size column
+     off the right edge. Let identity shrink — its text already ellipses. */
+  grid-template-columns: 44px minmax(0, 1fr) auto 88px 18px;
   min-height: 82px;
   padding: 12px 16px;
 }
@@ -3332,22 +3193,6 @@
   font-size: 12px;
   border: 1px solid color-mix(in srgb, var(--semantic-text-danger) 25%, transparent);
   border-radius: 8px;
-}
-
-.quarantine-release-note {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  max-width: 620px;
-  margin: 14px 0 0;
-  color: var(--semantic-text-secondary);
-  font-size: 11px;
-  line-height: 1.5;
-}
-
-.quarantine-release-note svg {
-  flex: 0 0 auto;
-  color: var(--semantic-text-warning);
 }
 
 .plan-demo-note--locked {

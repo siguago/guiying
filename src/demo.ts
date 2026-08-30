@@ -81,7 +81,7 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
           {
             label: '文件系统时间',
             value: '2021 / 2024 / 2025',
-            source: '组内 birthtime 与 mtime',
+            source: '文件创建与修改时间',
             confidence: 'medium',
             note: '后两份集中在复制批次，已降权。',
           },
@@ -137,7 +137,7 @@ export function createDemoReport(root = '/Volumes/影像归档/手机照片'): S
           {
             label: '复制时间',
             value: '2026-01-12 11:31:07 +08:00',
-            source: '重复副本 birthtime / mtime',
+            source: '副本的文件创建与修改时间',
             confidence: 'low',
             note: '与同目录大量文件完全相同，判定为批量复制时间。',
           },
