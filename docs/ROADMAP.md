@@ -80,6 +80,7 @@
 - 文件系统能力与 fallback：[engineering/FILESYSTEMS.md](./engineering/FILESYSTEMS.md)
 - 持久化模型与已知 blocker：[engineering/DATA_MODEL.md](./engineering/DATA_MODEL.md)
 - vNext 视觉与交互方向：[ui-delivery/design-direction.md](./ui-delivery/design-direction.md)
+- 体验整改问题登记与批次：[product/UX_REMEDIATION_PLAN.md](./product/UX_REMEDIATION_PLAN.md)
 
 ## 4. 发布通道
 
