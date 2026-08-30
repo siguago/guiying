@@ -3788,6 +3788,11 @@ pub(crate) struct DuplicateGroupMemberItem {
     modified_time_seconds: String,
     modified_time_nanoseconds: String,
     timestamp_granularity_ns: Option<String>,
+    /// Information only. Decided natively so it is reproducible, but it never
+    /// authorises anything: the user still picks, and the plan compiler
+    /// re-derives eligibility on its own (PRD FR-04).
+    suggested_keeper: bool,
+    suggestion_reason: Option<String>,
 }
 
 const MAX_QUARANTINE_GROUP_MEMBERS: i64 = 256;
@@ -3836,6 +3841,132 @@ impl GroupEligibility {
             Self::ReviewRequired { copy, .. } | Self::Blocked { copy, .. } => Some(copy),
         }
     }
+}
+
+/// Whether a file name carries a copy marker a copying tool appended.
+///
+/// Recognises the shapes macOS, Windows and browsers actually produce, and
+/// deliberately does not treat a name that merely ends in digits (`IMG_4821`)
+/// as a copy — the marker has to be separated from the stem.
+fn has_copy_marker(file_name: &str) -> bool {
+    let stem = match file_name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => file_name,
+    };
+    let stem = stem.trim_end();
+    // " (1)" / " (12)"
+    if let Some(rest) = stem.strip_suffix(')') {
+        if let Some((head, digits)) = rest.rsplit_once('(') {
+            if head.ends_with(' ')
+                && !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
+    // " 2" — a space-separated trailing number, as Finder and many uploaders add
+    if let Some((head, tail)) = stem.rsplit_once(' ') {
+        if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) && !head.is_empty() {
+            return true;
+        }
+        // " copy" / " copy 2" / " 副本"
+        let lowered = tail.to_ascii_lowercase();
+        if lowered == "copy" || tail == "副本" {
+            return true;
+        }
+    }
+    let lowered = stem.to_ascii_lowercase();
+    lowered.ends_with(" copy") || stem.ends_with("-副本") || stem.ends_with(" 副本")
+}
+
+fn path_depth(display_path: &str) -> usize {
+    display_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .count()
+}
+
+fn file_name_of(display_path: &str) -> &str {
+    display_path.rsplit('/').next().unwrap_or(display_path)
+}
+
+/// One member's rank as a keeper candidate. Lower sorts better.
+///
+/// Ordering is total and derived only from sealed evidence, so the same group
+/// always produces the same suggestion (PRD FR-03). The trailing ordinal makes
+/// ties deterministic rather than dependent on row order.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct KeeperRank {
+    has_copy_marker: bool,
+    depth: usize,
+    birth_time_seconds: i64,
+    ordinal: i64,
+}
+
+/// The reason shown to the user for a suggested keeper, in plain language.
+///
+/// A suggestion is information, never authorisation: the user still chooses,
+/// and the plan compiler re-derives eligibility independently (PRD FR-04).
+fn keeper_suggestion_reason(best: &KeeperRank, others: &[KeeperRank]) -> &'static str {
+    if !best.has_copy_marker && others.iter().any(|other| other.has_copy_marker) {
+        return "文件名没有被追加复制序号";
+    }
+    if others.iter().any(|other| other.depth > best.depth) {
+        return "位于更靠外层的目录";
+    }
+    if others
+        .iter()
+        .any(|other| other.birth_time_seconds > best.birth_time_seconds)
+    {
+        return "文件创建时间最早";
+    }
+    "扫描顺序中的第一份"
+}
+
+/// Pick the member to suggest keeping, or `None` when no suggestion should be
+/// offered.
+///
+/// Reads the whole group, bounded by the same ceiling the plan compiler
+/// enforces: a group larger than that is not organisable anyway, so it gets no
+/// suggestion rather than an expensive one. Any read failure yields `None` —
+/// a missing suggestion is a non-event, and must never block listing members.
+fn suggest_group_keeper(
+    reader: &EvidenceReader,
+    group: &guiying_store::ScanHistoryGroupContext,
+) -> Option<(i64, &'static str)> {
+    let mut ranks: Vec<KeeperRank> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = reader
+            .list_duplicate_group_members_page(group, cursor.as_ref(), 128)
+            .ok()?;
+        for member in &page.items {
+            ranks.push(KeeperRank {
+                has_copy_marker: has_copy_marker(file_name_of(&member.display_path)),
+                depth: path_depth(&member.display_path),
+                birth_time_seconds: member.birth_time.map_or(i64::MAX, |value| value.seconds),
+                ordinal: member.ordinal,
+            });
+        }
+        if ranks.len() > MAX_QUARANTINE_GROUP_MEMBERS as usize {
+            return None;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    if ranks.len() < 2 {
+        return None;
+    }
+    let best = *ranks.iter().min()?;
+    let others: Vec<KeeperRank> = ranks
+        .iter()
+        .copied()
+        .filter(|rank| rank.ordinal != best.ordinal)
+        .collect();
+    Some((best.ordinal, keeper_suggestion_reason(&best, &others)))
 }
 
 /// Decide whether a sealed duplicate group may be planned for quarantine.
@@ -4990,6 +5121,7 @@ pub(crate) async fn list_duplicate_group_members(
         result_read_token,
         move |reader, context, result_scope| {
             let group = resolve_history_group(reader, context, group_build_id)?;
+            let suggestion = suggest_group_keeper(reader, &group);
             let decoded = decode_result_cursor::<DuplicateGroupMemberCursor>(
                 result_scope,
                 DUPLICATE_GROUP_MEMBERS_CURSOR_ENDPOINT,
@@ -4998,7 +5130,17 @@ pub(crate) async fn list_duplicate_group_members(
             let page = reader
                 .list_duplicate_group_members_page(&group, decoded.as_ref(), limit)
                 .map_err(|_| AppError::result_store("重复组成员封印证据读取失败。"))?;
-            map_member_page(result_scope, page)
+            let mut mapped = map_member_page(result_scope, page)?;
+            if let Some((ordinal, reason)) = suggestion {
+                let ordinal = ordinal.to_string();
+                for item in &mut mapped.items {
+                    if item.ordinal == ordinal {
+                        item.suggested_keeper = true;
+                        item.suggestion_reason = Some(reason.to_owned());
+                    }
+                }
+            }
+            Ok(mapped)
         },
     )
     .await
@@ -5300,6 +5442,8 @@ fn map_member_page(
                 timestamp_granularity_ns: member
                     .timestamp_granularity_ns
                     .map(|value| value.to_string()),
+                suggested_keeper: false,
+                suggestion_reason: None,
             })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
@@ -6322,6 +6466,117 @@ fn emit_status_event(app: &AppHandle, owner_window_label: &str, status: &ScanJob
 mod tests {
     use super::*;
     use guiying_core::{CancellationToken, NoopScanControl};
+
+    #[test]
+    fn copy_markers_are_recognised_without_catching_ordinary_names() {
+        for name in [
+            "IMG_4821 2.HEIC",
+            "IMG_4821 10.HEIC",
+            "IMG_4821 (1).HEIC",
+            "IMG_4821 copy.HEIC",
+            "IMG_4821 Copy.HEIC",
+            "report copy 2.pdf",
+            "假期 副本.jpg",
+            "假期-副本.jpg",
+        ] {
+            assert!(has_copy_marker(name), "expected a copy marker in {name}");
+        }
+        // Names that merely end in digits are the originals, not copies.
+        for name in [
+            "IMG_4821.HEIC",
+            "PXL_20220712_092011.jpg",
+            "DSC00002.ARW",
+            "2021.jpg",
+            "v2.mov",
+            "IMG_4821",
+        ] {
+            assert!(!has_copy_marker(name), "unexpected copy marker in {name}");
+        }
+    }
+
+    #[test]
+    fn keeper_rank_prefers_uncopied_shallow_and_older_files() {
+        let original = KeeperRank {
+            has_copy_marker: false,
+            depth: 4,
+            birth_time_seconds: 200,
+            ordinal: 1,
+        };
+        let copy_marked = KeeperRank {
+            has_copy_marker: true,
+            depth: 2,
+            birth_time_seconds: 100,
+            ordinal: 0,
+        };
+        // A copy marker outweighs both a shallower path and an older timestamp.
+        assert!(original < copy_marked);
+
+        let deeper = KeeperRank {
+            depth: 6,
+            ..original
+        };
+        assert!(original < deeper);
+
+        let younger = KeeperRank {
+            birth_time_seconds: 900,
+            ..original
+        };
+        assert!(original < younger);
+
+        // Ties fall back to ordinal so the same group always ranks the same way.
+        let same_but_later_ordinal = KeeperRank {
+            ordinal: 7,
+            ..original
+        };
+        assert!(original < same_but_later_ordinal);
+    }
+
+    #[test]
+    fn keeper_suggestion_reason_names_the_deciding_signal() {
+        let best = KeeperRank {
+            has_copy_marker: false,
+            depth: 3,
+            birth_time_seconds: 100,
+            ordinal: 0,
+        };
+        assert_eq!(
+            keeper_suggestion_reason(
+                &best,
+                &[KeeperRank {
+                    has_copy_marker: true,
+                    ..best
+                }]
+            ),
+            "文件名没有被追加复制序号"
+        );
+        assert_eq!(
+            keeper_suggestion_reason(&best, &[KeeperRank { depth: 9, ..best }]),
+            "位于更靠外层的目录"
+        );
+        assert_eq!(
+            keeper_suggestion_reason(
+                &best,
+                &[KeeperRank {
+                    birth_time_seconds: 900,
+                    ..best
+                }]
+            ),
+            "文件创建时间最早"
+        );
+        // Nothing distinguishes them: say so plainly rather than invent a reason.
+        assert_eq!(
+            keeper_suggestion_reason(&best, &[KeeperRank { ordinal: 4, ..best }]),
+            "扫描顺序中的第一份"
+        );
+    }
+
+    #[test]
+    fn path_depth_counts_directories_not_separators() {
+        assert_eq!(path_depth("/Volumes/Photos/IMG.HEIC"), 3);
+        assert_eq!(path_depth("/Volumes/Photos/2021/05/IMG.HEIC"), 5);
+        assert_eq!(file_name_of("/Volumes/Photos/IMG.HEIC"), "IMG.HEIC");
+        assert_eq!(file_name_of("IMG.HEIC"), "IMG.HEIC");
+    }
 
     #[test]
     fn group_eligibility_admits_only_plain_independent_groups() {

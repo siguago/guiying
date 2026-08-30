@@ -399,13 +399,51 @@ test('withheld groups are separated, explained, and offer no keeper control', as
   // PRD 5.1: engine authorisation, not user risk acknowledgement — there is no
   // keeper control and no route into a plan, not merely a disabled one.
   await expect(page.getByRole('radio')).toHaveCount(0)
-  await expect(page.getByRole('button', { name: /预览本组/ })).toHaveCount(0)
+  await expect(page.getByLabel('当前整理计划')).toHaveCount(0)
   await expect(page.getByText('保留哪一份？')).toHaveCount(0)
 
   // Selecting an eligible group restores the decision controls.
   await page.getByRole('button').filter({ hasText: 'IMG_4821.HEIC' }).first().click()
   await expect(page.getByText('保留哪一份？')).toBeVisible()
-  await expect(page.getByRole('button', { name: /预览本组/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /预览/ })).toBeVisible()
+
+  const accessibility = await new AxeBuilder({ page }).analyze()
+  expect(accessibility.violations).toEqual([])
+})
+
+test('accepting the page suggestions builds one plan across groups', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
+
+  // One click decides every eligible, undecided group on the page — the whole
+  // point of R1: at 709 groups a per-group loop is not completable.
+  await page.getByRole('button', { name: /接受这一页的建议（2 组）/ }).click()
+
+  const bar = page.getByLabel('当前整理计划')
+  await expect(bar).toContainText('已决定 2 组')
+  await expect(bar).toContainText('3 个副本移入隔离区')
+
+  // The withheld group is never swept up by the bulk action.
+  await expect(page.getByText('已选保留：').first()).toBeVisible()
+  await expect(page.getByRole('button').filter({ hasText: '为安全保留' })).toHaveCount(1)
+
+  await page.getByRole('button', { name: /预览：移走 3 个副本/ }).click()
+
+  // Whatever the action bar promised has to be itemised before anything moves.
+  await expect(page.getByRole('heading', { name: /2 组 · 移走 3 个副本/ })).toBeVisible()
+  const planned = page.locator('.plan-groups li')
+  await expect(planned).toHaveCount(2)
+  await expect(planned.first()).toContainText('移走 2 个')
+  await expect(planned.nth(1)).toContainText('移走 1 个')
+
+  // This build executes one group per run; the copy must say so rather than
+  // let the plan total imply the button does all of it.
+  await expect(page.getByText(/本版本一次执行一组/)).toBeVisible()
+  await expect(page.getByRole('button', { name: /执行演示隔离（移走 2 个）/ })).toBeVisible()
 
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
@@ -422,10 +460,12 @@ test('demo workflow selects the recommended keeper, previews reversible isolatio
   const recommendedKeeper = page.getByRole('radio', { name: /IMG_4821\.HEIC.*建议保留/ })
   await recommendedKeeper.check()
   await expect(recommendedKeeper).toBeChecked()
-  await expect(page.getByLabel('当前组操作')).toContainText('保留 IMG_4821.HEIC')
+  // The bar now reports the whole plan, not just the selected group.
+  await expect(page.getByLabel('当前整理计划')).toContainText('已决定 1 组')
+  await expect(page.getByLabel('当前整理计划')).toContainText('2 个副本移入隔离区')
 
-  await page.getByRole('button', { name: '预览本组隔离计划' }).click()
-  await expect(page.getByRole('heading', { name: '确认这一组的隔离计划' })).toBeVisible()
+  await page.getByRole('button', { name: /预览：移走 2 个副本/ }).click()
+  await expect(page.getByRole('heading', { name: '确认整理计划' })).toBeVisible()
   await expect(page.getByText(/不会永久删除.*不会改写照片内容或时间/)).toBeVisible()
   await expect(page.getByText('生成恢复清单，可从归影隔离区还原')).toBeVisible()
   await expect(page.getByText('合成数据演示只模拟状态，不会访问本地文件。')).toBeVisible()
@@ -491,6 +531,8 @@ test('default release locks live quarantine while sealed adapters keep pathless 
       nativePath: { encoding: 'utf8', rawBase64 },
       sizeBytes: '4096',
       hasStableFileIdentity: true,
+      suggestedKeeper: ordinal === '0',
+      suggestionReason: ordinal === '0' ? '文件名没有被追加复制序号' : null,
       birthTimeSeconds: '1609459200',
       birthTimeNanoseconds: '0',
       modifiedTimeSeconds: '1609459200',
@@ -589,8 +631,8 @@ test('default release locks live quarantine while sealed adapters keep pathless 
   await expect(page.getByRole('heading', { name: '发现 1 组完全相同的文件' })).toBeVisible()
 
   await page.getByRole('radio', { name: /KEEP\.JPG/ }).check()
-  await page.getByRole('button', { name: '预览本组整理计划' }).click()
-  await expect(page.getByRole('heading', { name: '查看这一组的整理计划' })).toBeVisible()
+  await page.getByRole('button', { name: /预览：移走 1 个副本/ }).click()
+  await expect(page.getByRole('heading', { name: '查看整理计划' })).toBeVisible()
   await expect(page.getByText(/你可以查看计划，但当前版本不会移动本地文件/)).toBeVisible()
   await expect(page.getByRole('button', { name: '真实隔离仍在安全验证中' })).toBeDisabled()
 
@@ -1781,6 +1823,8 @@ test('persistent results page groups, members, and issues without unbounded accu
       pathEncoding: 'utf8',
       sizeBytes: '4',
       hasStableFileIdentity: true,
+      suggestedKeeper: ordinal === '0',
+      suggestionReason: ordinal === '0' ? '文件名没有被追加复制序号' : null,
       birthTimeSeconds: ordinal === '0' ? '1609459200' : '1735689600',
       birthTimeNanoseconds: '0',
       modifiedTimeSeconds: ordinal === '0' ? '1609459200' : '1735689600',
@@ -2151,6 +2195,8 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
       pathEncoding: 'utf8',
       sizeBytes: '4',
       hasStableFileIdentity: true,
+      suggestedKeeper: ordinal === '0',
+      suggestionReason: ordinal === '0' ? '文件名没有被追加复制序号' : null,
       birthTimeSeconds: '1609459200',
       birthTimeNanoseconds: '0',
       modifiedTimeSeconds: '1609459200',

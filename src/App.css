@@ -1468,6 +1468,63 @@
 /* Eligibility split. Withheld groups use the warning role (design direction
    §5: amber means "held back for safety"), never danger — nothing is wrong
    with the user's files, guiying is simply declining to move them. */
+/* One row per decided group, so the plan total the action bar promised is
+   actually itemised before anything moves. */
+.plan-groups {
+  display: grid;
+  gap: 1px;
+  margin: 20px 0 0;
+  padding: 0;
+  list-style: none;
+  background: var(--semantic-border-subtle);
+  border: 1px solid var(--semantic-border-default);
+  border-radius: var(--semantic-radius-control);
+  overflow: hidden;
+}
+
+.plan-groups li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 14px;
+  background: var(--semantic-surface-canvas);
+}
+
+.plan-groups li.is-current {
+  background: var(--semantic-surface-selected);
+}
+
+.plan-groups strong {
+  display: block;
+  font-size: 13px;
+}
+
+.plan-groups small {
+  display: block;
+  margin-top: 3px;
+  color: var(--semantic-text-secondary);
+  font-size: 11px;
+}
+
+.plan-groups li > span {
+  flex: 0 0 auto;
+  color: var(--semantic-text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.button--compact {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.keeper-block .button--compact {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
 .group-list__heading {
   display: flex;
   align-items: baseline;

@@ -1691,10 +1691,12 @@ function GroupInspector({
   onRetry,
   onLoadPrevious,
   onLoadNext,
+  onClearDecision,
   onSelectKeeper,
   selectedKeeperId,
   selectedKeeperName,
 }: {
+  onClearDecision: () => void
   captureTimeStageStatus?: CaptureTimeStageStatus
   group: DuplicateGroup
   isLive: boolean
@@ -1815,6 +1817,9 @@ function GroupInspector({
               <strong>保留 {selectedKeeper?.name ?? selectedKeeperName ?? '已选择的文件'}</strong>
               <p>预览前不会移动文件；执行后其余副本仍可从隔离区恢复。</p>
             </div>
+            <button className="button button--quiet button--compact" onClick={onClearDecision} type="button">
+              这一组暂不处理
+            </button>
           </div>
         ) : (
           <div className="keeper-block">
@@ -2333,11 +2338,18 @@ function ResultsWorkspace({
   onStageChange: (stage: ResultStage) => void
 }) {
   const [stage, setStage] = useState<ResultStage>('review')
+  // Keyed by group id and kept across pages. Each decision carries the numbers
+  // its own summary needs, so the running plan total stays correct after the
+  // group list has paged away — the cursor pager never holds the whole library.
   const [keeperSelections, setKeeperSelections] = useState<Record<string, {
     fileId: string
     fileName: string
     ordinal?: string
+    groupName: string
+    moveCount: number
+    reclaimableBytes: number
   }>>({})
+  const [isAcceptingSuggestions, setIsAcceptingSuggestions] = useState(false)
   const [demoRestored, setDemoRestored] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [liveOperationId, setLiveOperationId] = useState<string | null>(null)
@@ -2572,10 +2584,19 @@ function ResultsWorkspace({
   )
   const selectedGroupWithheld = selectedGroup ? selectedGroup.eligibility !== 'eligible' : false
 
+  // The running plan across every group decided so far, including groups that
+  // have since paged out of view.
+  const planTotals = useMemo(() => {
+    const decisions = Object.values(keeperSelections)
+    return {
+      groupCount: decisions.length,
+      moveCount: decisions.reduce((sum, decision) => sum + decision.moveCount, 0),
+      bytes: decisions.reduce((sum, decision) => sum + decision.reclaimableBytes, 0),
+    }
+  }, [keeperSelections])
+  const undecidedOnPage = eligibleGroups.filter((group) => !keeperSelections[group.id]).length
+
   const currentDecision = selectedGroup ? keeperSelections[selectedGroup.id] : undefined
-  const currentKeeper = currentDecision
-    ? memberFiles.find((file) => file.id === currentDecision.fileId)
-    : undefined
   const currentMoveCount = selectedGroup ? Math.max(0, selectedGroup.memberCount - 1) : 0
 
   function selectKeeper(fileId: string) {
@@ -2589,8 +2610,69 @@ function ResultsWorkspace({
         fileId: file.id,
         fileName: file.name,
         ordinal: file.ordinal,
+        groupName: selectedGroup.previewName,
+        moveCount: Math.max(0, selectedGroup.memberCount - 1),
+        reclaimableBytes: selectedGroup.reclaimableBytes,
       },
     }))
+  }
+
+  function clearDecision(groupId: string) {
+    setActionError(null)
+    setKeeperSelections((current) => {
+      const { [groupId]: _removed, ...rest } = current
+      return rest
+    })
+  }
+
+  /// Accept the native suggestion for every eligible, still-undecided group on
+  /// this page. Bounded to the page on purpose: the group list is cursor-paged
+  /// and guiying does not load the whole library to offer a bulk action.
+  async function acceptPageSuggestions() {
+    if (isAcceptingSuggestions) return
+    const pending = eligibleGroups.filter((group) => !keeperSelections[group.id])
+    if (pending.length === 0) return
+    setIsAcceptingSuggestions(true)
+    setActionError(null)
+    const accepted: typeof keeperSelections = {}
+    let skipped = 0
+    const resultReadToken = report.resultReadToken
+    try {
+      for (const group of pending) {
+        // Sealed results page members in; synthetic groups carry theirs inline.
+        let files = group.files
+        if (resultReadToken) {
+          try {
+            files = (await loadDuplicateGroupMemberPage(resultReadToken, group.id, null)).files
+          } catch {
+            skipped += 1
+            continue
+          }
+        }
+        const suggested = files.find((file) => file.isRecommendedKeeper)
+        if (!suggested) {
+          skipped += 1
+          continue
+        }
+        accepted[group.id] = {
+          fileId: suggested.id,
+          fileName: suggested.name,
+          ordinal: suggested.ordinal,
+          groupName: group.previewName,
+          moveCount: Math.max(0, group.memberCount - 1),
+          reclaimableBytes: group.reclaimableBytes,
+        }
+      }
+      if (Object.keys(accepted).length > 0) {
+        setKeeperSelections((current) => ({ ...current, ...accepted }))
+      }
+      if (skipped > 0) {
+        // Never silently under-apply: say how many groups still need a choice.
+        setActionError(`${skipped} 组没有可用的建议，仍需要你自己选择保留项。`)
+      }
+    } finally {
+      setIsAcceptingSuggestions(false)
+    }
   }
 
   function previewCurrentDecision() {
@@ -2676,7 +2758,9 @@ function ResultsWorkspace({
     }
   }
 
-  if (selectedGroup && currentDecision && (stage === 'plan' || stage === 'executing')) {
+  if (planTotals.groupCount > 0 && (stage === 'plan' || stage === 'executing')) {
+    const planEntries = Object.entries(keeperSelections)
+    const executableEntry = selectedGroup && currentDecision ? selectedGroup.id : null
     return (
       <main className="workspace workspace--results plan-workspace">
         <header className="plan-header">
@@ -2689,8 +2773,8 @@ function ResultsWorkspace({
             </span>
             <h1>
               {report.dataMode === 'synthetic' || internalQuarantineEnabled
-                ? '确认这一组的隔离计划'
-                : '查看这一组的整理计划'}
+                ? '确认整理计划'
+                : '查看整理计划'}
             </h1>
             <p>
               {report.dataMode === 'synthetic' || internalQuarantineEnabled
@@ -2704,23 +2788,40 @@ function ResultsWorkspace({
           <div className="plan-sheet__heading">
             <div>
               <span>内容已完整比对</span>
-              <h2 id="plan-title">{selectedGroup.previewName}</h2>
+              <h2 id="plan-title">
+                {planTotals.groupCount.toLocaleString('zh-CN')} 组 · 移走 {planTotals.moveCount.toLocaleString('zh-CN')} 个副本
+              </h2>
             </div>
-            <strong>{formatBytes(selectedGroup.reclaimableBytes)}</strong>
+            <strong>{formatBytes(planTotals.bytes)}</strong>
           </div>
-          <div className="decision-lanes" role="list">
-            <article className="decision-lane decision-lane--keep" role="listitem">
+          {/* Keep → Move is a relation, not a list: article/listitem was an
+              invalid ARIA pairing, and the lanes already carry their own
+              text labels. */}
+          <div className="decision-lanes">
+            <article className="decision-lane decision-lane--keep">
               <span><CheckCircle2 aria-hidden="true" size={18} /> 保留原位</span>
-              <strong>{currentDecision.fileName}</strong>
-              <code>{currentKeeper?.path ?? '已选择的成员'}</code>
+              <strong>{planTotals.groupCount.toLocaleString('zh-CN')} 个文件</strong>
+              <small>每组保留一份，留在原来的位置</small>
             </article>
             <ArrowRight aria-hidden="true" className="decision-lanes__arrow" size={22} />
-            <article className="decision-lane decision-lane--move" role="listitem">
+            <article className="decision-lane decision-lane--move">
               <span><Archive aria-hidden="true" size={18} /> 移入隔离区</span>
-              <strong>{currentMoveCount} 个完全相同的副本</strong>
+              <strong>{planTotals.moveCount.toLocaleString('zh-CN')} 个完全相同的副本</strong>
               <small>保留原目录结构；恢复时不会覆盖同名文件</small>
             </article>
           </div>
+
+          <ol className="plan-groups">
+            {planEntries.map(([groupId, decision]) => (
+              <li className={groupId === executableEntry ? 'is-current' : ''} key={groupId}>
+                <div>
+                  <strong>{decision.groupName}</strong>
+                  <small>保留 {decision.fileName}</small>
+                </div>
+                <span>移走 {decision.moveCount.toLocaleString('zh-CN')} 个 · {formatBytes(decision.reclaimableBytes)}</span>
+              </li>
+            ))}
+          </ol>
           <ul className="plan-guards">
             <li><Check size={15} /> 执行前再次核验目录、文件身份和逐字节内容</li>
             <li><Check size={15} /> 仅同一磁盘内移动，不复制后删除</li>
@@ -2733,18 +2834,36 @@ function ResultsWorkspace({
           ) : (
             <div className="plan-demo-note"><FolderOpen size={15} /> 执行时会再次打开系统目录选择器，用于重新授权同一个根目录。</div>
           )}
+          {planTotals.groupCount > 1 && (report.dataMode === 'synthetic' || internalQuarantineEnabled) ? (
+            // Never let the plan total imply the button does all of it: this
+            // build executes one group per run.
+            <div className="plan-demo-note plan-demo-note--locked">
+              <Info size={15} /> 本版本一次执行一组。
+              {executableEntry
+                ? `这次会处理「${keeperSelections[executableEntry]?.groupName}」，其余 ${planTotals.groupCount - 1} 组的决定会保留。`
+                : '请先在结果页选中要执行的那一组。'}
+            </div>
+          ) : null}
           {actionError ? <div className="inline-load-state inline-load-state--error" role="alert"><TriangleAlert size={15} /> {actionError}</div> : null}
           <div className="plan-actions">
             <button className="button button--quiet" disabled={stage === 'executing'} onClick={() => setStage('review')} type="button">返回修改</button>
             <button
               className="button button--ink"
-              disabled={stage === 'executing' || (report.dataMode !== 'synthetic' && !internalQuarantineEnabled)}
+              disabled={
+                stage === 'executing'
+                || executableEntry === null
+                || (report.dataMode !== 'synthetic' && !internalQuarantineEnabled)
+              }
               onClick={() => void executeCurrentPlan()}
               type="button"
             >
               {stage === 'executing'
                 ? <><LoaderCircle className="is-spinning" size={16} /> 正在复核并隔离…</>
-                : <><Archive size={16} /> {report.dataMode === 'synthetic' ? '执行演示隔离' : internalQuarantineEnabled ? '重新授权并执行' : '真实隔离仍在安全验证中'}</>}
+                : <><Archive size={16} /> {report.dataMode === 'synthetic'
+                  ? `执行演示隔离（移走 ${currentMoveCount} 个）`
+                  : internalQuarantineEnabled
+                    ? `重新授权并移走 ${currentMoveCount} 个副本`
+                    : '真实隔离仍在安全验证中'}</>}
             </button>
           </div>
         </section>
@@ -2895,7 +3014,21 @@ function ResultsWorkspace({
         <section aria-labelledby="groups-title" className="group-panel">
           <div className="group-panel__header">
             <div><span>内容完全相同</span><h2 id="groups-title">选择一组，然后决定保留哪份</h2></div>
-            <span className="read-only-badge"><CheckCircle2 size={13} /> 可逐组处理</span>
+            {undecidedOnPage > 0 ? (
+              <button
+                className="button button--quiet button--compact"
+                disabled={isAcceptingSuggestions}
+                onClick={() => void acceptPageSuggestions()}
+                type="button"
+              >
+                {isAcceptingSuggestions
+                  ? <LoaderCircle aria-hidden="true" className="is-spinning" size={14} />
+                  : <Check aria-hidden="true" size={14} />}
+                接受这一页的建议（{undecidedOnPage} 组）
+              </button>
+            ) : (
+              <span className="read-only-badge"><CheckCircle2 size={13} /> 这一页已决定</span>
+            )}
           </div>
           {groups.length > 0 ? (
             <div aria-busy={isLoadingGroups} className="group-list">
@@ -2987,6 +3120,7 @@ function ResultsWorkspace({
             onLoadNext={() => void loadNextMembers()}
             onLoadPrevious={() => void loadPreviousMembers()}
             onRetry={() => void retryMembers()}
+            onClearDecision={() => selectedGroup && clearDecision(selectedGroup.id)}
             onSelectKeeper={selectKeeper}
             selectedKeeperId={currentDecision?.fileId}
             selectedKeeperName={currentDecision?.fileName}
@@ -3003,23 +3137,35 @@ function ResultsWorkspace({
           </div>
         </section>
       ) : selectedGroup ? (
-        <section aria-label="当前组操作" className="review-action-bar">
+        // The bar reports the whole plan, not just the selected group: with
+        // hundreds of groups the running total is what the user is building.
+        <section aria-label="当前整理计划" className="review-action-bar">
           <div className="review-action-bar__summary">
-            <span className={`review-action-bar__status${currentDecision ? ' is-ready' : ''}`}>
-              {currentDecision ? <Check size={14} /> : <Circle size={12} />}
-              {currentDecision ? `保留 ${currentDecision.fileName}` : '尚未选择保留项'}
+            <span className={`review-action-bar__status${planTotals.groupCount > 0 ? ' is-ready' : ''}`}>
+              {planTotals.groupCount > 0 ? <Check size={14} /> : <Circle size={12} />}
+              {planTotals.groupCount > 0
+                ? `已决定 ${planTotals.groupCount.toLocaleString('zh-CN')} 组`
+                : '尚未决定任何一组'}
             </span>
             <span>
-              {currentDecision
-                ? report.dataMode === 'synthetic' || internalQuarantineEnabled
-                  ? `本组将隔离 ${currentMoveCount} 个副本 · ${formatBytes(selectedGroup.reclaimableBytes)}`
-                  : `计划预览：${currentMoveCount} 个重复副本 · ${formatBytes(selectedGroup.reclaimableBytes)}`
-                : `先完成当前组；不需要一次处理全部 ${report.totalDuplicateGroups.toLocaleString('zh-CN')} 组`}
+              {planTotals.groupCount > 0
+                ? `保留 ${planTotals.groupCount.toLocaleString('zh-CN')} 个文件，`
+                  + `${planTotals.moveCount.toLocaleString('zh-CN')} 个副本移入隔离区 · `
+                  + `${formatBytes(planTotals.bytes)}`
+                  + (currentDecision ? '' : '；当前这一组还没有选择保留项')
+                : `共 ${report.totalDuplicateGroups.toLocaleString('zh-CN')} 组，可以先接受建议再逐组复核`}
             </span>
           </div>
           {actionError ? <span className="review-action-bar__error" role="alert">{actionError}</span> : null}
-          <button className="button button--ink" disabled={!currentDecision} onClick={previewCurrentDecision} type="button">
-            {report.dataMode === 'synthetic' || internalQuarantineEnabled ? '预览本组隔离计划' : '预览本组整理计划'}
+          <button
+            className="button button--ink"
+            disabled={planTotals.groupCount === 0}
+            onClick={previewCurrentDecision}
+            type="button"
+          >
+            {planTotals.moveCount > 0
+              ? `预览：移走 ${planTotals.moveCount.toLocaleString('zh-CN')} 个副本`
+              : '预览整理计划'}
             <ArrowRight aria-hidden="true" size={16} />
           </button>
         </section>

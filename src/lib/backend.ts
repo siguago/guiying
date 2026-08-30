@@ -261,6 +261,8 @@ interface CoreDuplicateGroupMemberItem {
   nativePath?: CoreNativePathRef
   sizeBytes: string
   hasStableFileIdentity: boolean
+  suggestedKeeper: boolean
+  suggestionReason: string | null
   birthTimeSeconds: string | null
   birthTimeNanoseconds: string | null
   modifiedTimeSeconds: string
@@ -1445,10 +1447,17 @@ export async function loadDuplicateGroupMemberPage(
           '文件修改时间',
         ),
         fileTimeNote: fileTimePrecisionNote(file.timestampGranularityNs),
-        // The persisted ordinal is only a deterministic evidence ordering. It is
-        // never a keeper decision, and the read-only pipeline currently seals no
-        // keeper policy.
-        isRecommendedKeeper: false,
+        // Suggested natively from sealed evidence (scan_service::
+        // suggest_group_keeper). A suggestion is information, never
+        // authorisation: the user still chooses, and the plan compiler
+        // re-derives eligibility on its own. A suggestion without a reason is
+        // dropped rather than shown unexplained.
+        isRecommendedKeeper: file.suggestedKeeper === true
+          && typeof file.suggestionReason === 'string'
+          && file.suggestionReason.length > 0,
+        keeperReason: typeof file.suggestionReason === 'string' && file.suggestionReason.length > 0
+          ? file.suggestionReason
+          : undefined,
       }
     }),
     nextCursor: page.nextCursor,
