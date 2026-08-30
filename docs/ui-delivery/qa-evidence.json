@@ -71,10 +71,11 @@
       "evidence_ids": [
         "core-rust-test-log",
         "scan-jobs-rust-test-log",
-        "manual-safety-review"
+        "manual-safety-review",
+        "v02-rust-qa"
       ],
       "limitation_id": null,
-      "notes": "Code review found no WebView path authority and no network, photo move, rename, timestamp, or delete command. Same-process pause/resume retains live descriptors only for the current run; report export creates a separately selected new JSON/CSV file and never grants photo mutation authority. UI text discloses possible filesystem-managed atime updates."
+      "notes": "The WebView receives no path authority. New quarantine IPC accepts only sealed identifiers, but standard builds compile a fail-closed stub and return QUARANTINE_RELEASE_GATE_CLOSED before opening a mutation picker; the real module is behind a default-off internal feature. Same-process pause/resume retains live descriptors only for the current run; report export creates a separately selected new JSON/CSV file and never grants photo mutation authority."
     },
     {
       "id": "desktop-product-entrypoint-desktop-zh-cn-responsive",
@@ -219,10 +220,15 @@
         "responsive-large-capture",
         "paged-results-capture",
         "raw-metadata-review-capture",
-        "historical-catalog-capture"
+        "historical-catalog-capture",
+        "v02-landing-capture",
+        "v02-review-capture",
+        "v02-plan-capture",
+        "v02-complete-capture",
+        "v02-ui-qa"
       ],
       "limitation_id": null,
-      "notes": "Current landing, scanning, compact/large results, paged-result with history export controls, historical-catalog and expanded raw-metadata browser captures were reviewed at original size. Their current SHA-256 values are mapped below; the packaged icon has its own asset report."
+      "notes": "The v0.2 read-only landing, selected-keeper review, synthetic Keep/Move plan and explicitly labelled synthetic completion captures were reviewed at original size. The rejected user screenshot and v0.2 review were inspected together to verify that the dead-end export/evidence hierarchy did not regress. Compact 1024x768 was inspected live in the same browser session."
     },
     {
       "id": "desktop-system-entrypoint-desktop-zh-cn-visual",
@@ -238,10 +244,11 @@
       "capability": "manual",
       "result": "passed",
       "evidence_ids": [
-        "system-direction-artifact"
+        "system-direction-artifact",
+        "v02-ui-qa"
       ],
       "limitation_id": null,
-      "notes": "The direction contract maps signature evidence grammar, components, states, layout, accessibility, anti-goals, and repository ownership."
+      "notes": "The implemented direction contract records the three materially different territories, selected cool-neutral local photo workbench, Keep/Move signature, rejected archive-style anti-reference, provenance, components, states, accessibility and repository ownership."
     }
   ],
   "evidence": [
@@ -413,6 +420,91 @@
         "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
       ],
       "notes": "The 1280x820 historical catalog distinguishes sealed display text from current filesystem authority, labels partial coverage and optional capture-time outcomes, contains no PII, and passed axe; SHA-256 25df634b04fea231090b5d59f3ce541d0f570cf58a2904c1acfcdc1803b9cacc."
+    },
+    {
+      "id": "v02-ui-qa",
+      "kind": "manual-review",
+      "path": "evidence/v02-ui-qa.txt",
+      "captured_at": "2026-08-13T00:00:00+08:00",
+      "tool": "Codex in-app browser, Vite, TypeScript, Oxlint and DTCG exporter",
+      "version": "v0.2 implementation review",
+      "command": "pnpm build && pnpm lint && pnpm tokens:check; direct in-app-browser flow at 1280x820 and 1024x768",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection",
+        "desktop-system-entrypoint-desktop-zh-cn-visual"
+      ],
+      "notes": "Directly exercised keeper selection, plan preview, synthetic quarantine and restore without starting a second browser. The exact limitations and browser-selection constraint are recorded in the text artifact."
+    },
+    {
+      "id": "v02-rust-qa",
+      "kind": "test-output",
+      "path": "evidence/v02-rust-qa.txt",
+      "captured_at": "2026-08-13T00:00:00+08:00",
+      "tool": "Cargo, rustfmt, Clippy and repository safety review",
+      "version": "v0.2 default release gate and internal prototype",
+      "command": "cargo fmt --check; cargo check/clippy/test --all-targets with default features and --all-features",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-privacy"
+      ],
+      "notes": "Default build: 74/74 tests and release gate closed. Internal prototype: 81/81 tests including eight quarantine race/no-overwrite/restore cases. The artifact explicitly records the still-missing release safety protocol."
+    },
+    {
+      "id": "v02-landing-capture",
+      "kind": "screenshot",
+      "path": "evidence/v02-landing-1280x820.jpg",
+      "captured_at": "2026-08-13T00:00:00+08:00",
+      "tool": "Codex in-app browser and original-size image inspection",
+      "version": "v0.2",
+      "command": "Open the production Vite entry at 1280x820 and capture the landing state",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The landing state states the task and read-only boundary, offers keeper-plan preview, labels real execution as locked, and disables the unopened recovery catalog; SHA-256 439ec7090ab4d773a3f5f2c53e864db2efddee200693e80669e15ce687a6b95f."
+    },
+    {
+      "id": "v02-review-capture",
+      "kind": "screenshot",
+      "path": "evidence/v02-review-1280x820.jpg",
+      "captured_at": "2026-08-13T00:00:00+08:00",
+      "tool": "Codex in-app browser and original-size image inspection",
+      "version": "v0.2",
+      "command": "Run the labelled synthetic scan, select the recommended keeper and capture at 1280x820",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The selected keeper, automatically derived isolation outcomes, one-group-at-a-time message and sticky plan action remain visible. Inspected beside the rejected screenshot; SHA-256 dfcbac59090a18effcfa4a7874b687fb2df8c600561837af4ff12355a95d2d2e."
+    },
+    {
+      "id": "v02-plan-capture",
+      "kind": "screenshot",
+      "path": "evidence/v02-plan-1280x820.jpg",
+      "captured_at": "2026-08-13T00:00:00+08:00",
+      "tool": "Codex in-app browser and original-size image inspection",
+      "version": "v0.2",
+      "command": "Open the selected group's Keep/Move plan and capture at 1280x820",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "The green Keep and violet Move tracks show the exact object/count, no-delete/no-time-write guards and recovery manifest before execution; SHA-256 959f682d6f7c36f210fb4ff0ac38b0c93baa52e7a9c647691bfc90ba048c3c5e."
+    },
+    {
+      "id": "v02-complete-capture",
+      "kind": "screenshot",
+      "path": "evidence/v02-complete-1280x820.jpg",
+      "captured_at": "2026-08-13T00:00:00+08:00",
+      "tool": "Codex in-app browser and original-size image inspection",
+      "version": "v0.2",
+      "command": "Execute the labelled synthetic isolation and capture the recoverable completion state at 1280x820",
+      "exit_code": 0,
+      "target_ids": [
+        "desktop-product-entrypoint-desktop-zh-cn-image-inspection"
+      ],
+      "notes": "Completion states what remained, what moved, that no local file was touched in the demo, and exposes restore as the primary recovery action; SHA-256 080c22b6204dfa5d3d297275080de01b481b193d03c1e4656db7fb47d6271839."
     },
     {
       "id": "packaged-icon-inspection",

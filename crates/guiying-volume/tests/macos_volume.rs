@@ -2,7 +2,8 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, MetadataExt};
+use std::time::{Duration, Instant};
 
 use guiying_volume::{
     BoundMediaPath, BoundVolumeSession, CaseBehaviorObservation, IdentityStrength,
@@ -399,6 +400,60 @@ fn opened_files_are_bound_to_both_session_and_path() {
 }
 
 #[test]
+fn authorization_metadata_change_keeps_selected_root_binding_valid() {
+    let fixture = temp_volume_root();
+    let selected = fixture.path().join("selected");
+    fs::create_dir(&selected).expect("selected root");
+    let session = BoundVolumeSession::bind(&selected).expect("binding");
+    let before = session.observation().root_identity();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut value = 0_u8;
+
+    let after = loop {
+        value = value.wrapping_add(1);
+        rustix::fs::setxattr(
+            &selected,
+            "com.guiying.test.root-authorization",
+            &[value],
+            rustix::fs::XattrFlags::empty(),
+        )
+        .expect("write harmless authorization-like xattr");
+        let metadata = fs::metadata(&selected).expect("selected root metadata");
+        if metadata.ctime() != before.change_time_seconds
+            || u32::try_from(metadata.ctime_nsec()).ok() != Some(before.change_time_nanoseconds)
+        {
+            break metadata;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "xattr update must advance directory ctime"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert_eq!(after.dev(), before.device);
+    assert_eq!(after.ino(), before.inode);
+    assert_eq!(
+        std::os::macos::fs::MetadataExt::st_gen(&after),
+        before.generation
+    );
+    assert_eq!(after.mode(), before.mode);
+    session
+        .revalidate()
+        .expect("authorization metadata must not replace the selected root");
+    let current = session
+        .verify_directory(&relative(&session, b""))
+        .expect("selected root remains safely reopenable");
+    assert_eq!(current.device, before.device);
+    assert_eq!(current.inode, before.inode);
+    assert_eq!(current.generation, before.generation);
+    assert_ne!(
+        (current.change_time_seconds, current.change_time_nanoseconds),
+        (before.change_time_seconds, before.change_time_nanoseconds)
+    );
+}
+
+#[test]
 fn replacing_the_selected_root_invalidates_the_binding() {
     let fixture = temp_volume_root();
     let selected = fixture.path().join("selected");
@@ -406,8 +461,12 @@ fn replacing_the_selected_root_invalidates_the_binding() {
     let session = BoundVolumeSession::bind(&selected).expect("binding");
 
     let old = fixture.path().join("old-selected");
-    fs::rename(&selected, old).expect("move selected root");
+    fs::rename(&selected, &old).expect("move selected root");
     fs::create_dir(&selected).expect("same-name replacement root");
+    let original = fs::metadata(&old).expect("original root metadata");
+    let replacement = fs::metadata(&selected).expect("replacement root metadata");
+    assert_eq!(original.dev(), replacement.dev());
+    assert_ne!(original.ino(), replacement.ino());
     assert!(matches!(
         session.revalidate(),
         Err(VolumeError::RootBindingChanged)

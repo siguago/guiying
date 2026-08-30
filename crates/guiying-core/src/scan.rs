@@ -729,14 +729,18 @@ fn revalidate_roots(
         match result {
             Ok((metadata, snapshot))
                 if metadata.file_type().is_dir() == root.is_directory
-                    && snapshot == root.snapshot => {}
+                    && if root.is_directory {
+                        snapshot.same_root_directory_state(&root.snapshot)
+                    } else {
+                        snapshot == root.snapshot
+                    } => {}
             Ok(_) => {
                 stable = false;
                 push_issue(
                     issues,
                     ScanIssueCode::RootChangedDuringScan,
                     root.path.clone(),
-                    "scan root identity, device, or change time changed".to_owned(),
+                    "scan root object or directory contents changed".to_owned(),
                 );
             }
             Err(error) => {

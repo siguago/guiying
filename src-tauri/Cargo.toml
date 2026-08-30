@@ -9,6 +9,13 @@ rust-version = "1.92.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+# Internal temp-directory validation only. This is not a release capability:
+# the full dual-journal, reconciliation, filesystem-probe, and logical-asset
+# safety contracts are not implemented yet.
+internal-quarantine = []
+
 [lib]
 name = "guiying_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -32,9 +39,18 @@ getrandom = "=0.3.4"
 base64 = "=0.23.1"
 blake3 = "=1.5.5"
 libc = "0.2"
+guiying-volume = { version = "0.1.0", path = "../crates/guiying-volume" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "=3.15.0"
+
+[profile.dev]
+debug = "line-tables-only"          # 行号级调试信息（保留 backtrace 的文件:行号），比完整 debuginfo 小得多
+split-debuginfo = "unpacked"        # macOS 推荐：debuginfo 不塞进 .rlib，便于后续清理
+
+# 第三方依赖几乎不会被单步调试，整体关掉它们的 debuginfo（最大的一笔节省）
+[profile.dev.package."*"]
+debug = false

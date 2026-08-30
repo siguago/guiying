@@ -74,7 +74,7 @@ fn compare_files_exact_inner(
 ) -> Result<ByteComparison, VerificationError> {
     // Same clamp semantics as the streaming exact comparison: the configured
     // buffer is honored up to 1 MiB per side and can never be zero.
-    let buffer_bytes = buffer_bytes.min(VERIFY_BUFFER_BYTES).max(1);
+    let buffer_bytes = buffer_bytes.clamp(1, VERIFY_BUFFER_BYTES);
     if effective_scan_directive(control) == ScanDirective::Cancel {
         return Err(VerificationError::Cancelled);
     }

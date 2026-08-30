@@ -2,32 +2,46 @@
   "schema_version": "1.0",
   "pairs": [
     {
-      "name": "Primary ink on paper",
+      "name": "Primary slate on cool canvas",
       "role": "body-text",
-      "foreground": "#17231f",
-      "background": "#f5f2e9",
+      "foreground": "#18202b",
+      "background": "#f5f7fa",
       "minimum": 4.5
     },
     {
-      "name": "Evidence green control on paper",
-      "role": "non-text-ui",
-      "foreground": "#1f7257",
-      "background": "#f5f2e9",
-      "minimum": 3.0
+      "name": "Secondary slate on white work surface",
+      "role": "small-text",
+      "foreground": "#52606f",
+      "background": "#ffffff",
+      "minimum": 4.5
     },
     {
-      "name": "Focus indicator on white surface",
+      "name": "White primary button label on cobalt",
+      "role": "small-text",
+      "foreground": "#ffffff",
+      "background": "#315cf4",
+      "minimum": 4.5
+    },
+    {
+      "name": "Cobalt focus indicator on white",
       "role": "focus-indicator",
-      "foreground": "#1f7257",
+      "foreground": "#315cf4",
       "background": "#ffffff",
       "minimum": 3.0
     },
     {
-      "name": "Review amber text on paper",
-      "role": "small-text",
-      "foreground": "#8a5012",
-      "background": "#f5f2e9",
-      "minimum": 4.5
+      "name": "Keep track on keep surface",
+      "role": "non-text-ui",
+      "foreground": "#16794c",
+      "background": "#def7e9",
+      "minimum": 3.0
+    },
+    {
+      "name": "Move track on move surface",
+      "role": "non-text-ui",
+      "foreground": "#6756d9",
+      "background": "#eceaff",
+      "minimum": 3.0
     }
   ]
 }

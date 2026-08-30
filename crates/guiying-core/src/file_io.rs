@@ -112,6 +112,38 @@ impl FileSnapshot {
             None
         }
     }
+
+    /// Compare the stable object behind an already-opened directory.
+    ///
+    /// On Unix, permission bits and `ctime` are not object identity. macOS may
+    /// update both while attaching native directory-selection authorization
+    /// metadata. The caller must still prove directory type and root/mount
+    /// boundaries independently.
+    pub(crate) fn same_directory_object(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.file_id.is_some()
+                && self.file_id == other.file_id
+                && self.generation() == other.generation()
+                && (self.mode & u32::from(libc::S_IFMT)) == (other.mode & u32::from(libc::S_IFMT))
+        }
+        #[cfg(not(unix))]
+        {
+            self == other
+        }
+    }
+
+    /// Compare selected-root directory contents while allowing authorization
+    /// metadata to change. Directory entry changes still update the directory
+    /// `mtime` and are therefore rejected during coverage finalization.
+    pub(crate) fn same_root_directory_state(&self, other: &Self) -> bool {
+        self.same_directory_object(other)
+            && self.len == other.len
+            && self.allocated_size == other.allocated_size
+            && self.modified == other.modified
+            && self.created == other.created
+            && self.hard_link_count == other.hard_link_count
+    }
 }
 
 // Access time is observation-only. Merely reading a file can update atime, so

@@ -1,51 +1,48 @@
-# Phase 1 实现交接
+# 归影 v0.2 实现交接
 
 ## 技术映射
 
-- `src/App.tsx`：Phase 1 状态机、工作流轨道、扫描暂停/继续/停止、历史目录、封存结果、JSON/CSV 导出与错误界面。
-- `src/App.css` 与 `src/index.css`：桌面布局、紧凑断点、焦点与减少动画设置。
-- `src/lib/backend.ts`：Tauri 目录选择、只读扫描 invoke、暂停/继续/停止、轻量状态、历史打开、每 token 有界串行结果分页、严格导出 DTO 与浏览器合成数据适配。
-- `src-tauri/src/lib.rs` / `scan_service.rs` / `runtime_lock.rs` / `export_target.rs`：单任务调度、进程级数据库锁、同进程枚举暂停/继续、合作式取消、EvidenceReader、窗口绑定 result/export token、只读分页和新报告文件的安全发布；没有照片移动、重命名、改时或删除命令。
-- `crates/guiying-core/` / `guiying-volume/` / `guiying-runtime/`：分层 BLAKE3、descriptor/mount 夹持、逐字节比较、枚举安全点与可信证据适配。暂停依赖当前进程中存活的 traversal/runtime，不跨进程恢复。
-- `crates/guiying-store/`：应用数据目录中的认证观察、阶段封印、D1 组、有界分页、运行租约/控制请求/暂停检查点和一致性历史导出快照；不打开用户媒体。
+- `src/App.tsx`：扫描与历史基础；结果内的 `review → plan → executing → complete/restore` 状态；keeper 草稿、Keep/Move 只读预览、合成执行/恢复和受 internal gate 保护的独立恢复界面。
+- `src/App.css` / `src/index.css`：冷中性桌面工作台、双轨、1280/1024 桌面适配、焦点与 reduced-motion。
+- `design-system/tokens.tokens.json`：DTCG 源；冷中性表面、钴蓝 action、绿色 Keep 和紫色 Move。`pnpm tokens:build` 生成 `src/styles/tokens.css`。
+- `src/lib/backend.ts`：严格的 result/member DTO，以及隔离计划、执行、恢复根、记录列表和恢复结果适配。所有计数/字节边界先验证十进制字符串再转安全整数。
+- `src-tauri/src/quarantine_service.rs`：窗口绑定短期计划/恢复令牌、原生目录选择、根/卷/文件身份复核、同卷 no-replace 移动、持久 manifest 与恢复。
+- `src-tauri/src/scan_service.rs`：从窗口绑定 result token 读取组和成员的原生证据；只向 quarantine service 提供经过验证的内部结构，不向 WebView返回真实路径字节。
+- `src-tauri/src/lib.rs`：注册命令、共享 manager，并在窗口关闭时撤销隔离和恢复授权。
+- 原有 `guiying-core` / `guiying-volume` / `guiying-runtime` / `guiying-store`：继续提供 D1 扫描、卷夹持、证据持久化和单进程互斥。
 
-## 令牌与组件
+## 权限与事务边界
 
-`design-system/tokens.tokens.json` 是 DTCG 源，`pnpm tokens:build` 确定性生成 `src/styles/tokens.css`。组件不依赖外部 UI 框架；图标统一从 `lucide-react` 导入，品牌标记由 `src/components/BrandMark.tsx` 原创绘制。
+WebView 不能发送文件系统路径来执行移动。内部计划适配只接受 `resultReadToken`、`groupBuildId` 和由封存成员页返回的 `keeperOrdinal`。但这个契约不是发布授权：标准构建的 Cargo feature 与前端开关都关闭，原生命令统一 fail closed。
 
-核心组件状态包括 idle、ready-to-scan、scanning、pausing、paused、resuming、history、results 与 error。目录对话框关闭后恢复触发按钮焦点；重复组使用 `aria-pressed` 表达选择；详情区可聚焦滚动；`prefers-reduced-motion` 关闭非必要动画。持久化结果只保留当前 group/member/issue 页，分页导航带有明确的 loading、error、retry、previous 与 next 状态；失败不会清空上一成功页。历史 display path 始终标为封存文本，不恢复目录权限。
+隔离只在同一卷的 `.guiying-quarantine` 中进行，不做“复制后删除”，目标使用 no-replace。清单写入操作 ID、keeper、原相对路径、文件身份、内容摘要与逐项状态。执行中任一不确定都 fail closed；计划令牌一次性使用并有短有效期。
 
-暂停/继续命令以 owner window、job id 和阶段门约束，只在目录枚举安全点落盘控制回执；停止优先于暂停并可唤醒暂停中的 worker。暂停检查点用于校验状态与故障收敛，不保存可在新进程重建的目录遍历器或描述符，因此应用退出后必须重新扫描。前端以操作代际隔离迟到的暂停/继续响应，避免其覆盖取消或终态。
+恢复重新通过系统选择器绑定原根，并使用 `qroot-*` 读取清单。原路径已有不同对象时不覆盖；部分恢复必须返回 `remainingCount`。隔离区不是备份，也不会自动永久删除。
 
-历史导出由 result token 派生的一次性、窗口绑定 export token 授权，并在原生侧保留目标目录句柄；WebView 只接收安全文件名，不接收目标父路径。JSON 与 CSV 使用同一规范逻辑记录序列和 BLAKE3 摘要；默认隐去显示路径，可显式包含封存显示文本。`complete_evidence` 仅导出 summary、duplicate group、duplicate member 与 scan issue，明确排除 capture-time candidate/member/metadata 记录、raw field/detail、locator、原生路径字节、路径键和文件身份；summary 仍可携带封存报告既有的 `time_outcome` 汇总。导出创建新报告文件，不构成照片写授权。
+## 前端状态约束
 
-## 构建与运行
+- 每组 keeper 使用原生 radio；建议仅提供理由，不自动执行。
+- 选择以 group ID/member ID 独立于分页数组保存；一次只预览并执行当前组，避免把已加载页冒充全部结果。
+- 合成模式只修改 React 状态，从不调用 Tauri 隔离/恢复命令。
+- Internal 执行前重新授权；取消选择器回到计划而不是报错或伪成功。标准构建不进入该分支。
+- Internal 完成页保留“本次操作”与恢复入口；恢复错误不抹掉已隔离事实。独立恢复页也只在 internal 前端开关下可达。
+- 时间证据和导出保留为次要/高级内容，不构成 keeper 或写授权。
+
+## 构建与验证
 
 ```bash
 pnpm tokens:check
 pnpm build
 pnpm lint
-pnpm test:ui
 pnpm tauri:dev
-pnpm exec tauri build --debug
+python3 /Users/sigua/.codex/skills/craft-ui-design/scripts/validate_delivery.py docs/ui-delivery
 ```
 
-Rust 验证命令记录于仓库根 README。Tauri WebView capability 只开放
-`core:event:allow-listen` 与 `core:event:allow-unlisten`；目录选择由受审计的
-Rust command 调用原生对话框并签发窗口绑定的一次性令牌，WebView 没有 dialog、
-fs、shell、HTTP 或 image-from-path capability。这不是对 Rust command 的 OS 沙箱，
-安全性仍依赖 command 代码审计与只读核心 API。
+Rust 使用 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 和 `cargo test --all-targets --all-features`。当前已加入完整合成闭环测试；浏览器本轮直接执行了同一流程和 1024 × 768 检查。具体结果与未完成门禁只以 `qa-evidence.json` 为准。
 
-逐目标结果、证据与限制的双向映射以 `qa-evidence.json` 为唯一机器记录；本说明不替代该文件。
+## 当前限制
 
-## 当前约束
-
-- 桌面主链已展示受支持容器中的封印拍摄时间候选、成员判断、问题账本和按需原始元数据字段；尚未实现 AAE、Google Takeout JSON、Live Photo 等跨文件关系推断。
-- UI 不按路径或成员顺序推断 keeper。当前阶段没有 keeper 或 donor 决策，也没有任何写授权。
-- 组内成员同时展示扫描快照中的 birth/mtime 与精度说明；文件系统时间始终作为独立、低可信线索，不会替代内嵌拍摄时间证据。
-- SQLite 只读扫描证据已接入 UI；未来文件动作表仍 dormant，不构成执行授权。
-- 历史 catalog 由 owner-window 并发门有界读取，详细证据只接受限时 `resultReadToken`；同一 token 的前端请求经深度 8 的共享队列串行，匹配桌面端单飞契约。
-- 历史导出仅接受完成且精确封印的历史结果；摘要上限 2 MiB/1 条记录，完整重复证据上限 256 MiB/250,000 条记录，超限、超时、取消或目标身份异常均拒绝无条件成功。
-- 安装包已使用 `design-system/assets/guiying-app-icon.svg` 生成的归影品牌图标；16/32/64 px 在深浅背景下均保留照片叠层与确认标记，导出位图不应手工编辑。
-- 浏览器 E2E 覆盖合成数据流程；真实外置卷和系统目录对话框仍需人工验收矩阵。
-- 本轮只完成 Tauri 的 cargo check/test/strict clippy/rustdoc/fmt，没有生成 bundle，也没有 native-run；历史 bundle/原生运行日志不作为当前树动态证据。
+- 首版只处理单个 D1 组和普通独立文件；伴随资产、模糊 xattr/ACL/resource fork、time donor、非独立硬链接/克隆等不合格组整组保留。
+- 真实外置卷掉盘、写满、权限变化、同名冲突、崩溃对账、APFS/HFS+/exFAT 差异仍需破坏性测试卷矩阵。
+- 浏览器截图不能替代当前 Tauri WebView、原生系统选择器或 VoiceOver 证明。
+- 永久删除、时间写入、D2/D3、相似照片和跨卷整理不在 v0.2 范围。

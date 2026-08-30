@@ -90,6 +90,10 @@ pub(crate) struct AppError {
 }
 
 impl AppError {
+    pub(crate) fn quarantine(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(code, message, None)
+    }
+
     fn invalid_root(message: impl Into<String>) -> Self {
         Self::new("INVALID_SCAN_ROOT", message, None)
     }
@@ -708,6 +712,7 @@ pub(crate) struct ScanJobManager {
     history_exports: Arc<StdMutex<HistoryExportRegistry>>,
     history_reader: Arc<StdMutex<Option<SharedEvidenceReader>>>,
     history_reads: Arc<StdMutex<HistoryReadGate>>,
+    filesystem_mutations: Arc<StdMutex<FilesystemMutationGate>>,
     database_path: Arc<OnceLock<PathBuf>>,
 }
 
@@ -721,7 +726,32 @@ impl Default for ScanJobManager {
             history_exports: Arc::new(StdMutex::new(HistoryExportRegistry::default())),
             history_reader: Arc::new(StdMutex::new(None)),
             history_reads: Arc::new(StdMutex::new(HistoryReadGate::default())),
+            filesystem_mutations: Arc::new(StdMutex::new(FilesystemMutationGate::default())),
             database_path: Arc::new(OnceLock::new()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct FilesystemMutationGate {
+    active_operation_id: Option<String>,
+}
+
+#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+pub(crate) struct FilesystemMutationPermit {
+    gate: Arc<StdMutex<FilesystemMutationGate>>,
+    operation_id: String,
+}
+
+#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+impl Drop for FilesystemMutationPermit {
+    fn drop(&mut self) {
+        let mut gate = match self.gate.lock() {
+            Ok(gate) => gate,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if gate.active_operation_id.as_deref() == Some(self.operation_id.as_str()) {
+            gate.active_operation_id = None;
         }
     }
 }
@@ -1975,6 +2005,7 @@ impl ScanJobManager {
                     active.status.job_id.clone(),
                 ));
             }
+            self.ensure_no_running_filesystem_mutation()?;
         }
         let binding = self
             .snapshot_result_export_binding(owner_window_label, result_read_token)
@@ -2047,6 +2078,7 @@ impl ScanJobManager {
                     active.status.job_id.clone(),
                 ));
             }
+            self.ensure_no_running_filesystem_mutation()?;
         }
         let now = Instant::now();
         let expires_at = now
@@ -2131,6 +2163,7 @@ impl ScanJobManager {
                 active.status.job_id.clone(),
             ));
         }
+        self.ensure_no_running_filesystem_mutation()?;
         let (binding, generation, scope, projection) = {
             let mut registry = self
                 .history_exports
@@ -2309,6 +2342,65 @@ impl ScanJobManager {
         }
     }
 
+    fn ensure_no_running_filesystem_mutation(&self) -> Result<(), AppError> {
+        let gate = self.filesystem_mutations.lock().map_err(|_| {
+            AppError::quarantine(
+                "FILESYSTEM_MUTATION_GATE_UNAVAILABLE",
+                "隔离执行状态不可用；为避免与扫描并发，已拒绝继续。",
+            )
+        })?;
+        if gate.active_operation_id.is_none() {
+            Ok(())
+        } else {
+            Err(AppError::quarantine(
+                "FILESYSTEM_MUTATION_ALREADY_RUNNING",
+                "已有隔离或恢复操作正在执行；请等待完成后重试。",
+            ))
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+    pub(crate) async fn begin_filesystem_mutation(
+        &self,
+        operation_id: &str,
+    ) -> Result<FilesystemMutationPermit, AppError> {
+        if operation_id.is_empty() || operation_id.len() > 128 {
+            return Err(AppError::quarantine(
+                "INVALID_QUARANTINE_OPERATION_ID",
+                "隔离操作编号无效。",
+            ));
+        }
+        let scan_registry = self.registry.lock().await;
+        if let Some(active) = &scan_registry.active {
+            return Err(AppError::quarantine(
+                "QUARANTINE_BLOCKED_BY_SCAN",
+                format!(
+                    "扫描 {} 正在运行；请等待扫描完成后再执行隔离或恢复。",
+                    active.status.job_id
+                ),
+            ));
+        }
+        self.ensure_no_running_history_export()?;
+        let mut gate = self.filesystem_mutations.lock().map_err(|_| {
+            AppError::quarantine(
+                "FILESYSTEM_MUTATION_GATE_UNAVAILABLE",
+                "隔离执行状态不可用；已拒绝继续。",
+            )
+        })?;
+        if gate.active_operation_id.is_some() {
+            return Err(AppError::quarantine(
+                "FILESYSTEM_MUTATION_ALREADY_RUNNING",
+                "已有隔离或恢复操作正在执行；请等待完成后重试。",
+            ));
+        }
+        gate.active_operation_id = Some(operation_id.to_owned());
+        drop(scan_registry);
+        Ok(FilesystemMutationPermit {
+            gate: Arc::clone(&self.filesystem_mutations),
+            operation_id: operation_id.to_owned(),
+        })
+    }
+
     #[cfg(test)]
     fn pending_history_export_count(&self) -> usize {
         let registry = match self.history_exports.lock() {
@@ -2474,6 +2566,7 @@ impl ScanJobManager {
         let mut registry = self.registry.lock().await;
         ensure_scan_start_available(&registry)?;
         self.ensure_no_running_history_export()?;
+        self.ensure_no_running_filesystem_mutation()?;
         Ok(reserve_job(&mut registry, owner_window_label))
     }
 
@@ -2487,6 +2580,7 @@ impl ScanJobManager {
         let mut registry = self.registry.lock().await;
         ensure_scan_start_available(&registry)?;
         self.ensure_no_running_history_export()?;
+        self.ensure_no_running_filesystem_mutation()?;
         let root = self.consume_scan_root(&owner_window_label, root_token)?;
         let reservation = reserve_job(&mut registry, owner_window_label);
         Ok((root, reservation))
@@ -3691,6 +3785,44 @@ pub(crate) struct DuplicateGroupMemberItem {
     timestamp_granularity_ns: Option<String>,
 }
 
+#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+const MAX_QUARANTINE_GROUP_MEMBERS: i64 = 256;
+#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+const MAX_QUARANTINE_GROUP_LOGICAL_BYTES: i64 = 64 * 1024 * 1024 * 1024;
+
+/// Trusted, non-WebView projection used to construct one fail-closed
+/// quarantine plan. Native bytes never leave Rust; the result token remains
+/// the authority for resolving this projection again immediately before a
+/// mutation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+pub(crate) struct QuarantineGroupEvidence {
+    pub(crate) scan_run_id: i64,
+    pub(crate) group_build_id: i64,
+    pub(crate) keeper_ordinal: i64,
+    pub(crate) group_key: Vec<u8>,
+    pub(crate) manifest_digest: Vec<u8>,
+    pub(crate) member_count: i64,
+    pub(crate) logical_reclaimable_bytes: i64,
+    pub(crate) members: Vec<QuarantineMemberEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+pub(crate) struct QuarantineMemberEvidence {
+    pub(crate) ordinal: i64,
+    pub(crate) observation_id: i64,
+    pub(crate) stable_path_key: Vec<u8>,
+    pub(crate) mount_relative_path_raw: Vec<u8>,
+    pub(crate) root_relative_path_raw: Vec<u8>,
+    pub(crate) path_encoding: String,
+    pub(crate) source_signature: Vec<u8>,
+    pub(crate) size_bytes: i64,
+    pub(crate) file_object_key: Vec<u8>,
+    pub(crate) birth_time: Option<guiying_store::FileTimestampParts>,
+    pub(crate) modified_time: guiying_store::FileTimestampParts,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ScanIssueItem {
@@ -4775,6 +4907,163 @@ pub(crate) async fn list_duplicate_group_members(
                 .list_duplicate_group_members_page(&group, decoded.as_ref(), limit)
                 .map_err(|_| AppError::result_store("重复组成员封印证据读取失败。"))?;
             map_member_page(result_scope, page)
+        },
+    )
+    .await
+}
+
+#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+pub(crate) async fn load_quarantine_group_evidence(
+    manager: &ScanJobManager,
+    owner_window_label: &str,
+    result_read_token: &str,
+    group_build_id: &str,
+    keeper_ordinal: &str,
+) -> Result<QuarantineGroupEvidence, AppError> {
+    let group_build_id = parse_positive_id("quarantine", "groupBuildId", group_build_id)?;
+    let keeper_ordinal = parse_nonnegative_id("quarantine", "keeperOrdinal", keeper_ordinal)?;
+    with_result_reader(
+        manager,
+        owner_window_label,
+        result_read_token,
+        move |reader, context, _result_scope| {
+            let mut group_cursor = None;
+            let group = loop {
+                let page = reader
+                    .list_duplicate_groups_page(
+                        context,
+                        group_cursor.as_ref(),
+                        guiying_store::MAX_PAGE_SIZE,
+                    )
+                    .map_err(|_| {
+                        AppError::quarantine(
+                            "QUARANTINE_EVIDENCE_UNAVAILABLE",
+                            "隔离计划无法读取封存重复组证据。",
+                        )
+                    })?;
+                if let Some(group) = page
+                    .items
+                    .into_iter()
+                    .find(|group| group.build_id == group_build_id)
+                {
+                    break group;
+                }
+                group_cursor = page.next_cursor;
+                if group_cursor.is_none() {
+                    return Err(AppError::quarantine(
+                        "QUARANTINE_GROUP_NOT_FOUND",
+                        "所选重复组不属于当前封存结果。",
+                    ));
+                }
+            };
+            if !(2..=MAX_QUARANTINE_GROUP_MEMBERS).contains(&group.member_count)
+                || group.independent_file_count != group.member_count
+                || group.logical_reclaimable_bytes < 0
+                || group.logical_reclaimable_bytes > MAX_QUARANTINE_GROUP_LOGICAL_BYTES
+                || keeper_ordinal >= group.member_count
+            {
+                return Err(AppError::quarantine(
+                    "QUARANTINE_GROUP_INELIGIBLE",
+                    "该组不是受支持的普通独立文件组，或超过单组隔离安全上限。",
+                ));
+            }
+            let group_context = resolve_history_group(reader, context, group_build_id)?;
+            let expected_count = usize::try_from(group.member_count).map_err(|_| {
+                AppError::quarantine(
+                    "QUARANTINE_GROUP_INELIGIBLE",
+                    "重复组成员数量超出当前平台范围。",
+                )
+            })?;
+            let mut members = Vec::with_capacity(expected_count);
+            let mut cursor = None;
+            loop {
+                let page = reader
+                    .list_duplicate_group_members_page(&group_context, cursor.as_ref(), 128)
+                    .map_err(|_| {
+                        AppError::quarantine(
+                            "QUARANTINE_EVIDENCE_UNAVAILABLE",
+                            "隔离计划无法读取完整成员证据。",
+                        )
+                    })?;
+                if page.items.is_empty() && page.next_cursor.is_some() {
+                    return Err(AppError::quarantine(
+                        "QUARANTINE_EVIDENCE_INVALID",
+                        "重复组分页证据不连续；已拒绝生成隔离计划。",
+                    ));
+                }
+                for member in page.items {
+                    let expected_ordinal = i64::try_from(members.len()).map_err(|_| {
+                        AppError::quarantine(
+                            "QUARANTINE_EVIDENCE_INVALID",
+                            "重复组成员序号超出当前平台范围。",
+                        )
+                    })?;
+                    let file_object_key = member.file_object_key.clone().ok_or_else(|| {
+                        AppError::quarantine(
+                            "QUARANTINE_FILE_IDENTITY_WEAK",
+                            "组内至少一个文件缺少稳定文件对象身份；已拒绝隔离。",
+                        )
+                    })?;
+                    if member.group_build_id != group_build_id
+                        || member.ordinal != expected_ordinal
+                        || member.sort_rank != expected_ordinal
+                        || member.path_encoding != "unix_bytes"
+                        || member.root_relative_path_raw.is_empty()
+                        || member.stable_path_key.len() != 32
+                        || member.source_signature.len() != 32
+                        || file_object_key.len() != 32
+                        || member.size_bytes < 0
+                        || members.len() >= expected_count
+                    {
+                        return Err(AppError::quarantine(
+                            "QUARANTINE_EVIDENCE_INVALID",
+                            "重复组成员证据不完整或不是规范的独立普通文件。",
+                        ));
+                    }
+                    members.push(QuarantineMemberEvidence {
+                        ordinal: member.ordinal,
+                        observation_id: member.observation_id,
+                        stable_path_key: member.stable_path_key,
+                        mount_relative_path_raw: member.mount_relative_path_raw,
+                        root_relative_path_raw: member.root_relative_path_raw,
+                        path_encoding: member.path_encoding,
+                        source_signature: member.source_signature,
+                        size_bytes: member.size_bytes,
+                        file_object_key,
+                        birth_time: member.birth_time,
+                        modified_time: member.modified_time,
+                    });
+                }
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            if members.len() != expected_count
+                || members
+                    .get(usize::try_from(keeper_ordinal).map_err(|_| {
+                        AppError::quarantine(
+                            "INVALID_KEEPER_ORDINAL",
+                            "保留项序号超出当前平台范围。",
+                        )
+                    })?)
+                    .is_none()
+            {
+                return Err(AppError::quarantine(
+                    "QUARANTINE_EVIDENCE_INVALID",
+                    "重复组封存成员数量与组摘要不一致。",
+                ));
+            }
+            Ok(QuarantineGroupEvidence {
+                scan_run_id: context.scan_run_id(),
+                group_build_id,
+                keeper_ordinal,
+                group_key: group.group_key.as_bytes().to_vec(),
+                manifest_digest: group.manifest_digest.as_bytes().to_vec(),
+                member_count: group.member_count,
+                logical_reclaimable_bytes: group.logical_reclaimable_bytes,
+                members,
+            })
         },
     )
     .await

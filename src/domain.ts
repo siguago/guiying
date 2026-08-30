@@ -265,6 +265,8 @@ export interface CaptureTimeMetadataFieldRawDetail {
 
 export interface DuplicateFile {
   id: string
+  /** Stable member ordinal sealed with the duplicate group; used for native quarantine planning. */
+  ordinal?: string
   name: string
   path: string
   nativePath?: NativePathRef

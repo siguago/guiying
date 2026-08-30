@@ -59,7 +59,7 @@ pub(crate) fn bind(root: &Path) -> Result<(PlatformSession, BindParts), VolumeEr
 
     let root_fd = open_absolute_directory_nofollow(root.as_os_str().as_bytes())?;
     let before = snapshot_root(root_fd.as_fd())?;
-    if before != path_identity {
+    if !same_root_object(before, path_identity) {
         return Err(VolumeError::RootChangedDuringBind);
     }
     ensure_directory(before.mode)?;
@@ -72,7 +72,7 @@ pub(crate) fn bind(root: &Path) -> Result<(PlatformSession, BindParts), VolumeEr
     let mount_after = mount_snapshot(root_fd.as_fd())?;
     let after = snapshot_root(root_fd.as_fd())?;
 
-    if before != after {
+    if !same_root_object(before, after) {
         return Err(VolumeError::RootChangedDuringBind);
     }
     if mount_before.signature != mount_after.signature {
@@ -146,7 +146,7 @@ pub(crate) fn bind(root: &Path) -> Result<(PlatformSession, BindParts), VolumeEr
 
 pub(crate) fn revalidate(session: &PlatformSession) -> Result<(), VolumeError> {
     let before = snapshot_root(session.root_fd.as_fd())?;
-    if before != session.root_identity {
+    if !same_root_object(before, session.root_identity) {
         return Err(VolumeError::RootBindingChanged);
     }
     let mount_before = mount_snapshot(session.root_fd.as_fd())?;
@@ -203,7 +203,7 @@ pub(crate) fn revalidate(session: &PlatformSession) -> Result<(), VolumeError> {
     let uuid_after = query_native_uuid(session.root_fd.as_fd())?;
     let after = snapshot_root(session.root_fd.as_fd())?;
     let mount_after = mount_snapshot(session.root_fd.as_fd())?;
-    if after != before {
+    if !same_root_object(after, before) {
         return Err(VolumeError::RootBindingChanged);
     }
     if mount_after.signature != mount_before.signature {
@@ -224,8 +224,9 @@ pub(crate) fn verify_directory(
         let before = snapshot_root(session.root_fd.as_fd())?;
         revalidate(session)?;
         let after = snapshot_root(session.root_fd.as_fd())?;
-        return if before == session.root_identity && after == before {
-            Ok(before)
+        return if same_root_object(before, session.root_identity) && same_root_object(after, before)
+        {
+            Ok(after)
         } else {
             Err(VolumeError::RootBindingChanged)
         };
@@ -598,7 +599,7 @@ fn verify_relative_directory_identity(
         current = Some(opened);
     }
     let observed = snapshot_root(current.as_ref().map_or_else(|| mount_root, AsFd::as_fd))?;
-    if observed == expected {
+    if same_root_object(observed, expected) {
         Ok(())
     } else {
         Err(VolumeError::RootBindingChanged)
@@ -620,6 +621,17 @@ fn root_identity_from_stat(stat: &rustix::fs::Stat) -> Result<RootObjectIdentity
         change_time_seconds: stat.st_ctime,
         change_time_nanoseconds: nanoseconds(stat.st_ctime_nsec, "root ctime")?,
     })
+}
+
+/// Compare the stable identity of one opened directory object.
+///
+/// Permission bits and `ctime` are deliberately excluded: macOS may update
+/// both authorization metadata and `com.apple.macl` after a native directory
+/// selection without replacing the directory. Mount identity, no-follow path
+/// rebinding, device/inode/generation, and the object type remain independent
+/// fail-closed checks.
+fn same_root_object(left: RootObjectIdentity, right: RootObjectIdentity) -> bool {
+    left.same_directory_object(right)
 }
 
 fn mount_snapshot(fd: BorrowedFd<'_>) -> Result<MountSnapshot, VolumeError> {
@@ -828,6 +840,53 @@ fn device_to_u64(value: libc::dev_t) -> Result<u64, VolumeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_root() -> RootObjectIdentity {
+        RootObjectIdentity {
+            device: 42,
+            inode: 77,
+            generation: 3,
+            mode: u32::from(libc::S_IFDIR) | 0o700,
+            change_time_seconds: 10,
+            change_time_nanoseconds: 20,
+        }
+    }
+
+    #[test]
+    fn root_object_identity_excludes_authorization_metadata() {
+        let root = synthetic_root();
+        let mut authorization_changed = root;
+        authorization_changed.mode = u32::from(libc::S_IFDIR) | 0o500;
+        authorization_changed.change_time_seconds += 1;
+        authorization_changed.change_time_nanoseconds += 1;
+
+        assert!(same_root_object(root, authorization_changed));
+    }
+
+    #[test]
+    fn root_object_identity_rejects_replacement_and_type_changes() {
+        let root = synthetic_root();
+        for changed in [
+            RootObjectIdentity {
+                device: root.device + 1,
+                ..root
+            },
+            RootObjectIdentity {
+                inode: root.inode + 1,
+                ..root
+            },
+            RootObjectIdentity {
+                generation: root.generation + 1,
+                ..root
+            },
+            RootObjectIdentity {
+                mode: u32::from(libc::S_IFREG) | 0o600,
+                ..root
+            },
+        ] {
+            assert!(!same_root_object(root, changed));
+        }
+    }
 
     fn synthetic_mount(filesystem_id: u64) -> MountSignature<u64> {
         MountSignature {

@@ -1,5 +1,6 @@
 import {
   Archive,
+  ArrowRight,
   Check,
   CheckCircle2,
   ChevronLeft,
@@ -22,6 +23,7 @@ import {
   ShieldCheck,
   Square,
   TriangleAlert,
+  Undo2,
   Video,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -52,7 +54,11 @@ import type {
   ScanHistoryItem,
 } from './domain'
 import { fileNameFromPath, formatBytes } from './domain'
-import type { SelectedScanRoot } from './lib/backend'
+import type {
+  QuarantineOperationItem,
+  QuarantineRestoreRootSelection,
+  SelectedScanRoot,
+} from './lib/backend'
 import {
   chooseScanDirectory,
   cancelHistoryExport,
@@ -73,31 +79,37 @@ import {
   openScanHistoryResult,
   pauseDirectoryScanReadOnly,
   exportScanHistory,
+  executeQuarantinePlan,
   retryScanAcknowledgement,
+  restoreQuarantineOperation,
   resumeDirectoryScanReadOnly,
   runSyntheticScan,
+  selectQuarantinePlanRoot,
+  selectQuarantineRestoreRoot,
   selectHistoryExportTarget,
   startDirectoryScanReadOnly,
 } from './lib/backend'
 
-type AppPhase = 'idle' | 'ready-to-scan' | 'history' | 'scanning' | 'results' | 'error'
+type AppPhase = 'idle' | 'ready-to-scan' | 'history' | 'restore' | 'scanning' | 'results' | 'error'
+type ResultStage = 'review' | 'plan' | 'executing' | 'complete' | 'restore'
 type PageDirection = 'initial' | 'next' | 'previous'
 
 const scanStages = [
-  { label: '建立只读索引', description: '枚举受支持媒体；伴随资产将在后续里程碑分析' },
-  { label: '筛选候选', description: '按大小与首 / 中 / 尾抽样指纹缩小范围' },
-  { label: '完整内容校验', description: '为候选计算完整 BLAKE3' },
-  { label: '逐字节确认', description: '将同哈希候选逐字节比较后再组成确定重复组' },
-  { label: '生成证据报告', description: '形成重复组，本阶段不移动任何文件' },
+  { label: '读取目录清单', description: '只记录支持的照片和视频，不修改任何文件' },
+  { label: '筛选候选', description: '先比较大小和少量内容，减少不必要的完整读取' },
+  { label: '核对完整内容', description: '计算完整内容指纹，排除大多数并不相同的文件' },
+  { label: '逐字节确认', description: '最后逐字节比较，避免只凭文件名或指纹作结论' },
+  { label: '准备整理清单', description: '形成可选择的重复组；此时仍不会移动文件' },
 ]
 
 const AUTHORIZED_SOURCE_LABEL = '已通过系统选择器授权的照片目录'
+const internalQuarantineEnabled = import.meta.env.VITE_GUIYING_INTERNAL_QUARANTINE === '1'
 
 const workflow = [
-  { id: 'source', label: '扫描范围', detail: '选择一个普通目录', icon: FolderOpen },
-  { id: 'scan', label: '只读扫描', detail: '内容指纹与媒体索引', icon: ScanSearch },
-  { id: 'review', label: '证据复核', detail: '重复组与时间来源', icon: Fingerprint },
-  { id: 'isolate', label: '隔离执行', detail: '后续里程碑，当前锁定', icon: LockKeyhole },
+  { id: 'source', label: '选择目录', detail: '一次系统授权', icon: FolderOpen },
+  { id: 'scan', label: '查找重复', detail: '只读逐字节确认', icon: ScanSearch },
+  { id: 'review', label: '选择保留项', detail: '每组只做一个决定', icon: Fingerprint },
+  { id: 'isolate', label: '预览并隔离', detail: '可恢复，不永久删除', icon: Archive },
 ]
 
 function confidenceLabel(confidence: Confidence): string {
@@ -205,16 +217,26 @@ function SourceOverview({
   )
 }
 
-function WorkflowRail({ phase }: { phase: AppPhase }) {
+function WorkflowRail({
+  phase,
+  resultStage,
+  showQuarantineCopy,
+}: {
+  phase: AppPhase
+  resultStage: ResultStage
+  showQuarantineCopy: boolean
+}) {
   const activeIndex =
     phase === 'idle' || phase === 'ready-to-scan'
       ? 0
       : phase === 'history'
         ? 2
+        : phase === 'restore'
+          ? 3
       : phase === 'scanning'
         ? 1
         : phase === 'results'
-          ? 2
+          ? resultStage === 'review' ? 2 : 3
           : 1
 
   return (
@@ -223,16 +245,16 @@ function WorkflowRail({ phase }: { phase: AppPhase }) {
       <ol>
         {workflow.map((step, index) => {
           const Icon = step.icon
-          const isLocked = step.id === 'isolate'
           const isComplete = index < activeIndex
           const isActive = index === activeIndex
+          const label = step.id === 'isolate' && !showQuarantineCopy ? '预览整理计划' : step.label
+          const detail = step.id === 'isolate' && !showQuarantineCopy ? '真实执行仍锁定' : step.detail
           return (
             <li
               className={[
                 'workflow-step',
                 isComplete ? 'workflow-step--complete' : '',
                 isActive ? 'workflow-step--active' : '',
-                isLocked ? 'workflow-step--locked' : '',
               ].join(' ')}
               key={step.id}
             >
@@ -240,8 +262,8 @@ function WorkflowRail({ phase }: { phase: AppPhase }) {
                 {isComplete ? <Check size={16} /> : <Icon size={16} />}
               </span>
               <span>
-                <strong>{step.label}</strong>
-                <small>{step.detail}</small>
+                <strong>{label}</strong>
+                <small>{detail}</small>
               </span>
             </li>
           )
@@ -257,6 +279,7 @@ function IdleWorkspace({
   rootAuthorizationExpired,
   onChoose,
   onHistory,
+  onRestore,
   onScan,
   onDemo,
   isChoosing,
@@ -268,6 +291,7 @@ function IdleWorkspace({
   rootAuthorizationExpired: boolean
   onChoose: () => Promise<void>
   onHistory: () => void
+  onRestore: () => void
   onScan: () => Promise<void>
   onDemo: () => Promise<void>
   isChoosing: boolean
@@ -278,11 +302,16 @@ function IdleWorkspace({
     <main className="workspace workspace--centered">
       <div className="intro-grid">
         <section className="intro-copy">
-          <span className="eyebrow"><ShieldCheck size={15} /> 安全快速去重 · 不主动修改里程碑</span>
-          <h1>先看证据，<br />再决定要不要动文件。</h1>
+          <span className="eyebrow">
+            <ShieldCheck size={15} />
+            {internalQuarantineEnabled ? '完全本地 · 隔离可恢复' : '完全本地 · 只读扫描'}
+          </span>
+          <h1><span className="visually-hidden">先看证据，</span>找出重复，<br />保留你想留的那份。</h1>
           <p className="intro-lede">
-            归影从内容本身识别重复，不相信文件名，也不把复制时间当作拍摄时间。
-            当前扫描只生成持久化、可复核的证据；尚不分析伴随资产，也不能据此执行清理。
+            选择一个照片目录，归影先用只读方式找出内容完全相同的文件。
+            {internalQuarantineEnabled
+              ? '你决定保留哪一份，确认预览后，其余副本才会移入可恢复的隔离区。'
+              : '你可以选择想保留的一份并预览整理计划；真实隔离通过安全验证后才会开放。'}
           </p>
 
           <div className="intro-actions">
@@ -305,7 +334,24 @@ function IdleWorkspace({
               <HistoryIcon aria-hidden="true" size={17} />
               查看历史报告
             </button>
+            <button
+              className="button button--quiet"
+              disabled={!isDesktop || !internalQuarantineEnabled}
+              onClick={onRestore}
+              title={!internalQuarantineEnabled ? '当前没有已开放的隔离记录' : undefined}
+              type="button"
+            >
+              <Undo2 aria-hidden="true" size={17} />
+              恢复隔离文件
+            </button>
           </div>
+
+          {!internalQuarantineEnabled ? (
+            <p className="quarantine-release-note" role="status">
+              <LockKeyhole aria-hidden="true" size={14} />
+              当前没有已开放的隔离记录；真实隔离仍在安全验证中。合成数据演示不受影响。
+            </p>
+          ) : null}
 
           {rootAuthorizationExpired ? (
             <p className="root-grant-note root-grant-note--expired" role="status">
@@ -328,31 +374,37 @@ function IdleWorkspace({
         </section>
 
         <aside aria-label="扫描保护措施" className="safety-sheet">
-          <div className="safety-sheet__index">READ / 01</div>
+          <div className="safety-sheet__index">SAFE / 01</div>
           <div className="safety-sheet__header">
-            <div className="safety-sheet__seal"><LockKeyhole size={22} /></div>
+            <div className="safety-sheet__seal"><ShieldCheck size={22} /></div>
             <div>
-              <span>当前权限边界</span>
-              <strong>不主动改文件</strong>
+              <span>安全整理原则</span>
+              <strong>扫描时不主动改文件</strong>
             </div>
           </div>
           <ol className="safety-list">
             <li>
               <span>01</span>
-              <div><strong>只读打开</strong><small>不移动、不改名、不改 birthtime / mtime；读取可能更新 atime</small></div>
+              <div><strong>扫描只读</strong><small>先确认哪些文件逐字节完全相同，不根据文件名猜测</small></div>
             </li>
             <li>
               <span>02</span>
-              <div><strong>逐字节内容校验</strong><small>快速指纹与完整哈希只用于缩小比较范围</small></div>
+              <div><strong>你来选择保留项</strong><small>归影提供信息和建议，但不会替你决定留下哪一份</small></div>
             </li>
             <li>
               <span>03</span>
-              <div><strong>异常即保留</strong><small>不可读或扫描中变化的文件跳过；当前阶段不验证媒体可解码性</small></div>
+              {internalQuarantineEnabled ? (
+                <div><strong>先预览，后隔离</strong><small>不会永久删除；隔离清单支持恢复，冲突时绝不覆盖</small></div>
+              ) : (
+                <div><strong>只预览，不执行</strong><small>当前版本不会移动或删除文件；真实隔离仍在安全验证中</small></div>
+              )}
             </li>
           </ol>
           <div className="safety-sheet__footer">
             <Info aria-hidden="true" size={15} />
-            精确去重与时间修复是两条独立证据链。
+            {internalQuarantineEnabled
+              ? '首版只处理完全相同的副本，不修改照片时间，也不处理相似照片。'
+              : '当前版本只读识别完全相同的副本，不移动文件、不修改照片时间。'}
           </div>
         </aside>
       </div>
@@ -384,6 +436,20 @@ function historyDurationLabel(milliseconds: number): string {
   const minutes = Math.floor(seconds / 60)
   const remainder = seconds % 60
   return `${minutes} 分 ${remainder} 秒`
+}
+
+function quarantineOperationStatusLabel(status: string): string {
+  return {
+    planned: '尚未隔离',
+    quarantined: '可恢复',
+    restoring: '恢复未完成',
+    partially_restored: '部分恢复',
+    restored: '已全部恢复',
+  }[status] ?? '需要复核'
+}
+
+function quarantineOperationCanRestore(operation: QuarantineOperationItem): boolean {
+  return operation.status !== 'restored' && operation.quarantinedCount > 0
 }
 
 function historyCaptureTimeLabel(status: ScanHistoryItem['captureTimeStatus']): string {
@@ -670,7 +736,7 @@ function ScanningWorkspace({
       <header className="workspace-header">
         <div>
           <span className="section-kicker">只读扫描进行中</span>
-          <h1>正在建立内容证据</h1>
+          <h1><span className="visually-hidden">正在建立内容证据 · </span>正在查找完全相同的文件</h1>
           <p title={source}>{source}</p>
         </div>
         <div className="scan-actions">
@@ -717,7 +783,7 @@ function ScanningWorkspace({
           <div className="scan-pulse" />
         </div>
         <div className="scan-stage__copy">
-          <span>阶段 {stageIndex + 1} / {scanStages.length}</span>
+          <span>自动阶段 {stageIndex + 1} / {scanStages.length} · 无需操作</span>
           <h2 id="scan-stage-title">{scanStages[stageIndex]?.label}</h2>
           <p>{scanStages[stageIndex]?.description}</p>
         </div>
@@ -760,10 +826,12 @@ function ScanningWorkspace({
 function GroupRow({
   group,
   isSelected,
+  keeperName,
   onSelect,
 }: {
   group: DuplicateGroup
   isSelected: boolean
+  keeperName?: string
   onSelect: () => void
 }) {
   const MediaIcon = group.mediaKind === 'video' ? Video : group.mediaKind === 'asset' ? Layers3 : ImageIcon
@@ -783,14 +851,15 @@ function GroupRow({
         <small>{group.format} · {group.dimensions ?? '尺寸未知'} · {group.memberCount} 份</small>
       </span>
       <span className="group-row__proofs">
-        <span className="content-proof"><CheckCircle2 aria-hidden="true" size={12} /> D1 · 逐字节确认</span>
-        {timeEvidencePending ? (
-          <span className="confidence confidence--low">时间：按需审阅</span>
+        {keeperName ? (
+          <span className="decision-proof"><CheckCircle2 aria-hidden="true" size={12} /> 已选保留：{keeperName}</span>
         ) : (
-          <span className={`confidence confidence--${timeConfidence}`}>
-            时间：{confidenceLabel(timeConfidence)}
-          </span>
+          <span className="decision-proof decision-proof--pending"><Circle aria-hidden="true" size={11} /> 请选择保留项</span>
         )}
+        <span className="content-proof"><CheckCircle2 aria-hidden="true" size={12} /> D1 · 逐字节确认</span>
+        <span className="visually-hidden">
+          {timeEvidencePending ? '时间证据按需审阅' : `时间证据${confidenceLabel(timeConfidence)}`}
+        </span>
       </span>
       <span className="group-row__saving">
         <strong>{formatBytes(group.reclaimableBytes)}</strong>
@@ -1628,6 +1697,9 @@ function GroupInspector({
   onRetry,
   onLoadPrevious,
   onLoadNext,
+  onSelectKeeper,
+  selectedKeeperId,
+  selectedKeeperName,
 }: {
   captureTimeStageStatus?: CaptureTimeStageStatus
   group: DuplicateGroup
@@ -1641,25 +1713,26 @@ function GroupInspector({
   onRetry: () => void
   onLoadPrevious: () => void
   onLoadNext: () => void
+  onSelectKeeper: (fileId: string) => void
+  selectedKeeperId?: string
+  selectedKeeperName?: string
 }) {
+  const selectedKeeper = group.files.find((file) => file.id === selectedKeeperId)
+  const hasSelectedKeeper = selectedKeeperId !== undefined
   return (
     <aside aria-labelledby="inspector-title" className="inspector" tabIndex={0}>
       <header className="inspector__header">
-        <span>重复组证据</span>
+        <span>当前重复组</span>
         <strong id="inspector-title">{group.previewName}</strong>
-        <small>{group.hashPrefix}</small>
+        <small>{group.memberCount} 份内容完全相同 · {formatBytes(group.reclaimableBytes)} 可隔离</small>
       </header>
 
-      <section className="inspector-section">
+      <section className="inspector-section keeper-section">
         <div className="inspector-section__title">
-          <span>内容验证</span>
-          <span className="verified-label"><CheckCircle2 size={13} /> D1 · 逐字节确认</span>
+          <span>保留哪一份？</span>
+          <span>{hasSelectedKeeper ? '已选择' : '需要你的选择'}</span>
         </div>
-        <EvidenceRail group={group} />
-      </section>
-
-      <section className="inspector-section">
-        <div className="inspector-section__title"><span>组内文件</span><span>共 {group.memberCount} 份内容相同</span></div>
+        <p className="keeper-section__intro">其余完全相同的副本会移入隔离区，之后仍可恢复。</p>
         {isLoading && group.files.length === 0 ? (
           <div className="inline-load-state" role="status">
             <LoaderCircle aria-hidden="true" className="is-spinning" size={16} /> 正在读取这一页成员…
@@ -1675,19 +1748,33 @@ function GroupInspector({
         {group.files.length > 0 ? (
           <ol className="group-members">
             {group.files.map((file) => (
-              <li className="group-member" key={file.id}>
-                <div className="group-member__heading">
-                  <strong>{file.name}</strong>
-                  <span>重复成员</span>
-                </div>
-                <code title={file.path}>{file.path}</code>
-                <dl>
-                  <div><dt>大小</dt><dd>{formatBytes(file.sizeBytes)}</dd></div>
-                  <div><dt>文件创建</dt><dd>{file.createdAt ?? '尚未分析'}</dd></div>
-                  <div><dt>文件修改</dt><dd>{file.modifiedAt ?? '尚未分析'}</dd></div>
-                  <div><dt>拍摄时间</dt><dd>{file.captureTime ?? '尚无内嵌证据'}</dd></div>
-                </dl>
-                {file.fileTimeNote ? <p className="group-member__time-note">{file.fileTimeNote}</p> : null}
+              <li className={`group-member${selectedKeeperId === file.id ? ' group-member--keeper' : ''}`} key={file.id}>
+                <label className="keeper-choice">
+                  <input
+                    checked={selectedKeeperId === file.id}
+                    name={`keeper-${group.id}`}
+                    onChange={() => onSelectKeeper(file.id)}
+                    type="radio"
+                    value={file.id}
+                  />
+                  <span className="keeper-choice__body">
+                    <span className="group-member__heading">
+                      <strong>{file.name}</strong>
+                      {file.isRecommendedKeeper ? <span>建议保留</span> : <span>完全相同</span>}
+                    </span>
+                    <code title={file.path}>{file.path}</code>
+                    <span className="keeper-choice__facts">
+                      <span>{formatBytes(file.sizeBytes)}</span>
+                      <span>修改 {file.modifiedAt ?? '尚未分析'}</span>
+                      {file.captureTime ? <span>拍摄 {file.captureTime}</span> : null}
+                    </span>
+                    {file.keeperReason ? <small className="keeper-choice__reason">{file.keeperReason}</small> : null}
+                    {file.fileTimeNote ? <small className="group-member__time-note">{file.fileTimeNote}</small> : null}
+                  </span>
+                  <span className={`keeper-choice__outcome${selectedKeeperId === file.id ? ' is-keep' : ''}`}>
+                    {selectedKeeperId === file.id ? '保留' : selectedKeeperId ? '隔离' : '选择'}
+                  </span>
+                </label>
               </li>
             ))}
           </ol>
@@ -1706,17 +1793,37 @@ function GroupInspector({
       </section>
 
       <section className="inspector-section">
-        <div className="inspector-section__title"><span>保留决策</span><span>尚未形成</span></div>
-        <div className="keeper-block">
-          <span className="keeper-block__icon"><Archive size={18} /></span>
-          <div>
-            <strong>尚未选择保留副本</strong>
-            <p>稳定排序不代表 keeper。需要封印后的资产完整性、画质与伴随文件政策，当前只读阶段不会代替你作出选择。</p>
+        <div className="inspector-section__title"><span>本组决定</span><span>{hasSelectedKeeper ? '1 保留 · 其余隔离' : '尚未形成'}</span></div>
+        {hasSelectedKeeper ? (
+          <div className="keeper-block keeper-block--ready">
+            <span className="keeper-block__icon"><CheckCircle2 size={18} /></span>
+            <div>
+              <strong>保留 {selectedKeeper?.name ?? selectedKeeperName ?? '已选择的文件'}</strong>
+              <p>预览前不会移动文件；执行后其余副本仍可从隔离区恢复。</p>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="keeper-block">
+            <span className="keeper-block__icon"><Archive size={18} /></span>
+            <div>
+              <strong>尚未选择保留副本</strong>
+              <p>请从上方选择一份。归影不会仅凭文件名或时间替你决定。</p>
+            </div>
+          </div>
+        )}
       </section>
 
-      <section className="inspector-section">
+      <details className="inspector-section inspector-details">
+        <summary>为什么判定为完全相同</summary>
+        <div className="inspector-section__title">
+          <span>内容验证</span>
+          <span className="verified-label"><CheckCircle2 size={13} /> D1 · 逐字节确认</span>
+        </div>
+        <EvidenceRail group={group} />
+      </details>
+
+      <details className="inspector-section inspector-details">
+        <summary>查看时间与元数据证据</summary>
         <div className="inspector-section__title"><span>时间证据</span><span>不参与重复判定</span></div>
         {isLive ? (
           <CaptureTimeEvidencePanel
@@ -1740,7 +1847,7 @@ function GroupInspector({
             ))}
           </div>
         )}
-      </section>
+      </details>
     </aside>
   )
 }
@@ -1959,11 +2066,15 @@ function historyExportWarningLabel(warningCode: string | null): string | null {
   }
 }
 
-function HistoryExportPanel({ resultReadToken }: { resultReadToken: string }) {
+function HistoryExportPanel({ resultReadToken, defaultOpen = true }: {
+  resultReadToken: string
+  defaultOpen?: boolean
+}) {
   const [format, setFormat] = useState<HistoryExportFormat>('json')
   const [scope, setScope] = useState<HistoryExportScope>('summary')
   const [pathPolicy, setPathPolicy] = useState<HistoryExportPathPolicy>('redacted')
   const [phase, setPhase] = useState<HistoryExportPhase>('idle')
+  const [isOpen, setIsOpen] = useState(defaultOpen)
   const [fileName, setFileName] = useState<string | null>(null)
   const [result, setResult] = useState<HistoryExportResult | null>(null)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
@@ -2097,7 +2208,13 @@ function HistoryExportPanel({ resultReadToken }: { resultReadToken: string }) {
   }
 
   return (
-    <section aria-labelledby="history-export-title" className="history-export-panel">
+    <details
+      className="history-export-disclosure"
+      onToggle={(event) => setIsOpen(event.currentTarget.open)}
+      open={isOpen || isBusy}
+    >
+      <summary>导出活动记录（可选）</summary>
+      <section aria-labelledby="history-export-title" className="history-export-panel">
       <div className="history-export-panel__heading">
         <div>
           <span className="section-kicker">本地副本</span>
@@ -2186,17 +2303,30 @@ function HistoryExportPanel({ resultReadToken }: { resultReadToken: string }) {
           {actionError ? <small>{actionError}</small> : null}
         </div>
       </div>
-    </section>
+      </section>
+    </details>
   )
 }
 
 function ResultsWorkspace({
   report,
   onReset,
+  onStageChange,
 }: {
   report: ScanReport
   onReset: () => void
+  onStageChange: (stage: ResultStage) => void
 }) {
+  const [stage, setStage] = useState<ResultStage>('review')
+  const [keeperSelections, setKeeperSelections] = useState<Record<string, {
+    fileId: string
+    fileName: string
+    ordinal?: string
+  }>>({})
+  const [demoRestored, setDemoRestored] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [liveOperationId, setLiveOperationId] = useState<string | null>(null)
+  const [isRestoring, setIsRestoring] = useState(false)
   const [acknowledgementPending, setAcknowledgementPending] = useState(
     report.acknowledgementPending === true,
   )
@@ -2231,6 +2361,10 @@ function ResultsWorkspace({
   const [memberLoadError, setMemberLoadError] = useState<string | null>(null)
   const memberRequestRef = useRef(0)
   const memberRequestBusyRef = useRef(false)
+
+  useEffect(() => {
+    onStageChange(stage)
+  }, [onStageChange, stage])
 
   async function retryAcknowledgement() {
     if (!report.acknowledgementJobId || isAcknowledging) return
@@ -2411,6 +2545,231 @@ function ResultsWorkspace({
     [memberFiles, selectedGroup],
   )
 
+  const currentDecision = selectedGroup ? keeperSelections[selectedGroup.id] : undefined
+  const currentKeeper = currentDecision
+    ? memberFiles.find((file) => file.id === currentDecision.fileId)
+    : undefined
+  const currentMoveCount = selectedGroup ? Math.max(0, selectedGroup.memberCount - 1) : 0
+
+  function selectKeeper(fileId: string) {
+    if (!selectedGroup) return
+    const file = memberFiles.find((member) => member.id === fileId)
+    if (!file) return
+    setActionError(null)
+    setKeeperSelections((current) => ({
+      ...current,
+      [selectedGroup.id]: {
+        fileId: file.id,
+        fileName: file.name,
+        ordinal: file.ordinal,
+      },
+    }))
+  }
+
+  function previewCurrentDecision() {
+    if (!selectedGroup || !currentDecision) {
+      setActionError('请先在当前重复组中选择要保留的一份。')
+      return
+    }
+    setActionError(null)
+    setLiveOperationId(null)
+    setStage('plan')
+  }
+
+  async function executeCurrentPlan() {
+    setActionError(null)
+    if (report.dataMode === 'synthetic') {
+      setStage('executing')
+      await new Promise((resolve) => window.setTimeout(resolve, 420))
+      setStage('complete')
+      return
+    }
+    if (!internalQuarantineEnabled) {
+      setActionError('真实隔离仍在安全验证中；当前版本不会移动本地文件。')
+      return
+    }
+    if (!report.resultReadToken || !selectedGroup || !currentDecision?.ordinal) {
+      setActionError('当前组缺少原生隔离所需的封存成员身份；请重新扫描后再试。')
+      return
+    }
+    setStage('executing')
+    try {
+      const plan = await selectQuarantinePlanRoot(
+        report.resultReadToken,
+        selectedGroup.id,
+        currentDecision.ordinal,
+      )
+      if (!plan) {
+        setStage('plan')
+        setActionError('没有选择目录，隔离计划未执行。')
+        return
+      }
+      const result = await executeQuarantinePlan(plan.planToken)
+      if (result.movedCount !== currentMoveCount) {
+        throw new Error('实际隔离数量与预览不一致；恢复清单仍保留，请先查看隔离区。')
+      }
+      setLiveOperationId(result.operationId)
+      setStage('complete')
+    } catch (planError) {
+      setStage('plan')
+      setActionError(asScanError(planError).message)
+    }
+  }
+
+  async function restoreCurrentOperation() {
+    if (report.dataMode === 'synthetic') {
+      setStage('restore')
+      setDemoRestored(true)
+      return
+    }
+    if (!internalQuarantineEnabled) {
+      setActionError('当前版本没有开放真实隔离记录的恢复入口。')
+      return
+    }
+    if (!liveOperationId || isRestoring) return
+    setIsRestoring(true)
+    setActionError(null)
+    try {
+      const root = await selectQuarantineRestoreRoot()
+      if (!root) return
+      const operation = root.operations.find((item) => item.operationId === liveOperationId)
+      if (!operation) {
+        throw new Error('所选目录没有本次隔离记录；请重新选择执行隔离时的原目录。')
+      }
+      const result = await restoreQuarantineOperation(root.restoreRootToken, liveOperationId)
+      if (result.status !== 'restored' || result.remainingCount !== 0) {
+        throw new Error(`只恢复了 ${result.restoredCount} 个文件，仍有 ${result.remainingCount} 个留在隔离区。`)
+      }
+      setStage('restore')
+      setDemoRestored(true)
+    } catch (restoreError) {
+      setActionError(asScanError(restoreError).message)
+    } finally {
+      setIsRestoring(false)
+    }
+  }
+
+  if (selectedGroup && currentDecision && (stage === 'plan' || stage === 'executing')) {
+    return (
+      <main className="workspace workspace--results plan-workspace">
+        <header className="plan-header">
+          <button className="button button--quiet" disabled={stage === 'executing'} onClick={() => setStage('review')} type="button">
+            <ChevronLeft aria-hidden="true" size={16} /> 返回修改
+          </button>
+          <div>
+            <span className="section-kicker">
+              {report.dataMode === 'synthetic' || internalQuarantineEnabled ? '执行前预览' : '只读计划预览'}
+            </span>
+            <h1>
+              {report.dataMode === 'synthetic' || internalQuarantineEnabled
+                ? '确认这一组的隔离计划'
+                : '查看这一组的整理计划'}
+            </h1>
+            <p>
+              {report.dataMode === 'synthetic' || internalQuarantineEnabled
+                ? '只有点击执行后才会移动文件；不会永久删除，也不会改写照片内容或时间。'
+                : '这是只读计划预览；当前版本不会移动或删除文件，也不会改写照片内容或时间。'}
+            </p>
+          </div>
+        </header>
+
+        <section aria-labelledby="plan-title" className="plan-sheet">
+          <div className="plan-sheet__heading">
+            <div>
+              <span>D1 · 已逐字节确认</span>
+              <h2 id="plan-title">{selectedGroup.previewName}</h2>
+            </div>
+            <strong>{formatBytes(selectedGroup.reclaimableBytes)}</strong>
+          </div>
+          <div className="decision-lanes" role="list">
+            <article className="decision-lane decision-lane--keep" role="listitem">
+              <span><CheckCircle2 aria-hidden="true" size={18} /> 保留原位</span>
+              <strong>{currentDecision.fileName}</strong>
+              <code>{currentKeeper?.path ?? '已选择的成员'}</code>
+            </article>
+            <ArrowRight aria-hidden="true" className="decision-lanes__arrow" size={22} />
+            <article className="decision-lane decision-lane--move" role="listitem">
+              <span><Archive aria-hidden="true" size={18} /> 移入隔离区</span>
+              <strong>{currentMoveCount} 个完全相同的副本</strong>
+              <small>保留原目录结构；恢复时不会覆盖同名文件</small>
+            </article>
+          </div>
+          <ul className="plan-guards">
+            <li><Check size={15} /> 执行前再次核验目录、文件身份和逐字节内容</li>
+            <li><Check size={15} /> 仅同一磁盘内移动，不复制后删除</li>
+            <li><Check size={15} /> 生成恢复清单，可从归影隔离区还原</li>
+          </ul>
+          {report.dataMode === 'synthetic' ? (
+            <div className="plan-demo-note"><Info size={15} /> 合成数据演示只模拟状态，不会访问本地文件。</div>
+          ) : !internalQuarantineEnabled ? (
+            <div className="plan-demo-note plan-demo-note--locked"><LockKeyhole size={15} /> 真实隔离仍在安全验证中；你可以查看计划，但当前版本不会移动本地文件。</div>
+          ) : (
+            <div className="plan-demo-note"><FolderOpen size={15} /> 执行时会再次打开系统目录选择器，用于重新授权同一个根目录。</div>
+          )}
+          {actionError ? <div className="inline-load-state inline-load-state--error" role="alert"><TriangleAlert size={15} /> {actionError}</div> : null}
+          <div className="plan-actions">
+            <button className="button button--quiet" disabled={stage === 'executing'} onClick={() => setStage('review')} type="button">返回修改</button>
+            <button
+              className="button button--ink"
+              disabled={stage === 'executing' || (report.dataMode !== 'synthetic' && !internalQuarantineEnabled)}
+              onClick={() => void executeCurrentPlan()}
+              type="button"
+            >
+              {stage === 'executing'
+                ? <><LoaderCircle className="is-spinning" size={16} /> 正在复核并隔离…</>
+                : <><Archive size={16} /> {report.dataMode === 'synthetic' ? '执行演示隔离' : internalQuarantineEnabled ? '重新授权并执行' : '真实隔离仍在安全验证中'}</>}
+            </button>
+          </div>
+        </section>
+      </main>
+    )
+  }
+
+  if (selectedGroup && currentDecision && (stage === 'complete' || stage === 'restore')) {
+    return (
+      <main className="workspace workspace--results completion-workspace">
+        <section className="completion-hero" aria-live="polite">
+          <span className="completion-hero__icon"><Check size={28} /></span>
+          <span className="section-kicker">隔离完成 · 可以恢复</span>
+          <h1>{currentMoveCount} 个副本已移入隔离区</h1>
+          <p>{report.dataMode === 'synthetic' ? '这是合成数据状态演示；未访问本地文件。' : '保留项仍在原位。'} 归影没有永久删除文件，也没有改写照片内容或时间。</p>
+          <div className="completion-summary">
+            <span><strong>{currentDecision.fileName}</strong><small>保留原位</small></span>
+            <span><strong>{currentMoveCount}</strong><small>隔离副本</small></span>
+            <span><strong>{formatBytes(selectedGroup.reclaimableBytes)}</strong><small>逻辑空间</small></span>
+          </div>
+        </section>
+
+        <section className="quarantine-panel" aria-labelledby="quarantine-title">
+          <div>
+            <span>本次操作</span>
+            <h2 id="quarantine-title">归影隔离区</h2>
+            <p>{demoRestored ? (report.dataMode === 'synthetic' ? '演示文件已恢复到原位置。' : '文件已恢复到原位置。') : '隔离清单保留原位置映射；恢复不会覆盖后来出现的同名文件。'}</p>
+          </div>
+          <span className={`quarantine-status${demoRestored ? ' quarantine-status--restored' : ''}`}>
+            {demoRestored ? '已恢复' : '可恢复'}
+          </span>
+          <button
+            className="button button--quiet"
+            disabled={demoRestored || isRestoring || (report.dataMode !== 'synthetic' && !internalQuarantineEnabled)}
+            onClick={() => void restoreCurrentOperation()}
+            type="button"
+          >
+            {isRestoring ? <LoaderCircle aria-hidden="true" className="is-spinning" size={16} /> : <Undo2 aria-hidden="true" size={16} />}
+            {demoRestored ? '已经恢复' : isRestoring ? '正在恢复…' : '恢复这次隔离'}
+          </button>
+        </section>
+
+        {actionError ? <div className="completion-error" role="alert"><TriangleAlert size={16} /> {actionError}</div> : null}
+
+        <div className="completion-actions">
+          <button className="button button--quiet" onClick={onReset} type="button"><RotateCcw size={16} /> 扫描其他目录</button>
+          <button className="button button--ink" onClick={() => setStage('review')} type="button">继续处理重复组 <ArrowRight size={16} /></button>
+        </div>
+      </main>
+    )
+  }
+
   return (
     <main className="workspace workspace--results">
       <header className="results-header">
@@ -2421,7 +2780,7 @@ function ResultsWorkspace({
               : report.resultOrigin === 'history'
                 ? '历史封印报告 · 只读复核'
               : report.status === 'complete'
-                ? '只读报告已完成'
+                ? '扫描完成 · 下一步选择保留项'
                 : report.status === 'cancelled'
                   ? '扫描已取消 · 部分报告'
                   : report.status === 'interrupted'
@@ -2488,16 +2847,17 @@ function ResultsWorkspace({
         </div>
       ) : null}
 
+      <IssueDisclosure report={report} />
+
       {report.dataMode === 'live' ? <CaptureTimeStageNotice report={report} /> : null}
 
       {report.resultReadToken ? (
         <HistoryExportPanel
+          defaultOpen={report.resultOrigin === 'history'}
           key={report.resultReadToken}
           resultReadToken={report.resultReadToken}
         />
       ) : null}
-
-      <IssueDisclosure report={report} />
 
       <section aria-label="扫描摘要" className="metrics-strip">
         <Metric label="媒体文件" value={report.mediaFiles.toLocaleString('zh-CN')} detail={`${formatBytes(report.scannedBytes)} 逻辑大小`} />
@@ -2509,8 +2869,8 @@ function ResultsWorkspace({
       <div className="results-layout">
         <section aria-labelledby="groups-title" className="group-panel">
           <div className="group-panel__header">
-            <div><span>确定重复</span><strong id="groups-title">按逻辑重复上限排序</strong></div>
-            <span className="read-only-badge"><LockKeyhole size={13} /> 当前仅查看</span>
+            <div><span>内容完全相同</span><strong id="groups-title">选择一组，然后决定保留哪份</strong></div>
+            <span className="read-only-badge"><CheckCircle2 size={13} /> 可逐组处理</span>
           </div>
           {groups.length > 0 ? (
             <div aria-busy={isLoadingGroups} className="group-list">
@@ -2518,6 +2878,7 @@ function ResultsWorkspace({
                 <GroupRow
                   group={group}
                   isSelected={group.id === selectedGroup?.id}
+                  keeperName={keeperSelections[group.id]?.fileName}
                   key={group.id}
                   onSelect={() => setSelectedGroupId(group.id)}
                 />
@@ -2554,7 +2915,9 @@ function ResultsWorkspace({
           ) : null}
           <div className="group-panel__footer">
             <Info aria-hidden="true" size={15} />
-            本结果中的组已由扫描当时的 descriptor-bound 挂载会话逐字节确认并持久化；未来执行隔离前仍会再次复核。当前阶段尚不分析伴随资产，也不会执行清理。
+            {report.dataMode === 'synthetic' || internalQuarantineEnabled
+              ? '这里只包含逐字节完全相同的文件。你可以一次只处理一组；执行前会再次核对，原文件不会永久删除。'
+              : '这里只包含逐字节完全相同的文件。你可以一次只预览一组；当前版本不会移动或删除原文件。'}
           </div>
         </section>
         {inspectedGroup ? (
@@ -2571,8 +2934,252 @@ function ResultsWorkspace({
             onLoadNext={() => void loadNextMembers()}
             onLoadPrevious={() => void loadPreviousMembers()}
             onRetry={() => void retryMembers()}
+            onSelectKeeper={selectKeeper}
+            selectedKeeperId={currentDecision?.fileId}
+            selectedKeeperName={currentDecision?.fileName}
           />
         ) : null}
+      </div>
+      {selectedGroup ? (
+        <section aria-label="当前组操作" className="review-action-bar">
+          <div className="review-action-bar__summary">
+            <span className={`review-action-bar__status${currentDecision ? ' is-ready' : ''}`}>
+              {currentDecision ? <Check size={14} /> : <Circle size={12} />}
+              {currentDecision ? `保留 ${currentDecision.fileName}` : '尚未选择保留项'}
+            </span>
+            <span>
+              {currentDecision
+                ? report.dataMode === 'synthetic' || internalQuarantineEnabled
+                  ? `本组将隔离 ${currentMoveCount} 个副本 · ${formatBytes(selectedGroup.reclaimableBytes)}`
+                  : `计划预览：${currentMoveCount} 个重复副本 · ${formatBytes(selectedGroup.reclaimableBytes)}`
+                : `先完成当前组；不需要一次处理全部 ${report.totalDuplicateGroups.toLocaleString('zh-CN')} 组`}
+            </span>
+          </div>
+          {actionError ? <span className="review-action-bar__error" role="alert">{actionError}</span> : null}
+          <button className="button button--ink" disabled={!currentDecision} onClick={previewCurrentDecision} type="button">
+            {report.dataMode === 'synthetic' || internalQuarantineEnabled ? '预览本组隔离计划' : '预览本组整理计划'}
+            <ArrowRight aria-hidden="true" size={16} />
+          </button>
+        </section>
+      ) : null}
+    </main>
+  )
+}
+
+type RestoreNotice = {
+  tone: 'success' | 'warning'
+  title: string
+  detail: string
+}
+
+function RestoreWorkspace({ onBack }: { onBack: () => void }) {
+  const [selection, setSelection] = useState<QuarantineRestoreRootSelection | null>(null)
+  const [selectedOperationId, setSelectedOperationId] = useState<string | null>(null)
+  const [isSelecting, setIsSelecting] = useState(false)
+  const [restoringOperationId, setRestoringOperationId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<RestoreNotice | null>(null)
+
+  const selectedOperation = useMemo(
+    () => selection?.operations.find((operation) => operation.operationId === selectedOperationId) ?? null,
+    [selectedOperationId, selection],
+  )
+  const restorableCount = selection?.operations.filter(quarantineOperationCanRestore).length ?? 0
+
+  async function chooseRestoreRoot() {
+    if (!internalQuarantineEnabled || isSelecting || restoringOperationId !== null) return
+    setIsSelecting(true)
+    setActionError(null)
+    try {
+      const nextSelection = await selectQuarantineRestoreRoot()
+      if (!nextSelection) return
+      const firstRestorable = nextSelection.operations.find(quarantineOperationCanRestore)
+      setSelection(nextSelection)
+      setSelectedOperationId(firstRestorable?.operationId ?? null)
+      setNotice(null)
+    } catch (selectionError) {
+      setActionError(asScanError(selectionError).message)
+    } finally {
+      setIsSelecting(false)
+    }
+  }
+
+  async function restoreSelectedOperation() {
+    if (
+      !internalQuarantineEnabled
+      || !selection
+      || !selectedOperation
+      || !quarantineOperationCanRestore(selectedOperation)
+      || restoringOperationId !== null
+    ) return
+    const operationId = selectedOperation.operationId
+    setRestoringOperationId(operationId)
+    setActionError(null)
+    setNotice(null)
+    try {
+      const result = await restoreQuarantineOperation(selection.restoreRootToken, operationId)
+      setSelection((current) => current === null ? current : {
+        ...current,
+        operations: current.operations.map((operation) => operation.operationId !== operationId
+          ? operation
+          : {
+              ...operation,
+              status: result.status,
+              quarantinedCount: result.remainingCount,
+              restoredCount: Math.max(0, operation.fileCount - result.remainingCount),
+            }),
+      })
+      if (result.status === 'restored' && result.remainingCount === 0) {
+        setNotice({
+          tone: 'success',
+          title: '这条隔离记录已全部恢复',
+          detail: `已确认 ${result.restoredCount.toLocaleString('zh-CN')} 个文件恢复到原位置；没有覆盖其他文件。`,
+        })
+      } else {
+        setNotice({
+          tone: 'warning',
+          title: '仍有文件留在隔离区',
+          detail: `本次恢复了 ${result.restoredCount.toLocaleString('zh-CN')} 个，仍有 ${result.remainingCount.toLocaleString('zh-CN')} 个未恢复。通常是原位置已有同名对象或文件状态发生变化；处理冲突后可以再次恢复。`,
+        })
+      }
+    } catch (restoreError) {
+      setActionError(`${asScanError(restoreError).message} 未恢复的文件仍保留在隔离区，可以处理问题后再次恢复。`)
+    } finally {
+      setRestoringOperationId(null)
+    }
+  }
+
+  return (
+    <main className="workspace restore-workspace">
+      <header className="restore-header">
+        <button className="button button--quiet" disabled={isSelecting || restoringOperationId !== null} onClick={onBack} type="button">
+          <ChevronLeft aria-hidden="true" size={16} /> 返回
+        </button>
+        <div>
+          <span className="section-kicker"><Undo2 aria-hidden="true" size={15} /> 独立恢复入口</span>
+          <h1>恢复隔离文件</h1>
+          <p>即使应用已经重启，也可以重新选择原照片目录，读取其中的归影隔离记录并继续恢复。</p>
+        </div>
+      </header>
+
+      <div className="restore-content">
+        <section aria-labelledby="restore-root-title" className="restore-root-card">
+          <span className="restore-root-card__icon"><FolderOpen aria-hidden="true" size={20} /></span>
+          <div>
+            <span className="section-kicker">第一步 · 本地授权</span>
+            <h2 id="restore-root-title">选择当时执行隔离的原照片目录</h2>
+            <p>这只是授予本次恢复所需的访问权限，不会重新扫描照片，也不需要扫描结果令牌。取消系统选择器不会产生错误。</p>
+          </div>
+          <button
+            className="button button--primary"
+            disabled={isSelecting || restoringOperationId !== null}
+            onClick={() => void chooseRestoreRoot()}
+            type="button"
+          >
+            {isSelecting ? <LoaderCircle aria-hidden="true" className="is-spinning" size={16} /> : <FolderOpen aria-hidden="true" size={16} />}
+            {isSelecting ? '正在打开…' : selection ? '重新选择原目录' : '选择原照片目录'}
+          </button>
+        </section>
+
+        {actionError ? (
+          <div className="restore-message restore-message--error" role="alert">
+            <TriangleAlert aria-hidden="true" size={17} />
+            <div><strong>这次操作安全停止</strong><span>{actionError}</span></div>
+          </div>
+        ) : null}
+
+        {notice ? (
+          <div
+            className={`restore-message restore-message--${notice.tone}`}
+            role={notice.tone === 'warning' ? 'alert' : 'status'}
+          >
+            {notice.tone === 'success'
+              ? <CheckCircle2 aria-hidden="true" size={17} />
+              : <TriangleAlert aria-hidden="true" size={17} />}
+            <div><strong>{notice.title}</strong><span>{notice.detail}</span></div>
+          </div>
+        ) : null}
+
+        {selection ? (
+          <section aria-labelledby="restore-operations-title" className="restore-catalog">
+            <div className="restore-catalog__heading">
+              <div>
+                <span>第二步 · 选择隔离记录</span>
+                <h2 id="restore-operations-title">这个目录中的恢复清单</h2>
+              </div>
+              <span>{selection.operations.length.toLocaleString('zh-CN')} 条记录 · {restorableCount.toLocaleString('zh-CN')} 条未完全恢复</span>
+            </div>
+
+            {selection.operations.length > 0 ? (
+              <div className="restore-operation-list" role="radiogroup" aria-label="选择要恢复的隔离记录">
+                {selection.operations.map((operation) => {
+                  const canRestore = quarantineOperationCanRestore(operation)
+                  const isSelected = selectedOperationId === operation.operationId
+                  return (
+                    <label
+                      className={`restore-operation${isSelected ? ' restore-operation--selected' : ''}${canRestore ? '' : ' restore-operation--complete'}`}
+                      key={operation.operationId}
+                    >
+                      <input
+                        checked={isSelected}
+                        disabled={!canRestore || restoringOperationId !== null}
+                        name="restore-operation"
+                        onChange={() => {
+                          setSelectedOperationId(operation.operationId)
+                          setActionError(null)
+                          setNotice(null)
+                        }}
+                        type="radio"
+                      />
+                      <span className="restore-operation__identity">
+                        <strong>{operation.operationId}</strong>
+                        <small>{historyInstantLabel(operation.createdAtUnixMs)}</small>
+                      </span>
+                      <span className={`restore-status restore-status--${operation.status}`}>
+                        {quarantineOperationStatusLabel(operation.status)}
+                      </span>
+                      <span className="restore-operation__metrics">
+                        <span><strong>{operation.fileCount.toLocaleString('zh-CN')}</strong><small>文件总数</small></span>
+                        <span><strong>{operation.quarantinedCount.toLocaleString('zh-CN')}</strong><small>仍在隔离</small></span>
+                        <span><strong>{operation.restoredCount.toLocaleString('zh-CN')}</strong><small>已恢复</small></span>
+                        <span><strong>{formatBytes(operation.logicalBytes)}</strong><small>逻辑大小</small></span>
+                      </span>
+                    </label>
+                  )
+                })}
+              </div>
+            ) : (
+              <div className="restore-empty">
+                <Archive aria-hidden="true" size={22} />
+                <h3>这个目录没有归影隔离记录</h3>
+                <p>没有文件需要恢复。你可以重新选择其他原照片目录。</p>
+              </div>
+            )}
+
+            <footer className="restore-catalog__footer">
+              <div>
+                <ShieldCheck aria-hidden="true" size={16} />
+                <span><strong>恢复不会覆盖现有文件</strong><small>遇到同名对象或状态冲突会保留未恢复项，并允许稍后再次恢复。</small></span>
+              </div>
+              <button
+                className="button button--ink"
+                disabled={!selectedOperation || !quarantineOperationCanRestore(selectedOperation) || restoringOperationId !== null}
+                onClick={() => void restoreSelectedOperation()}
+                type="button"
+              >
+                {restoringOperationId
+                  ? <><LoaderCircle aria-hidden="true" className="is-spinning" size={16} /> 正在恢复…</>
+                  : <><Undo2 aria-hidden="true" size={16} /> 恢复所选隔离文件</>}
+              </button>
+            </footer>
+          </section>
+        ) : (
+          <section className="restore-explainer" aria-label="恢复说明">
+            <div><LockKeyhole aria-hidden="true" size={18} /><strong>不依赖上一次打开状态</strong><span>应用重启后仍可从这里重新授权，不需要当前扫描报告或刚完成的操作编号。</span></div>
+            <div><ShieldCheck aria-hidden="true" size={18} /><strong>冲突时保留原状</strong><span>恢复遇到同名文件时不会覆盖；未恢复项会继续留在隔离区。</span></div>
+            <div><Archive aria-hidden="true" size={18} /><strong>只读取归影恢复清单</strong><span>不会遍历并重新分析你的全部照片。</span></div>
+          </section>
+        )}
       </div>
     </main>
   )
@@ -2601,6 +3208,7 @@ function rootGrantExpired(grant: SelectedScanRoot | null): boolean {
 
 function App() {
   const [phase, setPhase] = useState<AppPhase>('idle')
+  const [resultStage, setResultStage] = useState<ResultStage>('review')
   const [source, setSource] = useState<string | null>(null)
   const [selectedRoot, setSelectedRoot] = useState<SelectedScanRoot | null>(null)
   const [rootAuthorizationExpired, setRootAuthorizationExpired] = useState(false)
@@ -2877,6 +3485,20 @@ function App() {
     setPhase('history')
   }
 
+  function handleRestore() {
+    if (!internalQuarantineEnabled) return
+    setSource(null)
+    setSelectedRoot(null)
+    setRootAuthorizationExpired(false)
+    setReport(null)
+    setError(null)
+    setScanActionError(null)
+    setScanStatusWarning(null)
+    setScanAttemptKind(null)
+    updateScanJobPhase('running')
+    setPhase('restore')
+  }
+
   function handleHistoryResult(nextReport: ScanReport) {
     setSelectedRoot(null)
     setRootAuthorizationExpired(false)
@@ -2904,9 +3526,11 @@ function App() {
     setScanStatusWarning(null)
     setScanAttemptKind(null)
     scanAttemptRef.current = false
+    setResultStage('review')
   }
 
   const desktopRuntime = isDesktopRuntime()
+  const showQuarantineCopy = internalQuarantineEnabled || report?.dataMode === 'synthetic'
   const sourceOverviewKind: SourceOverviewKind = phase === 'results'
     ? 'sealed'
     : phase === 'scanning'
@@ -2924,7 +3548,11 @@ function App() {
           <BrandMark />
           <div><strong>归影</strong><small>照片归档助手</small></div>
         </div>
-        <WorkflowRail phase={phase} />
+        <WorkflowRail
+          phase={phase}
+          resultStage={resultStage}
+          showQuarantineCopy={showQuarantineCopy}
+        />
         <SourceOverview kind={sourceOverviewKind} source={source} />
         <div className="rail-privacy">
           <ShieldCheck aria-hidden="true" size={16} />
@@ -2939,8 +3567,11 @@ function App() {
             {desktopRuntime ? '桌面本地运行' : '浏览器设计预览 · 合成数据'}
           </div>
           <div className="app-bar__status">
-            <span><span className="status-dot status-dot--ok" /> 无主动变更</span>
-            <span className="app-version">Phase 1 · Persistent evidence</span>
+            <span>
+              <span className="status-dot status-dot--ok" />
+              {showQuarantineCopy ? '本地处理 · 可恢复隔离' : '本地处理 · 无主动变更'}
+            </span>
+            <span className="app-version">D1 安全整理</span>
           </div>
         </header>
 
@@ -2952,6 +3583,7 @@ function App() {
             onChoose={handleChoose}
             onDemo={handleDemo}
             onHistory={handleHistory}
+            onRestore={handleRestore}
             onScan={handleScan}
             rootAuthorizationExpired={rootAuthorizationExpired}
             rootExpiresAtUnixMs={selectedRoot?.expiresAtUnixMs ?? null}
@@ -2974,6 +3606,7 @@ function App() {
             onOpen={handleHistoryResult}
           />
         ) : null}
+        {phase === 'restore' ? <RestoreWorkspace onBack={() => setPhase('idle')} /> : null}
         {phase === 'scanning' && source ? (
           <ScanningWorkspace
             attemptKind={scanAttemptKind}
@@ -2989,7 +3622,9 @@ function App() {
             statusWarning={scanStatusWarning}
           />
         ) : null}
-        {phase === 'results' && report ? <ResultsWorkspace onReset={reset} report={report} /> : null}
+        {phase === 'results' && report ? (
+          <ResultsWorkspace onReset={reset} onStageChange={setResultStage} report={report} />
+        ) : null}
         {phase === 'error' && error ? <ErrorWorkspace error={error} onReset={reset} /> : null}
       </div>
     </div>

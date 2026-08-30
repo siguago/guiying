@@ -1,7 +1,7 @@
 {
   "schema_version": "2.0",
   "project": "归影 Guiying",
-  "scope": "Phase 1 desktop interface for no-active-mutation exact-byte scanning, same-process enumeration pause/resume, sealed capture-time evidence, bounded result paging, read-only historical review, and JSON/CSV duplicate-evidence export",
+  "scope": "v0.2 desktop product flow for D1 exact duplicates: choose a keeper and preview Keep/Move in the standard read-only build; exercise a clearly labelled synthetic quarantine/restore loop; keep the native prototype behind default-off internal gates while advanced evidence and export remain secondary",
   "delivery_tier": "complete",
   "delivery_mode": "implementation",
   "integration_mode": "existing_repository",
@@ -18,17 +18,17 @@
       ],
       "implementation_stack": "Tauri + React + TypeScript + Rust",
       "implementation_stack_version": "Tauri 2.11.x; React 19.2.8; TypeScript 6.0.2; Rust 1.77.2 and 1.92.0 validation toolchains",
-      "design_guidance": "Repository desktop safety model, platform-app guidance, and native macOS interaction conventions",
-      "design_guidance_version": "reviewed 2026-08-10",
-      "guidance_checked_at": "2026-08-10",
+      "design_guidance": "User-centred local photo workbench, repository safety model, platform-app guidance, and native macOS interaction conventions",
+      "design_guidance_version": "v0.2 reviewed 2026-08-13",
+      "guidance_checked_at": "2026-08-13",
       "source_urls": [],
-      "fallback_notes": "Unknown filesystem capability, incomplete scan, path ambiguity, mount identity change, or content conflict remains report-only and cannot authorize a mutation. Reading may update filesystem-managed atime."
+      "fallback_notes": "Only one explicitly selected D1 group can enter a read-only plan. Standard builds never execute quarantine or restore and return QUARANTINE_RELEASE_GATE_CLOSED. The internal prototype remains test-only; unknown filesystem capability, sidecar ambiguity, non-independent members, path or mount identity change, content drift, restore conflict, or journal uncertainty fails closed. Reading may update filesystem-managed atime."
     }
   ],
   "direction": {
-    "name": "档案纸上的校验台账",
-    "north_star": "让每个整理结论像一份可检查的档案记录，而不是要求用户盲信的清理按钮。",
-    "signature_device": "纵向证据脊柱串联大小、抽样指纹、完整 BLAKE3、扫描逐字节确认与未来执行前复核。"
+    "name": "中性本地照片工作台",
+    "north_star": "每一屏都回答用户现在可以安全做什么：选择保留项、看清 Keep/Move 计划，并在写入门禁未完成时明确停在只读预览。",
+    "signature_device": "Keep / Move 双轨贯穿成员选择、计划预览、隔离结果与恢复状态。"
   },
   "themes": [
     "default"
@@ -115,13 +115,13 @@
     "design_direction": {
       "status": "created",
       "kind": "documentation",
-      "notes": "The evidence-led direction, grammar, signature spine, same-process pause boundary, export scope, anti-goals, current Phase 1 states, and safety language are documented.",
+      "notes": "The implemented cool-neutral workbench, Keep/Move signature, three-direction comparison, rejected warm-paper archive anti-reference, provenance, states, and safety language are documented.",
       "path": "design-direction.md"
     },
     "token_source": {
       "status": "inherited",
       "kind": "dtcg_tokens",
-      "notes": "Canonical repository source is design-system/tokens.tokens.json and is owned with the production UI."
+      "notes": "Canonical repository source is design-system/tokens.tokens.json; v0.2 replaces the rejected warm-paper/forest-green bundle with cool neutrals, cobalt action, emerald Keep and violet Move roles."
     },
     "token_export": {
       "status": "inherited",
@@ -163,7 +163,7 @@
     },
     "browser_rendering": {
       "status": "used",
-      "notes": "Playwright renders explicitly labelled synthetic-data states for responsive, keyboard, contrast, and accessibility checks."
+      "notes": "The in-app browser rendered the default read-only landing and exercised explicitly labelled synthetic review, plan, quarantine and restore states at 1280x820 plus the 1024x768 review boundary."
     },
     "figma": {
       "status": "not_needed",
@@ -175,14 +175,14 @@
     },
     "image_inspection": {
       "status": "used",
-      "notes": "All current browser captures, including landing, scanning, paged results, historical catalog and expanded raw-metadata states, plus the packaged icon were decoded and inspected at full size."
+      "notes": "The rejected user screenshot and new review screenshot were inspected together; new plan and completion captures were also inspected at original size. The review preserves context while replacing the dead-end evidence/export hierarchy with an actionable keeper decision and read-only plan; the reversible execution shown in browser evidence is explicitly synthetic."
     }
   },
   "evidence": {
     "qa": {
       "status": "partial",
       "path": "qa-evidence.json",
-      "notes": "Core 65, Store 134, runtime 32, Tauri 70 and Playwright 28 tests plus strict static gates passed where mapped. This iteration has no Tauri bundle/native-run; current native visuals, real external-volume dialog/export flow and VoiceOver remain explicit limitations."
+      "notes": "Frontend production build, lint, DTCG synchronization and manual in-app-browser flow/compact visual checks passed. Rust quarantine/restore gates are recorded after the native service run. Current native bundle visuals, real external-volume fault matrix and VoiceOver remain explicit limitations."
     },
     "sources": {
       "path": "handoff/sources.md",
@@ -200,5 +200,5 @@
     "limitation-native-visual",
     "limitation-screen-reader"
   ],
-  "created_at": "2026-08-10T23:20:04+08:00"
+  "created_at": "2026-08-13T00:00:00+08:00"
 }

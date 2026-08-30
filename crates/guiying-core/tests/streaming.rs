@@ -385,7 +385,7 @@ fn a_nonmedia_file_root_does_not_shift_later_root_ticket_indices() {
     let mut hash_sink = RecordingSink::default();
     let hashed = session
         .full_hash_batch(
-            &[observation.ticket.clone()],
+            std::slice::from_ref(&observation.ticket),
             &mut hash_sink,
             &NoopScanControl,
         )
@@ -565,7 +565,11 @@ fn sample_evidence_uses_the_same_authenticated_observation_signature() {
     let mut sink = RecordingSink::default();
 
     let outcome = session
-        .sample_batch(&[observation.ticket.clone()], &mut sink, &NoopScanControl)
+        .sample_batch(
+            std::slice::from_ref(&observation.ticket),
+            &mut sink,
+            &NoopScanControl,
+        )
         .expect("fresh sample");
 
     assert_eq!(outcome.completed, 1);
@@ -760,7 +764,11 @@ fn changing_a_public_identity_field_invalidates_the_old_ticket() {
     let mut sink = RecordingSink::default();
 
     let outcome = session
-        .full_hash_batch(&[observation.ticket.clone()], &mut sink, &NoopScanControl)
+        .full_hash_batch(
+            std::slice::from_ref(&observation.ticket),
+            &mut sink,
+            &NoopScanControl,
+        )
         .expect("changed identity is a per-file issue");
 
     assert_eq!(outcome.failed, 1);
@@ -953,6 +961,87 @@ fn changed_directory_coverage_interrupts_without_a_coverage_seal() {
         .expect("coverage finalization returns interrupted");
     assert_eq!(finalization.status, StreamBatchStatus::Interrupted);
     assert_eq!(finalization.failed, prior_failures);
+    assert!(!coverage_sink
+        .events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::CoverageVerified(_))));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn selected_root_authorization_metadata_does_not_interrupt_coverage() {
+    let temporary = TempDir::new().expect("tempdir");
+    let root = temporary.path().join("root");
+    fs::create_dir(&root).expect("root");
+    write_media(&root, "photo.jpg", b"fixture");
+    let mut session = guiying_core::Scanner::default()
+        .start_streaming([&root], StreamLimits::default())
+        .expect("start session");
+
+    rustix::fs::setxattr(
+        &root,
+        "com.guiying.test.root-authorization",
+        b"selected",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .expect("simulate native selection authorization");
+    let mut enumeration = RecordingSink::default();
+    session
+        .enumerate(&mut enumeration, &NoopScanControl)
+        .expect("enumerate after authorization metadata changed");
+    rustix::fs::setxattr(
+        &root,
+        "com.guiying.test.root-authorization",
+        b"refreshed",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .expect("refresh authorization after enumeration");
+
+    let mut directories = enumeration.directory_tickets();
+    directories.sort_by_key(|ticket| *ticket.sort_key());
+    let mut coverage_sink = RecordingSink::default();
+    for page in directories.chunks(1) {
+        let outcome = session
+            .revalidate_directory_batch(page, &mut coverage_sink, &NoopScanControl)
+            .expect("authorization metadata is not a directory content change");
+        assert_eq!(outcome.failed, 0);
+    }
+    let finalization = session
+        .finalize_coverage(&mut coverage_sink, &NoopScanControl)
+        .expect("finalize coverage");
+
+    assert_eq!(finalization.status, StreamBatchStatus::Completed);
+    assert!(coverage_sink
+        .events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::CoverageVerified(_))));
+}
+
+#[test]
+fn selected_root_directory_entry_change_still_interrupts_coverage() {
+    let temporary = TempDir::new().expect("tempdir");
+    write_media(temporary.path(), "photo.jpg", b"fixture");
+    let mut session = guiying_core::Scanner::default()
+        .start_streaming([temporary.path()], StreamLimits::default())
+        .expect("start session");
+    let mut enumeration = RecordingSink::default();
+    session
+        .enumerate(&mut enumeration, &NoopScanControl)
+        .expect("enumerate");
+    write_media(temporary.path(), "arrived-late.jpg", b"late fixture");
+
+    let mut directories = enumeration.directory_tickets();
+    directories.sort_by_key(|ticket| *ticket.sort_key());
+    let mut coverage_sink = RecordingSink::default();
+    let replay = session
+        .revalidate_directory_batch(&directories, &mut coverage_sink, &NoopScanControl)
+        .expect("changed root is bounded evidence");
+    assert_eq!(replay.failed, 1);
+    let finalization = session
+        .finalize_coverage(&mut coverage_sink, &NoopScanControl)
+        .expect("coverage finalization returns interrupted");
+
+    assert_eq!(finalization.status, StreamBatchStatus::Interrupted);
     assert!(!coverage_sink
         .events
         .iter()

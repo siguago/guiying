@@ -1,9 +1,19 @@
 mod export_target;
+#[cfg(all(target_os = "macos", feature = "internal-quarantine"))]
+mod quarantine_service;
+#[cfg(not(all(target_os = "macos", feature = "internal-quarantine")))]
+#[path = "quarantine_service_stub.rs"]
+mod quarantine_service;
 mod runtime_lock;
 mod scan_service;
 
 use std::path::PathBuf;
 
+use quarantine_service::{
+    ExecuteQuarantinePlanResponse, QuarantineManager, QuarantineOperationPage,
+    RestoreQuarantineOperationResponse, SelectQuarantinePlanRootResponse,
+    SelectQuarantineRestoreRootResponse,
+};
 use scan_service::{
     AcknowledgeScanResponse, AppError, CancelHistoryExportResponse, CaptureTimeCandidatePage,
     CaptureTimeGroupSummaryItem, CaptureTimeGroupSummaryPage, CaptureTimeIssuePage,
@@ -387,6 +397,82 @@ async fn get_capture_time_metadata_field_raw_detail(
     .await
 }
 
+#[tauri::command]
+async fn select_quarantine_plan_root(
+    window: WebviewWindow,
+    scan_state: State<'_, ScanJobManager>,
+    quarantine_state: State<'_, QuarantineManager>,
+    result_read_token: String,
+    group_build_id: String,
+    keeper_ordinal: String,
+) -> Result<SelectQuarantinePlanRootResponse, AppError> {
+    quarantine_service::select_quarantine_plan_root(
+        window,
+        scan_state.inner(),
+        quarantine_state.inner(),
+        &result_read_token,
+        &group_build_id,
+        &keeper_ordinal,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn execute_quarantine_plan(
+    window: WebviewWindow,
+    scan_state: State<'_, ScanJobManager>,
+    quarantine_state: State<'_, QuarantineManager>,
+    plan_token: String,
+) -> Result<ExecuteQuarantinePlanResponse, AppError> {
+    quarantine_service::execute_quarantine_plan(
+        scan_state.inner(),
+        quarantine_state.inner(),
+        window.label(),
+        &plan_token,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn select_quarantine_restore_root(
+    window: WebviewWindow,
+    quarantine_state: State<'_, QuarantineManager>,
+) -> Result<SelectQuarantineRestoreRootResponse, AppError> {
+    quarantine_service::select_quarantine_restore_root(window, quarantine_state.inner()).await
+}
+
+#[tauri::command]
+async fn list_quarantine_operations(
+    window: WebviewWindow,
+    quarantine_state: State<'_, QuarantineManager>,
+    restore_root_token: String,
+) -> Result<QuarantineOperationPage, AppError> {
+    quarantine_service::list_quarantine_operations(
+        quarantine_state.inner(),
+        window.label(),
+        &restore_root_token,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn restore_quarantine_operation(
+    window: WebviewWindow,
+    scan_state: State<'_, ScanJobManager>,
+    quarantine_state: State<'_, QuarantineManager>,
+    restore_root_token: String,
+    operation_id: String,
+) -> Result<RestoreQuarantineOperationResponse, AppError> {
+    quarantine_service::restore_quarantine_operation(
+        scan_state.inner(),
+        quarantine_state.inner(),
+        window.label(),
+        &restore_root_token,
+        &operation_id,
+    )
+    .await
+}
+
 fn initialize_store_at(
     database_path: PathBuf,
     manager: &ScanJobManager,
@@ -419,10 +505,13 @@ fn acquire_and_initialize_store(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let scan_jobs = ScanJobManager::default();
+    let quarantine = QuarantineManager::default();
     let setup_scan_jobs = scan_jobs.clone();
     let window_scan_jobs = scan_jobs.clone();
+    let window_quarantine = quarantine.clone();
     let result = tauri::Builder::default()
         .manage(scan_jobs)
+        .manage(quarantine)
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let app_data_dir = app.path().app_data_dir()?;
@@ -452,6 +541,7 @@ pub fn run() {
                     window.label().to_owned(),
                     window_scan_jobs.clone(),
                 );
+                quarantine_service::revoke_for_owner(&window_quarantine, window.label());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -479,6 +569,11 @@ pub fn run() {
             list_capture_time_metadata_reports,
             list_capture_time_metadata_fields,
             get_capture_time_metadata_field_raw_detail,
+            select_quarantine_plan_root,
+            execute_quarantine_plan,
+            select_quarantine_restore_root,
+            list_quarantine_operations,
+            restore_quarantine_operation,
         ])
         .run(tauri::generate_context!());
 

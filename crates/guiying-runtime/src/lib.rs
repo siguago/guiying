@@ -1079,10 +1079,17 @@ impl ActiveReadOnlyScan {
                 .revalidate_directory_batch(&tickets, &mut sink, control);
             for directory in &bound {
                 let after = self.volume.verify_directory(&directory.path)?;
-                if after != directory.identity
-                    || directory_object_signature(after)
-                        != directory.record.directory_object_signature
-                {
+                let unchanged = if directory.record.root_relative_path_raw.is_empty() {
+                    after.same_directory_object(directory.identity)
+                        && after.same_directory_object(self.volume.observation().root_identity())
+                        && root_directory_object_signature(after)
+                            == directory.record.directory_object_signature
+                } else {
+                    after == directory.identity
+                        && directory_object_signature(after)
+                            == directory.record.directory_object_signature
+                };
+                if !unchanged {
                     return Err(RuntimeError::EvidenceMismatch(
                         "directory changed across core coverage replay".to_owned(),
                     ));
@@ -2372,7 +2379,13 @@ fn bind_directory_ticket(
     }
     let path = volume.relative_path(record.root_relative_path_raw.clone())?;
     let identity = volume.verify_directory(&path)?;
-    if directory_object_signature(identity) != record.directory_object_signature {
+    let identity_matches = if record.root_relative_path_raw.is_empty() {
+        identity.same_directory_object(volume.observation().root_identity())
+            && root_directory_object_signature(identity) == record.directory_object_signature
+    } else {
+        directory_object_signature(identity) == record.directory_object_signature
+    };
+    if !identity_matches {
         return Err(RuntimeError::EvidenceMismatch(
             "stored directory identity differs from the live volume descriptor".to_owned(),
         ));
@@ -3180,7 +3193,7 @@ fn validate_root_observation(
         ));
     }
     volume.revalidate()?;
-    compare_root_identity(
+    compare_root_binding_identity(
         "root",
         core.file_id,
         core.generation,
@@ -3276,29 +3289,73 @@ fn validate_directory_observation(
         ));
     }
     let raw = path_ref_raw(&core.root_relative_path)?;
+    let is_root = raw.is_empty();
     let path = volume.relative_path(raw.clone())?;
     let identity = volume.verify_directory(&path)?;
-    compare_root_identity(
-        "directory",
-        core.file_id,
-        core.generation,
-        core.mode,
-        core.change_time,
-        identity,
-    )?;
+    if is_root {
+        compare_root_binding_identity(
+            "root directory",
+            core.file_id,
+            core.generation,
+            core.mode,
+            core.change_time,
+            identity,
+        )?;
+    } else {
+        compare_directory_snapshot_identity(
+            "directory",
+            core.file_id,
+            core.generation,
+            core.mode,
+            core.change_time,
+            identity,
+        )?;
+    }
     Ok(CoreDirectoryObservationInput {
         root_relative_path_raw: raw,
         path_encoding: native_encoding(path.root_relative().encoding()).to_owned(),
         display_path: path.root_relative().display().to_owned(),
         source_signature: SourceSignature::from_runtime_evidence(core.source_signature),
-        directory_object_signature: directory_object_signature(identity),
+        directory_object_signature: if is_root {
+            root_directory_object_signature(identity)
+        } else {
+            directory_object_signature(identity)
+        },
         ticket_blob: core.ticket.as_bytes().to_vec(),
         ticket_sort_key: TicketSortKey::from_core_evidence(*core.ticket.sort_key()),
         observed_at_ms,
     })
 }
 
-fn compare_root_identity(
+fn compare_root_binding_identity(
+    label: &str,
+    file_id: Option<guiying_core::FileId>,
+    generation: Option<u32>,
+    mode: Option<u32>,
+    _change_time: Option<guiying_core::FileTimestamp>,
+    volume: RootObjectIdentity,
+) -> Result<(), RuntimeError> {
+    let observed = file_id
+        .zip(generation)
+        .zip(mode)
+        .map(|((file_id, generation), mode)| RootObjectIdentity {
+            device: file_id.device,
+            inode: file_id.inode,
+            generation,
+            mode,
+            change_time_seconds: volume.change_time_seconds,
+            change_time_nanoseconds: volume.change_time_nanoseconds,
+        });
+    if observed.is_some_and(|observed| observed.same_directory_object(volume)) {
+        Ok(())
+    } else {
+        Err(RuntimeError::EvidenceMismatch(format!(
+            "{label} descriptor object differs between core and volume"
+        )))
+    }
+}
+
+fn compare_directory_snapshot_identity(
     label: &str,
     file_id: Option<guiying_core::FileId>,
     generation: Option<u32>,
@@ -3538,6 +3595,16 @@ fn directory_object_signature(identity: RootObjectIdentity) -> DirectoryObjectSi
     DirectoryObjectSignature::from_runtime_evidence(*hasher.finalize().as_bytes())
 }
 
+fn root_directory_object_signature(identity: RootObjectIdentity) -> DirectoryObjectSignature {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"guiying.runtime.root-directory-object.v1\0");
+    hasher.update(&identity.device.to_le_bytes());
+    hasher.update(&identity.inode.to_le_bytes());
+    hasher.update(&identity.generation.to_le_bytes());
+    hasher.update(&(identity.mode & 0o170000).to_le_bytes());
+    DirectoryObjectSignature::from_runtime_evidence(*hasher.finalize().as_bytes())
+}
+
 fn hash_root_identity(hasher: &mut blake3::Hasher, identity: RootObjectIdentity) {
     hasher.update(&identity.device.to_le_bytes());
     hasher.update(&identity.inode.to_le_bytes());
@@ -3686,6 +3753,39 @@ mod tests {
         fn on_progress(&mut self, _progress: &ScanProgress) {
             self.events += 1;
         }
+    }
+
+    #[test]
+    fn root_directory_signature_excludes_authorization_metadata_only() {
+        let root = RootObjectIdentity {
+            device: 42,
+            inode: 77,
+            generation: 3,
+            mode: 0o040700,
+            change_time_seconds: 10,
+            change_time_nanoseconds: 20,
+        };
+        let authorization_changed = RootObjectIdentity {
+            mode: 0o040500,
+            change_time_seconds: 11,
+            change_time_nanoseconds: 21,
+            ..root
+        };
+        assert_eq!(
+            root_directory_object_signature(root),
+            root_directory_object_signature(authorization_changed)
+        );
+        assert_ne!(
+            directory_object_signature(root),
+            directory_object_signature(authorization_changed)
+        );
+        assert_ne!(
+            root_directory_object_signature(root),
+            root_directory_object_signature(RootObjectIdentity {
+                inode: root.inode + 1,
+                ..root
+            })
+        );
     }
 
     #[derive(Default)]
@@ -4415,7 +4515,12 @@ mod tests {
         assert!(
             matches!(
                 error,
-                RuntimeError::EvidenceMismatch(_) | RuntimeError::Volume(_)
+                RuntimeError::EvidenceMismatch(_)
+                    | RuntimeError::Volume(_)
+                    | RuntimeError::StageIncomplete {
+                        stage: "directory coverage",
+                        ..
+                    }
             ),
             "unexpected coverage failure: {error:?}"
         );
@@ -4426,6 +4531,47 @@ mod tests {
             .is_empty());
         assert_eq!(fs::read(&first)?, b"duplicate");
         assert_eq!(fs::read(&second)?, b"duplicate");
+        Ok(())
+    }
+
+    #[test]
+    fn selected_root_authorization_metadata_can_change_without_aborting_scan(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let media = TempDir::new()?;
+        let application = TempDir::new()?;
+        fs::write(media.path().join("first.jpg"), b"duplicate")?;
+        fs::write(media.path().join("second.jpg"), b"duplicate")?;
+        let mut runtime = ActiveReadOnlyScan::start(
+            application.path().join("runtime.sqlite3"),
+            fs::canonicalize(media.path())?,
+            ScanOptions::default(),
+        )?;
+
+        rustix::fs::setxattr(
+            media.path(),
+            "com.guiying.test.root-authorization",
+            b"selected",
+            rustix::fs::XattrFlags::empty(),
+        )?;
+        let enumeration = runtime.enumerate(&NoopScanControl, &mut ())?;
+        assert_eq!(enumeration.status, StreamBatchStatus::Completed);
+        rustix::fs::setxattr(
+            media.path(),
+            "com.guiying.test.root-authorization",
+            b"refreshed",
+            rustix::fs::XattrFlags::empty(),
+        )?;
+
+        let fingerprints = runtime.fingerprint_candidates(&NoopScanControl, &mut ())?;
+        assert_eq!(fingerprints.full_hashed_files, 2);
+        let exact = runtime.verify_exact_duplicates(&NoopScanControl, &mut ())?;
+        assert_eq!(exact.verified_groups, 1);
+        let coverage = runtime
+            .coverage_summary()
+            .ok_or("coverage summary missing after exact verification")?;
+        assert_eq!(coverage.status, StreamBatchStatus::Completed);
+        assert_eq!(coverage.failed_count, 0);
+
         Ok(())
     }
 

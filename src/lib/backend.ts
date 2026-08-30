@@ -116,6 +116,84 @@ export interface ReadOnlyScanSession {
   result: Promise<ScanReport>
 }
 
+interface CoreSelectQuarantinePlanRootResponse {
+  planToken: string | null
+  expiresAtUnixMs: string | null
+  groupBuildId: string | null
+  keeperOrdinal: string | null
+  moveCount: string | null
+  logicalBytes: string | null
+}
+
+export interface QuarantinePlanSelection {
+  planToken: string
+  expiresAtUnixMs: string
+  groupBuildId: string
+  keeperOrdinal: string
+  moveCount: number
+  logicalBytes: number
+}
+
+interface CoreExecuteQuarantinePlanResponse {
+  operationId: string
+  movedCount: string
+  logicalBytes: string
+  status: 'quarantined'
+}
+
+export interface QuarantineExecutionResult {
+  operationId: string
+  movedCount: number
+  logicalBytes: number
+  status: 'quarantined'
+}
+
+interface CoreQuarantineOperationItem {
+  operationId: string
+  createdAtUnixMs: string
+  status: string
+  fileCount: string
+  quarantinedCount: string
+  restoredCount: string
+  logicalBytes: string
+}
+
+export interface QuarantineOperationItem {
+  operationId: string
+  createdAtUnixMs: string
+  status: 'prepared' | 'quarantining' | 'quarantined' | 'needs_recovery' | 'restoring' | 'restored' | 'partially_restored'
+  fileCount: number
+  quarantinedCount: number
+  restoredCount: number
+  logicalBytes: number
+}
+
+interface CoreSelectQuarantineRestoreRootResponse {
+  restoreRootToken: string | null
+  expiresAtUnixMs: string | null
+  operations: CoreQuarantineOperationItem[]
+}
+
+export interface QuarantineRestoreRootSelection {
+  restoreRootToken: string
+  expiresAtUnixMs: string
+  operations: QuarantineOperationItem[]
+}
+
+interface CoreRestoreQuarantineOperationResponse {
+  operationId: string
+  restoredCount: string
+  remainingCount: string
+  status: 'restored' | 'partially_restored'
+}
+
+export interface QuarantineRestoreResult {
+  operationId: string
+  restoredCount: number
+  remainingCount: number
+  status: 'restored' | 'partially_restored'
+}
+
 interface CoreScanResultSummary {
   schemaVersion: number
   scanRunId: string
@@ -490,6 +568,11 @@ function requirePositiveDecimal(value: string, label: string): void {
   if (parsed <= 0n) throw new Error(`${label}必须为正整数；该页已拒绝展示。`)
 }
 
+function requireNonNegativeDecimal(value: string, label: string): void {
+  const parsed = parseSignedDecimal(value, label)
+  if (parsed < 0n) throw new Error(`${label}必须为非负整数；该响应已拒绝使用。`)
+}
+
 function fileSystemTimestamp(
   seconds: string | null,
   nanoseconds: string | null,
@@ -825,6 +908,21 @@ function requireResultReadToken(value: string): string {
 function requireHistoryExportToken(value: string): string {
   if (typeof value !== 'string' || !/^export-[0-9a-f]{64}$/.test(value)) {
     throw new Error('导出授权 token 格式无效；请重新选择导出文件。')
+  }
+  return value
+}
+
+function requireQuarantineIdentifier(
+  value: string,
+  prefix: 'qplan-' | 'qroot-' | 'op-',
+  label: string,
+): string {
+  if (
+    typeof value !== 'string'
+    || !value.startsWith(prefix)
+    || !/^[0-9a-f]{64}$/.test(value.slice(prefix.length))
+  ) {
+    throw new Error(`${label}格式无效。`)
   }
   return value
 }
@@ -1280,6 +1378,7 @@ export async function loadDuplicateGroupMemberPage(
     files: page.items.map((file) => {
       return {
         id: file.observationId,
+        ordinal: file.ordinal,
         name: fileNameFromPath(file.displayPath),
         path: file.displayPath,
         nativePath: adaptNativePathRef(file.nativePath, '重复成员路径'),
@@ -2879,6 +2978,172 @@ export async function retryScanAcknowledgement(jobId: string): Promise<void> {
   } catch (error) {
     if (errorCode(error) === 'SCAN_JOB_NOT_FOUND') return
     throw error
+  }
+}
+
+function adaptQuarantineOperation(
+  operation: CoreQuarantineOperationItem,
+): QuarantineOperationItem {
+  if (!/^(0|[1-9]\d*)$/.test(operation.createdAtUnixMs)) {
+    throw new Error('隔离记录时间格式无效。')
+  }
+  const operationId = requireQuarantineIdentifier(operation.operationId, 'op-', '隔离记录编号')
+  const allowedStatuses = new Set<QuarantineOperationItem['status']>([
+    'prepared',
+    'quarantining',
+    'quarantined',
+    'needs_recovery',
+    'restoring',
+    'restored',
+    'partially_restored',
+  ])
+  if (!allowedStatuses.has(operation.status as QuarantineOperationItem['status'])) {
+    throw new Error('隔离记录状态无效。')
+  }
+  const fileCount = decimalToSafeNumber(operation.fileCount, '隔离记录文件数')
+  const quarantinedCount = decimalToSafeNumber(operation.quarantinedCount, '隔离记录已隔离数')
+  const restoredCount = decimalToSafeNumber(operation.restoredCount, '隔离记录已恢复数')
+  if (quarantinedCount > fileCount || restoredCount > fileCount - quarantinedCount) {
+    throw new Error('隔离记录文件计数相互矛盾。')
+  }
+  if (operation.status === 'restored' && (quarantinedCount !== 0 || restoredCount !== fileCount)) {
+    throw new Error('已恢复隔离记录的文件计数不完整。')
+  }
+  return {
+    operationId,
+    createdAtUnixMs: operation.createdAtUnixMs,
+    status: operation.status as QuarantineOperationItem['status'],
+    fileCount,
+    quarantinedCount,
+    restoredCount,
+    logicalBytes: decimalToSafeNumber(operation.logicalBytes, '隔离记录逻辑大小'),
+  }
+}
+
+export async function selectQuarantinePlanRoot(
+  resultReadToken: string,
+  groupBuildId: string,
+  keeperOrdinal: string,
+): Promise<QuarantinePlanSelection | null> {
+  requireResultReadToken(resultReadToken)
+  requirePositiveDecimal(groupBuildId, '重复组编号')
+  requireNonNegativeDecimal(keeperOrdinal, '保留成员序号')
+  const response = await invoke<CoreSelectQuarantinePlanRootResponse>(
+    'select_quarantine_plan_root',
+    { resultReadToken, groupBuildId, keeperOrdinal },
+  )
+  if (response.planToken === null) {
+    if (
+      response.expiresAtUnixMs !== null
+      || response.groupBuildId !== null
+      || response.keeperOrdinal !== null
+      || response.moveCount !== null
+      || response.logicalBytes !== null
+    ) {
+      throw new Error('取消的隔离计划仍携带部分授权；已拒绝该响应。')
+    }
+    return null
+  }
+  requireQuarantineIdentifier(response.planToken, 'qplan-', '隔离计划授权')
+  if (
+    response.expiresAtUnixMs === null
+    || response.groupBuildId !== groupBuildId
+    || response.keeperOrdinal !== keeperOrdinal
+    || response.moveCount === null
+    || response.logicalBytes === null
+  ) {
+    throw new Error('隔离计划没有完整绑定本次选择；已拒绝该响应。')
+  }
+  requireNonNegativeDecimal(response.expiresAtUnixMs, '隔离计划到期时间')
+  return {
+    planToken: response.planToken,
+    expiresAtUnixMs: response.expiresAtUnixMs,
+    groupBuildId,
+    keeperOrdinal,
+    moveCount: decimalToSafeNumber(response.moveCount, '隔离计划移动数'),
+    logicalBytes: decimalToSafeNumber(response.logicalBytes, '隔离计划逻辑大小'),
+  }
+}
+
+export async function executeQuarantinePlan(
+  planToken: string,
+): Promise<QuarantineExecutionResult> {
+  requireQuarantineIdentifier(planToken, 'qplan-', '隔离计划授权')
+  const response = await invoke<CoreExecuteQuarantinePlanResponse>(
+    'execute_quarantine_plan',
+    { planToken },
+  )
+  if (response.status !== 'quarantined') {
+    throw new Error('隔离执行返回了无法识别的状态。')
+  }
+  const operationId = requireQuarantineIdentifier(response.operationId, 'op-', '隔离记录编号')
+  return {
+    operationId,
+    movedCount: decimalToSafeNumber(response.movedCount, '实际隔离文件数'),
+    logicalBytes: decimalToSafeNumber(response.logicalBytes, '实际隔离逻辑大小'),
+    status: response.status,
+  }
+}
+
+export async function selectQuarantineRestoreRoot(): Promise<QuarantineRestoreRootSelection | null> {
+  const response = await invoke<CoreSelectQuarantineRestoreRootResponse>(
+    'select_quarantine_restore_root',
+  )
+  if (response.restoreRootToken === null) {
+    if (response.expiresAtUnixMs !== null || response.operations.length !== 0) {
+      throw new Error('取消的恢复授权仍携带隔离记录；已拒绝该响应。')
+    }
+    return null
+  }
+  if (response.expiresAtUnixMs === null) {
+    throw new Error('恢复目录授权格式无效。')
+  }
+  requireQuarantineIdentifier(response.restoreRootToken, 'qroot-', '恢复目录授权')
+  requireNonNegativeDecimal(response.expiresAtUnixMs, '恢复目录授权到期时间')
+  return {
+    restoreRootToken: response.restoreRootToken,
+    expiresAtUnixMs: response.expiresAtUnixMs,
+    operations: response.operations.map(adaptQuarantineOperation),
+  }
+}
+
+export async function loadQuarantineOperations(
+  restoreRootToken: string,
+): Promise<QuarantineOperationItem[]> {
+  requireQuarantineIdentifier(restoreRootToken, 'qroot-', '恢复目录授权')
+  const response = await invoke<{ operations: CoreQuarantineOperationItem[] }>(
+    'list_quarantine_operations',
+    { restoreRootToken },
+  )
+  return response.operations.map(adaptQuarantineOperation)
+}
+
+export async function restoreQuarantineOperation(
+  restoreRootToken: string,
+  operationId: string,
+): Promise<QuarantineRestoreResult> {
+  requireQuarantineIdentifier(restoreRootToken, 'qroot-', '恢复目录授权')
+  requireQuarantineIdentifier(operationId, 'op-', '隔离记录编号')
+  const response = await invoke<CoreRestoreQuarantineOperationResponse>(
+    'restore_quarantine_operation',
+    { restoreRootToken, operationId },
+  )
+  if (response.operationId !== operationId) {
+    throw new Error('恢复结果不属于本次隔离记录；已拒绝该响应。')
+  }
+  const restoredCount = decimalToSafeNumber(response.restoredCount, '实际恢复文件数')
+  const remainingCount = decimalToSafeNumber(response.remainingCount, '仍在隔离区文件数')
+  if (
+    (response.status === 'restored' && remainingCount !== 0)
+    || (response.status === 'partially_restored' && remainingCount === 0)
+  ) {
+    throw new Error('恢复结果状态与剩余文件数矛盾。')
+  }
+  return {
+    operationId,
+    restoredCount,
+    remainingCount,
+    status: response.status,
   }
 }
 

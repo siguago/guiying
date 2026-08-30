@@ -79,11 +79,15 @@ cancellation, or sink failure cannot mint evidence.
 Core evidence intentionally reports `CurrentCoreSessionOnly`. It does **not**
 establish a stable volume identity or a durable mount session. On macOS,
 `StreamRootObservation` exposes device, inode, generation, mode, ctime, and the
-complete core source signature from the actually bound root descriptor. The
-runtime must compare those fields with the active `guiying-volume`
-`BoundVolumeSession` and add its capability/mount/root-scope proof before a
-store adapter accepts the evidence as v5 fresh evidence. Missing or mismatched
-volume evidence must fail closed.
+core source signature from the actually bound root descriptor. Stable root
+object identity is device/inode/generation plus directory type. Permission
+bits and ctime remain audit observations: macOS native folder selection may
+update authorization metadata without replacing the directory. Root coverage
+still binds directory mtime and the authenticated ticket set, while nested
+directory and file snapshots retain their strict state checks. The runtime
+must additionally bind this evidence to the active `guiying-volume`
+capability/mount/root scope before a store adapter accepts v5 fresh evidence.
+Missing or mismatched volume evidence must fail closed.
 
 Matching the selected root identity is necessary but not sufficient. Core's
 `stay_on_filesystem` check uses the object device ID, which cannot distinguish

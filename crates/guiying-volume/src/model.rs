@@ -209,6 +209,25 @@ pub struct RootObjectIdentity {
     pub change_time_nanoseconds: u32,
 }
 
+impl RootObjectIdentity {
+    /// Whether two snapshots name the same Unix directory object.
+    ///
+    /// Permission bits and `ctime` are observations, not object identity:
+    /// macOS can change them while attaching native directory-selection
+    /// authorization metadata. Callers must still validate the mount and
+    /// no-follow path binding independently.
+    pub const fn same_directory_object(self, other: Self) -> bool {
+        const FILE_TYPE_MASK: u32 = 0o170000;
+        const DIRECTORY_TYPE: u32 = 0o040000;
+
+        self.device == other.device
+            && self.inode == other.inode
+            && self.generation == other.generation
+            && self.mode & FILE_TYPE_MASK == DIRECTORY_TYPE
+            && other.mode & FILE_TYPE_MASK == DIRECTORY_TYPE
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct FileObjectIdentity {
     #[serde(serialize_with = "serialize_u64_decimal")]

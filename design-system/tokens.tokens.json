@@ -1,67 +1,87 @@
 {
-  "$description": "归影桌面端设计令牌。色彩取自档案纸、暗房工作台和校验印章，服务于证据、警告与可逆操作的清晰表达。",
+  "$description": "归影桌面端设计令牌。冷中性照片工作台让内容、保留选择和可恢复隔离成为视觉主角；中文仅作为本地化约束，不决定艺术风格。",
   "reference": {
     "color": {
-      "paper": {
+      "neutral": {
         "canvas": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.952941, 0.945098, 0.913725], "alpha": 1, "hex": "#f3f1e9" }
+          "$value": { "colorSpace": "srgb", "components": [0.960784, 0.968627, 0.980392], "alpha": 1, "hex": "#f5f7fa" }
         },
         "surface": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.984314, 0.980392, 0.960784], "alpha": 1, "hex": "#fbfaf5" }
+          "$value": { "colorSpace": "srgb", "components": [1, 1, 1], "alpha": 1, "hex": "#ffffff" }
         },
         "muted": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.917647, 0.905882, 0.866667], "alpha": 1, "hex": "#eae7dd" }
+          "$value": { "colorSpace": "srgb", "components": [0.92549, 0.941176, 0.960784], "alpha": 1, "hex": "#ecf0f5" }
         }
       },
-      "ink": {
+      "slate": {
         "strong": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.094118, 0.12549, 0.113725], "alpha": 1, "hex": "#18201d" }
+          "$value": { "colorSpace": "srgb", "components": [0.094118, 0.12549, 0.168627], "alpha": 1, "hex": "#18202b" }
         },
         "muted": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.356863, 0.4, 0.376471], "alpha": 1, "hex": "#5b6660" }
+          "$value": { "colorSpace": "srgb", "components": [0.321569, 0.376471, 0.435294], "alpha": 1, "hex": "#52606f" }
         }
       },
       "line": {
         "$type": "color",
-        "$value": { "colorSpace": "srgb", "components": [0.811765, 0.823529, 0.788235], "alpha": 1, "hex": "#cfd2c9" }
+        "$value": { "colorSpace": "srgb", "components": [0.815686, 0.847059, 0.886275], "alpha": 1, "hex": "#d0d8e2" }
       },
-      "green": {
+      "blue": {
         "600": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.145098, 0.407843, 0.309804], "alpha": 1, "hex": "#25684f" }
+          "$value": { "colorSpace": "srgb", "components": [0.192157, 0.360784, 0.956863], "alpha": 1, "hex": "#315cf4" }
         },
         "800": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.090196, 0.294118, 0.219608], "alpha": 1, "hex": "#174b38" }
+          "$value": { "colorSpace": "srgb", "components": [0.117647, 0.235294, 0.698039], "alpha": 1, "hex": "#1e3cb2" }
         },
         "100": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.866667, 0.917647, 0.890196], "alpha": 1, "hex": "#ddeae3" }
+          "$value": { "colorSpace": "srgb", "components": [0.901961, 0.92549, 1], "alpha": 1, "hex": "#e6ecff" }
+        }
+      },
+      "violet": {
+        "600": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.403922, 0.337255, 0.85098], "alpha": 1, "hex": "#6756d9" }
+        },
+        "100": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.92549, 0.917647, 1], "alpha": 1, "hex": "#eceaff" }
+        }
+      },
+      "emerald": {
+        "700": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.086275, 0.47451, 0.298039], "alpha": 1, "hex": "#16794c" }
+        },
+        "100": {
+          "$type": "color",
+          "$value": { "colorSpace": "srgb", "components": [0.870588, 0.968627, 0.913725], "alpha": 1, "hex": "#def7e9" }
         }
       },
       "amber": {
         "600": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.541176, 0.313725, 0.070588], "alpha": 1, "hex": "#8a5012" }
+          "$value": { "colorSpace": "srgb", "components": [0.658824, 0.372549, 0], "alpha": 1, "hex": "#a85f00" }
         },
         "100": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.945098, 0.890196, 0.807843], "alpha": 1, "hex": "#f1e3ce" }
+          "$value": { "colorSpace": "srgb", "components": [1, 0.937255, 0.827451], "alpha": 1, "hex": "#ffefd3" }
         }
       },
       "red": {
         "600": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.627451, 0.266667, 0.219608], "alpha": 1, "hex": "#a04438" }
+          "$value": { "colorSpace": "srgb", "components": [0.768627, 0.239216, 0.294118], "alpha": 1, "hex": "#c43d4b" }
         },
         "100": {
           "$type": "color",
-          "$value": { "colorSpace": "srgb", "components": [0.94902, 0.870588, 0.854902], "alpha": 1, "hex": "#f2deda" }
+          "$value": { "colorSpace": "srgb", "components": [1, 0.901961, 0.913725], "alpha": 1, "hex": "#ffe6e9" }
         }
       },
       "white": {
@@ -105,29 +125,35 @@
   },
   "semantic": {
     "surface": {
-      "canvas": { "$type": "color", "$value": "{reference.color.paper.canvas}" },
-      "primary": { "$type": "color", "$value": "{reference.color.paper.surface}" },
-      "secondary": { "$type": "color", "$value": "{reference.color.paper.muted}" },
-      "selected": { "$type": "color", "$value": "{reference.color.green.100}" },
+      "canvas": { "$type": "color", "$value": "{reference.color.neutral.canvas}" },
+      "primary": { "$type": "color", "$value": "{reference.color.neutral.surface}" },
+      "secondary": { "$type": "color", "$value": "{reference.color.neutral.muted}" },
+      "selected": { "$type": "color", "$value": "{reference.color.blue.100}" },
       "warning": { "$type": "color", "$value": "{reference.color.amber.100}" },
       "danger": { "$type": "color", "$value": "{reference.color.red.100}" }
     },
+    "track": {
+      "keep": { "$type": "color", "$value": "{reference.color.emerald.700}" },
+      "keepSurface": { "$type": "color", "$value": "{reference.color.emerald.100}" },
+      "move": { "$type": "color", "$value": "{reference.color.violet.600}" },
+      "moveSurface": { "$type": "color", "$value": "{reference.color.violet.100}" }
+    },
     "text": {
-      "primary": { "$type": "color", "$value": "{reference.color.ink.strong}" },
-      "secondary": { "$type": "color", "$value": "{reference.color.ink.muted}" },
+      "primary": { "$type": "color", "$value": "{reference.color.slate.strong}" },
+      "secondary": { "$type": "color", "$value": "{reference.color.slate.muted}" },
       "inverse": { "$type": "color", "$value": "{reference.color.white}" },
-      "positive": { "$type": "color", "$value": "{reference.color.green.800}" },
+      "positive": { "$type": "color", "$value": "{reference.color.emerald.700}" },
       "warning": { "$type": "color", "$value": "{reference.color.amber.600}" },
       "danger": { "$type": "color", "$value": "{reference.color.red.600}" }
     },
     "border": {
       "default": { "$type": "color", "$value": "{reference.color.line}" },
-      "strong": { "$type": "color", "$value": "{reference.color.ink.muted}" },
-      "focus": { "$type": "color", "$value": "{reference.color.green.600}" }
+      "strong": { "$type": "color", "$value": "{reference.color.slate.muted}" },
+      "focus": { "$type": "color", "$value": "{reference.color.blue.600}" }
     },
     "action": {
-      "primary": { "$type": "color", "$value": "{reference.color.green.600}" },
-      "primaryHover": { "$type": "color", "$value": "{reference.color.green.800}" },
+      "primary": { "$type": "color", "$value": "{reference.color.blue.600}" },
+      "primaryHover": { "$type": "color", "$value": "{reference.color.blue.800}" },
       "danger": { "$type": "color", "$value": "{reference.color.red.600}" }
     },
     "font": {

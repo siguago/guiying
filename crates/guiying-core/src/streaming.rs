@@ -266,11 +266,14 @@ pub enum StreamRootKind {
 /// Explicit root descriptor evidence for runtime/volume binding.
 ///
 /// On macOS, `device`, `inode`, `generation`, `mode`, and `change_time`
-/// correspond to the fields in `guiying_volume::RootObjectIdentity`. A runtime
-/// must compare them and the volume root/source binding before upgrading core
-/// evidence beyond [`StreamTrustScope::CurrentCoreSessionOnly`]. Matching root
-/// fields is necessary but not sufficient: `st_dev` alone cannot detect every
-/// same-device descendant/bind mount.
+/// correspond to the fields in `guiying_volume::RootObjectIdentity`. Stable
+/// root-object binding uses device/inode/generation plus the directory type;
+/// permission bits and `change_time` remain observations because native folder
+/// selection may update authorization metadata without replacing the root. A
+/// runtime must also compare the volume root/source binding before upgrading
+/// core evidence beyond [`StreamTrustScope::CurrentCoreSessionOnly`]. Matching
+/// root fields is necessary but not sufficient: `st_dev` alone cannot detect
+/// every same-device descendant/bind mount.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamRootObservation {
     pub root_index: u16,
@@ -1398,7 +1401,11 @@ impl StreamingScanSession {
             root_index,
             &root_relative_path,
             directory.snapshot(),
-            SnapshotKind::Directory,
+            if directory.relative_components().is_empty() {
+                SnapshotKind::RootDirectory
+            } else {
+                SnapshotKind::Directory
+            },
         );
         let ticket =
             self.make_directory_ticket(root_index, directory.relative_components(), signature)?;
@@ -1828,7 +1835,11 @@ impl StreamingScanSession {
                         claims.root_index,
                         &root_relative_path,
                         &snapshot,
-                        SnapshotKind::Directory,
+                        if claims.components.is_empty() {
+                            SnapshotKind::RootDirectory
+                        } else {
+                            SnapshotKind::Directory
+                        },
                     ) == claims.source_signature
                 }
                 Err(_) => false,
@@ -1930,7 +1941,11 @@ impl StreamingScanSession {
             match snapshot_path(&root.path) {
                 Ok((metadata, snapshot))
                     if metadata.file_type().is_dir() == root.is_directory
-                        && snapshot == root.snapshot => {}
+                        && if root.is_directory {
+                            snapshot.same_root_directory_state(&root.snapshot)
+                        } else {
+                            snapshot == root.snapshot
+                        } => {}
                 Ok(_) => {
                     stable = false;
                     finalization_failures = finalization_failures.checked_add(1).ok_or(
@@ -1939,7 +1954,7 @@ impl StreamingScanSession {
                     events.push(StreamEvent::Issue(make_issue(
                         ScanIssueCode::RootChangedDuringScan,
                         root.path.clone(),
-                        "scan root identity, device, or change time changed".to_owned(),
+                        "scan root object or directory contents changed".to_owned(),
                     )))?;
                 }
                 Err(error) => {
@@ -2170,6 +2185,7 @@ struct TicketClaims {
 enum SnapshotKind {
     File,
     Directory,
+    RootDirectory,
 }
 
 struct OpenedObservation {
@@ -2478,7 +2494,7 @@ fn make_root_observation(
 ) -> StreamRootObservation {
     let root_relative_path = relative_path_ref(&[]);
     let snapshot_kind = match kind {
-        StreamRootKind::Directory => SnapshotKind::Directory,
+        StreamRootKind::Directory => SnapshotKind::RootDirectory,
         StreamRootKind::RegularFile => SnapshotKind::File,
     };
     StreamRootObservation {
@@ -2705,7 +2721,7 @@ fn compare_opened_fresh(
             right_after_source_signature: right_after,
         });
     }
-    let buffer_bytes = configured_buffer_bytes.min(EXACT_BUFFER_BYTES_MAX).max(1);
+    let buffer_bytes = configured_buffer_bytes.clamp(1, EXACT_BUFFER_BYTES_MAX);
     let mut left_buffer = vec![0_u8; buffer_bytes];
     let mut right_buffer = vec![0_u8; buffer_bytes];
     let mut left_hasher = blake3::Hasher::new();
@@ -2886,6 +2902,7 @@ fn snapshot_signature(snapshot: &FileSnapshot, kind: SnapshotKind) -> [u8; 32] {
     hasher.update(&[match kind {
         SnapshotKind::File => 1,
         SnapshotKind::Directory => 2,
+        SnapshotKind::RootDirectory => 3,
     }]);
     hasher.update(&snapshot.len.to_le_bytes());
     update_optional_u64(&mut hasher, snapshot.allocated_size);
@@ -2894,10 +2911,26 @@ fn snapshot_signature(snapshot: &FileSnapshot, kind: SnapshotKind) -> [u8; 32] {
     update_optional_u64(&mut hasher, snapshot.file_id.map(|id| id.device));
     update_optional_u64(&mut hasher, snapshot.file_id.map(|id| id.inode));
     update_optional_u64(&mut hasher, snapshot.hard_link_count);
-    update_optional_u64(&mut hasher, snapshot.mode().map(u64::from));
+    update_optional_u64(
+        &mut hasher,
+        snapshot.mode().map(|mode| {
+            u64::from(if matches!(kind, SnapshotKind::RootDirectory) {
+                #[cfg(unix)]
+                {
+                    mode & u32::from(libc::S_IFMT)
+                }
+                #[cfg(not(unix))]
+                {
+                    mode
+                }
+            } else {
+                mode
+            })
+        }),
+    );
     update_optional_u64(&mut hasher, snapshot.generation().map(u64::from));
     #[cfg(unix)]
-    {
+    if !matches!(kind, SnapshotKind::RootDirectory) {
         hasher.update(&snapshot.change_seconds.to_le_bytes());
         hasher.update(&snapshot.change_nanoseconds.to_le_bytes());
     }

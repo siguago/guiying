@@ -63,7 +63,10 @@ target-volume write APIs.
   proof.
 - `verify_directory` similarly performs two nofollow reopens with complete
   mount-signature checks and returns only `RootObjectIdentity`; no directory or
-  raw descriptor escapes the crate.
+  raw descriptor escapes the crate. Selected-root rebinding identifies the
+  object by device/inode/generation and directory type. Permission bits and
+  ctime are retained as observations but do not invalidate the binding when
+  macOS attaches ACL/xattr authorization metadata.
 - Native bytes/code units are retained exactly. Display text is never used for
   addressing. The stable path key uses the complete path relative to the real
   mount root, so equal suffixes under different selected roots do not collide,

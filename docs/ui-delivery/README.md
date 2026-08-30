@@ -1,28 +1,40 @@
-# 归影 Phase 1 UI 交付包
+# 归影 v0.2 UI 交付包
 
-这是现有仓库的 complete / implementation / desktop / zh-CN 交付记录，范围为 Phase 1 当前已实现的无主动变更 D1 扫描、封印时间证据、有界分页、历史只读复核、同一进程内的目录枚举暂停/继续，以及封存历史的 JSON/CSV 导出。视觉方向为“档案纸上的校验台账”，签名装置是贯穿重复验证与时间来源的证据脊柱。任何照片写能力仍锁定。
+这是 `complete / implementation / existing_repository / desktop / zh-CN` 交付记录。v0.2 从用户任务重新组织产品：**找出完全相同的文件 → 选择保留项 → 预览 Keep / Move → 可恢复隔离 → 恢复**。JSON/CSV 导出、时间来源和原始证据仍保留，但不再占据主流程。
 
-暂停只在目录枚举安全点生效，并依赖当前应用进程中仍然存活的扫描运行时与目录描述符；退出应用或进程中断后不能继续原扫描，必须重新选择目录并扫描。历史导出只创建用户另行选择的新报告文件，不会写入照片；`complete_evidence` 仅包含摘要、确定重复组、成员和扫描问题，不包含拍摄时间候选/成员/元数据记录、原始字段或定位器；摘要仍保留历史报告既有的 `time_outcome` 汇总状态。
+视觉采用冷中性“本地照片工作台”。绿色 Keep 与紫色 Move 双轨是跨成员选择、计划预览和恢复结果的签名装置；旧暖纸、墨绿和“档案台账”组合已经在 [design-direction.md](./design-direction.md) 中登记为 anti-reference，不能作为连续性理由继续使用。中文只影响本地化和排版测试，不决定传统或复古艺术方向。
 
-## 打开方式
+## 已实现
 
-在仓库根目录安装依赖后运行原生应用：
+- 每组用原生 radio 选择唯一 keeper；其余完全相同的成员自动进入隔离意图。
+- 决策独立于当前分页缓存，可逐组处理，不要求一次完成全部结果。
+- 计划页明确显示保留原位、移入隔离区、数量、逻辑大小，以及不永久删除、不改时间、执行前复核和恢复清单。
+- 合成数据可完整演示选择、预览、隔离、完成与恢复，持续声明不会访问本地文件。
+- 真实结果可完成 keeper 决策和 Keep/Move 只读预览；标准构建的真实执行按钮默认禁用，后端即使被直接调用也返回 release-gate 错误。
+- 实验性原生隔离/恢复只在显式 internal Cargo feature 与前端开关同时开启时用于专用测试卷；它不是发布能力，也不代表已完成双份日志、启动对账和全部逻辑资产门。
+- 独立恢复界面已可在 internal fixture 中跨重启读取 operation 清单、处理 partial/冲突并重试；标准构建不显示未开放的隔离记录。
+
+## 打开与验证
+
+在仓库根目录运行：
 
 ```bash
 pnpm install
+pnpm dev
 pnpm tauri:dev
 ```
 
-浏览器级交互与无障碍复核：
+静态与交付包门禁：
 
 ```bash
-pnpm test:ui
+pnpm build
+pnpm lint
+pnpm tokens:check
+python3 /Users/sigua/.codex/skills/craft-ui-design/scripts/validate_delivery.py docs/ui-delivery
 ```
 
-## 交付关系
+机器可读入口见 [manifest.json](./manifest.json)，QA 映射见 [qa-evidence.json](./qa-evidence.json)，产品范围和实施顺序分别见 [PRD](../product/PRD.md) 与 [ROADMAP](../ROADMAP.md)。
 
-- 本包创建：设计方向、内容与实现映射、QA 记录、截图和限制说明。
-- 仓库继承：DTCG 令牌与 CSS 导出、React/Tauri/Rust 生产源、Lucide 图标来源、Playwright + axe 测试。
-- 当前未交付：真实移动硬盘全流程验收、VoiceOver 人工走查、跨进程续扫，以及任何照片移动、重命名、改时或删除功能。品牌应用图标已由仓库内 SVG 确定性生成；本轮未重新生成或运行 Tauri 安装包。
+## 仍需门禁
 
-机器可读入口见 `manifest.json`，测试与证据的双向映射见 `qa-evidence.json`。当前状态为 ready with limitations：同进程枚举暂停/继续与封存历史导出已经过本机自动化门禁；这不证明跨进程恢复、当前 Tauri bundle/native-run、真实外置卷流程或任何照片文件动作。
+当前浏览器预览和 Rust 自动化不能替代 Tauri 原生端到端、VoiceOver，以及 APFS/HFS+/exFAT 真实外置卷的掉盘、写满、权限变化、同名冲突和恢复故障矩阵。隔离区不是备份，也不会自动永久删除；时间修复、D2/D3 和相似照片不在本版范围内。

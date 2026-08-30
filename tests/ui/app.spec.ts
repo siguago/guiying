@@ -299,8 +299,15 @@ test('landing page communicates the read-only boundary', async ({ page }, testIn
 
   await expect(page).toHaveTitle(/归影/)
   await expect(page.getByRole('heading', { name: /先看证据/ })).toBeVisible()
+  await expect(page.getByText('完全本地 · 只读扫描')).toBeVisible()
+  await expect(page.getByText(/真实隔离通过安全验证后才会开放/)).toBeVisible()
+  await expect(page.getByRole('navigation', { name: '整理流程' })).toContainText('预览整理计划')
+  await expect(page.getByRole('navigation', { name: '整理流程' })).toContainText('真实执行仍锁定')
+  await expect(page.getByText('本地处理 · 无主动变更')).toBeVisible()
   await expect(page.getByText('不主动改文件')).toBeVisible()
   await expect(page.getByRole('button', { name: '请在桌面应用中选择目录' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '恢复隔离文件' })).toBeDisabled()
+  await expect(page.getByText(/当前没有已开放的隔离记录.*真实隔离仍在安全验证中/)).toBeVisible()
 
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
@@ -334,6 +341,375 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
   expect(accessibility.violations).toEqual([])
 
   await captureEvidence(page, testInfo, 'results-1280x820.png')
+})
+
+test('demo workflow selects the recommended keeper, previews reversible isolation, and restores it', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
+
+  const recommendedKeeper = page.getByRole('radio', { name: /IMG_4821\.HEIC.*建议保留/ })
+  await recommendedKeeper.check()
+  await expect(recommendedKeeper).toBeChecked()
+  await expect(page.getByLabel('当前组操作')).toContainText('保留 IMG_4821.HEIC')
+
+  await page.getByRole('button', { name: '预览本组隔离计划' }).click()
+  await expect(page.getByRole('heading', { name: '确认这一组的隔离计划' })).toBeVisible()
+  await expect(page.getByText(/不会永久删除.*不会改写照片内容或时间/)).toBeVisible()
+  await expect(page.getByText('生成恢复清单，可从归影隔离区还原')).toBeVisible()
+  await expect(page.getByText('合成数据演示只模拟状态，不会访问本地文件。')).toBeVisible()
+
+  await page.getByRole('button', { name: '执行演示隔离' }).click()
+  await expect(page.getByRole('button', { name: '正在复核并隔离…' })).toBeDisabled()
+  await page.clock.runFor(500)
+
+  await expect(page.getByRole('heading', { name: '2 个副本已移入隔离区' })).toBeVisible()
+  await expect(page.getByText(/没有永久删除文件.*没有改写照片内容或时间/)).toBeVisible()
+  await expect(page.getByText('可恢复', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: '恢复这次隔离' }).click()
+  await expect(page.getByText('演示文件已恢复到原位置。')).toBeVisible()
+  await expect(page.getByText('已恢复', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: '已经恢复' })).toBeDisabled()
+})
+
+test('default release locks live quarantine while sealed adapters keep pathless payloads', async ({ page }) => {
+  await page.addInitScript(() => {
+    const resultReadToken = `result-${'c'.repeat(64)}`
+    const planToken = `qplan-${'d'.repeat(64)}`
+    const restoreRootToken = `qroot-${'e'.repeat(64)}`
+    const operationId = `op-${'a'.repeat(64)}`
+    const calls: Array<{ command: string; payload: Record<string, unknown> }> = []
+    const historyItem = {
+      historyEntryId: '31',
+      rootDisplay: '/Volumes/Quarantine Fixture',
+      scanMode: 'full',
+      startedAtUnixMs: '1000',
+      finishedAtUnixMs: '2000',
+      durationMs: '1000',
+      coverageStatus: 'complete',
+      observedFiles: '2',
+      logicalBytes: '8192',
+      verifiedGroups: '1',
+      verifiedMembers: '2',
+      redundantCopies: '1',
+      logicalReclaimableBytes: '4096',
+      issues: '0',
+      unresolvedIssues: '0',
+      captureTime: {
+        status: 'not_run',
+        expectedGroups: '0',
+        evidenceGroups: '0',
+        unavailableGroups: '0',
+        failedGroups: '0',
+        sealedReportReadBytes: '0',
+        sealedReportReadOperations: '0',
+      },
+    }
+    const member = (
+      ordinal: string,
+      observationId: string,
+      name: string,
+      rawBase64: string,
+    ) => ({
+      groupBuildId: '301',
+      ordinal,
+      observationId,
+      displayPath: `/Volumes/Quarantine Fixture/${name}`,
+      pathEncoding: 'utf8',
+      nativePath: { encoding: 'utf8', rawBase64 },
+      sizeBytes: '4096',
+      hasStableFileIdentity: true,
+      birthTimeSeconds: '1609459200',
+      birthTimeNanoseconds: '0',
+      modifiedTimeSeconds: '1609459200',
+      modifiedTimeNanoseconds: '0',
+      timestampGranularityNs: null,
+    })
+
+    Object.assign(window, {
+      isTauri: true,
+      __QUARANTINE_WIRING_FIXTURE__: { calls, resultReadToken, planToken, restoreRootToken, operationId },
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
+          calls.push({ command, payload })
+          if (command === 'list_scan_history') {
+            return { schemaVersion: 1, items: [historyItem], nextCursor: null }
+          }
+          if (command === 'open_scan_history') {
+            return {
+              schemaVersion: 1,
+              historyEntryId: '31',
+              resultReadToken,
+              expiresAtUnixMs: '9999999999999',
+              summary: historyItem,
+            }
+          }
+          if (command === 'list_duplicate_groups') {
+            return {
+              items: [{
+                groupBuildId: '301',
+                groupKeyHex: 'ab'.repeat(32),
+                memberCount: '2',
+                independentFileCount: '2',
+                sizeBytes: '4096',
+                previewPath: '/Volumes/Quarantine Fixture/KEEP.JPG',
+                logicalReclaimableBytes: '4096',
+                finalizedAtUnixMs: '2000',
+              }],
+              nextCursor: null,
+            }
+          }
+          if (command === 'list_duplicate_group_members') {
+            return {
+              items: [
+                member('0', '3010', 'KEEP.JPG', 'L1ZvbHVtZXMvUXVhcmFudGluZSBGaXh0dXJlL0tFRVAuSlBH'),
+                member('1', '3011', 'COPY.JPG', 'L1ZvbHVtZXMvUXVhcmFudGluZSBGaXh0dXJlL0NPUFkuSlBH'),
+              ],
+              nextCursor: null,
+            }
+          }
+          if (command === 'select_quarantine_plan_root') {
+            return {
+              planToken,
+              expiresAtUnixMs: '9999999999999',
+              groupBuildId: '301',
+              keeperOrdinal: '0',
+              moveCount: '1',
+              logicalBytes: '4096',
+            }
+          }
+          if (command === 'execute_quarantine_plan') {
+            return { operationId, movedCount: '1', logicalBytes: '4096', status: 'quarantined' }
+          }
+          if (command === 'select_quarantine_restore_root') {
+            return {
+              restoreRootToken,
+              expiresAtUnixMs: '9999999999999',
+              operations: [{
+                operationId,
+                createdAtUnixMs: '2000',
+                status: 'quarantined',
+                fileCount: '1',
+                quarantinedCount: '1',
+                restoredCount: '0',
+                logicalBytes: '4096',
+              }],
+            }
+          }
+          if (command === 'restore_quarantine_operation') {
+            return { operationId, restoredCount: '1', remainingCount: '0', status: 'restored' }
+          }
+          if (command === 'close_result_read') return { revoked: true }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '查看历史报告' }).click()
+  await page.getByRole('button', { name: '打开 /Volumes/Quarantine Fixture 的封存报告' }).click()
+  await expect(page.getByRole('heading', { name: '发现 1 组确定重复' })).toBeVisible()
+
+  await page.getByRole('radio', { name: /KEEP\.JPG/ }).check()
+  await page.getByRole('button', { name: '预览本组整理计划' }).click()
+  await expect(page.getByRole('heading', { name: '查看这一组的整理计划' })).toBeVisible()
+  await expect(page.getByText(/你可以查看计划，但当前版本不会移动本地文件/)).toBeVisible()
+  await expect(page.getByRole('button', { name: '真实隔离仍在安全验证中' })).toBeDisabled()
+
+  await page.evaluate(async () => {
+    const backendModulePath = '/src/lib/backend.ts'
+    const backend = await import(/* @vite-ignore */ backendModulePath)
+    const fixture = (window as unknown as Window & {
+      __QUARANTINE_WIRING_FIXTURE__: {
+        resultReadToken: string
+        planToken: string
+        operationId: string
+      }
+    }).__QUARANTINE_WIRING_FIXTURE__
+    const plan = await backend.selectQuarantinePlanRoot(fixture.resultReadToken, '301', '0')
+    if (!plan) throw new Error('fixture plan selector unexpectedly returned null')
+    await backend.executeQuarantinePlan(plan.planToken)
+    const root = await backend.selectQuarantineRestoreRoot()
+    if (!root) throw new Error('fixture restore selector unexpectedly returned null')
+    await backend.restoreQuarantineOperation(root.restoreRootToken, fixture.operationId)
+  })
+
+  const fixture = await page.evaluate(() => (
+    window as unknown as Window & {
+      __QUARANTINE_WIRING_FIXTURE__: {
+        calls: Array<{ command: string; payload: Record<string, unknown> }>
+        resultReadToken: string
+        planToken: string
+        restoreRootToken: string
+        operationId: string
+      }
+    }
+  ).__QUARANTINE_WIRING_FIXTURE__)
+  const actionCalls = fixture.calls.filter((call) => [
+    'select_quarantine_plan_root',
+    'execute_quarantine_plan',
+    'select_quarantine_restore_root',
+    'restore_quarantine_operation',
+  ].includes(call.command))
+
+  expect(actionCalls).toEqual([
+    {
+      command: 'select_quarantine_plan_root',
+      payload: {
+        resultReadToken: fixture.resultReadToken,
+        groupBuildId: '301',
+        keeperOrdinal: '0',
+      },
+    },
+    { command: 'execute_quarantine_plan', payload: { planToken: fixture.planToken } },
+    { command: 'select_quarantine_restore_root', payload: {} },
+    {
+      command: 'restore_quarantine_operation',
+      payload: { restoreRootToken: fixture.restoreRootToken, operationId: fixture.operationId },
+    },
+  ])
+  for (const call of actionCalls) {
+    expect(JSON.stringify(call.payload)).not.toMatch(/"(?:path|nativePath)"/i)
+  }
+})
+
+test('internal recovery reopens manifests after restart and keeps partial conflicts retryable', async ({ page }) => {
+  // Production remains compile-time locked. This route only turns on the
+  // internal build flag inside this fixture page so the unreleased flow can be
+  // exercised without weakening the shipped default.
+  await page.route('**/src/App.tsx*', async (route) => {
+    const response = await route.fetch()
+    const source = await response.text()
+    const enabledSource = source.replace(
+      /const internalQuarantineEnabled\s*=\s*import\.meta\.env\.VITE_GUIYING_INTERNAL_QUARANTINE\s*===\s*["']1["'];?/,
+      'const internalQuarantineEnabled = true;',
+    )
+    if (enabledSource === source) throw new Error('internal quarantine build flag was not found in App.tsx')
+    await route.fulfill({ response, body: enabledSource })
+  })
+
+  await page.addInitScript(() => {
+    const restoreRootToken = `qroot-${'f'.repeat(64)}`
+    const operationId = `op-${'b'.repeat(64)}`
+    const restoredOperationId = `op-${'c'.repeat(64)}`
+    const calls: Array<{ command: string; payload: Record<string, unknown> }> = []
+    let selectionCount = 0
+    let restoreCount = 0
+    Object.assign(window, {
+      isTauri: true,
+      __INDEPENDENT_RESTORE_FIXTURE__: { calls, restoreRootToken, operationId },
+      __TAURI_INTERNALS__: {
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
+          calls.push({ command, payload })
+          if (command === 'select_quarantine_restore_root') {
+            selectionCount += 1
+            if (selectionCount === 1) {
+              return { restoreRootToken: null, expiresAtUnixMs: null, operations: [] }
+            }
+            return {
+              restoreRootToken,
+              expiresAtUnixMs: '9999999999999',
+              operations: [
+                {
+                  operationId,
+                  createdAtUnixMs: '1723507200000',
+                  status: 'partially_restored',
+                  fileCount: '3',
+                  quarantinedCount: '2',
+                  restoredCount: '1',
+                  logicalBytes: '12288',
+                },
+                {
+                  operationId: restoredOperationId,
+                  createdAtUnixMs: '1723420800000',
+                  status: 'restored',
+                  fileCount: '2',
+                  quarantinedCount: '0',
+                  restoredCount: '2',
+                  logicalBytes: '8192',
+                },
+              ],
+            }
+          }
+          if (command === 'restore_quarantine_operation') {
+            restoreCount += 1
+            return restoreCount === 1
+              ? { operationId, restoredCount: '1', remainingCount: '1', status: 'partially_restored' }
+              : { operationId, restoredCount: '1', remainingCount: '0', status: 'restored' }
+          }
+          throw new Error(`unexpected fixture command: ${command}`)
+        },
+      },
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '恢复隔离文件' }).click()
+  await expect(page.getByRole('heading', { name: '恢复隔离文件' })).toBeVisible()
+  await expect(page.getByText(/不需要当前扫描报告或刚完成的操作编号/)).toBeVisible()
+
+  await page.getByRole('button', { name: '选择原照片目录' }).click()
+  await expect(page.getByRole('heading', { name: '恢复隔离文件' })).toBeVisible()
+  await expect(page.getByRole('alert')).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: '这个目录中的恢复清单' })).toHaveCount(0)
+
+  await page.getByRole('button', { name: '选择原照片目录' }).click()
+  await expect(page.getByRole('heading', { name: '这个目录中的恢复清单' })).toBeVisible()
+  await expect(page.getByText('2 条记录 · 1 条未完全恢复')).toBeVisible()
+
+  const partialOperation = page.locator('.restore-operation').filter({ hasText: `op-${'b'.repeat(64)}` })
+  await expect(partialOperation).toContainText('部分恢复')
+  await expect(partialOperation).toContainText('3')
+  await expect(partialOperation).toContainText('2')
+  await expect(partialOperation).toContainText('1')
+  await expect(partialOperation).toContainText('12 KiB')
+  await expect(page.getByRole('radio', { name: new RegExp(`op-${'b'.repeat(64)}`) })).toBeChecked()
+  await expect(page.getByRole('radio', { name: new RegExp(`op-${'c'.repeat(64)}`) })).toBeDisabled()
+
+  const restoreButton = page.getByRole('button', { name: '恢复所选隔离文件' })
+  await restoreButton.click()
+  await expect(page.getByText('仍有文件留在隔离区')).toBeVisible()
+  await expect(page.getByText(/本次恢复了 1 个，仍有 1 个未恢复/)).toBeVisible()
+  await expect(restoreButton).toBeEnabled()
+
+  await restoreButton.click()
+  await expect(page.getByText('这条隔离记录已全部恢复')).toBeVisible()
+  await expect(partialOperation).toContainText('已全部恢复')
+  await expect(restoreButton).toBeDisabled()
+
+  const fixture = await page.evaluate(() => (
+    window as unknown as Window & {
+      __INDEPENDENT_RESTORE_FIXTURE__: {
+        calls: Array<{ command: string; payload: Record<string, unknown> }>
+        restoreRootToken: string
+        operationId: string
+      }
+    }
+  ).__INDEPENDENT_RESTORE_FIXTURE__)
+  expect(fixture.calls).toEqual([
+    { command: 'select_quarantine_restore_root', payload: {} },
+    { command: 'select_quarantine_restore_root', payload: {} },
+    {
+      command: 'restore_quarantine_operation',
+      payload: { restoreRootToken: fixture.restoreRootToken, operationId: fixture.operationId },
+    },
+    {
+      command: 'restore_quarantine_operation',
+      payload: { restoreRootToken: fixture.restoreRootToken, operationId: fixture.operationId },
+    },
+  ])
+  for (const call of fixture.calls) {
+    expect(JSON.stringify(call.payload)).not.toMatch(/path|nativePath|resultReadToken|liveOperationId/i)
+  }
 })
 
 test('core flow remains reachable using only the keyboard', async ({ browserName, page }) => {

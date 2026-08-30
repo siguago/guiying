@@ -1,0 +1,19 @@
+归影 v0.2 Rust / Tauri 安全门禁
+日期：2026-08-13（Asia/Shanghai）
+
+标准构建（internal-quarantine 默认关闭）
+- cargo fmt --check：通过
+- cargo check --all-targets：通过
+- cargo clippy --all-targets -- -D warnings：通过
+- cargo test --all-targets：74 / 74 通过
+- 发布门测试确认 macOS 标准构建返回 QUARANTINE_RELEASE_GATE_CLOSED，不弹隔离目录选择器，不移动真实文件。
+
+内部原型（--all-features，仅用于 tempdir / 专用测试卷）
+- cargo check --all-targets --all-features：通过
+- cargo clippy --all-targets --all-features -- -D warnings：通过
+- cargo test --all-targets --all-features：81 / 81 通过
+- quarantine 定向测试：8 / 8 通过。覆盖 no-overwrite、keeper 路径替换、源父目录脱离、隔离目标脱离、恢复父目录脱离、损坏 manifest 逐项隔离和完整往返。
+
+发布边界
+- 上述内部原型测试不能代替 SAFETY.md 要求的双份追加日志、启动/重挂对账、C3 能力探测、全部逻辑资产门或真实外置卷故障矩阵。
+- 所以 internal-quarantine 仍不是面向用户的发布能力。

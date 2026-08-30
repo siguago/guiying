@@ -1319,6 +1319,7 @@ dependencies = [
  "guiying-core",
  "guiying-runtime",
  "guiying-store",
+ "guiying-volume",
  "libc",
  "log",
  "serde",

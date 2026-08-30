@@ -169,7 +169,12 @@ mod platform {
                 rustix::io::dup(&descriptor)
                     .map_err(|error| BindDirectoryError::Io(error.into()))?,
             );
-            Self::from_descriptor(path, descriptor, Some(expected), root_anchor, Vec::new())
+            let bound = Self::from_descriptor(path, descriptor, None, root_anchor, Vec::new())?;
+            if bound.snapshot.same_directory_object(expected) {
+                Ok(bound)
+            } else {
+                Err(BindDirectoryError::Changed)
+            }
         }
 
         pub(crate) fn path(&self) -> &Path {
@@ -436,8 +441,12 @@ mod platform {
 
         pub(crate) fn revalidate(&self) -> Result<(), BindDirectoryError> {
             let descriptor = if self.relative_components.is_empty() {
-                rustix::io::dup(&self.root_anchor)
-                    .map_err(|error| BindDirectoryError::Io(error.into()))?
+                rustix::fs::open(
+                    &self.path,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| BindDirectoryError::Io(error.into()))?
             } else {
                 let mut opened_directories = Vec::<rustix::fd::OwnedFd>::new();
                 for component in self.relative_components.iter() {
@@ -465,7 +474,13 @@ mod platform {
             if !metadata.file_type().is_dir() {
                 return Err(BindDirectoryError::NotDirectory);
             }
-            if FileSnapshot::from_metadata(&metadata) != self.snapshot {
+            let observed = FileSnapshot::from_metadata(&metadata);
+            let unchanged = if self.relative_components.is_empty() {
+                observed.same_root_directory_state(&self.snapshot)
+            } else {
+                observed == self.snapshot
+            };
+            if !unchanged {
                 return Err(BindDirectoryError::Changed);
             }
             Ok(())
