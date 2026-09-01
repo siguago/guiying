@@ -333,6 +333,10 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
   // live behind "如何确认？" (PRD 4.2).
   await expect(page.getByText(/阶段 \d+ \/ 5/)).toHaveCount(0)
   await expect(page.getByRole('term').filter({ hasText: '已检查' })).toBeVisible()
+  // The demo reports a real entry count, not its stage loop index — the same
+  // magnitude the results page will state, so the two surfaces cannot
+  // contradict each other inside one flow.
+  await expect(page.getByText('18,642')).toBeVisible()
   // Algorithm stages exist, but stay collapsed until the user asks.
   await expect(page.getByText('如何确认？')).toBeVisible()
   await expect(page.getByText('读取目录清单')).toBeHidden()

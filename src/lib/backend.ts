@@ -2718,6 +2718,7 @@ export async function startDirectoryScanReadOnly(
   onStatusWarning?: (warning: string | null) => void,
   onPhase?: (phase: ScanJobPhase) => void,
   onAttemptKind?: (attemptKind: ScanAttemptKind) => void,
+  onStartedAt?: (startedAtUnixMs: number) => void,
 ): Promise<ReadOnlyScanSession> {
   if (!isTauri()) {
     throw new Error('浏览器预览不能读取本地目录；请运行桌面应用，或使用明确标注的合成数据演示。')
@@ -2749,12 +2750,20 @@ export async function startDirectoryScanReadOnly(
       onStatusWarning,
       onPhase,
       onAttemptKind,
+      onProgress,
+      onStartedAt,
     )
     return { jobId: response.jobId, result }
   } catch (error) {
     const existingJobId = recoverableExistingJobId(error)
     if (existingJobId) {
       expectedJobId = existingJobId
+      // Attaching to an already-running job must not present a blank scan:
+      // replay the event buffered before the start response (the success
+      // branch already does), and let the status poll below fill in the rest.
+      if (progressBeforeStartResponse?.jobId === expectedJobId) {
+        onProgress?.(progressBeforeStartResponse)
+      }
       const result = waitForScanResult(
         existingJobId,
         startedAt,
@@ -2762,6 +2771,8 @@ export async function startDirectoryScanReadOnly(
         onStatusWarning,
         onPhase,
         onAttemptKind,
+        onProgress,
+        onStartedAt,
       )
       return { jobId: existingJobId, result }
     }
@@ -2800,10 +2811,13 @@ async function waitForScanResult(
   onStatusWarning?: (warning: string | null) => void,
   onPhase?: (phase: ScanJobPhase) => void,
   onAttemptKind?: (attemptKind: ScanAttemptKind) => void,
+  onProgress?: (progress: ScanProgress) => void,
+  onStartedAt?: (startedAtUnixMs: number) => void,
 ): Promise<ScanReport> {
   let consecutiveStatusFailures = 0
   let observedAttemptKind: ScanAttemptKind | null = null
   let observedScanRunId: string | null = null
+  let reportedStartedAt = false
   try {
     for (;;) {
       let rawStatus: unknown
@@ -2840,6 +2854,16 @@ async function waitForScanResult(
         onAttemptKind?.(status.attemptKind)
       }
       onPhase?.(status.phase)
+      // The poll carries the job's own start time and latest progress; feed
+      // both back so attaching to a long-running job shows its real elapsed
+      // time and stage instead of a fresh-looking zero state.
+      if (!reportedStartedAt) {
+        reportedStartedAt = true
+        onStartedAt?.(status.startedAtUnixMs)
+      }
+      if (status.progress !== null) {
+        onProgress?.(status.progress)
+      }
 
       if (status.phase === 'completed' || status.phase === 'cancelled') {
         const measuredDuration = status.finishedAtUnixMs === null
@@ -3228,7 +3252,14 @@ export async function runSyntheticScan(
     'complete',
   ]
   for (const [index, stage] of stages.entries()) {
-    onProgress?.({ stage, completed: index + 1, total: stages.length })
+    // Only the enumeration counter means "entries seen" globally; later
+    // stages report batch-scoped numbers the UI deliberately ignores, so the
+    // demo emits a plausible entry count rather than its loop index.
+    onProgress?.({
+      stage,
+      completed: stage === 'enumerating' ? 18_642 : index + 1,
+      total: stage === 'enumerating' ? null : stages.length,
+    })
     await new Promise((resolve) => window.setTimeout(resolve, 260))
   }
   return createDemoReport(DEMO_ROOT)

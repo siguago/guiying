@@ -850,6 +850,16 @@
   line-height: 1.05;
 }
 
+.scan-counts__phase {
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.4;
+  align-self: end;
+  padding-bottom: 6px;
+}
+
 .scan-method {
   grid-column: 2;
   margin-top: 28px;
@@ -2515,7 +2525,7 @@
 
   .scan-stage {
     grid-template-columns: 120px minmax(0, 1fr);
-    gap: 28px;
+    column-gap: 28px;
   }
 
   .scan-stage__visual {

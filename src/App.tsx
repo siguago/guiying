@@ -58,6 +58,7 @@ import { fileNameFromPath, formatBytes } from './domain'
 import type {
   QuarantineOperationItem,
   QuarantineRestoreRootSelection,
+  ScanProgress,
   SelectedScanRoot,
 } from './lib/backend'
 import {
@@ -651,8 +652,7 @@ function HistoryWorkspace({
 function ScanningWorkspace({
   source,
   stageIndex,
-  completed,
-  total,
+  seenCount,
   startedAtMs,
   attemptKind,
   canCancel,
@@ -666,8 +666,7 @@ function ScanningWorkspace({
 }: {
   source: string
   stageIndex: number
-  completed: number
-  total: number | null
+  seenCount: number
   startedAtMs: number | null
   attemptKind: ScanAttemptKind | null
   canCancel: boolean
@@ -680,8 +679,9 @@ function ScanningWorkspace({
   onResume: () => Promise<void>
 }) {
   // Elapsed time is data the user asked for, not decoration: keep it ticking
-  // under reduced-motion, and stop the timer as soon as the scan is paused so
-  // a paused scan does not keep reporting time it is not spending.
+  // under reduced-motion. The timer stops while paused, and App shifts
+  // startedAtMs forward by the paused span on resume, so idle time never
+  // enters the label.
   const [nowMs, setNowMs] = useState(() => Date.now())
   const isRunning = jobPhase === 'running' || jobPhase === 'pausing' || jobPhase === 'resuming'
   useEffect(() => {
@@ -693,7 +693,6 @@ function ScanningWorkspace({
   const elapsedLabel = startedAtMs === null
     ? null
     : historyDurationLabel(Math.max(0, nowMs - startedAtMs))
-  const remaining = total === null ? null : Math.max(0, total - completed)
   const isPaused = jobPhase === 'paused'
   const isPausing = jobPhase === 'pausing'
   const isResuming = jobPhase === 'resuming'
@@ -766,14 +765,18 @@ function ScanningWorkspace({
           <div className="scan-pulse" />
         </div>
         <dl className="scan-counts">
+          {/* One number with one meaning: entries seen while enumerating. The
+              later stages report batch-scoped counts in other units, so this
+              freezes rather than saw-toothing through them; a global
+              "remaining" figure does not exist in the pipeline's events. */}
           <div>
-            <dt>已检查</dt>
-            <dd>{completed.toLocaleString('zh-CN')}</dd>
+            <dt>{stageIndex === 0 ? '已检查' : '已发现文件'}</dt>
+            <dd>{seenCount.toLocaleString('zh-CN')}</dd>
           </div>
-          {remaining !== null ? (
+          {stageIndex > 0 ? (
             <div>
-              <dt>待检查</dt>
-              <dd>{remaining.toLocaleString('zh-CN')}</dd>
+              <dt>当前</dt>
+              <dd className="scan-counts__phase">正在比对内容</dd>
             </div>
           ) : null}
           {elapsedLabel ? (
@@ -3575,10 +3578,10 @@ function App() {
   const [report, setReport] = useState<ScanReport | null>(null)
   const [error, setError] = useState<ScanErrorShape | null>(null)
   const [stageIndex, setStageIndex] = useState(0)
-  const [scanCounts, setScanCounts] = useState<{ completed: number; total: number | null }>({
-    completed: 0,
-    total: null,
-  })
+  // Entries seen during enumeration — the only counter the core reports in a
+  // globally meaningful unit. Later stages emit batch-scoped numbers in other
+  // units (tickets, compare pairs), so this freezes once enumeration ends.
+  const [scanSeenCount, setScanSeenCount] = useState(0)
   const [scanStartedAtMs, setScanStartedAtMs] = useState<number | null>(null)
   const [isChoosing, setIsChoosing] = useState(false)
   const [activeScanJobId, setActiveScanJobId] = useState<string | null>(null)
@@ -3588,6 +3591,36 @@ function App() {
   const [scanActionError, setScanActionError] = useState<string | null>(null)
   const [scanStatusWarning, setScanStatusWarning] = useState<string | null>(null)
   const chooseButtonRef = useRef<HTMLButtonElement>(null)
+
+  // Paused time is not scan time: when the job leaves 'paused', shift the
+  // start point forward by however long it sat there, so the elapsed label
+  // resumes where it stopped instead of leaping over the idle span.
+  const pauseStartedAtRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (scanJobPhase === 'paused') {
+      if (pauseStartedAtRef.current === null) pauseStartedAtRef.current = Date.now()
+      return
+    }
+    if (pauseStartedAtRef.current !== null) {
+      const pausedForMs = Date.now() - pauseStartedAtRef.current
+      pauseStartedAtRef.current = null
+      setScanStartedAtMs((current) => (current === null ? current : current + pausedForMs))
+    }
+  }, [scanJobPhase])
+
+  const applyScanProgress = useCallback((progress: ScanProgress) => {
+    const nextStage = {
+      enumerating: 0,
+      sampling: 1,
+      full_hashing: 2,
+      verifying: 3,
+      complete: 4,
+    }[progress.stage]
+    setStageIndex(nextStage)
+    if (progress.stage === 'enumerating') {
+      setScanSeenCount(progress.completed)
+    }
+  }, [])
   const scanAttemptRef = useRef(false)
   const activeScanJobIdRef = useRef<string | null>(null)
   const scanJobPhaseRef = useRef<ScanJobPhase>('running')
@@ -3692,7 +3725,7 @@ function App() {
     const rootToken = selectedRoot.rootToken
     scanAttemptRef.current = true
     setStageIndex(0)
-    setScanCounts({ completed: 0, total: null })
+    setScanSeenCount(0)
     setScanStartedAtMs(Date.now())
     setError(null)
     setScanActionError(null)
@@ -3703,20 +3736,11 @@ function App() {
     try {
       const session = await startDirectoryScanReadOnly(
         rootToken,
-        (progress) => {
-          const nextStage = {
-            enumerating: 0,
-            sampling: 1,
-            full_hashing: 2,
-            verifying: 3,
-            complete: 4,
-          }[progress.stage]
-          setStageIndex(nextStage)
-          setScanCounts({ completed: progress.completed, total: progress.total ?? null })
-        },
+        applyScanProgress,
         setScanStatusWarning,
         observeScanJobPhase,
         setScanAttemptKind,
+        setScanStartedAtMs,
       )
       setActiveScanJobId(session.jobId)
       activeScanJobIdRef.current = session.jobId
@@ -3835,7 +3859,7 @@ function App() {
     setRootAuthorizationExpired(false)
     setSource(demoRoot)
     setStageIndex(0)
-    setScanCounts({ completed: 0, total: null })
+    setScanSeenCount(0)
     setScanStartedAtMs(Date.now())
     setError(null)
     setScanActionError(null)
@@ -3844,17 +3868,7 @@ function App() {
     updateScanJobPhase('running')
     setPhase('scanning')
     try {
-      const demo = await runSyntheticScan((progress) => {
-        const nextStage = {
-          enumerating: 0,
-          sampling: 1,
-          full_hashing: 2,
-          verifying: 3,
-          complete: 4,
-        }[progress.stage]
-        setStageIndex(nextStage)
-        setScanCounts({ completed: progress.completed, total: progress.total ?? null })
-      })
+      const demo = await runSyntheticScan(applyScanProgress)
       setReport(demo)
       setPhase('results')
     } finally {
@@ -3938,7 +3952,7 @@ function App() {
     setReport(null)
     setError(null)
     setStageIndex(0)
-    setScanCounts({ completed: 0, total: null })
+    setScanSeenCount(0)
     setScanStartedAtMs(null)
     setActiveScanJobId(null)
     activeScanJobIdRef.current = null
@@ -4038,7 +4052,7 @@ function App() {
             attemptKind={scanAttemptKind}
             canCancel={activeScanJobId !== null}
             cancelError={scanActionError}
-            completed={scanCounts.completed}
+            seenCount={scanSeenCount}
             isCancelling={isCancelling}
             jobPhase={scanJobPhase}
             onCancel={handleCancelScan}
@@ -4048,7 +4062,6 @@ function App() {
             stageIndex={stageIndex}
             startedAtMs={scanStartedAtMs}
             statusWarning={scanStatusWarning}
-            total={scanCounts.total}
           />
         ) : null}
         {phase === 'results' && report ? (
