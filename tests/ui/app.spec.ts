@@ -435,10 +435,14 @@ test('accepting the page suggestions builds one plan across groups', async ({ pa
 
   // Whatever the action bar promised has to be itemised before anything moves.
   await expect(page.getByRole('heading', { name: /2 组 · 移走 3 个副本/ })).toBeVisible()
+  // Rows are ordered largest reclaimable first, and each names its keeper's
+  // full path so same-named copies stay distinguishable before execution.
   const planned = page.locator('.plan-groups li')
   await expect(planned).toHaveCount(2)
-  await expect(planned.first()).toContainText('移走 2 个')
-  await expect(planned.nth(1)).toContainText('移走 1 个')
+  await expect(planned.first()).toContainText('IMG_7710.MOV')
+  await expect(planned.first()).toContainText('移走 1 个')
+  await expect(planned.nth(1)).toContainText('移走 2 个')
+  await expect(planned.nth(1).locator('code')).toContainText('/Volumes/')
 
   // This build executes one group per run; the copy must say so rather than
   // let the plan total imply the button does all of it.
@@ -447,6 +451,70 @@ test('accepting the page suggestions builds one plan across groups', async ({ pa
 
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
+})
+
+test('the accumulated plan stays reachable and executed groups leave the ledger', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await page.getByRole('button', { name: /接受这一页的建议（2 组）/ }).click()
+
+  // Selecting a group without a decision must not lock the plan away: the
+  // preview gate matches the button that opens it (review finding 1).
+  await page.getByRole('button').filter({ hasText: '为安全保留' }).first().click()
+  await page.getByRole('button', { name: /预览：移走 3 个副本/ }).click()
+  await expect(page.getByRole('heading', { name: '确认整理计划' })).toBeVisible()
+  await expect(page.getByText('请先在结果页选中要执行的那一组。')).toBeVisible()
+  await page.getByRole('button', { name: '返回修改' }).first().click()
+
+  // Execute the first group, then return: its copies must leave the running
+  // totals, its row reads 已整理, and it cannot be re-planned (finding 3).
+  await page.getByRole('button').filter({ hasText: 'IMG_4821.HEIC' }).first().click()
+  await page.getByRole('button', { name: /预览：移走 3 个副本/ }).click()
+  await page.getByRole('button', { name: /执行演示隔离（移走 2 个）/ }).click()
+  await expect(page.getByRole('heading', { name: '2 个副本已移入隔离区' })).toBeVisible()
+  // A fresh operation must not inherit the previous restore state (finding 9).
+  await expect(page.getByRole('button', { name: '恢复这次隔离' })).toBeEnabled()
+
+  await page.getByRole('button', { name: '继续处理重复组' }).click()
+  // The selection is still the executed group, so the bar reports its state
+  // plus what remains of the plan — already-moved copies are not in it.
+  const executedBar = page.getByLabel('当前组操作')
+  await expect(executedBar).toContainText('这一组已整理')
+  await expect(executedBar).toContainText('其余计划：1 组 · 1 个副本待移入隔离区')
+  await expect(page.getByText('已整理').first()).toBeVisible()
+
+  // The executed group offers no keeper controls and no re-execution route.
+  await page.getByRole('button').filter({ hasText: 'IMG_4821.HEIC' }).first().click()
+  await expect(page.getByText('这一组已整理').first()).toBeVisible()
+  await expect(page.getByRole('radio')).toHaveCount(0)
+  await expect(page.getByText('保留哪一份？')).toHaveCount(0)
+  // Its member paths stay visible, read-only.
+  await expect(page.getByText('这一组包含的文件')).toBeVisible()
+  await expect(page.locator('code').filter({ hasText: '/Volumes/影像归档/已整理/2021/05/IMG_4821.HEIC' })).toBeVisible()
+})
+
+test('leaving the results page with pending decisions asks before discarding them', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await page.getByRole('button', { name: /接受这一页的建议（2 组）/ }).click()
+  await expect(page.getByLabel('当前整理计划')).toContainText('已决定 2 组')
+
+  // Dismissing the confirm keeps the plan intact (review finding 2).
+  page.once('dialog', (dialog) => {
+    expect(dialog.message()).toContain('丢弃 2 组尚未执行的决定')
+    void dialog.dismiss()
+  })
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: /活动/ }).click()
+  await expect(page.getByLabel('当前整理计划')).toContainText('已决定 2 组')
+
+  // Accepting it leaves knowingly.
+  page.once('dialog', (dialog) => void dialog.accept())
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: /活动/ }).click()
+  await expect(page.getByRole('heading', { name: '过去的扫描' })).toBeVisible()
 })
 
 test('demo workflow selects the recommended keeper, previews reversible isolation, and restores it', async ({ page }) => {

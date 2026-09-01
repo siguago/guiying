@@ -241,11 +241,15 @@ function DestinationNav({
           const isBlocked = busyReason !== null && !isCurrent
           return (
             <li key={item.id}>
+              {/* aria-disabled instead of disabled: the button stays in the
+                  tab order so keyboard and screen-reader users can reach it
+                  and hear WHY it refuses, instead of it silently vanishing. */}
               <button
                 aria-current={isCurrent ? 'page' : undefined}
-                className={`destination${isCurrent ? ' destination--current' : ''}`}
-                disabled={isBlocked}
-                onClick={() => onNavigate(item.id)}
+                aria-describedby={isBlocked ? `destination-blocked-${item.id}` : undefined}
+                aria-disabled={isBlocked || undefined}
+                className={`destination${isCurrent ? ' destination--current' : ''}${isBlocked ? ' destination--blocked' : ''}`}
+                onClick={() => { if (!isBlocked) onNavigate(item.id) }}
                 title={isBlocked ? busyReason : undefined}
                 type="button"
               >
@@ -255,6 +259,11 @@ function DestinationNav({
                   <small>{item.detail}</small>
                 </span>
               </button>
+              {/* Description, not name: the reason must be announced without
+                  polluting the button's accessible name. */}
+              {isBlocked ? (
+                <span className="visually-hidden" id={`destination-blocked-${item.id}`}>{busyReason}</span>
+              ) : null}
             </li>
           )
         })}
@@ -816,11 +825,13 @@ function ScanningWorkspace({
 
 function GroupRow({
   group,
+  isExecuted,
   isSelected,
   keeperName,
   onSelect,
 }: {
   group: DuplicateGroup
+  isExecuted: boolean
   isSelected: boolean
   keeperName?: string
   onSelect: () => void
@@ -842,7 +853,9 @@ function GroupRow({
         <small>{group.format} · {group.dimensions ?? '尺寸未知'} · {group.memberCount} 份</small>
       </span>
       <span className="group-row__proofs">
-        {group.eligibility !== 'eligible' ? (
+        {isExecuted ? (
+          <span className="decision-proof"><CheckCircle2 aria-hidden="true" size={12} /> 已整理</span>
+        ) : group.eligibility !== 'eligible' ? (
           <span className="decision-proof decision-proof--withheld">
             <ShieldCheck aria-hidden="true" size={12} /> 为安全保留
           </span>
@@ -1691,11 +1704,13 @@ function GroupInspector({
   onRetry,
   onLoadPrevious,
   onLoadNext,
+  isExecuted,
   onClearDecision,
   onSelectKeeper,
   selectedKeeperId,
   selectedKeeperName,
 }: {
+  isExecuted: boolean
   onClearDecision: () => void
   captureTimeStageStatus?: CaptureTimeStageStatus
   group: DuplicateGroup
@@ -1715,6 +1730,10 @@ function GroupInspector({
 }) {
   const selectedKeeper = group.files.find((file) => file.id === selectedKeeperId)
   const hasSelectedKeeper = selectedKeeperId !== undefined
+  // A group accepts a keeper decision only when the engine would accept the
+  // plan and it has not already been executed. Everyone else still gets the
+  // full member list — paths included — just without decision controls.
+  const canDecide = group.eligibility === 'eligible' && !isExecuted
   return (
     <aside aria-labelledby="inspector-title" className="inspector" tabIndex={0}>
       <header className="inspector__header">
@@ -1722,11 +1741,22 @@ function GroupInspector({
         <strong id="inspector-title">{group.previewName}</strong>
         <small>
           {group.memberCount} 份内容完全相同
-          {group.eligibility === 'eligible' ? ` · ${formatBytes(group.reclaimableBytes)} 可隔离` : null}
+          {canDecide ? ` · ${formatBytes(group.reclaimableBytes)} 可隔离` : null}
         </small>
       </header>
 
-      {group.eligibility !== 'eligible' ? (
+      {isExecuted ? (
+        <section aria-labelledby="executed-title" className="inspector-section withheld-section">
+          <div className="inspector-section__title">
+            <span id="executed-title">这一组已整理</span>
+            <span>已执行</span>
+          </div>
+          <p className="withheld-section__reason">
+            其余副本已移入归影隔离区；下面的清单是扫描时记录的原位置。
+          </p>
+          <p className="withheld-section__note">可以从完成页或隔离区恢复这次移动。</p>
+        </section>
+      ) : group.eligibility !== 'eligible' ? (
         // PRD FR-03: a withheld group must be able to answer "why can't this
         // one move?" — and it must not present a keeper control at all, since
         // the engine would refuse the plan anyway.
@@ -1740,13 +1770,16 @@ function GroupInspector({
             这一组的内容确实逐字节完全相同。归影只是不会在这种情况下移动文件；你的照片没有任何改变。
           </p>
         </section>
-      ) : (
+      ) : null}
+
       <section className="inspector-section keeper-section">
         <div className="inspector-section__title">
-          <span>保留哪一份？</span>
-          <span>{hasSelectedKeeper ? '已选择' : '需要你的选择'}</span>
+          <span>{canDecide ? '保留哪一份？' : '这一组包含的文件'}</span>
+          <span>{canDecide ? (hasSelectedKeeper ? '已选择' : '需要你的选择') : `${group.memberCount} 份`}</span>
         </div>
-        <p className="keeper-section__intro">其余完全相同的副本会移入隔离区，之后仍可恢复。</p>
+        {canDecide ? (
+          <p className="keeper-section__intro">其余完全相同的副本会移入隔离区，之后仍可恢复。</p>
+        ) : null}
         {isLoading && group.files.length === 0 ? (
           <div className="inline-load-state" role="status">
             <LoaderCircle aria-hidden="true" className="is-spinning" size={16} /> 正在读取这一页成员…
@@ -1761,36 +1794,47 @@ function GroupInspector({
         ) : null}
         {group.files.length > 0 ? (
           <ol className="group-members">
-            {group.files.map((file) => (
-              <li className={`group-member${selectedKeeperId === file.id ? ' group-member--keeper' : ''}`} key={file.id}>
-                <label className="keeper-choice">
-                  <input
-                    checked={selectedKeeperId === file.id}
-                    name={`keeper-${group.id}`}
-                    onChange={() => onSelectKeeper(file.id)}
-                    type="radio"
-                    value={file.id}
-                  />
-                  <span className="keeper-choice__body">
-                    <span className="group-member__heading">
-                      <strong>{file.name}</strong>
-                      {file.isRecommendedKeeper ? <span>建议保留</span> : <span>完全相同</span>}
-                    </span>
-                    <code title={file.path}>{file.path}</code>
-                    <span className="keeper-choice__facts">
-                      <span>{formatBytes(file.sizeBytes)}</span>
-                      <span>修改 {file.modifiedAt ?? '尚未分析'}</span>
-                      {file.captureTime ? <span>拍摄 {file.captureTime}</span> : null}
-                    </span>
-                    {file.keeperReason ? <small className="keeper-choice__reason">{file.keeperReason}</small> : null}
-                    {file.fileTimeNote ? <small className="group-member__time-note">{file.fileTimeNote}</small> : null}
+            {group.files.map((file) => {
+              const body = (
+                <span className="keeper-choice__body">
+                  <span className="group-member__heading">
+                    <strong>{file.name}</strong>
+                    {canDecide
+                      ? file.isRecommendedKeeper ? <span>建议保留</span> : <span>完全相同</span>
+                      : <span>完全相同</span>}
                   </span>
-                  <span className={`keeper-choice__outcome${selectedKeeperId === file.id ? ' is-keep' : ''}`}>
-                    {selectedKeeperId === file.id ? '保留' : selectedKeeperId ? '隔离' : '选择'}
+                  <code title={file.path}>{file.path}</code>
+                  <span className="keeper-choice__facts">
+                    <span>{formatBytes(file.sizeBytes)}</span>
+                    <span>修改 {file.modifiedAt ?? '尚未分析'}</span>
+                    {file.captureTime ? <span>拍摄 {file.captureTime}</span> : null}
                   </span>
-                </label>
-              </li>
-            ))}
+                  {canDecide && file.keeperReason ? <small className="keeper-choice__reason">{file.keeperReason}</small> : null}
+                  {file.fileTimeNote ? <small className="group-member__time-note">{file.fileTimeNote}</small> : null}
+                </span>
+              )
+              return (
+                <li className={`group-member${selectedKeeperId === file.id ? ' group-member--keeper' : ''}`} key={file.id}>
+                  {canDecide ? (
+                    <label className="keeper-choice">
+                      <input
+                        checked={selectedKeeperId === file.id}
+                        name={`keeper-${group.id}`}
+                        onChange={() => onSelectKeeper(file.id)}
+                        type="radio"
+                        value={file.id}
+                      />
+                      {body}
+                      <span className={`keeper-choice__outcome${selectedKeeperId === file.id ? ' is-keep' : ''}`}>
+                        {selectedKeeperId === file.id ? '保留' : selectedKeeperId ? '隔离' : '选择'}
+                      </span>
+                    </label>
+                  ) : (
+                    <div className="keeper-choice keeper-choice--readonly">{body}</div>
+                  )}
+                </li>
+              )
+            })}
           </ol>
         ) : null}
         {(canLoadPrevious || canLoadNext) && !loadError ? (
@@ -1805,9 +1849,8 @@ function GroupInspector({
           </nav>
         ) : null}
       </section>
-      )}
 
-      {group.eligibility === 'eligible' ? (
+      {canDecide ? (
       <section className="inspector-section">
         <div className="inspector-section__title"><span>本组决定</span><span>{hasSelectedKeeper ? '1 保留 · 其余隔离' : '尚未形成'}</span></div>
         {hasSelectedKeeper ? (
@@ -2332,10 +2375,12 @@ function ResultsWorkspace({
   report,
   onReset,
   onStageChange,
+  onPlanStateChange,
 }: {
   report: ScanReport
   onReset: () => void
   onStageChange: (stage: ResultStage) => void
+  onPlanStateChange: (state: { decidedCount: number; isRestoring: boolean }) => void
 }) {
   const [stage, setStage] = useState<ResultStage>('review')
   // Keyed by group id and kept across pages. Each decision carries the numbers
@@ -2345,11 +2390,25 @@ function ResultsWorkspace({
     fileId: string
     fileName: string
     ordinal?: string
+    keeperPath: string
     groupName: string
     moveCount: number
     reclaimableBytes: number
   }>>({})
   const [isAcceptingSuggestions, setIsAcceptingSuggestions] = useState(false)
+  // Executed groups leave the plan ledger the moment they succeed: totals must
+  // never keep counting copies that are already in quarantine, and the
+  // completion page renders from this snapshot rather than from a decision
+  // that no longer exists.
+  const [executedGroupIds, setExecutedGroupIds] = useState<ReadonlySet<string>>(new Set())
+  const [completedOperation, setCompletedOperation] = useState<{
+    groupId: string
+    groupName: string
+    fileName: string
+    keeperPath: string
+    moveCount: number
+    reclaimableBytes: number
+  } | null>(null)
   const [demoRestored, setDemoRestored] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [liveOperationId, setLiveOperationId] = useState<string | null>(null)
@@ -2594,10 +2653,37 @@ function ResultsWorkspace({
       bytes: decisions.reduce((sum, decision) => sum + decision.reclaimableBytes, 0),
     }
   }, [keeperSelections])
-  const undecidedOnPage = eligibleGroups.filter((group) => !keeperSelections[group.id]).length
+  const undecidedOnPage = eligibleGroups.filter(
+    (group) => !keeperSelections[group.id] && !executedGroupIds.has(group.id),
+  ).length
+
+  // Lift what App's navigation guards need: how many undecided-but-committed
+  // groups a leave would discard, and whether a restore is in flight. Cleared
+  // on unmount so stale values can never block navigation later.
+  useEffect(() => {
+    onPlanStateChange({ decidedCount: planTotals.groupCount, isRestoring })
+    return () => onPlanStateChange({ decidedCount: 0, isRestoring: false })
+  }, [onPlanStateChange, planTotals.groupCount, isRestoring])
 
   const currentDecision = selectedGroup ? keeperSelections[selectedGroup.id] : undefined
-  const currentMoveCount = selectedGroup ? Math.max(0, selectedGroup.memberCount - 1) : 0
+  const selectedGroupExecuted = selectedGroup ? executedGroupIds.has(selectedGroup.id) : false
+
+  // Both writers (manual pick and bulk accept) assemble the denormalized
+  // snapshot here, so the shape cannot drift between them.
+  function keeperDecisionFor(
+    group: DuplicateGroup,
+    file: { id: string; name: string; ordinal?: string; path: string },
+  ) {
+    return {
+      fileId: file.id,
+      fileName: file.name,
+      ordinal: file.ordinal,
+      keeperPath: file.path,
+      groupName: group.previewName,
+      moveCount: Math.max(0, group.memberCount - 1),
+      reclaimableBytes: group.reclaimableBytes,
+    }
+  }
 
   function selectKeeper(fileId: string) {
     if (!selectedGroup) return
@@ -2606,14 +2692,7 @@ function ResultsWorkspace({
     setActionError(null)
     setKeeperSelections((current) => ({
       ...current,
-      [selectedGroup.id]: {
-        fileId: file.id,
-        fileName: file.name,
-        ordinal: file.ordinal,
-        groupName: selectedGroup.previewName,
-        moveCount: Math.max(0, selectedGroup.memberCount - 1),
-        reclaimableBytes: selectedGroup.reclaimableBytes,
-      },
+      [selectedGroup.id]: keeperDecisionFor(selectedGroup, file),
     }))
   }
 
@@ -2630,12 +2709,15 @@ function ResultsWorkspace({
   /// and guiying does not load the whole library to offer a bulk action.
   async function acceptPageSuggestions() {
     if (isAcceptingSuggestions) return
-    const pending = eligibleGroups.filter((group) => !keeperSelections[group.id])
+    const pending = eligibleGroups.filter(
+      (group) => !keeperSelections[group.id] && !executedGroupIds.has(group.id),
+    )
     if (pending.length === 0) return
     setIsAcceptingSuggestions(true)
     setActionError(null)
     const accepted: typeof keeperSelections = {}
-    let skipped = 0
+    let readFailures = 0
+    let withoutSuggestion = 0
     const resultReadToken = report.resultReadToken
     try {
       for (const group of pending) {
@@ -2645,39 +2727,45 @@ function ResultsWorkspace({
           try {
             files = (await loadDuplicateGroupMemberPage(resultReadToken, group.id, null)).files
           } catch {
-            skipped += 1
+            // A transport failure is not "no suggestion": the group may well
+            // have one, so tell the user to retry rather than to pick manually.
+            readFailures += 1
             continue
           }
         }
         const suggested = files.find((file) => file.isRecommendedKeeper)
         if (!suggested) {
-          skipped += 1
+          withoutSuggestion += 1
           continue
         }
-        accepted[group.id] = {
-          fileId: suggested.id,
-          fileName: suggested.name,
-          ordinal: suggested.ordinal,
-          groupName: group.previewName,
-          moveCount: Math.max(0, group.memberCount - 1),
-          reclaimableBytes: group.reclaimableBytes,
-        }
+        accepted[group.id] = keeperDecisionFor(group, suggested)
       }
       if (Object.keys(accepted).length > 0) {
-        setKeeperSelections((current) => ({ ...current, ...accepted }))
+        // The user's own picks always win: a keeper chosen while this loop was
+        // fetching must never be replaced by the pre-loop suggestion snapshot.
+        setKeeperSelections((current) => {
+          const next = { ...current }
+          for (const [groupId, decision] of Object.entries(accepted)) {
+            if (!next[groupId]) next[groupId] = decision
+          }
+          return next
+        })
       }
-      if (skipped > 0) {
-        // Never silently under-apply: say how many groups still need a choice.
-        setActionError(`${skipped} 组没有可用的建议，仍需要你自己选择保留项。`)
-      }
+      const parts: string[] = []
+      if (readFailures > 0) parts.push(`${readFailures} 组读取失败，可以再点一次重试`)
+      if (withoutSuggestion > 0) parts.push(`${withoutSuggestion} 组没有可用的建议，需要你自己选择保留项`)
+      // Never silently under-apply: whatever was not decided gets named.
+      if (parts.length > 0) setActionError(`${parts.join('；')}。`)
     } finally {
       setIsAcceptingSuggestions(false)
     }
   }
 
-  function previewCurrentDecision() {
-    if (!selectedGroup || !currentDecision) {
-      setActionError('请先在当前重复组中选择要保留的一份。')
+  function previewPlan() {
+    // Same gate as the button that opens it: any decided group is enough. The
+    // plan page itself explains which single group this build will execute.
+    if (planTotals.groupCount === 0) {
+      setActionError('请先为至少一组选择要保留的一份。')
       return
     }
     setActionError(null)
@@ -2685,11 +2773,38 @@ function ResultsWorkspace({
     setStage('plan')
   }
 
+  // Consume the executed group's decision: snapshot what the completion page
+  // needs, mark the group done, and take it out of the plan ledger so totals
+  // stop counting copies that are already in quarantine.
+  function settleExecutedGroup(groupId: string, decision: NonNullable<typeof currentDecision>) {
+    setCompletedOperation({
+      groupId,
+      groupName: decision.groupName,
+      fileName: decision.fileName,
+      keeperPath: decision.keeperPath,
+      moveCount: decision.moveCount,
+      reclaimableBytes: decision.reclaimableBytes,
+    })
+    setExecutedGroupIds((current) => new Set(current).add(groupId))
+    setKeeperSelections((current) => {
+      const { [groupId]: _executed, ...rest } = current
+      return rest
+    })
+  }
+
   async function executeCurrentPlan() {
     setActionError(null)
+    // A fresh execution gets a fresh restore state: the previous operation's
+    // "已恢复" must not leak onto the next completion page.
+    setDemoRestored(false)
+    if (!selectedGroup || !currentDecision) {
+      setActionError('请先在结果页选中要执行的那一组。')
+      return
+    }
     if (report.dataMode === 'synthetic') {
       setStage('executing')
       await new Promise((resolve) => window.setTimeout(resolve, 420))
+      settleExecutedGroup(selectedGroup.id, currentDecision)
       setStage('complete')
       return
     }
@@ -2697,7 +2812,7 @@ function ResultsWorkspace({
       setActionError('真实隔离仍在安全验证中；当前版本不会移动本地文件。')
       return
     }
-    if (!report.resultReadToken || !selectedGroup || !currentDecision?.ordinal) {
+    if (!report.resultReadToken || !currentDecision.ordinal) {
       setActionError('这一组缺少隔离所需的文件身份记录；请重新扫描后再试。')
       return
     }
@@ -2714,10 +2829,11 @@ function ResultsWorkspace({
         return
       }
       const result = await executeQuarantinePlan(plan.planToken)
-      if (result.movedCount !== currentMoveCount) {
+      if (result.movedCount !== currentDecision.moveCount) {
         throw new Error('实际隔离数量与预览不一致；恢复清单仍保留，请先查看隔离区。')
       }
       setLiveOperationId(result.operationId)
+      settleExecutedGroup(selectedGroup.id, currentDecision)
       setStage('complete')
     } catch (planError) {
       setStage('plan')
@@ -2759,8 +2875,12 @@ function ResultsWorkspace({
   }
 
   if (planTotals.groupCount > 0 && (stage === 'plan' || stage === 'executing')) {
+    // Integer-like ids would otherwise enumerate in numeric key order, which
+    // differs between demo and sealed data; sort explicitly, largest first.
     const planEntries = Object.entries(keeperSelections)
+      .sort(([, a], [, b]) => b.reclaimableBytes - a.reclaimableBytes)
     const executableEntry = selectedGroup && currentDecision ? selectedGroup.id : null
+    const executableDecision = executableEntry ? keeperSelections[executableEntry] : null
     return (
       <main className="workspace workspace--results plan-workspace">
         <header className="plan-header">
@@ -2817,6 +2937,7 @@ function ResultsWorkspace({
                 <div>
                   <strong>{decision.groupName}</strong>
                   <small>保留 {decision.fileName}</small>
+                  <code title={decision.keeperPath}>{decision.keeperPath}</code>
                 </div>
                 <span>移走 {decision.moveCount.toLocaleString('zh-CN')} 个 · {formatBytes(decision.reclaimableBytes)}</span>
               </li>
@@ -2839,8 +2960,8 @@ function ResultsWorkspace({
             // build executes one group per run.
             <div className="plan-demo-note plan-demo-note--locked">
               <Info size={15} /> 本版本一次执行一组。
-              {executableEntry
-                ? `这次会处理「${keeperSelections[executableEntry]?.groupName}」，其余 ${planTotals.groupCount - 1} 组的决定会保留。`
+              {executableDecision
+                ? `这次会处理「${executableDecision.groupName}」，其余 ${planTotals.groupCount - 1} 组的决定会保留。`
                 : '请先在结果页选中要执行的那一组。'}
             </div>
           ) : null}
@@ -2860,9 +2981,9 @@ function ResultsWorkspace({
               {stage === 'executing'
                 ? <><LoaderCircle className="is-spinning" size={16} /> 正在复核并隔离…</>
                 : <><Archive size={16} /> {report.dataMode === 'synthetic'
-                  ? `执行演示隔离（移走 ${currentMoveCount} 个）`
+                  ? `执行演示隔离（移走 ${executableDecision?.moveCount ?? 0} 个）`
                   : internalQuarantineEnabled
-                    ? `重新授权并移走 ${currentMoveCount} 个副本`
+                    ? `重新授权并移走 ${executableDecision?.moveCount ?? 0} 个副本`
                     : '真实隔离仍在安全验证中'}</>}
             </button>
           </div>
@@ -2871,18 +2992,18 @@ function ResultsWorkspace({
     )
   }
 
-  if (selectedGroup && currentDecision && (stage === 'complete' || stage === 'restore')) {
+  if (completedOperation && (stage === 'complete' || stage === 'restore')) {
     return (
       <main className="workspace workspace--results completion-workspace">
         <section className="completion-hero" aria-live="polite">
           <span className="completion-hero__icon"><Check size={28} /></span>
           <span className="section-kicker">隔离完成 · 可以恢复</span>
-          <h1>{currentMoveCount} 个副本已移入隔离区</h1>
+          <h1>{completedOperation.moveCount} 个副本已移入隔离区</h1>
           <p>{report.dataMode === 'synthetic' ? '这是合成数据状态演示；未访问本地文件。' : '保留项仍在原位。'} 归影没有永久删除文件，也没有改写照片内容或时间。</p>
           <div className="completion-summary">
-            <span><strong>{currentDecision.fileName}</strong><small>保留原位</small></span>
-            <span><strong>{currentMoveCount}</strong><small>隔离副本</small></span>
-            <span><strong>{formatBytes(selectedGroup.reclaimableBytes)}</strong><small>逻辑空间</small></span>
+            <span><strong>{completedOperation.fileName}</strong><small title={completedOperation.keeperPath}>保留原位</small></span>
+            <span><strong>{completedOperation.moveCount}</strong><small>隔离副本</small></span>
+            <span><strong>{formatBytes(completedOperation.reclaimableBytes)}</strong><small>逻辑空间</small></span>
           </div>
         </section>
 
@@ -3041,6 +3162,7 @@ function ResultsWorkspace({
                   {eligibleGroups.map((group) => (
                     <GroupRow
                       group={group}
+                      isExecuted={executedGroupIds.has(group.id)}
                       isSelected={group.id === selectedGroup?.id}
                       keeperName={keeperSelections[group.id]?.fileName}
                       key={group.id}
@@ -3061,6 +3183,7 @@ function ResultsWorkspace({
                   {withheldGroups.map((group) => (
                     <GroupRow
                       group={group}
+                      isExecuted={executedGroupIds.has(group.id)}
                       isSelected={group.id === selectedGroup?.id}
                       keeperName={keeperSelections[group.id]?.fileName}
                       key={group.id}
@@ -3120,6 +3243,7 @@ function ResultsWorkspace({
             onLoadNext={() => void loadNextMembers()}
             onLoadPrevious={() => void loadPreviousMembers()}
             onRetry={() => void retryMembers()}
+            isExecuted={selectedGroupExecuted}
             onClearDecision={() => selectedGroup && clearDecision(selectedGroup.id)}
             onSelectKeeper={selectKeeper}
             selectedKeeperId={currentDecision?.fileId}
@@ -3135,6 +3259,33 @@ function ResultsWorkspace({
             </span>
             <span>{selectedGroup.blockReasonCopy}</span>
           </div>
+          {actionError ? <span className="review-action-bar__error" role="alert">{actionError}</span> : null}
+          {planTotals.groupCount > 0 ? (
+            <button className="button button--ink" onClick={previewPlan} type="button">
+              {`预览：移走 ${planTotals.moveCount.toLocaleString('zh-CN')} 个副本`}
+              <ArrowRight aria-hidden="true" size={16} />
+            </button>
+          ) : null}
+        </section>
+      ) : selectedGroup && selectedGroupExecuted ? (
+        <section aria-label="当前组操作" className="review-action-bar">
+          <div className="review-action-bar__summary">
+            <span className="review-action-bar__status is-ready">
+              <Check size={14} /> 这一组已整理
+            </span>
+            <span>
+              {planTotals.groupCount > 0
+                ? `其余计划：${planTotals.groupCount.toLocaleString('zh-CN')} 组 · ${planTotals.moveCount.toLocaleString('zh-CN')} 个副本待移入隔离区`
+                : '副本已移入隔离区，可从完成页或隔离区恢复'}
+            </span>
+          </div>
+          {actionError ? <span className="review-action-bar__error" role="alert">{actionError}</span> : null}
+          {planTotals.groupCount > 0 ? (
+            <button className="button button--ink" onClick={previewPlan} type="button">
+              {`预览：移走 ${planTotals.moveCount.toLocaleString('zh-CN')} 个副本`}
+              <ArrowRight aria-hidden="true" size={16} />
+            </button>
+          ) : null}
         </section>
       ) : selectedGroup ? (
         // The bar reports the whole plan, not just the selected group: with
@@ -3160,7 +3311,7 @@ function ResultsWorkspace({
           <button
             className="button button--ink"
             disabled={planTotals.groupCount === 0}
-            onClick={previewCurrentDecision}
+            onClick={previewPlan}
             type="button"
           >
             {planTotals.moveCount > 0
@@ -3417,6 +3568,7 @@ function rootGrantExpired(grant: SelectedScanRoot | null): boolean {
 function App() {
   const [phase, setPhase] = useState<AppPhase>('idle')
   const [resultStage, setResultStage] = useState<ResultStage>('review')
+  const [resultsPlanState, setResultsPlanState] = useState({ decidedCount: 0, isRestoring: false })
   const [source, setSource] = useState<string | null>(null)
   const [selectedRoot, setSelectedRoot] = useState<SelectedScanRoot | null>(null)
   const [rootAuthorizationExpired, setRootAuthorizationExpired] = useState(false)
@@ -3710,15 +3862,40 @@ function App() {
     }
   }
 
+  // One busy source for the nav's display AND the handlers' own refusal, so a
+  // future caller (keyboard shortcut, deep link) cannot bypass the guard the
+  // way a DOM disabled attribute could.
+  const appBusyReason = phase === 'scanning'
+    ? '扫描进行中；停止扫描后可以离开'
+    : phase === 'results' && resultStage === 'executing'
+      ? '正在移动文件；完成后可以离开'
+      : phase === 'results' && resultsPlanState.isRestoring
+        ? '正在恢复文件；完成后可以离开'
+        : null
+
+  // Leaving the results page destroys the in-memory report and every keeper
+  // decision with it. A busy workspace refuses outright; a plan in progress is
+  // the user's to discard, but only knowingly.
+  function confirmLeaveResults(): boolean {
+    if (appBusyReason !== null) return false
+    if (phase === 'results' && resultsPlanState.decidedCount > 0) {
+      return window.confirm(
+        `离开整理会丢弃 ${resultsPlanState.decidedCount} 组尚未执行的决定；这不会移动任何照片。仍要离开吗？`,
+      )
+    }
+    return true
+  }
+
   // The organize destination returns to wherever the main flow currently is:
   // an in-memory report stays on its results page, otherwise start over at the
   // picker. It never cancels a scan — the nav blocks that instead.
   function handleOrganize() {
-    if (phase === 'scanning' || resultStage === 'executing') return
+    if (appBusyReason !== null) return
     setPhase(report ? 'results' : 'idle')
   }
 
   function handleHistory() {
+    if (!confirmLeaveResults()) return
     setReport(null)
     setError(null)
     setScanActionError(null)
@@ -3730,6 +3907,7 @@ function App() {
 
   function handleRestore() {
     if (!internalQuarantineEnabled) return
+    if (!confirmLeaveResults()) return
     setSource(null)
     setSelectedRoot(null)
     setRootAuthorizationExpired(false)
@@ -3795,13 +3973,7 @@ function App() {
         </div>
         <DestinationNav
           current={phase === 'history' ? 'activity' : phase === 'restore' ? 'quarantine' : 'organize'}
-          busyReason={
-            phase === 'scanning'
-              ? '扫描进行中；停止扫描后可以离开'
-              : resultStage === 'executing'
-                ? '正在移动文件；完成后可以离开'
-                : null
-          }
+          busyReason={appBusyReason}
           onNavigate={(id) => {
             if (id === 'activity') handleHistory()
             else if (id === 'quarantine') handleRestore()
@@ -3880,7 +4052,12 @@ function App() {
           />
         ) : null}
         {phase === 'results' && report ? (
-          <ResultsWorkspace onReset={reset} onStageChange={setResultStage} report={report} />
+          <ResultsWorkspace
+            onPlanStateChange={setResultsPlanState}
+            onReset={reset}
+            onStageChange={setResultStage}
+            report={report}
+          />
         ) : null}
         {phase === 'error' && error ? <ErrorWorkspace error={error} onReset={reset} /> : null}
       </div>

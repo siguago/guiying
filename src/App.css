@@ -111,9 +111,15 @@
   outline-offset: 2px;
 }
 
-.destination:disabled {
+.destination:disabled,
+.destination--blocked {
   color: color-mix(in srgb, var(--semantic-text-inverse) 38%, transparent);
   cursor: not-allowed;
+}
+
+.destination--blocked:hover {
+  color: color-mix(in srgb, var(--semantic-text-inverse) 38%, transparent);
+  background: none;
 }
 
 .destination--current {
@@ -2886,6 +2892,13 @@
   align-items: start;
   padding: 12px;
   cursor: pointer;
+}
+
+/* Read-only variant: same body, no radio column, no pointer affordance —
+   used for withheld and already-executed groups whose members stay visible. */
+.keeper-choice--readonly {
+  grid-template-columns: minmax(0, 1fr);
+  cursor: default;
 }
 
 .keeper-choice > input {
