@@ -1454,16 +1454,16 @@ export async function loadDuplicateGroupMemberPage(
         ),
         fileTimeNote: fileTimePrecisionNote(file.timestampGranularityNs),
         // Suggested natively from sealed evidence (scan_service::
-        // suggest_group_keeper). A suggestion is information, never
+        // suggest_keeper_from_members). A suggestion is information, never
         // authorisation: the user still chooses, and the plan compiler
-        // re-derives eligibility on its own. A suggestion without a reason is
-        // dropped rather than shown unexplained.
-        isRecommendedKeeper: file.suggestedKeeper === true
+        // re-derives eligibility on its own. A suggestion without a reason —
+        // or a reason without the flag — is dropped rather than shown
+        // half-explained.
+        ...(file.suggestedKeeper === true
           && typeof file.suggestionReason === 'string'
-          && file.suggestionReason.length > 0,
-        keeperReason: typeof file.suggestionReason === 'string' && file.suggestionReason.length > 0
-          ? file.suggestionReason
-          : undefined,
+          && file.suggestionReason.length > 0
+          ? { isRecommendedKeeper: true, keeperReason: file.suggestionReason }
+          : { isRecommendedKeeper: false }),
       }
     }),
     nextCursor: page.nextCursor,

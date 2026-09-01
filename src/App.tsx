@@ -820,7 +820,7 @@ function ScanningWorkspace({
           </span>
         ) : stageIndex === 0
           ? '暂停后可以继续；退出应用需要重新扫描。随时可以停止。'
-          : '停止后已检查的结果仍会保留；扫描不会移动、改名或修改照片。')}
+          : '停止后本次结果不会保存，需要重新扫描；扫描不会移动、改名或修改照片。')}
       </div>
     </main>
   )
@@ -3061,7 +3061,8 @@ function ResultsWorkspace({
           <p className="results-scale">
             共检查 {report.mediaFiles.toLocaleString('zh-CN')} 个媒体文件，其中{' '}
             {report.duplicateFiles.toLocaleString('zh-CN')} 个是重复副本，重复占用{' '}
-            {formatBytes(report.reclaimableBytes)}；移入隔离区暂不会释放空间。
+            {formatBytes(report.reclaimableBytes)}；移入隔离区暂不会释放空间，
+            克隆或快照产生的副本也可能并不额外占用磁盘。
           </p>
           <p title={report.root}>{report.root}</p>
           {report.resultOrigin === 'history' ? (
