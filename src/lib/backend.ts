@@ -18,6 +18,7 @@ import type {
   CaptureTimeMetadataReport,
   CaptureTimeStageSummary,
   DuplicateGroup,
+  GroupEligibility,
   HistoryExportFormat,
   HistoryExportPathPolicy,
   HistoryExportResult,
@@ -246,6 +247,9 @@ interface CoreDuplicateGroupItem {
   previewPath: string
   logicalReclaimableBytes: string
   finalizedAtUnixMs: string
+  eligibility: string
+  blockReasonCode: string | null
+  blockReasonCopy: string | null
 }
 
 interface CoreDuplicateGroupMemberItem {
@@ -257,6 +261,8 @@ interface CoreDuplicateGroupMemberItem {
   nativePath?: CoreNativePathRef
   sizeBytes: string
   hasStableFileIdentity: boolean
+  suggestedKeeper: boolean
+  suggestionReason: string | null
   birthTimeSeconds: string | null
   birthTimeNanoseconds: string | null
   modifiedTimeSeconds: string
@@ -690,9 +696,62 @@ function formatUtcInstant(seconds: string | null, nanoseconds: string | null): s
   return `Unix ${seconds}.${nanos.toString().padStart(9, '0')} 秒 UTC`
 }
 
+function adaptGroupEligibility(group: CoreDuplicateGroupItem): {
+  eligibility: GroupEligibility
+  blockReasonCode: string | null
+  blockReasonCopy: string | null
+} {
+  // Fail closed: an unrecognised verdict, or a withheld group that cannot say
+  // why, is treated as blocked. Only an exact 'eligible' with no reason
+  // attached may offer the group for planning.
+  const withheld = (code: string, copy: string) => ({
+    eligibility: 'blocked' as const,
+    blockReasonCode: code,
+    blockReasonCopy: copy,
+  })
+  if (group.eligibility === 'eligible') {
+    if (group.blockReasonCode !== null || group.blockReasonCopy !== null) {
+      return withheld(
+        'GROUP_ELIGIBILITY_INCONSISTENT',
+        '这一组的资格判定自相矛盾，归影不会在结论不一致时提供整理入口。',
+      )
+    }
+    return { eligibility: 'eligible', blockReasonCode: null, blockReasonCopy: null }
+  }
+  if (!ipcContract.groupEligibilityKinds.includes(group.eligibility)) {
+    return withheld(
+      'GROUP_ELIGIBILITY_UNKNOWN',
+      '这一组返回了归影无法识别的资格结论，已按不可整理处理。',
+    )
+  }
+  if (group.eligibility !== 'review_required' && group.eligibility !== 'blocked') {
+    return withheld(
+      'GROUP_ELIGIBILITY_UNKNOWN',
+      '这一组返回了归影无法识别的资格结论，已按不可整理处理。',
+    )
+  }
+  if (
+    typeof group.blockReasonCode !== 'string'
+    || group.blockReasonCode.length === 0
+    || typeof group.blockReasonCopy !== 'string'
+    || group.blockReasonCopy.length === 0
+  ) {
+    return withheld(
+      'GROUP_ELIGIBILITY_UNEXPLAINED',
+      '这一组暂不能整理，但没有返回原因；归影不会在无法解释时提供整理入口。',
+    )
+  }
+  return {
+    eligibility: group.eligibility,
+    blockReasonCode: group.blockReasonCode,
+    blockReasonCopy: group.blockReasonCopy,
+  }
+}
+
 function adaptGroup(group: CoreDuplicateGroupItem): DuplicateGroup {
   const memberCount = decimalToSafeNumber(group.memberCount, '重复组成员数量')
   return {
+    ...adaptGroupEligibility(group),
     id: group.groupBuildId,
     hashPrefix: `组:${group.groupKeyHex.slice(0, 10)}…`,
     previewName: fileNameFromPath(group.previewPath),
@@ -710,7 +769,7 @@ function adaptGroup(group: CoreDuplicateGroupItem): DuplicateGroup {
     evidence: [
       {
         label: '拍摄时间',
-        value: '选择该组后按需读取封印证据',
+        value: '选择该组后按需读取时间证据',
         source: '拍摄时间分析与 D1 内容判定保持分离',
         confidence: 'low',
         note: '文件系统时间只作为独立关系线索，不会据此自动选择主副本。',
@@ -1394,10 +1453,17 @@ export async function loadDuplicateGroupMemberPage(
           '文件修改时间',
         ),
         fileTimeNote: fileTimePrecisionNote(file.timestampGranularityNs),
-        // The persisted ordinal is only a deterministic evidence ordering. It is
-        // never a keeper decision, and the read-only pipeline currently seals no
-        // keeper policy.
-        isRecommendedKeeper: false,
+        // Suggested natively from sealed evidence (scan_service::
+        // suggest_keeper_from_members). A suggestion is information, never
+        // authorisation: the user still chooses, and the plan compiler
+        // re-derives eligibility on its own. A suggestion without a reason —
+        // or a reason without the flag — is dropped rather than shown
+        // half-explained.
+        ...(file.suggestedKeeper === true
+          && typeof file.suggestionReason === 'string'
+          && file.suggestionReason.length > 0
+          ? { isRecommendedKeeper: true, keeperReason: file.suggestionReason }
+          : { isRecommendedKeeper: false }),
       }
     }),
     nextCursor: page.nextCursor,
@@ -2652,6 +2718,7 @@ export async function startDirectoryScanReadOnly(
   onStatusWarning?: (warning: string | null) => void,
   onPhase?: (phase: ScanJobPhase) => void,
   onAttemptKind?: (attemptKind: ScanAttemptKind) => void,
+  onStartedAt?: (startedAtUnixMs: number) => void,
 ): Promise<ReadOnlyScanSession> {
   if (!isTauri()) {
     throw new Error('浏览器预览不能读取本地目录；请运行桌面应用，或使用明确标注的合成数据演示。')
@@ -2683,12 +2750,20 @@ export async function startDirectoryScanReadOnly(
       onStatusWarning,
       onPhase,
       onAttemptKind,
+      onProgress,
+      onStartedAt,
     )
     return { jobId: response.jobId, result }
   } catch (error) {
     const existingJobId = recoverableExistingJobId(error)
     if (existingJobId) {
       expectedJobId = existingJobId
+      // Attaching to an already-running job must not present a blank scan:
+      // replay the event buffered before the start response (the success
+      // branch already does), and let the status poll below fill in the rest.
+      if (progressBeforeStartResponse?.jobId === expectedJobId) {
+        onProgress?.(progressBeforeStartResponse)
+      }
       const result = waitForScanResult(
         existingJobId,
         startedAt,
@@ -2696,6 +2771,8 @@ export async function startDirectoryScanReadOnly(
         onStatusWarning,
         onPhase,
         onAttemptKind,
+        onProgress,
+        onStartedAt,
       )
       return { jobId: existingJobId, result }
     }
@@ -2734,10 +2811,13 @@ async function waitForScanResult(
   onStatusWarning?: (warning: string | null) => void,
   onPhase?: (phase: ScanJobPhase) => void,
   onAttemptKind?: (attemptKind: ScanAttemptKind) => void,
+  onProgress?: (progress: ScanProgress) => void,
+  onStartedAt?: (startedAtUnixMs: number) => void,
 ): Promise<ScanReport> {
   let consecutiveStatusFailures = 0
   let observedAttemptKind: ScanAttemptKind | null = null
   let observedScanRunId: string | null = null
+  let reportedStartedAt = false
   try {
     for (;;) {
       let rawStatus: unknown
@@ -2774,6 +2854,16 @@ async function waitForScanResult(
         onAttemptKind?.(status.attemptKind)
       }
       onPhase?.(status.phase)
+      // The poll carries the job's own start time and latest progress; feed
+      // both back so attaching to a long-running job shows its real elapsed
+      // time and stage instead of a fresh-looking zero state.
+      if (!reportedStartedAt) {
+        reportedStartedAt = true
+        onStartedAt?.(status.startedAtUnixMs)
+      }
+      if (status.progress !== null) {
+        onProgress?.(status.progress)
+      }
 
       if (status.phase === 'completed' || status.phase === 'cancelled') {
         const measuredDuration = status.finishedAtUnixMs === null
@@ -3162,7 +3252,14 @@ export async function runSyntheticScan(
     'complete',
   ]
   for (const [index, stage] of stages.entries()) {
-    onProgress?.({ stage, completed: index + 1, total: stages.length })
+    // Only the enumeration counter means "entries seen" globally; later
+    // stages report batch-scoped numbers the UI deliberately ignores, so the
+    // demo emits a plausible entry count rather than its loop index.
+    onProgress?.({
+      stage,
+      completed: stage === 'enumerating' ? 18_642 : index + 1,
+      total: stage === 'enumerating' ? null : stages.length,
+    })
     await new Promise((resolve) => window.setTimeout(resolve, 260))
   }
   return createDemoReport(DEMO_ROOT)

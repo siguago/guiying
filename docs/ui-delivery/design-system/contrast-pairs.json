@@ -42,6 +42,20 @@
       "foreground": "#6756d9",
       "background": "#eceaff",
       "minimum": 3.0
+    },
+    {
+      "name": "Amber warning text on amber notice surface",
+      "role": "small-text",
+      "foreground": "#7d4600",
+      "background": "#ffefd3",
+      "minimum": 4.5
+    },
+    {
+      "name": "Amber warning text on white work surface",
+      "role": "small-text",
+      "foreground": "#7d4600",
+      "background": "#ffffff",
+      "minimum": 4.5
     }
   ]
 }

@@ -13,5 +13,10 @@
   "maxRawMetadataFieldBytes": 1048576,
   "maxCursorBytes": 16384,
   "maxHistoryRootDisplayBytes": 65536,
-  "maxHistoryScanModeBytes": 64
+  "maxHistoryScanModeBytes": 64,
+  "groupEligibilityKinds": [
+    "eligible",
+    "review_required",
+    "blocked"
+  ]
 }

@@ -289,9 +289,9 @@ async function installHistoryExportFixture(page: Page, mode: HistoryExportFixtur
 
 async function openHistoryExportPanel(page: Page) {
   await page.goto('/')
-  await page.getByRole('button', { name: '查看历史报告' }).click()
-  await page.getByRole('button', { name: '打开 Archive/Export 的封存报告' }).click()
-  await expect(page.getByRole('heading', { name: '导出封存报告' })).toBeVisible()
+  await page.getByRole('button', { name: '活动记录' }).click()
+  await page.getByRole('button', { name: '打开 Archive/Export 的扫描记录' }).click()
+  await expect(page.getByRole('heading', { name: '导出活动记录（可选）' })).toBeVisible()
 }
 
 test('landing page communicates the read-only boundary', async ({ page }, testInfo) => {
@@ -301,13 +301,21 @@ test('landing page communicates the read-only boundary', async ({ page }, testIn
   await expect(page.getByRole('heading', { name: /先看证据/ })).toBeVisible()
   await expect(page.getByText('完全本地 · 只读扫描')).toBeVisible()
   await expect(page.getByText(/真实隔离通过安全验证后才会开放/)).toBeVisible()
-  await expect(page.getByRole('navigation', { name: '整理流程' })).toContainText('预览整理计划')
-  await expect(page.getByRole('navigation', { name: '整理流程' })).toContainText('真实执行仍锁定')
   await expect(page.getByText('本地处理 · 无主动变更')).toBeVisible()
-  await expect(page.getByText('不主动改文件')).toBeVisible()
   await expect(page.getByRole('button', { name: '请在桌面应用中选择目录' })).toBeDisabled()
-  await expect(page.getByRole('button', { name: '恢复隔离文件' })).toBeDisabled()
-  await expect(page.getByText(/当前没有已开放的隔离记录.*真实隔离仍在安全验证中/)).toBeVisible()
+
+  // The rail lists destinations the user can actually reach, not development
+  // steps. A locked future step must never reappear here, and the quarantine
+  // destination stays absent until the capability ships.
+  const rail = page.getByRole('navigation', { name: '主导航' })
+  await expect(rail.getByRole('button', { name: /整理/ })).toHaveAttribute('aria-current', 'page')
+  await expect(rail.getByRole('button', { name: /活动/ })).toBeEnabled()
+  await expect(rail).not.toContainText('隔离区')
+  await expect(rail).not.toContainText('锁定')
+  await expect(page.getByRole('button', { name: '恢复隔离文件' })).toHaveCount(0)
+
+  // Banned vocabulary must not reach an ordinary surface (PRD FR-09).
+  await expect(page.getByText(/封印|封存|逻辑重复上限|birthtime|mtime|atime/)).toHaveCount(0)
 
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
@@ -321,17 +329,33 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
 
   await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
   await expect(page.getByRole('heading', { name: '正在建立内容证据' })).toBeVisible()
-  await expect(page.getByText('阶段 1 / 5')).toBeVisible()
+  // The default scan view reports user-facing progress; the algorithm stages
+  // live behind "如何确认？" (PRD 4.2).
+  await expect(page.getByText(/阶段 \d+ \/ 5/)).toHaveCount(0)
+  await expect(page.getByRole('term').filter({ hasText: '已检查' })).toBeVisible()
+  // The demo reports a real entry count, not its stage loop index — the same
+  // magnitude the results page will state, so the two surfaces cannot
+  // contradict each other inside one flow.
+  await expect(page.getByText('18,642')).toBeVisible()
+  // Algorithm stages exist, but stay collapsed until the user asks.
+  await expect(page.getByText('如何确认？')).toBeVisible()
+  await expect(page.getByText('读取目录清单')).toBeHidden()
 
   await captureEvidence(page, testInfo, 'scanning-1280x820.png')
 
   await page.clock.runFor(1_500)
 
-  await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /IMG_4821\.HEIC/ })).toHaveAttribute('aria-pressed', 'true')
-  await expect(page.getByText('D1 · 逐字节确认').first()).toBeVisible()
-  await expect(page.getByText('时间：高可信').first()).toBeVisible()
-  await expect(page.getByText('不参与重复判定')).toBeVisible()
+  // Rows no longer carry an internal code; the content proof lives behind the
+  // "why" disclosure and is still reachable on demand (PRD 5.2, FR-09).
+  await expect(page.getByText('D1 · 逐字节确认')).toHaveCount(0)
+  await expect(page.getByText('内容已完整比对').first()).toBeHidden()
+  await page.getByText('为什么判定为完全相同').click()
+  await expect(page.getByText('内容已完整比对').first()).toBeVisible()
+  // Time evidence is an explanation, not a decision input: it stays behind its
+  // own disclosure. (This assertion previously named copy that no longer
+  // existed anywhere in the app and had been failing on main.)
   await expect(page.locator('code').filter({ hasText: '/Volumes/影像归档/已整理/2021/05/IMG_4821.HEIC' })).toBeVisible()
   await expect(page.locator('code').filter({ hasText: '/Volumes/影像归档/iPhone 全量备份 2024/IMG_4821.HEIC' })).toBeVisible()
   await expect(page.locator('code').filter({ hasText: '/Volumes/影像归档/手机照片 2025/IMG_4821 2.HEIC' })).toBeVisible()
@@ -341,6 +365,160 @@ test('read-only demo scan exposes progress and exact duplicate evidence', async 
   expect(accessibility.violations).toEqual([])
 
   await captureEvidence(page, testInfo, 'results-1280x820.png')
+
+  // Time evidence is an explanation, not a decision input: it stays behind its
+  // own disclosure. Checked after the axe pass so the audited surface stays the
+  // page's default state — see the known-issue note about disclosure contrast.
+  await page.getByText('查看时间与元数据证据').click()
+  await expect(page.getByText('规范拍摄时间')).toBeVisible()
+  await expect(page.getByText('高可信', { exact: true })).toBeVisible()
+  await expect(page.getByText(/birthtime|mtime/)).toHaveCount(0)
+  await expect(page.getByText('不参与重复判定')).toBeVisible()
+})
+
+test('withheld groups are separated, explained, and offer no keeper control', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
+
+  // PRD 4.3: results split by eligibility, not by evidence type.
+  await expect(page.getByRole('heading', { name: /可整理/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /为安全保留/ })).toBeVisible()
+
+  const withheldRow = page.getByRole('button').filter({ hasText: '为安全保留' }).first()
+  await expect(withheldRow).toBeVisible()
+  await withheldRow.click()
+
+  // PRD FR-03: the surface must answer "why can't this group move?" with a
+  // concrete reason, in plain language.
+  await expect(
+    page.getByRole('region', { name: '为什么这组暂时不能移动？' }),
+  ).toBeVisible()
+  await expect(page.getByText(/互为硬链接/).first()).toBeVisible()
+  await expect(page.getByText(/你的照片没有任何改变/)).toBeVisible()
+
+  // PRD 5.1: engine authorisation, not user risk acknowledgement — there is no
+  // keeper control and no route into a plan, not merely a disabled one.
+  await expect(page.getByRole('radio')).toHaveCount(0)
+  await expect(page.getByLabel('当前整理计划')).toHaveCount(0)
+  await expect(page.getByText('保留哪一份？')).toHaveCount(0)
+
+  // Selecting an eligible group restores the decision controls.
+  await page.getByRole('button').filter({ hasText: 'IMG_4821.HEIC' }).first().click()
+  await expect(page.getByText('保留哪一份？')).toBeVisible()
+  await expect(page.getByRole('button', { name: /预览/ })).toBeVisible()
+
+  const accessibility = await new AxeBuilder({ page }).analyze()
+  expect(accessibility.violations).toEqual([])
+})
+
+test('accepting the page suggestions builds one plan across groups', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
+
+  // One click decides every eligible, undecided group on the page — the whole
+  // point of R1: at 709 groups a per-group loop is not completable.
+  await page.getByRole('button', { name: /接受这一页的建议（2 组）/ }).click()
+
+  const bar = page.getByLabel('当前整理计划')
+  await expect(bar).toContainText('已决定 2 组')
+  await expect(bar).toContainText('3 个副本移入隔离区')
+
+  // The withheld group is never swept up by the bulk action.
+  await expect(page.getByText('已选保留：').first()).toBeVisible()
+  await expect(page.getByRole('button').filter({ hasText: '为安全保留' })).toHaveCount(1)
+
+  await page.getByRole('button', { name: /预览：移走 3 个副本/ }).click()
+
+  // Whatever the action bar promised has to be itemised before anything moves.
+  await expect(page.getByRole('heading', { name: /2 组 · 移走 3 个副本/ })).toBeVisible()
+  // Rows are ordered largest reclaimable first, and each names its keeper's
+  // full path so same-named copies stay distinguishable before execution.
+  const planned = page.locator('.plan-groups li')
+  await expect(planned).toHaveCount(2)
+  await expect(planned.first()).toContainText('IMG_7710.MOV')
+  await expect(planned.first()).toContainText('移走 1 个')
+  await expect(planned.nth(1)).toContainText('移走 2 个')
+  await expect(planned.nth(1).locator('code')).toContainText('/Volumes/')
+
+  // This build executes one group per run; the copy must say so rather than
+  // let the plan total imply the button does all of it.
+  await expect(page.getByText(/本版本一次执行一组/)).toBeVisible()
+  await expect(page.getByRole('button', { name: /执行演示隔离（移走 2 个）/ })).toBeVisible()
+
+  const accessibility = await new AxeBuilder({ page }).analyze()
+  expect(accessibility.violations).toEqual([])
+})
+
+test('the accumulated plan stays reachable and executed groups leave the ledger', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await page.getByRole('button', { name: /接受这一页的建议（2 组）/ }).click()
+
+  // Selecting a group without a decision must not lock the plan away: the
+  // preview gate matches the button that opens it (review finding 1).
+  await page.getByRole('button').filter({ hasText: '为安全保留' }).first().click()
+  await page.getByRole('button', { name: /预览：移走 3 个副本/ }).click()
+  await expect(page.getByRole('heading', { name: '确认整理计划' })).toBeVisible()
+  await expect(page.getByText('请先在结果页选中要执行的那一组。')).toBeVisible()
+  await page.getByRole('button', { name: '返回修改' }).first().click()
+
+  // Execute the first group, then return: its copies must leave the running
+  // totals, its row reads 已整理, and it cannot be re-planned (finding 3).
+  await page.getByRole('button').filter({ hasText: 'IMG_4821.HEIC' }).first().click()
+  await page.getByRole('button', { name: /预览：移走 3 个副本/ }).click()
+  await page.getByRole('button', { name: /执行演示隔离（移走 2 个）/ }).click()
+  await expect(page.getByRole('heading', { name: '2 个副本已移入隔离区' })).toBeVisible()
+  // A fresh operation must not inherit the previous restore state (finding 9).
+  await expect(page.getByRole('button', { name: '恢复这次隔离' })).toBeEnabled()
+
+  await page.getByRole('button', { name: '继续处理重复组' }).click()
+  // The selection is still the executed group, so the bar reports its state
+  // plus what remains of the plan — already-moved copies are not in it.
+  const executedBar = page.getByLabel('当前组操作')
+  await expect(executedBar).toContainText('这一组已整理')
+  await expect(executedBar).toContainText('其余计划：1 组 · 1 个副本待移入隔离区')
+  await expect(page.getByText('已整理').first()).toBeVisible()
+
+  // The executed group offers no keeper controls and no re-execution route.
+  await page.getByRole('button').filter({ hasText: 'IMG_4821.HEIC' }).first().click()
+  await expect(page.getByText('这一组已整理').first()).toBeVisible()
+  await expect(page.getByRole('radio')).toHaveCount(0)
+  await expect(page.getByText('保留哪一份？')).toHaveCount(0)
+  // Its member paths stay visible, read-only.
+  await expect(page.getByText('这一组包含的文件')).toBeVisible()
+  await expect(page.locator('code').filter({ hasText: '/Volumes/影像归档/已整理/2021/05/IMG_4821.HEIC' })).toBeVisible()
+})
+
+test('leaving the results page with pending decisions asks before discarding them', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+  await page.clock.runFor(1_500)
+  await page.getByRole('button', { name: /接受这一页的建议（2 组）/ }).click()
+  await expect(page.getByLabel('当前整理计划')).toContainText('已决定 2 组')
+
+  // Dismissing the confirm keeps the plan intact (review finding 2).
+  page.once('dialog', (dialog) => {
+    expect(dialog.message()).toContain('丢弃 2 组尚未执行的决定')
+    void dialog.dismiss()
+  })
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: /活动/ }).click()
+  await expect(page.getByLabel('当前整理计划')).toContainText('已决定 2 组')
+
+  // Accepting it leaves knowingly.
+  page.once('dialog', (dialog) => void dialog.accept())
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: /活动/ }).click()
+  await expect(page.getByRole('heading', { name: '过去的扫描' })).toBeVisible()
 })
 
 test('demo workflow selects the recommended keeper, previews reversible isolation, and restores it', async ({ page }) => {
@@ -349,15 +527,17 @@ test('demo workflow selects the recommended keeper, previews reversible isolatio
 
   await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
   await page.clock.runFor(1_500)
-  await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
 
   const recommendedKeeper = page.getByRole('radio', { name: /IMG_4821\.HEIC.*建议保留/ })
   await recommendedKeeper.check()
   await expect(recommendedKeeper).toBeChecked()
-  await expect(page.getByLabel('当前组操作')).toContainText('保留 IMG_4821.HEIC')
+  // The bar now reports the whole plan, not just the selected group.
+  await expect(page.getByLabel('当前整理计划')).toContainText('已决定 1 组')
+  await expect(page.getByLabel('当前整理计划')).toContainText('2 个副本移入隔离区')
 
-  await page.getByRole('button', { name: '预览本组隔离计划' }).click()
-  await expect(page.getByRole('heading', { name: '确认这一组的隔离计划' })).toBeVisible()
+  await page.getByRole('button', { name: /预览：移走 2 个副本/ }).click()
+  await expect(page.getByRole('heading', { name: '确认整理计划' })).toBeVisible()
   await expect(page.getByText(/不会永久删除.*不会改写照片内容或时间/)).toBeVisible()
   await expect(page.getByText('生成恢复清单，可从归影隔离区还原')).toBeVisible()
   await expect(page.getByText('合成数据演示只模拟状态，不会访问本地文件。')).toBeVisible()
@@ -423,6 +603,8 @@ test('default release locks live quarantine while sealed adapters keep pathless 
       nativePath: { encoding: 'utf8', rawBase64 },
       sizeBytes: '4096',
       hasStableFileIdentity: true,
+      suggestedKeeper: ordinal === '0',
+      suggestionReason: ordinal === '0' ? '文件名没有被追加复制序号' : null,
       birthTimeSeconds: '1609459200',
       birthTimeNanoseconds: '0',
       modifiedTimeSeconds: '1609459200',
@@ -461,6 +643,9 @@ test('default release locks live quarantine while sealed adapters keep pathless 
                 previewPath: '/Volumes/Quarantine Fixture/KEEP.JPG',
                 logicalReclaimableBytes: '4096',
                 finalizedAtUnixMs: '2000',
+                eligibility: 'eligible',
+                blockReasonCode: null,
+                blockReasonCopy: null,
               }],
               nextCursor: null,
             }
@@ -513,13 +698,13 @@ test('default release locks live quarantine while sealed adapters keep pathless 
   })
 
   await page.goto('/')
-  await page.getByRole('button', { name: '查看历史报告' }).click()
-  await page.getByRole('button', { name: '打开 /Volumes/Quarantine Fixture 的封存报告' }).click()
-  await expect(page.getByRole('heading', { name: '发现 1 组确定重复' })).toBeVisible()
+  await page.getByRole('button', { name: '活动记录' }).click()
+  await page.getByRole('button', { name: '打开 /Volumes/Quarantine Fixture 的扫描记录' }).click()
+  await expect(page.getByRole('heading', { name: '发现 1 组完全相同的文件' })).toBeVisible()
 
   await page.getByRole('radio', { name: /KEEP\.JPG/ }).check()
-  await page.getByRole('button', { name: '预览本组整理计划' }).click()
-  await expect(page.getByRole('heading', { name: '查看这一组的整理计划' })).toBeVisible()
+  await page.getByRole('button', { name: /预览：移走 1 个副本/ }).click()
+  await expect(page.getByRole('heading', { name: '查看整理计划' })).toBeVisible()
   await expect(page.getByText(/你可以查看计划，但当前版本不会移动本地文件/)).toBeVisible()
   await expect(page.getByRole('button', { name: '真实隔离仍在安全验证中' })).toBeDisabled()
 
@@ -712,22 +897,60 @@ test('internal recovery reopens manifests after restart and keeps partial confli
   }
 })
 
+test('a blocked destination keeps its clean name and announces the reason as description', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+
+  const activity = page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: /活动/ })
+  await expect(activity).not.toHaveAttribute('aria-disabled', 'true')
+
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+
+  // While the scan owns the workspace the destination refuses via
+  // aria-disabled — still focusable, reason exposed as a DESCRIPTION. The
+  // busy reason must never join the accessible name: a hidden span inside the
+  // label once made this button match getByRole('停止扫描') lookups.
+  await expect(activity).toHaveAttribute('aria-disabled', 'true')
+  await expect(activity).toHaveAccessibleName('活动 过去的扫描与导出')
+  await expect(activity).toHaveAccessibleDescription(/扫描进行中/)
+
+  // Refusal lives in the handler, not just the attribute. dispatchEvent
+  // instead of click(): with an installed fake clock, click()'s actionability
+  // wait advances the clock, finishing the demo scan mid-click and testing
+  // nothing — the handler must refuse on its own state, and does.
+  await activity.dispatchEvent('click')
+  await expect(page.getByRole('heading', { name: '正在查找完全相同的文件' })).toBeVisible()
+
+  await page.clock.runFor(1_500)
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
+  await expect(activity).not.toHaveAttribute('aria-disabled', 'true')
+})
+
 test('core flow remains reachable using only the keyboard', async ({ browserName, page }) => {
   // WebKit keeps the macOS keyboard model: plain Tab skips buttons, and
   // Option(Alt)+Tab is the canonical way Safari/WKWebView users reach them.
   const focusNext = browserName === 'webkit' ? 'Alt+Tab' : 'Tab'
   await page.goto('/')
+
+  // The destination rail is reachable by keyboard before the workspace —
+  // it is real navigation now, not a decorative step tracker.
+  const rail = page.getByRole('navigation', { name: '主导航' })
+  await page.keyboard.press(focusNext)
+  await expect(rail.getByRole('button', { name: /整理/ })).toBeFocused()
+  await page.keyboard.press(focusNext)
+  await expect(rail.getByRole('button', { name: /活动/ })).toBeFocused()
+
   await page.keyboard.press(focusNext)
   await expect(page.getByRole('button', { name: '运行合成数据扫描演示' })).toBeFocused()
   await page.keyboard.press('Enter')
-  await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
 })
 
 test('results adapt at the compact desktop boundary', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1024, height: 768 })
   await page.goto('/')
   await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
-  await expect(page.getByRole('heading', { name: /发现 3 组确定重复/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
 
   await captureEvidence(page, testInfo, 'results-1024x768.png')
 })
@@ -839,11 +1062,18 @@ test('a transient native status failure keeps cancellation control and recovers'
 
   await page.goto('/')
   await page.getByRole('button', { name: '选择照片目录' }).click()
+
+  // A far-future grant must stay usable. setTimeout clamps its delay to a
+  // 32-bit signed integer, so an unguarded countdown fires immediately and
+  // locks the user out of a grant the native layer still honours.
+  await expect(page.getByRole('button', { name: '开始只读扫描' })).toBeEnabled()
+  await expect(page.getByText(/目录授权已过期/)).toHaveCount(0)
+
   await page.getByRole('button', { name: '开始只读扫描' }).click()
 
   await expect(page.getByRole('button', { name: '停止扫描' })).toBeVisible()
   await expect(page.getByText(/暂时无法确认扫描状态/)).toBeVisible()
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
   await expect(page.getByText('/Volumes/Test Photos').first()).toBeVisible()
 })
 
@@ -867,10 +1097,13 @@ test('a fresh full child is disclosed only after the late opaque attempt status 
 
   const disclosure = page.getByRole('status')
   await expect(disclosure).toContainText('重新关联为新的全量扫描。')
-  await expect(disclosure).toContainText('同一逻辑卷标识 + 精确原生根范围')
-  await expect(disclosure).toContainText('本次从根开始全量重扫')
-  await expect(disclosure).toContainText('不恢复旧进度、文件句柄、目录权限或历史证据')
-  await expect(disclosure).toContainText('不证明是同一块物理磁盘')
+  // Plain language must not upgrade the guarantee: matching a logical volume
+  // identity is not proof of the same physical disk, and the copy has to keep
+  // saying so.
+  await expect(disclosure).toContainText('无法确认是不是同一块硬盘')
+  await expect(disclosure).toContainText('本次从头完整重扫')
+  await expect(disclosure).toContainText('不沿用旧的访问权限')
+  await expect(disclosure).not.toContainText('在同一个磁盘上')
 
   const calls = await page.evaluate(() => (
     window as unknown as Window & {
@@ -891,7 +1124,7 @@ test('a fresh full child is disclosed only after the late opaque attempt status 
   }
 
   await page.getByRole('button', { name: '停止扫描' }).click()
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
 })
 
 for (const malformed of [
@@ -1016,11 +1249,11 @@ test('enumeration pause is same-open only, resumes, and remains cancellable whil
   await page.goto('/')
   await page.getByRole('button', { name: '选择照片目录' }).click()
   await page.getByRole('button', { name: '开始只读扫描' }).click()
-  await expect(page.getByText('仅本次打开期间可继续；退出后需重新扫描')).toBeVisible()
+  await expect(page.getByText('暂停后可以继续；退出应用需要重新扫描。随时可以停止。')).toBeVisible()
 
   await page.getByRole('button', { name: '暂停扫描' }).click()
   await expect(page.getByRole('button', { name: '继续扫描' })).toBeVisible()
-  await expect(page.getByText('目录枚举已暂停')).toBeVisible()
+  await expect(page.getByText('扫描已暂停')).toBeVisible()
   await expect(page.getByRole('button', { name: '停止扫描' })).toBeEnabled()
 
   await page.getByRole('button', { name: '继续扫描' }).click()
@@ -1028,7 +1261,7 @@ test('enumeration pause is same-open only, resumes, and remains cancellable whil
   await page.getByRole('button', { name: '暂停扫描' }).click()
   await expect(page.getByRole('button', { name: '继续扫描' })).toBeVisible()
   await page.getByRole('button', { name: '停止扫描' }).click()
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
 
   const calls = await page.evaluate(() => (
     window as unknown as Window & {
@@ -1151,7 +1384,7 @@ for (const delayedControl of ['pause', 'resume'] as const) {
         __SCAN_CONTROL_RACE_FIXTURE__: { allowTerminal: () => void }
       }
     ).__SCAN_CONTROL_RACE_FIXTURE__.allowTerminal())
-    await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
   })
 }
 
@@ -1244,18 +1477,21 @@ test('enumeration completion clears a concurrent pausing state and advances the 
   await page.getByRole('button', { name: '开始只读扫描' }).click()
   await page.getByRole('button', { name: '暂停扫描' }).click()
 
-  await expect(page.getByRole('heading', { name: '筛选候选' })).toBeVisible()
+  // Stage names are no longer surfaced as headings. What the user can observe
+  // is that the scan left the enumeration phase: the pause control goes away
+  // and no stale "正在暂停" state is left behind.
+  await expect(page.getByRole('button', { name: /暂停扫描|继续扫描/ })).toHaveCount(0)
   await expect(page.getByText('正在暂停')).toHaveCount(0)
   await page.evaluate(() => (
     window as unknown as Window & {
       __PAUSE_ENUMERATION_RACE_FIXTURE__: { releasePause: () => void }
     }
   ).__PAUSE_ENUMERATION_RACE_FIXTURE__.releasePause())
-  await expect(page.getByRole('heading', { name: '筛选候选' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /暂停扫描|继续扫描/ })).toHaveCount(0)
   await expect(page.getByText('正在暂停')).toHaveCount(0)
 
   await page.getByRole('button', { name: '停止扫描' }).click()
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
 })
 
 test('webview rejects a path-shaped root authority instead of starting a scan', async ({ page }) => {
@@ -1286,7 +1522,7 @@ test('webview rejects a path-shaped root authority instead of starting a scan', 
 
   await expect(page.getByRole('heading', { name: '没有执行主动修改操作' })).toBeVisible()
   await expect(page.getByText(/原生目录授权 token 格式无效/)).toBeVisible()
-  await expect(page.getByText('尚未选择目录。')).toBeVisible()
+  await expect(page.getByText(/尚未选择文件夹。/)).toBeVisible()
   await expect(page.getByText('已授权')).toHaveCount(0)
   const startCalls = await page.evaluate(() => (
     window as unknown as Window & { __ROOT_TOKEN_FIXTURE__: { startCalls: number } }
@@ -1423,7 +1659,7 @@ test('an unexpired root authorization starts the scan before its deadline', asyn
   const startButton = page.getByRole('button', { name: '开始只读扫描' })
   await expect(startButton).toBeEnabled()
   await startButton.click()
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
 })
 
 test('historical reports are paged, opened with a read token, and revoked on return', async ({ page }, testInfo) => {
@@ -1499,9 +1735,9 @@ test('historical reports are paged, opened with a read token, and revoked on ret
   })
 
   await page.goto('/')
-  await page.getByRole('button', { name: '查看历史报告' }).click()
-  await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
-  await expect(page.getByText('卷根目录 · 封存显示文本')).toBeVisible()
+  await page.getByRole('button', { name: '活动记录' }).click()
+  await expect(page.getByRole('heading', { name: '过去的扫描' })).toBeVisible()
+  await expect(page.getByText('卷根目录').first()).toBeVisible()
   expect(await page.evaluate(() => (
     window as unknown as Window & { __HISTORY_FIXTURE__: { calls: Array<{ command: string }> } }
   ).__HISTORY_FIXTURE__.calls.filter((call) => call.command === 'open_scan_history'))).toHaveLength(0)
@@ -1509,27 +1745,27 @@ test('historical reports are paged, opened with a read token, and revoked on ret
   const accessibility = await new AxeBuilder({ page }).analyze()
   expect(accessibility.violations).toEqual([])
 
-  await page.getByLabel('历史报告分页').getByRole('button', { name: '下一页' }).click()
+  await page.getByLabel('活动记录分页').getByRole('button', { name: '下一页' }).click()
   await expect(page.getByText('history page fixture failure')).toBeVisible()
-  await expect(page.getByText('卷根目录 · 封存显示文本')).toBeVisible()
+  await expect(page.getByText('卷根目录').first()).toBeVisible()
   await page.getByRole('button', { name: '重试失败页' }).click()
-  await expect(page.getByText('Archive/2025 · 封存显示文本')).toBeVisible()
+  await expect(page.getByText('Archive/2025')).toBeVisible()
   await captureEvidence(page, testInfo, 'history-1280x820.png')
 
-  await page.getByRole('button', { name: '打开 Archive/2025 的封存报告' }).evaluate((button: HTMLElement) => {
+  await page.getByRole('button', { name: '打开 Archive/2025 的扫描记录' }).evaluate((button: HTMLElement) => {
     button.click()
     button.click()
   })
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
   expect(await page.evaluate(() => (
     window as unknown as Window & { __HISTORY_FIXTURE__: { calls: Array<{ command: string }> } }
   ).__HISTORY_FIXTURE__.calls.filter((call) => call.command === 'open_scan_history'))).toHaveLength(1)
-  await expect(page.getByText('历史封印报告 · 只读复核')).toBeVisible()
+  await expect(page.getByText('活动记录 · 只读复核')).toBeVisible()
   await expect(page.getByText('扫描未覆盖全部条目。')).toBeVisible()
-  await expect(page.getByText('封存范围文本')).toBeVisible()
-  await expect(page.getByText('当前没有目录读取或写入权限')).toBeVisible()
-  await page.getByRole('button', { name: '返回历史报告' }).click()
-  await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
+  await expect(page.getByText('扫描时的位置')).toBeVisible()
+  await expect(page.getByText('归影现在没有这个文件夹的权限')).toBeVisible()
+  await page.getByRole('button', { name: '返回活动记录' }).click()
+  await expect(page.getByRole('heading', { name: '过去的扫描' })).toBeVisible()
   await expect.poll(async () => page.evaluate(() => (
     window as unknown as Window & { __HISTORY_FIXTURE__: { closes: number } }
   ).__HISTORY_FIXTURE__.closes)).toBe(1)
@@ -1590,8 +1826,8 @@ test('a late history-open response cannot restore an exited view or retain its t
   })
 
   await page.goto('/')
-  await page.getByRole('button', { name: '查看历史报告' }).click()
-  await page.getByRole('button', { name: '打开 Archive/Late 的封存报告' }).click()
+  await page.getByRole('button', { name: '活动记录' }).click()
+  await page.getByRole('button', { name: '打开 Archive/Late 的扫描记录' }).click()
   await expect.poll(async () => page.evaluate(() => (
     window as unknown as Window & { __LATE_HISTORY_FIXTURE__: { openCalls: number } }
   ).__LATE_HISTORY_FIXTURE__.openCalls)).toBe(1)
@@ -1605,7 +1841,7 @@ test('a late history-open response cannot restore an exited view or retain its t
   await expect.poll(async () => page.evaluate(() => (
     window as unknown as Window & { __LATE_HISTORY_FIXTURE__: { closes: number } }
   ).__LATE_HISTORY_FIXTURE__.closes)).toBe(1)
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toHaveCount(0)
 })
 
 test('persistent results page groups, members, and issues without unbounded accumulation', async ({ page }, testInfo) => {
@@ -1676,6 +1912,9 @@ test('persistent results page groups, members, and issues without unbounded accu
       previewPath: `/Volumes/Test Photos/${name}`,
       logicalReclaimableBytes: memberCount === '3' ? '8' : '4',
       finalizedAtUnixMs: '2000',
+      eligibility: 'eligible',
+      blockReasonCode: null,
+      blockReasonCopy: null,
     })
     const member = (groupBuildId: string, ordinal: string, name: string) => ({
       groupBuildId,
@@ -1685,6 +1924,8 @@ test('persistent results page groups, members, and issues without unbounded accu
       pathEncoding: 'utf8',
       sizeBytes: '4',
       hasStableFileIdentity: true,
+      suggestedKeeper: ordinal === '0',
+      suggestionReason: ordinal === '0' ? '文件名没有被追加复制序号' : null,
       birthTimeSeconds: ordinal === '0' ? '1609459200' : '1735689600',
       birthTimeNanoseconds: '0',
       modifiedTimeSeconds: ordinal === '0' ? '1609459200' : '1735689600',
@@ -1889,16 +2130,20 @@ test('persistent results page groups, members, and issues without unbounded accu
   await page.getByRole('button', { name: '选择照片目录' }).click()
   await page.getByRole('button', { name: '开始只读扫描' }).click()
 
-  await expect(page.getByRole('heading', { name: '发现 2 组确定重复' })).toBeVisible()
-  await expect(page.getByText(/Unix 原生字节.*无损封存/)).toHaveCount(0)
-  await expect(page.getByText('当前没有目录读取或写入权限')).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 2 组完全相同的文件' })).toBeVisible()
+  await expect(page.getByText(/Unix 原生字节.*完整记录/)).toHaveCount(0)
+  await expect(page.getByText('归影现在没有这个文件夹的权限')).toBeVisible()
   await expect(page.getByRole('button', { name: /A\.JPG/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /B\.JPG/ })).toHaveCount(0)
   await expect(page.locator('code').filter({ hasText: '/Volumes/Test Photos/A-copy.JPG' })).toBeVisible()
   await expect(page.getByText('2021-01-01 00:00:00 UTC').first()).toBeVisible()
   await expect(page.getByText('2025-01-01 00:00:00 UTC').first()).toBeVisible()
   await expect(page.getByText(/文件系统实际时间精度未知/).first()).toBeVisible()
-  await expect(page.getByText('拍摄时间证据已封存')).toBeVisible()
+  await expect(page.getByText('拍摄时间已分析完成')).toBeVisible()
+
+  // Capture-time detail is advanced evidence behind its own disclosure. These
+  // assertions never ran on main: an earlier one in this block failed first.
+  await page.getByText('查看时间与元数据证据').click()
   await expect(page.getByText('存在符合证据资格的候选')).toBeVisible()
   await expect(page.getByText('2021-01-01 08:00:00.123000000')).toBeVisible()
   await expect(page.getByText('仅证据资格')).toBeVisible()
@@ -2039,6 +2284,9 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
       previewPath: `/Volumes/Test Photos/${name}`,
       logicalReclaimableBytes: '4',
       finalizedAtUnixMs: '1900',
+      eligibility: 'eligible',
+      blockReasonCode: null,
+      blockReasonCopy: null,
     })
     const member = (groupBuildId: string, ordinal: string, name: string) => ({
       groupBuildId,
@@ -2048,6 +2296,8 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
       pathEncoding: 'utf8',
       sizeBytes: '4',
       hasStableFileIdentity: true,
+      suggestedKeeper: ordinal === '0',
+      suggestionReason: ordinal === '0' ? '文件名没有被追加复制序号' : null,
       birthTimeSeconds: '1609459200',
       birthTimeNanoseconds: '0',
       modifiedTimeSeconds: '1609459200',
@@ -2347,7 +2597,7 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
   await page.goto('/')
   await page.getByRole('button', { name: '选择照片目录' }).click()
   await page.getByRole('button', { name: '开始只读扫描' }).click()
-  await expect(page.getByRole('heading', { name: '发现 2 组确定重复' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 2 组完全相同的文件' })).toBeVisible()
 
   const metadataCalls = async (command: string) => page.evaluate((target) => (
     window as unknown as Window & {
@@ -2382,6 +2632,9 @@ test('sealed raw metadata stays lazy, scoped, byte-exact, and fail-closed', asyn
   expect(await metadataCalls('list_capture_time_metadata_fields')).toHaveLength(0)
   expect(await metadataCalls('get_capture_time_metadata_field_raw_detail')).toHaveLength(0)
 
+  // Raw metadata is nested inside the capture-time disclosure; open the outer
+  // one first. (This click had been timing out on main.)
+  await page.getByText('查看时间与元数据证据').click()
   await page.getByText('原始元数据证据（1 个来源）').click()
   await expect.poll(async () => (
     await metadataCalls('list_capture_time_metadata_reports')
@@ -2645,8 +2898,8 @@ test('a permanently failing acknowledgement still delivers the sealed report and
   await page.getByRole('button', { name: '选择照片目录' }).click()
   await page.getByRole('button', { name: '开始只读扫描' }).click()
 
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
-  await expect(page.getByText('报告已封存，但任务回执仍待确认。')).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
+  await expect(page.getByText('结果已保存，但还需要确认一次。')).toBeVisible()
   expect(await page.evaluate(() => (
     window as unknown as Window & { __ACK_RETRY_FIXTURE__: { acknowledgements: number } }
   ).__ACK_RETRY_FIXTURE__.acknowledgements)).toBe(4)
@@ -2657,7 +2910,7 @@ test('a permanently failing acknowledgement still delivers the sealed report and
     }).__ACK_RETRY_FIXTURE__.allowAcknowledgement = true
   })
   await page.getByRole('button', { name: '重试确认' }).click()
-  await expect(page.getByText('报告已封存，但任务回执仍待确认。')).toHaveCount(0)
+  await expect(page.getByText('结果已保存，但还需要确认一次。')).toHaveCount(0)
 })
 
 test('cancelled work exposes no unsealed duplicate or issue pages', async ({ page }) => {
@@ -2719,9 +2972,9 @@ test('cancelled work exposes no unsealed duplicate or issue pages', async ({ pag
   await page.getByRole('button', { name: '选择照片目录' }).click()
   await page.getByRole('button', { name: '开始只读扫描' }).click()
 
-  await expect(page.getByRole('heading', { name: '发现 0 组确定重复' })).toBeVisible()
-  await expect(page.getByText(/取消态不会开放未封印的问题分页/)).toBeVisible()
-  await expect(page.getByText('0 B', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '发现 0 组完全相同的文件' })).toBeVisible()
+  await expect(page.getByText(/扫描取消后不再展开未完成部分的问题列表/)).toBeVisible()
+  await expect(page.getByText(/重复占用 0 B/)).toBeVisible()
   const resultPageCalls = await page.evaluate(() => (
     window as unknown as Window & { __CANCELLED_FIXTURE__: { resultPageCalls: number } }
   ).__CANCELLED_FIXTURE__.resultPageCalls)
@@ -2896,13 +3149,13 @@ test('a late history export selection is revoked and cannot overwrite the exited
 
   await page.getByRole('button', { name: '选择文件并导出' }).click()
   await expect(page.getByText('请在系统窗口中选择新文件名。')).toBeVisible()
-  await page.getByRole('button', { name: '返回历史报告' }).click()
+  await page.getByRole('button', { name: '返回活动记录' }).click()
   await page.evaluate(() => (
     window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { releaseSelection: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.releaseSelection())
-  await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '过去的扫描' })).toBeVisible()
   await expect.poll(async () => page.evaluate(() => (
     window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
@@ -2923,7 +3176,7 @@ test('leaving a running history export cancels it and ignores a late completion'
 
   await page.getByRole('button', { name: '选择文件并导出' }).click()
   await expect(page.getByRole('button', { name: '取消导出' })).toBeVisible()
-  await page.getByRole('button', { name: '返回历史报告' }).click()
+  await page.getByRole('button', { name: '返回活动记录' }).click()
   await expect.poll(async () => page.evaluate(() => (
     window as unknown as Window & {
       __HISTORY_EXPORT_FIXTURE__: { calls: Array<{ command: string }> }
@@ -2936,7 +3189,7 @@ test('leaving a running history export cancels it and ignores a late completion'
       __HISTORY_EXPORT_FIXTURE__: { releaseExport: () => void }
     }
   ).__HISTORY_EXPORT_FIXTURE__.releaseExport())
-  await expect(page.getByRole('heading', { name: '历史只读报告' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '过去的扫描' })).toBeVisible()
   await expect(page.getByText('sealed-report.json')).toHaveCount(0)
 })
 
