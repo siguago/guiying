@@ -401,3 +401,16 @@ S1-01 原文写「keeper 建议有 `isRecommendedKeeper` + `keeperReason`，这�
 | 附带 | dead CSS（.app-version/.content-proof 族）、backend 建议谓词重复 | 删除 / 合并 |
 
 暂不处理并记录在案：测试夹具三处粘贴改共享构造器（纯测试重构）、共享成员遍历助手（遍历已整体删除）、R3-b/R1 后半按第 7 节原计划。
+
+### 执行结果（四批全部完成）
+
+| 批次 | 提交 | 验证 |
+| --- | --- | --- |
+| FX-1 | `f862665` | 82 UI 测试（新增计划可达/出账、离开确认两条回归） |
+| FX-2 | `42eaaa2` | 90 Rust 测试（新增年份反例、未知时间理由、页内建议、契约词表断言） |
+| FX-3 | `abadc35` | demo 计数固定断言；附着回放走真实状态轮询 |
+| FX-4 | `7104361` | 停止承诺与克隆告警经浏览器实测 |
+
+与计划的偏差：#14（withheld 成员清单）并入 FX-1 完成——检查器重构为共享成员列表时一并解决，FX-4 只余文案与清理。实施中另发现并修复：裸 `npx tsc --noEmit` 在本仓库 project-references 结构（根 tsconfig `files: []`）下不检查任何文件，此前的"类型通过"是空转，验证命令一律改用 `tsc -b --force`；导航按钮内联隐藏文本会把 busyReason 并进可访问名（与「停止扫描」按钮名冲突），改用 `aria-describedby`。
+
+15 项报告 finding 全部 fixed；7 项裁出候选中 6 项一并修复（S2 catch 区分、S3 aria-disabled、S6 文案差一、S7 CSS gap、D6 暂停时长、D8 计划排序、Alt1 契约词表），仅测试夹具共享构造器一项明确不做。
