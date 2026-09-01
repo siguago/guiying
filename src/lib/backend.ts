@@ -718,6 +718,12 @@ function adaptGroupEligibility(group: CoreDuplicateGroupItem): {
     }
     return { eligibility: 'eligible', blockReasonCode: null, blockReasonCopy: null }
   }
+  if (!ipcContract.groupEligibilityKinds.includes(group.eligibility)) {
+    return withheld(
+      'GROUP_ELIGIBILITY_UNKNOWN',
+      '这一组返回了归影无法识别的资格结论，已按不可整理处理。',
+    )
+  }
   if (group.eligibility !== 'review_required' && group.eligibility !== 'blocked') {
     return withheld(
       'GROUP_ELIGIBILITY_UNKNOWN',

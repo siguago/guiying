@@ -3854,25 +3854,23 @@ fn has_copy_marker(file_name: &str) -> bool {
         _ => file_name,
     };
     let stem = stem.trim_end();
-    // " (1)" / " (12)"
+    let is_short_digit_run = |digits: &str, max_len: usize| {
+        !digits.is_empty() && digits.len() <= max_len && digits.bytes().all(|b| b.is_ascii_digit())
+    };
+    // " (1)" / " (12)" — copy tools count in small numbers; a long run is a
+    // year or an id, not a marker.
     if let Some(rest) = stem.strip_suffix(')') {
         if let Some((head, digits)) = rest.rsplit_once('(') {
-            if head.ends_with(' ')
-                && !digits.is_empty()
-                && digits.bytes().all(|b| b.is_ascii_digit())
-            {
+            if head.ends_with(' ') && is_short_digit_run(digits, 3) {
                 return true;
             }
         }
     }
-    // " 2" — a space-separated trailing number, as Finder and many uploaders add
+    // " 2" — Finder's space-separated counter. Capped at two digits so
+    // ordinary "名称 2018" / "Trip 2019" album names are never mistaken for
+    // copies: real duplicate counters this large do not occur, years do.
     if let Some((head, tail)) = stem.rsplit_once(' ') {
-        if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) && !head.is_empty() {
-            return true;
-        }
-        // " copy" / " copy 2" / " 副本"
-        let lowered = tail.to_ascii_lowercase();
-        if lowered == "copy" || tail == "副本" {
+        if is_short_digit_run(tail, 2) && !head.is_empty() {
             return true;
         }
     }
@@ -3915,58 +3913,50 @@ fn keeper_suggestion_reason(best: &KeeperRank, others: &[KeeperRank]) -> &'stati
     if others.iter().any(|other| other.depth > best.depth) {
         return "位于更靠外层的目录";
     }
-    if others
-        .iter()
-        .any(|other| other.birth_time_seconds > best.birth_time_seconds)
+    // "Earliest creation time" is an evidence claim: it may only be made when
+    // every compared member actually has a birth time. An unknown one carries
+    // the i64::MAX ordering sentinel — later for ranking, but not "later" as a
+    // fact the sealed data supports.
+    let all_birth_times_known = best.birth_time_seconds != i64::MAX
+        && others
+            .iter()
+            .all(|other| other.birth_time_seconds != i64::MAX);
+    if all_birth_times_known
+        && others
+            .iter()
+            .any(|other| other.birth_time_seconds > best.birth_time_seconds)
     {
         return "文件创建时间最早";
     }
     "扫描顺序中的第一份"
 }
 
-/// Pick the member to suggest keeping, or `None` when no suggestion should be
-/// offered.
+/// Pick the member to suggest keeping from a fully loaded group, or `None`
+/// when no suggestion should be offered.
 ///
-/// Reads the whole group, bounded by the same ceiling the plan compiler
-/// enforces: a group larger than that is not organisable anyway, so it gets no
-/// suggestion rather than an expensive one. Any read failure yields `None` —
-/// a missing suggestion is a non-event, and must never block listing members.
-fn suggest_group_keeper(
-    reader: &EvidenceReader,
-    group: &guiying_store::ScanHistoryGroupContext,
+/// Called only when one member page holds the entire group (first page, no
+/// further cursor), so it costs zero extra reads and cannot loop. A group too
+/// large for one page exceeds the plan compiler's ceiling anyway — it gets no
+/// suggestion rather than an expensive one. The reason predicates are strict
+/// comparisons `best` can never satisfy against itself, so the full slice is
+/// passed without filtering it out.
+fn suggest_keeper_from_members(
+    members: &[guiying_store::DuplicateGroupMemberRecord],
 ) -> Option<(i64, &'static str)> {
-    let mut ranks: Vec<KeeperRank> = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = reader
-            .list_duplicate_group_members_page(group, cursor.as_ref(), 128)
-            .ok()?;
-        for member in &page.items {
-            ranks.push(KeeperRank {
-                has_copy_marker: has_copy_marker(file_name_of(&member.display_path)),
-                depth: path_depth(&member.display_path),
-                birth_time_seconds: member.birth_time.map_or(i64::MAX, |value| value.seconds),
-                ordinal: member.ordinal,
-            });
-        }
-        if ranks.len() > MAX_QUARANTINE_GROUP_MEMBERS as usize {
-            return None;
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    if ranks.len() < 2 {
+    if members.len() < 2 {
         return None;
     }
-    let best = *ranks.iter().min()?;
-    let others: Vec<KeeperRank> = ranks
+    let ranks: Vec<KeeperRank> = members
         .iter()
-        .copied()
-        .filter(|rank| rank.ordinal != best.ordinal)
+        .map(|member| KeeperRank {
+            has_copy_marker: has_copy_marker(file_name_of(&member.display_path)),
+            depth: path_depth(&member.display_path),
+            birth_time_seconds: member.birth_time.map_or(i64::MAX, |value| value.seconds),
+            ordinal: member.ordinal,
+        })
         .collect();
-    Some((best.ordinal, keeper_suggestion_reason(&best, &others)))
+    let best = *ranks.iter().min()?;
+    Some((best.ordinal, keeper_suggestion_reason(&best, &ranks)))
 }
 
 /// Decide whether a sealed duplicate group may be planned for quarantine.
@@ -4001,7 +3991,7 @@ pub(crate) fn classify_group_eligibility(
     if member_count > MAX_QUARANTINE_GROUP_MEMBERS {
         return GroupEligibility::ReviewRequired {
             code: "GROUP_TOO_MANY_MEMBERS",
-            copy: "这一组的副本超过 256 个，超出一次整理的安全上限，需要分批处理。",
+            copy: "这一组相同的文件超过 256 份，超出一次整理的安全上限，需要分批处理。",
         };
     }
     if logical_reclaimable_bytes > MAX_QUARANTINE_GROUP_LOGICAL_BYTES {
@@ -5121,7 +5111,6 @@ pub(crate) async fn list_duplicate_group_members(
         result_read_token,
         move |reader, context, result_scope| {
             let group = resolve_history_group(reader, context, group_build_id)?;
-            let suggestion = suggest_group_keeper(reader, &group);
             let decoded = decode_result_cursor::<DuplicateGroupMemberCursor>(
                 result_scope,
                 DUPLICATE_GROUP_MEMBERS_CURSOR_ENDPOINT,
@@ -5130,6 +5119,15 @@ pub(crate) async fn list_duplicate_group_members(
             let page = reader
                 .list_duplicate_group_members_page(&group, decoded.as_ref(), limit)
                 .map_err(|_| AppError::result_store("重复组成员封印证据读取失败。"))?;
+            // Suggest only when this one response holds the whole group: the
+            // frontend's page size equals the plan compiler's member ceiling,
+            // so every group that could receive a suggestion fits — and a
+            // partial view must never produce a group-level verdict.
+            let suggestion = if decoded.is_none() && page.next_cursor.is_none() {
+                suggest_keeper_from_members(&page.items)
+            } else {
+                None
+            };
             let mut mapped = map_member_page(result_scope, page)?;
             if let Some((ordinal, reason)) = suggestion {
                 let ordinal = ordinal.to_string();
@@ -6563,11 +6561,84 @@ mod tests {
             ),
             "文件创建时间最早"
         );
+        // An unknown birth time (the i64::MAX ordering sentinel) is not
+        // "later": the earliest-creation claim may only be made when every
+        // compared member actually has one.
+        assert_eq!(
+            keeper_suggestion_reason(
+                &best,
+                &[KeeperRank {
+                    birth_time_seconds: i64::MAX,
+                    ..best
+                }]
+            ),
+            "扫描顺序中的第一份"
+        );
+        assert_eq!(
+            keeper_suggestion_reason(
+                &KeeperRank {
+                    birth_time_seconds: i64::MAX,
+                    ..best
+                },
+                &[KeeperRank {
+                    birth_time_seconds: 100,
+                    ordinal: 9,
+                    ..best
+                }]
+            ),
+            "扫描顺序中的第一份"
+        );
         // Nothing distinguishes them: say so plainly rather than invent a reason.
         assert_eq!(
             keeper_suggestion_reason(&best, &[KeeperRank { ordinal: 4, ..best }]),
             "扫描顺序中的第一份"
         );
+    }
+
+    fn member_fixture(
+        ordinal: i64,
+        display_path: &str,
+        birth: Option<i64>,
+    ) -> guiying_store::DuplicateGroupMemberRecord {
+        guiying_store::DuplicateGroupMemberRecord {
+            group_build_id: 1,
+            ordinal,
+            observation_id: ordinal + 100,
+            fingerprint_id: 1,
+            sort_rank: ordinal,
+            stable_path_key: vec![],
+            mount_relative_path_raw: vec![],
+            root_relative_path_raw: vec![],
+            path_encoding: "utf8".to_owned(),
+            display_path: display_path.to_owned(),
+            source_signature: vec![],
+            size_bytes: 4,
+            file_object_key: Some(vec![1]),
+            birth_time: birth.map(|seconds| guiying_store::FileTimestampParts {
+                seconds,
+                nanoseconds: 0,
+            }),
+            modified_time: guiying_store::FileTimestampParts {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            timestamp_granularity_ns: None,
+        }
+    }
+
+    #[test]
+    fn page_scoped_suggestion_prefers_the_uncopied_member_and_names_why() {
+        let members = [
+            member_fixture(0, "/Volumes/照片/备份/IMG_1 2.HEIC", Some(50)),
+            member_fixture(1, "/Volumes/照片/IMG_1.HEIC", Some(100)),
+        ];
+        assert_eq!(
+            suggest_keeper_from_members(&members),
+            Some((1, "文件名没有被追加复制序号"))
+        );
+        // A single member has nothing to suggest against.
+        assert_eq!(suggest_keeper_from_members(&members[..1]), None);
+        assert_eq!(suggest_keeper_from_members(&[]), None);
     }
 
     #[test]
@@ -6705,6 +6776,7 @@ mod tests {
         max_cursor_bytes: usize,
         max_history_root_display_bytes: usize,
         max_history_scan_mode_bytes: usize,
+        group_eligibility_kinds: Vec<String>,
     }
 
     #[test]
@@ -6761,6 +6833,27 @@ mod tests {
             (1..=MAX_SCAN_HISTORY_PAGE_LIMIT).contains(&contract.scan_history_page_size),
             "scanHistoryPageSize must satisfy 1..={MAX_SCAN_HISTORY_PAGE_LIMIT}",
         );
+
+        // The eligibility vocabulary is a closed set shared with the WebView
+        // adapter. Renaming or adding a variant without updating the contract
+        // must fail here, not silently degrade every group to blocked in the
+        // running app.
+        let kinds = [
+            GroupEligibility::Eligible,
+            GroupEligibility::ReviewRequired { code: "", copy: "" },
+            GroupEligibility::Blocked { code: "", copy: "" },
+        ];
+        assert_eq!(contract.group_eligibility_kinds.len(), kinds.len());
+        for kind in kinds {
+            assert!(
+                contract
+                    .group_eligibility_kinds
+                    .iter()
+                    .any(|entry| entry == kind.kind()),
+                "eligibility kind {:?} is missing from ipc-contract.json",
+                kind.kind(),
+            );
+        }
     }
 
     fn result(scan_run_id: i64) -> ScanResultSummary {
