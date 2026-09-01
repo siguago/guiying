@@ -897,6 +897,35 @@ test('internal recovery reopens manifests after restart and keeps partial confli
   }
 })
 
+test('a blocked destination keeps its clean name and announces the reason as description', async ({ page }) => {
+  await page.goto('/')
+  await page.clock.install()
+
+  const activity = page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: /活动/ })
+  await expect(activity).not.toHaveAttribute('aria-disabled', 'true')
+
+  await page.getByRole('button', { name: '运行合成数据扫描演示' }).click()
+
+  // While the scan owns the workspace the destination refuses via
+  // aria-disabled — still focusable, reason exposed as a DESCRIPTION. The
+  // busy reason must never join the accessible name: a hidden span inside the
+  // label once made this button match getByRole('停止扫描') lookups.
+  await expect(activity).toHaveAttribute('aria-disabled', 'true')
+  await expect(activity).toHaveAccessibleName('活动 过去的扫描与导出')
+  await expect(activity).toHaveAccessibleDescription(/扫描进行中/)
+
+  // Refusal lives in the handler, not just the attribute. dispatchEvent
+  // instead of click(): with an installed fake clock, click()'s actionability
+  // wait advances the clock, finishing the demo scan mid-click and testing
+  // nothing — the handler must refuse on its own state, and does.
+  await activity.dispatchEvent('click')
+  await expect(page.getByRole('heading', { name: '正在查找完全相同的文件' })).toBeVisible()
+
+  await page.clock.runFor(1_500)
+  await expect(page.getByRole('heading', { name: /发现 3 组完全相同的文件/ })).toBeVisible()
+  await expect(activity).not.toHaveAttribute('aria-disabled', 'true')
+})
+
 test('core flow remains reachable using only the keyboard', async ({ browserName, page }) => {
   // WebKit keeps the macOS keyboard model: plain Tab skips buttons, and
   // Option(Alt)+Tab is the canonical way Safari/WKWebView users reach them.

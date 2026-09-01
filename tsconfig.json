@@ -1,4 +1,8 @@
 {
+  // Solution-style config: "files" is empty and real settings live in the
+  // referenced projects. A bare `tsc --noEmit` here therefore type-checks
+  // NOTHING and exits 0 — it is not a valid verification command. Use
+  // `pnpm typecheck` (tsc -b --force), or `pnpm build`, which runs `tsc -b`.
   "files": [],
   "references": [
     { "path": "./tsconfig.app.json" },

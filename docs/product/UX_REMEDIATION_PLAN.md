@@ -414,3 +414,11 @@ S1-01 原文写「keeper 建议有 `isRecommendedKeeper` + `keeperReason`，这�
 与计划的偏差：#14（withheld 成员清单）并入 FX-1 完成——检查器重构为共享成员列表时一并解决，FX-4 只余文案与清理。实施中另发现并修复：裸 `npx tsc --noEmit` 在本仓库 project-references 结构（根 tsconfig `files: []`）下不检查任何文件，此前的"类型通过"是空转，验证命令一律改用 `tsc -b --force`；导航按钮内联隐藏文本会把 busyReason 并进可访问名（与「停止扫描」按钮名冲突），改用 `aria-describedby`。
 
 15 项报告 finding 全部 fixed；7 项裁出候选中 6 项一并修复（S2 catch 区分、S3 aria-disabled、S6 文案差一、S7 CSS gap、D6 暂停时长、D8 计划排序、Alt1 契约词表），仅测试夹具共享构造器一项明确不做。
+
+### 基础设施修复
+
+| 问题 | 修复 |
+| --- | --- |
+| 裸 `tsc --noEmit` 在根 tsconfig（`files: []` + references）下不检查任何文件即通过 | 新增 `pnpm typecheck`（`tsc -b --force`）并写入 README 验证清单与 CI；根 tsconfig 加 JSONC 注释警示。经注入错误对照验证：同一错误旧命令 exit 0，新命令 exit 2 |
+| 禁用导航按钮的原因文本曾并入可访问名 | 已在 FX-1 改 `aria-describedby`；新增守卫测试锁定「blocked 时名字保持干净、原因作为 description 暴露、handler 自行拒绝」 |
+| （实施守卫测试时新发现）安装假时钟后 `locator.click()` 的可交互性等待会推进假时钟 | 依赖「假时钟冻结中点击」的断言全部失真——demo 扫描会在 click 内部完成，守卫看似被穿透实为合法放行。守卫测试改用 `dispatchEvent('click')` 绕过会拨钟的等待；该陷阱记录于测试内注释 |

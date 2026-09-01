@@ -43,6 +43,7 @@ jobs:
       - name: Validate tokens, lint, and build frontend
         run: |
           pnpm tokens:check
+          pnpm typecheck
           pnpm lint
           pnpm build
 

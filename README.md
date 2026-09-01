@@ -55,6 +55,7 @@ pnpm dev
 
 ```bash
 pnpm tokens:check
+pnpm typecheck
 pnpm build
 pnpm lint
 pnpm test:ui
